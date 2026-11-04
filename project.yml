@@ -33,6 +33,11 @@ targets:
       - sdk: Security.framework
       - sdk: SystemConfiguration.framework
       - sdk: libresolv.tbd
+    # Push: Xcode swaps "development" for "production" when it signs a build for TestFlight or the App Store.
+    entitlements:
+      path: ios/Pulshade.entitlements
+      properties:
+        aps-environment: development
     info:
       path: ios/Info.plist
       properties:
@@ -41,6 +46,7 @@ targets:
         PulshadeRelayDirect: $(PULSHADE_RELAY_DIRECT)
         PulshadeRelayPin: $(PULSHADE_RELAY_PIN)
         PulshadeAdminKey: $(PULSHADE_ADMIN_KEY)
+        PulshadePetKey: $(PULSHADE_PET_KEY)
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen:
@@ -48,13 +54,16 @@ targets:
         UIUserInterfaceStyle: Dark
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         NSHumanReadableCopyright: Built by Zeekz
-        # Pulshade has its own end-to-end encryption (Double Ratchet, X25519, ML-KEM-768), beyond what the system provides.
-        ITSAppUsesNonExemptEncryption: true
-        NSCameraUsageDescription: Scan codes to link your devices, add friends and verify them. Frames are never saved.
+        # Pulshade has its own end-to-end encryption (Double Ratchet, X25519, ML-KEM-768) built on standard algorithms.
+        # App Store Connect's export compliance questions (2026-11-04: not distributed in France) said no documents are
+        # needed, so this is false and each upload isn't asked again. Revisit if the app is ever released in France.
+        ITSAppUsesNonExemptEncryption: false
+        NSCameraUsageDescription: Scan codes to link your devices, add friends and verify them, and take photos and videos for stories. Frames are never saved.
         CFBundleURLTypes:
           - CFBundleURLName: app.pulshade.link
             CFBundleURLSchemes: [pulshade]
-        NSMicrophoneUsageDescription: Record voice notes and make calls. Audio is encrypted before it leaves your phone.
+        NSPhotoLibraryAddUsageDescription: Save pictures from your chats to Photos. Pulshade only adds to your library and never reads it.
+        NSMicrophoneUsageDescription: Record voice notes, videos and make calls. Audio is encrypted before it leaves your phone.
         # fetch: iOS wakes the app now and then to check for announcements (AnnouncementWatch).
         UIBackgroundModes: [audio, fetch]
         BGTaskSchedulerPermittedIdentifiers: [app.pulshade.ios.announcements]
@@ -79,4 +88,8 @@ targets:
         "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
         # Set when building, e.g. PULSHADE_RELAY=http://192.168.1.20:7878, to point the phone at your Mac's relay.
         PULSHADE_RELAY: ""
+        # The Pulshade Admin app's public key (relay/admin-key.pub): collectibles and the reports mailbox count only if
+        # it signed them.
         PULSHADE_ADMIN_KEY: ""
+        # The relay's pet-signing public key (relay/pet-key.pub), for hatched and gifted collectibles.
+        PULSHADE_PET_KEY: ""

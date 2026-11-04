@@ -13,6 +13,7 @@ mod calls;
 mod directory;
 mod onion;
 mod pow;
+mod push;
 mod release;
 mod sealed;
 
@@ -40,6 +41,13 @@ use tokio::sync::Notify;
 
 const MAX_ENVELOPE: usize = 4 * 1024 * 1024;
 const MAX_QUEUE: usize = 2_000;
+/// Everything waiting in memory, all mailboxes together. Past this, deposits are refused (507) instead of letting
+/// the process grow until it's killed, which would lose every queued envelope at once.
+const MAX_TOTAL_BYTES: usize = 384 * 1024 * 1024;
+/// Mailboxes holding mail at once.
+const MAX_MAILBOXES: usize = 200_000;
+/// Receive keys per push registration, so a phone with more registers in several goes.
+const MAX_PUSH_KEYS: usize = 256;
 const MAX_KEYS_PER_FETCH: usize = 512;
 const MAX_ITEMS_PER_KEY: usize = 64;
 const TTL: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -59,6 +67,8 @@ struct Item {
 
 struct Store {
     queues: HashMap<Id, VecDeque<Item>>,
+    /// The size of everything in `queues`, kept up to date as mail comes and goes (and recounted by `purge`).
+    bytes: usize,
     /// Envelope ids are unpredictable, so they say nothing about how busy the relay is.
     id_seed: [u8; 32],
     counter: u64,
@@ -68,7 +78,7 @@ impl Default for Store {
     fn default() -> Self {
         let mut id_seed = [0u8; 32];
         std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut id_seed)).expect("no randomness");
-        Store { queues: HashMap::new(), id_seed, counter: 0 }
+        Store { queues: HashMap::new(), bytes: 0, id_seed, counter: 0 }
     }
 }
 
@@ -111,20 +121,36 @@ fn send_id_for(receive_key: &Id) -> Id {
     Sha256::digest(receive_key).into()
 }
 
-async fn deposit(State(store): State<Shared>, Path(send_id): Path<String>, body: Bytes) -> StatusCode {
+/// Whether mail in this deposit should wake a phone. An app says so with `x-pulshade-wake`: 1 for a message, 0 for
+/// anything else (a typing signal, a receipt). The relay can't read what's inside, so without the word, as from
+/// apps that don't send it yet, it wakes as it always did.
+fn wakes(headers: &HeaderMap) -> bool {
+    headers.get("x-pulshade-wake").and_then(|v| v.to_str().ok()) != Some("0")
+}
+
+async fn deposit(State(store): State<Shared>, Path(send_id): Path<String>, headers: HeaderMap, body: Bytes) -> StatusCode {
     let Some(id) = parse_id(&send_id) else { return StatusCode::BAD_REQUEST };
     if body.is_empty() || body.len() > MAX_ENVELOPE {
         return StatusCode::PAYLOAD_TOO_LARGE;
     }
     let mut store = store.lock().unwrap();
+    if store.bytes + body.len() > MAX_TOTAL_BYTES || (!store.queues.contains_key(&id) && store.queues.len() >= MAX_MAILBOXES) {
+        return StatusCode::INSUFFICIENT_STORAGE;
+    }
     let item = Item { id: store.next_id(), at: Instant::now(), blob: body };
+    let size = item.blob.len();
     let queue = store.queues.entry(id).or_default();
     if queue.len() >= MAX_QUEUE {
         return StatusCode::INSUFFICIENT_STORAGE;
     }
     queue.push_back(item);
+    store.bytes += size;
     drop(store);
     ARRIVALS.notify_waiters();
+    // A phone that asked for it is woken, with nothing about the mail in the push.
+    if wakes(&headers) {
+        push::global().notify(id);
+    }
     StatusCode::ACCEPTED
 }
 
@@ -200,13 +226,117 @@ async fn ack(State(store): State<Shared>, Json(req): Json<AckRequest>) -> Status
     for a in req.acks {
         let Some(receive_key) = parse_id(&a.key) else { continue };
         let send_id = send_id_for(&receive_key);
+        let mut freed = 0;
         if let Some(queue) = store.queues.get_mut(&send_id) {
-            queue.retain(|item| !a.ids.contains(&item.id));
+            queue.retain(|item| {
+                let keep = !a.ids.contains(&item.id);
+                if !keep { freed += item.blob.len(); }
+                keep
+            });
             if queue.is_empty() {
                 store.queues.remove(&send_id);
             }
         }
+        store.bytes = store.bytes.saturating_sub(freed);
     }
+    StatusCode::NO_CONTENT
+}
+
+// MARK: Push
+
+#[derive(Deserialize)]
+struct PushRegister {
+    /// The receive keys of the mailboxes to wake this phone for. Holding them proves they're the phone's own.
+    keys: Vec<String>,
+    token: String,
+    /// A token from a development build, which Apple's sandbox issues and only its sandbox accepts.
+    #[serde(default)]
+    sandbox: bool,
+    /// Whether the push makes a sound: the phone's own Sound setting.
+    #[serde(default = "yes")]
+    sound: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+struct PushOff {
+    keys: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct PushForget {
+    token: String,
+}
+
+fn mailboxes_of(keys: &[String]) -> Vec<Id> {
+    keys.iter().filter_map(|k| parse_id(k)).map(|k| send_id_for(&k)).collect()
+}
+
+/// Says whether this relay can send pushes at all, so the app only offers them where they'll work.
+async fn push_status() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "enabled": push::global().enabled() }))
+}
+
+async fn push_register(
+    State(state): State<AppState>,
+    caller::Caller(ip): caller::Caller,
+    headers: HeaderMap,
+    Json(req): Json<PushRegister>,
+) -> StatusCode {
+    let who = pow::rate_key(ip, &headers, "push");
+    if !state.limits.lock().unwrap().allow(who, "push", 60, Duration::from_secs(3600)) {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    let push = push::global();
+    if !push.enabled() {
+        return StatusCode::NOT_IMPLEMENTED;
+    }
+    if req.keys.len() > MAX_PUSH_KEYS || !push::valid_token(&req.token) {
+        return StatusCode::BAD_REQUEST;
+    }
+    if push.register(&mailboxes_of(&req.keys), &req.token.to_lowercase(), req.sandbox, req.sound) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::INSUFFICIENT_STORAGE
+    }
+}
+
+/// Everything registered for a device token goes. A phone sends this when its identity is wiped or a decoy opens,
+/// where it has no keys to name the mailboxes with.
+async fn push_forget(
+    State(state): State<AppState>,
+    caller::Caller(ip): caller::Caller,
+    headers: HeaderMap,
+    Json(req): Json<PushForget>,
+) -> StatusCode {
+    let who = pow::rate_key(ip, &headers, "push");
+    if !state.limits.lock().unwrap().allow(who, "push", 60, Duration::from_secs(3600)) {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    if !push::valid_token(&req.token) {
+        return StatusCode::BAD_REQUEST;
+    }
+    push::global().forget(&req.token.to_lowercase());
+    StatusCode::NO_CONTENT
+}
+
+async fn push_off(
+    State(state): State<AppState>,
+    caller::Caller(ip): caller::Caller,
+    headers: HeaderMap,
+    Json(req): Json<PushOff>,
+) -> StatusCode {
+    let who = pow::rate_key(ip, &headers, "push");
+    if !state.limits.lock().unwrap().allow(who, "push", 60, Duration::from_secs(3600)) {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    if req.keys.len() > MAX_PUSH_KEYS {
+        return StatusCode::BAD_REQUEST;
+    }
+    push::global().remove(&mailboxes_of(&req.keys));
     StatusCode::NO_CONTENT
 }
 
@@ -269,6 +399,96 @@ async fn held(
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
     state.directory.lock().unwrap().held_for(&proof).map(Json)
+}
+
+/// The collectibles given to an account, for that account only.
+async fn collectibles(
+    State(state): State<AppState>,
+    caller::Caller(ip): caller::Caller,
+    headers: HeaderMap,
+    Json(proof): Json<OwnerProof>,
+) -> Result<Json<Vec<directory::Mine>>, StatusCode> {
+    let who = pow::rate_key(ip, &headers, "collectibles");
+    if !state.limits.lock().unwrap().allow(who, "collectibles", 60, Duration::from_secs(3600)) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    state.directory.lock().unwrap().collectibles_of(&proof).map(Json)
+}
+
+/// Sets the owner's backup code for one of its collectibles.
+async fn collectible_code(State(state): State<AppState>, Json(set): Json<directory::CodeSet>) -> StatusCode {
+    match state.directory.lock().unwrap().set_code(&set) {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(code) => code,
+    }
+}
+
+/// A backup code entered in another account. Limited hard, and a proof of work over Tor, so codes can't be guessed.
+async fn claim_collectibles(
+    State(state): State<AppState>,
+    caller::Caller(ip): caller::Caller,
+    headers: HeaderMap,
+    Json(claim): Json<directory::Claim>,
+) -> Result<Json<Vec<directory::Claimed>>, StatusCode> {
+    let who = pow::rate_key(ip, &headers, "collectible-claim");
+    if !state.limits.lock().unwrap().allow(who, "collectible-claim", 10, Duration::from_secs(3600)) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    state.directory.lock().unwrap().claim(&claim).map(Json)
+}
+
+/// A giveaway code entered by an account. Limited hard, and a proof of work over Tor, so codes can't be guessed.
+async fn claim_giveaway(
+    State(state): State<AppState>,
+    caller::Caller(ip): caller::Caller,
+    headers: HeaderMap,
+    Json(entry): Json<directory::GiveawayEntry>,
+) -> Result<Json<directory::GiveawayPlace>, StatusCode> {
+    let who = pow::rate_key(ip, &headers, "giveaway-claim");
+    if !state.limits.lock().unwrap().allow(who, "giveaway-claim", 10, Duration::from_secs(3600)) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    state.directory.lock().unwrap().claim_giveaway(&entry).map(Json)
+}
+
+/// The eggs an account holds, for that account only.
+async fn eggs(
+    State(state): State<AppState>,
+    caller::Caller(ip): caller::Caller,
+    headers: HeaderMap,
+    Json(proof): Json<OwnerProof>,
+) -> Result<Json<Vec<directory::EggView>>, StatusCode> {
+    let who = pow::rate_key(ip, &headers, "eggs");
+    if !state.limits.lock().unwrap().allow(who, "eggs", 120, Duration::from_secs(3600)) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    state.directory.lock().unwrap().eggs_of(&proof).map(Json)
+}
+
+/// Puts one of the account's eggs to hatch.
+async fn egg_start(State(state): State<AppState>, Json(action): Json<directory::EggAction>) -> Result<Json<directory::EggView>, StatusCode> {
+    state.directory.lock().unwrap().start_egg(&action).map(Json)
+}
+
+/// Opens an egg that's ready.
+async fn egg_hatch(State(state): State<AppState>, Json(action): Json<directory::EggAction>) -> Result<Json<directory::Mine>, StatusCode> {
+    state.directory.lock().unwrap().hatch_egg(&action).map(Json)
+}
+
+/// Gives a collectible to another account.
+async fn collectible_gift(State(state): State<AppState>, Json(out): Json<directory::GiftOut>) -> StatusCode {
+    match state.directory.lock().unwrap().gift(&out) {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(code) => code,
+    }
+}
+
+/// Lets a collectible go.
+async fn collectible_release(State(state): State<AppState>, Json(out): Json<directory::ReleaseOut>) -> StatusCode {
+    match state.directory.lock().unwrap().release(&out) {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(code) => code,
+    }
 }
 
 async fn unhold(State(state): State<AppState>, Path(handle): Path<String>, Json(proof): Json<OwnerProof>) -> StatusCode {
@@ -473,6 +693,8 @@ fn purge(store: &Shared) {
         queue.retain(|item| now.duration_since(item.at) < TTL);
         !queue.is_empty()
     });
+    // Recounted, so the running total can't drift.
+    store.bytes = store.queues.values().flat_map(|q| q.iter()).map(|item| item.blob.len()).sum();
 }
 
 fn app(state: AppState) -> Router {
@@ -483,12 +705,24 @@ fn app(state: AppState) -> Router {
         .route("/v1/q/{send_id}", put(deposit))
         .route("/v1/fetch", post(fetch))
         .route("/v1/ack", post(ack))
+        .route("/v1/push", get(push_status).put(push_register))
+        .route("/v1/push/off", post(push_off))
+        .route("/v1/push/forget", post(push_forget))
         .route("/v1/dir/{handle}", get(lookup).put(claim))
         .route("/v1/dir/{handle}/delete", post(release))
         .route("/v1/mine", post(mine))
         .route("/v1/retire", post(retire))
         .route("/v1/held", post(held))
         .route("/v1/dir/{handle}/unhold", post(unhold))
+        .route("/v1/collectibles", post(collectibles))
+        .route("/v1/collectibles/code", post(collectible_code))
+        .route("/v1/collectibles/claim", post(claim_collectibles))
+        .route("/v1/collectibles/giveaway", post(claim_giveaway))
+        .route("/v1/collectibles/gift", post(collectible_gift))
+        .route("/v1/collectibles/release", post(collectible_release))
+        .route("/v1/eggs", post(eggs))
+        .route("/v1/eggs/start", post(egg_start))
+        .route("/v1/eggs/hatch", post(egg_hatch))
         .route("/v1/backup/{key}", put(backup_put).layer(DefaultBodyLimit::max(backup::MAX_BACKUP)))
         .route("/v1/backup/{key}/get", post(backup_get))
         .route("/v1/backup/{key}/delete", post(backup_remove))
@@ -508,6 +742,14 @@ fn creator_key() -> Option<String> {
         .or_else(|| std::fs::read_to_string("creator.key").ok())
         .map(|k| k.trim().to_string())
         .filter(|k| !k.is_empty())
+}
+
+/// The key the relay signs hatched and gifted pets with: 32 bytes as hex, from `PULSHADE_PET_KEY` or a `pet.key` file
+/// next to the relay. Without it, eggs can't hatch and nothing can be gifted.
+fn pet_signing_key() -> Option<ed25519_dalek::SigningKey> {
+    let hex_seed = std::env::var("PULSHADE_PET_KEY").ok().or_else(|| std::fs::read_to_string("pet.key").ok())?;
+    let raw: [u8; 32] = hex::decode(hex_seed.trim()).ok()?.try_into().ok()?;
+    Some(ed25519_dalek::SigningKey::from_bytes(&raw))
 }
 
 /// Keeps memory off the disk: no core file if the relay crashes, and (on Linux) no other process of this user
@@ -561,6 +803,7 @@ async fn main() {
         admin_token: Arc::new(admin_token()),
         started: Instant::now(),
     };
+    if let Some(key) = pet_signing_key() { state.directory.lock().unwrap().set_pet_key(key); }
 
     let (sweeper, backups) = (store.clone(), state.backups.clone());
     tokio::spawn(async move {
@@ -568,6 +811,7 @@ async fn main() {
         loop {
             tick.tick().await;
             purge(&sweeper);
+            push::global().sweep();
             backups.sweep(backup::BACKUP_TTL);
         }
     });
@@ -661,13 +905,23 @@ mod tests {
         [n; 32]
     }
 
+    #[test]
+    fn only_mail_an_app_calls_a_message_wakes_a_phone() {
+        let mut headers = HeaderMap::new();
+        assert!(wakes(&headers), "an app that doesn't say, wakes it as before");
+        headers.insert("x-pulshade-wake", "1".parse().unwrap());
+        assert!(wakes(&headers));
+        headers.insert("x-pulshade-wake", "0".parse().unwrap());
+        assert!(!wakes(&headers), "a typing signal or receipt doesn't");
+    }
+
     #[tokio::test]
     async fn deposit_fetch_ack_round_trip() {
         let store: Shared = Arc::default();
         let receive = key(7);
         let send = hex::encode(send_id_for(&receive));
 
-        assert_eq!(deposit(State(store.clone()), Path(send.clone()), Bytes::from_static(b"sealed")).await, StatusCode::ACCEPTED);
+        assert_eq!(deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), Bytes::from_static(b"sealed")).await, StatusCode::ACCEPTED);
 
         let Json(res) = fetch(State(store.clone()), Json(FetchRequest { keys: vec![hex::encode(receive)], wait: 0 })).await.unwrap();
         assert_eq!(res.items.len(), 1);
@@ -690,7 +944,7 @@ mod tests {
         let started = Instant::now();
         let waiting = tokio::spawn(fetch(State(store.clone()), Json(FetchRequest { keys: vec![hex::encode(receive)], wait: 10 })));
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(deposit(State(store.clone()), Path(send), Bytes::from_static(b"now")).await, StatusCode::ACCEPTED);
+        assert_eq!(deposit(State(store.clone()), Path(send), HeaderMap::new(), Bytes::from_static(b"now")).await, StatusCode::ACCEPTED);
         let Json(res) = waiting.await.unwrap().unwrap();
         assert_eq!(res.items.len(), 1);
         assert!(started.elapsed() < Duration::from_secs(2), "answered when the mail landed, not at the deadline");
@@ -702,12 +956,33 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_secs(1), "nothing for it: waited out the second");
     }
 
+    /// What's waiting is counted, so a flood is refused (507) before it can take the relay down, and acknowledging
+    /// or expiring mail gives the room back.
+    #[tokio::test]
+    async fn the_relay_refuses_mail_past_its_memory_budget_and_gives_room_back() {
+        let store: Shared = Arc::default();
+        let receive = key(21);
+        let send = hex::encode(send_id_for(&receive));
+        assert_eq!(deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), Bytes::from_static(b"12345")).await, StatusCode::ACCEPTED);
+        assert_eq!(store.lock().unwrap().bytes, 5);
+        store.lock().unwrap().bytes = MAX_TOTAL_BYTES - 3;
+        assert_eq!(deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), Bytes::from_static(b"abcd")).await, StatusCode::INSUFFICIENT_STORAGE);
+        assert_eq!(deposit(State(store.clone()), Path(send), HeaderMap::new(), Bytes::from_static(b"abc")).await, StatusCode::ACCEPTED);
+        // Expiry recounts from what's really there.
+        purge(&store);
+        assert_eq!(store.lock().unwrap().bytes, 5 + 3);
+        let Json(res) = fetch(State(store.clone()), Json(FetchRequest { keys: vec![hex::encode(receive)], wait: 0 })).await.unwrap();
+        let ids: Vec<u64> = res.items.iter().map(|i| i.id).collect();
+        ack(State(store.clone()), Json(AckRequest { acks: vec![Ack { key: hex::encode(receive), ids }] })).await;
+        assert_eq!(store.lock().unwrap().bytes, 0);
+    }
+
     #[tokio::test]
     async fn send_id_cannot_read() {
         let store: Shared = Arc::default();
         let receive = key(9);
         let send = hex::encode(send_id_for(&receive));
-        deposit(State(store.clone()), Path(send.clone()), Bytes::from_static(b"x")).await;
+        deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), Bytes::from_static(b"x")).await;
         // Someone holding only the send id gets nothing back.
         let Json(res) = fetch(State(store), Json(FetchRequest { keys: vec![send], wait: 0 })).await.unwrap();
         assert!(res.items.is_empty());
@@ -747,8 +1022,8 @@ mod tests {
     #[tokio::test]
     async fn rejects_bad_input() {
         let store: Shared = Arc::default();
-        assert_eq!(deposit(State(store.clone()), Path("nothex".into()), Bytes::from_static(b"x")).await, StatusCode::BAD_REQUEST);
+        assert_eq!(deposit(State(store.clone()), Path("nothex".into()), HeaderMap::new(), Bytes::from_static(b"x")).await, StatusCode::BAD_REQUEST);
         let send = hex::encode(send_id_for(&key(1)));
-        assert_eq!(deposit(State(store), Path(send), Bytes::new()).await, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(deposit(State(store), Path(send), HeaderMap::new(), Bytes::new()).await, StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

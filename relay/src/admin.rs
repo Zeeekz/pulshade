@@ -96,6 +96,63 @@ pub fn run(dir: &mut Directory, req: &AdminRequest, traffic: Traffic) -> Result<
             dir.give(&h, key.trim()).map_err(|_| "That isn't an account key".to_string())?;
             Ok(json!({ "given": h }))
         }
+        "collectibles" => Ok(json!(dir.given())),
+        "collectible-limits" => Ok(json!({ "default": crate::directory::DEFAULT_PER_ITEM, "most": crate::directory::MOST_PER_ITEM, "limits": dir.limits() })),
+        "set-collectible-limit" => {
+            // `item amount`: how many of it there can be.
+            let (item, amount) = arg.split_once(char::is_whitespace).ok_or("Give the item and how many")?;
+            let amount: u32 = amount.trim().parse().map_err(|_| "That isn't a number".to_string())?;
+            dir.set_limit(item.trim(), amount)?;
+            Ok(json!({ "item": item.trim(), "limit": amount }))
+        }
+        "reset-collectibles" => {
+            // Spelled out, so it can't happen by accident.
+            if arg != "everyone" { return Err("Say whose: everyone".into()); }
+            Ok(json!({ "reset": dir.reset_collectibles() }))
+        }
+        "collectibles-of" => {
+            // By handle, or by the account's public key.
+            let key = if arg.starts_with('@') || crate::directory::valid_handle(arg) {
+                let h = handle_arg(arg)?;
+                dir.get(&h).map(|e| e.key).ok_or(format!("@{h} isn't listed"))?
+            } else {
+                arg.to_string()
+            };
+            Ok(json!(dir.grants_of(&key)))
+        }
+        "take-collectible" => {
+            // `item serial`, as the panel shows it.
+            let (item, serial) = arg.split_once(char::is_whitespace).ok_or("Give the item and its number")?;
+            let serial: u32 = serial.trim().trim_start_matches('#').parse().map_err(|_| "That isn't a number".to_string())?;
+            if dir.take_collectible(item, serial) { Ok(json!({ "taken": item, "serial": serial })) }
+            else { Err(format!("No {item} #{serial} to take back")) }
+        }
+        "eggs" => Ok(json!(dir.eggs())),
+        "egg-kinds" => Ok(json!(crate::directory::EGG_KINDS.iter().map(|k| json!({
+            "name": k.name,
+            "seconds": k.seconds,
+            "inside": k.inside.iter().map(|(item, chance)| json!({ "item": item, "chance": chance })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>())),
+        "give-egg" => {
+            // `@handle-or-key kind`: an egg that its owner starts hatching, and the relay opens when it's ready.
+            let (who, kind) = arg.split_once(char::is_whitespace).ok_or("Give the account and the kind of egg")?;
+            let who = who.trim();
+            let key = if who.starts_with('@') || crate::directory::valid_handle(who) {
+                let h = handle_arg(who)?;
+                dir.get(&h).map(|e| e.key).ok_or(format!("@{h} isn't listed"))?
+            } else {
+                who.to_string()
+            };
+            let id = dir.give_egg(&key, kind.trim())?;
+            Ok(json!({ "egg": id, "kind": kind.trim() }))
+        }
+        "give-collectible" => {
+            // The grant, signed by the creator's app: `{ "item", "serial", "owner", "sig" }`.
+            let grant: crate::directory::Grant = serde_json::from_str(arg).map_err(|_| "That isn't a collectible".to_string())?;
+            let (item, serial) = (grant.item.clone(), grant.serial);
+            dir.give_collectible(grant)?;
+            Ok(json!({ "item": item, "serial": serial }))
+        }
         "announcements" => Ok(json!(dir.announcements())),
         "announce" => {
             // Signed by the admin app: `{ "id", "text", "date", "sig" }`.
@@ -106,6 +163,17 @@ pub fn run(dir: &mut Directory, req: &AdminRequest, traffic: Traffic) -> Result<
         }
         "unannounce" => {
             if dir.unannounce(arg) { Ok(json!({ "unannounced": arg })) } else { Err("No such announcement".into()) }
+        }
+        "claims" => Ok(json!(dir.claims().into_iter().map(|c| {
+            let to = dir.claimed_by(&c.item, c.serial);
+            json!({ "item": c.item, "serial": c.serial, "to": to })
+        }).collect::<Vec<_>>())),
+        "reissue" => {
+            // Signed by the admin app for the account that claimed it: `{ "item", "serial", "owner", "sig" }`.
+            let grant: crate::directory::Grant = serde_json::from_str(arg).map_err(|_| "That isn't a collectible".to_string())?;
+            let (item, serial) = (grant.item.clone(), grant.serial);
+            dir.reissue(grant)?;
+            Ok(json!({ "item": item, "serial": serial }))
         }
         "ban-handle" => {
             let h = handle_arg(arg)?;
@@ -141,6 +209,32 @@ pub fn run(dir: &mut Directory, req: &AdminRequest, traffic: Traffic) -> Result<
         "unreserve" => {
             let h = handle_arg(arg)?;
             if dir.unreserve(&h) { Ok(json!({ "unreserved": h })) } else { Err(format!("@{h} wasn't on the reserved list")) }
+        }
+        "giveaways" => Ok(json!(dir.giveaways().iter().map(|g| json!({
+            "id": g.id, "item": g.item, "opens": g.opens, "closes": g.closes, "max": g.max,
+            "claimed": g.claims.len(), "waiting": g.claims.iter().filter(|c| !c.done).count(),
+        })).collect::<Vec<_>>())),
+        "add-giveaway" => {
+            // `{ "id", "item", "hash", "opens", "closes", "max" }`: the code only as a hash.
+            let g: crate::directory::Giveaway = serde_json::from_str(arg).map_err(|_| "That isn't a giveaway".to_string())?;
+            let id = g.id.clone();
+            dir.add_giveaway(g)?;
+            Ok(json!({ "added": id }))
+        }
+        "remove-giveaway" => {
+            if dir.remove_giveaway(arg) { Ok(json!({ "removed": arg })) } else { Err("No such giveaway".into()) }
+        }
+        "giveaways-waiting" => Ok(json!(dir.giveaways_waiting().into_iter()
+            .map(|(id, item, key)| json!({ "giveaway": id, "item": item, "key": key })).collect::<Vec<_>>())),
+        "give-giveaway" => {
+            // Signed by the admin app: `{ "giveaway", "grant": { "item", "serial", "owner", "sig" } }`.
+            let v: Value = serde_json::from_str(arg).map_err(|_| "That isn't a giveaway grant".to_string())?;
+            let id = v.get("giveaway").and_then(Value::as_str).ok_or("Which giveaway?")?.to_string();
+            let grant: crate::directory::Grant = serde_json::from_value(v.get("grant").cloned().unwrap_or(Value::Null))
+                .map_err(|_| "That isn't a collectible".to_string())?;
+            let (item, serial) = (grant.item.clone(), grant.serial);
+            dir.give_giveaway(&id, grant)?;
+            Ok(json!({ "item": item, "serial": serial }))
         }
         "set-report-inbox" => {
             let inbox: Value = serde_json::from_str(arg).map_err(|_| "not a report inbox".to_string())?;

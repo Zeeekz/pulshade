@@ -1,66 +1,42 @@
-# Push notifications (design, not built)
+# Wake-up pushes
 
-**Status: a plan for review. Nothing here exists in the app or the relay yet.**
+**Status: built, optional, off by default.** On iPhone, Settings → Notifications → **Wake when locked** lets the
+relay wake a locked phone through Apple's push service (APNs) when a message arrives. Without it, an iPhone only
+receives while Pulshade is open, because iOS wakes a closed app only through Apple. The Mac doesn't need it: the app
+keeps running.
 
-## Goal
+## What happens
 
-Let people opt in to being woken when a message arrives on iPhone, without changing what Pulshade promises everyone
-else. Off by default. Settings says so plainly: *Recommended: keep this off. Notifications go through Apple, which can
-see that your phone got one and when.*
+1. **Registering.** The phone gets a device token from Apple and tells the relay "wake this token when mail lands in
+   these mailboxes", proving the mailboxes are its own with their receive keys. Only the main identity's mailboxes are
+   covered, never a persona's or a decoy's.
+2. **Marking messages.** Every deposit carries `x-pulshade-wake`: `1` for a message, `0` for anything else (a typing
+   signal, a receipt, a reaction). The relay can't read what's inside an envelope, so without this it couldn't tell a
+   message from a typing signal. Apps that don't send the header wake the phone as they always did.
+3. **Waking.** For a message, the relay sends Apple one push saying only "New message", and nothing about who or
+   what. The phone then fetches and decrypts as usual. A phone is woken at most once every 3 seconds, however much
+   mail lands, and the relay as a whole sends at most 30 pushes a second.
+4. **Staying registered.** The relay keeps registrations in memory only, so it forgets them when it restarts, and
+   after 7 days without a renewal. The phone renews every 15 minutes while Pulshade is open and at every launch.
+5. **Removing.** Turning the switch off, Burn, Detach, a panic passcode or opening a decoy takes the phone's
+   registrations off the relay.
 
-## Why it costs privacy
+## What each party learns
 
-iOS only wakes a closed app through Apple's push service (APNs). Using it means:
-
-1. **Apple** learns the device token and the time of each wake-up. Never message content.
-2. **Something Pulshade runs** must know "wake this token when mailbox X gets mail", which is a link between a device
-   and a mailbox. Today the relay knows no such link.
-3. **The phone's IP address reaches Apple** when the app registers, outside Tor.
-
-## Design
-
-- **Separate service.** A small push service, apart from the relay, holds the only token-to-wake-id table. The relay
-  never sees device tokens and the push service never sees mailbox keys or message envelopes.
-- **Wake ids, not mailboxes.** On opting in, the app makes a random wake id per mailbox group (per persona) and
-  registers `{wake id, device token}` with the push service, over Tor where possible (the token itself goes to Apple
-  directly, which can't be avoided).
-- **The relay pokes the wake id** when an envelope lands in a mailbox that has one. The poke carries no sender, no
-  size and no content: just "wake id W has mail". The relay learns the wake id, not the token, and the push service
-  learns the token, not the mailbox.
-- **The push is content-free.** A silent or "New message" push. The app then wakes, fetches over Tor as usual and
-  decrypts locally. Notification text still follows the existing setting (default "New message").
-- **Batching and delay.** Pokes are held a random few seconds and sent together so a push can't be lined up with one
-  specific send.
-- **Removal.** Turning the switch off, locking, Detach or Burn deletes the registration on the push service and
-  revokes the token. Registrations expire if not renewed.
-
-## What this does and doesn't protect
-
-| | With push on |
+| | With wake-ups on |
 |---|---|
-| Message content | Still hidden from everyone but the recipient |
-| Who you talk to | Hidden from Apple. Hidden from the relay and the push service unless they cooperate |
-| That you use Pulshade | Apple can tell the app registered a push, and when it wakes |
-| Timing | Apple and the push service see when wake-ups happen |
-| Your IP | Reaches Apple |
+| Message content | Hidden from everyone but the recipient |
+| Apple | That your iPhone was woken for Pulshade, and when. Never who wrote or what |
+| The relay | Which of your mailboxes belong to one device token (in memory only), and whether each deposit to them is a message. It already saw when envelopes arrive and roughly how big they are |
+| Your IP address | Reaches Apple when the phone registers, outside Tor, and reaches the relay as for any request |
+| Other mail | Receipts, typing signals and reactions don't wake the phone |
 
-The honest summary for users: it's like the notifications on any app, minus the content. People who need the
-strongest anonymity should leave it off.
+It's like notifications in any app, minus the content. People who need the strongest anonymity should leave it off.
+Settings says so plainly beside the switch.
 
-## To decide before building
+## For the operator
 
-1. **Who runs the push service**, and can it be a second small server beside the relay without becoming a second
-   point of failure for privacy?
-2. **Per persona or per account** wake ids. Per persona keeps personas unlinkable to Apple but costs more tokens.
-3. **Mac:** no push needed, the app can keep running.
-4. **Apple requirements:** the push entitlement, an APNs key, and a disclosure in the privacy label and policy.
-5. **Wording of the "recommended off" message** in Settings, and whether to show it again when switching on.
-
-## Work, in order
-
-1. Relay: optional wake poke, behind a setting that's off.
-2. Push service: register, remove, expire and send the content-free push.
-3. App: Settings switch (off by default) with the recommendation, registration over Tor, entitlement.
-4. Docs and policy: update [How Pulshade works](how-it-works.md), the [privacy policy](privacy-policy.md) and the
-   README's known limits.
-5. Tests: registration, removal on Burn and Detach, and that the relay never receives a token.
+Apple's push key (a `.p8` file) and its two IDs live on the relay's server only, never in this repository. See
+[Maintaining Pulshade](maintaining.md). A relay without a key answers `{"enabled": false}` to `GET /v1/push`, and
+phones don't register. Restarting the relay drops every registration until the phones next renew, so restart it
+sparingly.

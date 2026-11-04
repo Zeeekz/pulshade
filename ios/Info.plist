@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>app.pulshade.ios.announcements</string>
+	</array>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
@@ -31,6 +35,8 @@
 	</array>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
@@ -47,7 +53,7 @@
 		</dict>
 	</dict>
 	<key>NSCameraUsageDescription</key>
-	<string>Scan codes to link your devices, add friends and verify them. Frames are never saved.</string>
+	<string>Scan codes to link your devices, add friends and verify them, and take photos and videos for stories. Frames are never saved.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Unlock PULSHADE with Face ID.</string>
 	<key>NSHumanReadableCopyright</key>
@@ -55,19 +61,19 @@
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Reach a PULSHADE relay running on your own network.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Record voice notes and make calls. Audio is encrypted before it leaves your phone.</string>
+	<string>Record voice notes, videos and make calls. Audio is encrypted before it leaves your phone.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Save pictures from your chats to Photos. Pulshade only adds to your library and never reads it.</string>
 	<key>PulshadeAdminKey</key>
 	<string>$(PULSHADE_ADMIN_KEY)</string>
+	<key>PulshadePetKey</key>
+	<string>$(PULSHADE_PET_KEY)</string>
 	<key>PulshadeRelay</key>
 	<string>$(PULSHADE_RELAY)</string>
 	<key>PulshadeRelayDirect</key>
 	<string>$(PULSHADE_RELAY_DIRECT)</string>
 	<key>PulshadeRelayPin</key>
 	<string>$(PULSHADE_RELAY_PIN)</string>
-	<key>BGTaskSchedulerPermittedIdentifiers</key>
-	<array>
-		<string>app.pulshade.ios.announcements</string>
-	</array>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

@@ -12,7 +12,7 @@ let package = Package(
             swiftSettings: [.swiftLanguageMode(.v5)],
             linkerSettings: [.linkedFramework("Security"), .linkedFramework("SystemConfiguration"), .linkedLibrary("resolv")]
         ),
-        // What the app shares with the operator's tools: announcements and sealed reports.
+        // What the app and Pulshade Admin both need: collectibles and their art, and sealed reports.
         .target(
             name: "PulshadeShared",
             path: "Sources/PulshadeShared",

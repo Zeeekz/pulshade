@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # pulshade-mod-gate NAME "REQUEST": all a moderator's SSH key can do on this server. A moderator's line in
 # authorized_keys forces this to run, through sudo, for whatever they ask: they never get a shell. Anything not listed
-# here is refused, so a moderator can read reports and take down or ban handles, and nothing else: no announcements,
-# reserving, backups, restarts or other mailboxes. The admin token stays with root.
+# here is refused, so a moderator can read reports and take down or ban handles, and nothing else: no collectibles,
+# announcements, backups, restarts or other mailboxes. The admin token stays with root.
 #
 # Every request is logged to $data/mod/log with the moderator's name, so the operator can see who did what. The log
 # holds handles and counts, never a report or anything a person wrote.

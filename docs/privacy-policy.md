@@ -32,6 +32,9 @@ retired and no longer tied to anyone.
 groups, personas and settings on the server so your recovery code can restore it. We can't open it. It is deleted
 after 180 days if nobody restores it. Chats are never included.
 
+**Collectibles.** If you are given a collectible, the server keeps what it needs to show it and let its owner claim it
+again with a backup code: the item, its number and a hash of the code.
+
 **Reports.** If you report something, the report is sealed so that only Pulshade Admin can read it. It is sent from a
 throwaway key and carries your handle only if you add it.
 
@@ -54,8 +57,9 @@ how large (within a few set sizes). It can't see who sent it, who you are behind
 
 - Wherever you download Pulshade from, such as the App Store or our website, sees your IP address and what you
   download. Apple also checks the app when a Mac first opens it. These services have their own policies.
-- If you turn on notifications through Apple's service (if and when this is offered), Apple sees your device token and
-  when a notification is delivered, never message contents. Pulshade recommends leaving this off.
+- If you turn on "Wake when locked" on iPhone, notifications go through Apple's service: Apple sees your device token
+  and when a notification is delivered, never message contents, and Pulshade's server keeps your token, in memory only,
+  linked to your mailboxes while it's on. Pulshade recommends leaving this off if you need the strongest anonymity.
 - Your phone or computer may keep its own records of notifications and app use, which we can't control. By default,
   notifications say only "New message".
 
@@ -63,8 +67,8 @@ how large (within a few set sizes). It can't see who sent it, who you are behind
 
 - **Lock, Detach and Burn** in Settings control what stays on your device and the server. Burn deletes your account
   everywhere, and it can't be undone.
-- Because we hold no account details about you, we usually can't tell which data is yours. For a public handle,
-  contact us at [contact address] and we'll act on what we can verify.
+- Because we hold no account details about you, we usually can't tell which data is yours. For a public handle or a
+  collectible, contact us at [contact address] and we'll act on what we can verify.
 - **If you live in the EU, UK or a similar region**, you may have rights to access, correct and delete your data, or
   to complain to your data-protection authority. We can't look up what we can't link to you, and the above is what
   we hold. [Lawyer: confirm legal basis, controller details and any representative needed.]

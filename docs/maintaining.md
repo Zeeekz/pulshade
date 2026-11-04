@@ -1,7 +1,7 @@
 # Maintaining Pulshade
 
 Notes for running Pulshade's own server and making its builds. None of this is needed to use Pulshade, or to read
-the code.
+and test the code (see [Building from source](../README.md#building-from-source)).
 
 ## The operator's toolbox
 
@@ -51,6 +51,13 @@ relay for good, since two relays with the same onion keys would fight over the a
 The installer builds the relay, runs it as a `pulshade` user under systemd (it restarts itself and starts with the
 server), keeps the storage key in `/etc/pulshade` apart from the data in `/var/lib/pulshade`, lets only SSH through
 the firewall and turns on security updates. Running it again updates the relay and keeps its data.
+
+**Wake-up pushes** (optional, for locked iPhones: see [wake-up pushes](push-notifications.md)) need an Apple push key.
+Make an APNs key in your Apple developer account (Keys, with the Apple Push Notifications service ticked, for sandbox
+and production) and put the `.p8` file on the server as `/var/lib/pulshade/apns.p8`, with its IDs in
+`/var/lib/pulshade/apns.json` (`{"key_id": "…", "team_id": "…", "topic": "your.app.bundle.id"}`), both readable only
+by the relay's user. Restart the relay to pick them up. Without them `GET /v1/push` says `{"enabled": false}` and
+phones don't register. A restart forgets every registration until the phones renew (every 15 minutes while open).
 
 On the server, `pulshade-server` runs it: `start`, `stop`, `restart`, `status`, `logs`, `stats`, `ban @name`,
 `backup` and the rest (`pulshade-server help` lists it all). `pulshade-server update` fetches the latest code and
@@ -102,6 +109,6 @@ for; development builds take any.
 - A second identity on the same Mac: `PULSHADE_PROFILE=two build/Pulshade.app/Contents/MacOS/Pulshade`.
 - Sample data for reviewing the design (development builds only): `./scripts/build-app.sh debug`, then
   `PULSHADE_DEMO=1 build/Pulshade.app/Contents/MacOS/Pulshade`.
-- Tests: `./scripts/test.sh` runs everything against a throwaway server on a free port, never the real one. The tests
+- Tests: `./scripts/test.sh` runs everything against a throwaway server on port 7890, never the real one. The tests
   that go out over the real Tor network are off unless you ask:
   `PULSHADE_TOR_TEST=1 PULSHADE_TEST_ONION=http://….onion swift test --filter TorNetworkTests`.

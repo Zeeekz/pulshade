@@ -43,6 +43,14 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         center?.removeDeliveredNotifications(withIdentifiers: [conversation.uuidString])
     }
 
+    /// Removes the "New message" banners Apple delivered while the phone was locked.
+    func clearWakeBanners() async {
+        guard let center else { return }
+        let delivered = await center.deliveredNotifications()
+        let ids = delivered.filter { $0.request.trigger is UNPushNotificationTrigger }.map(\.request.identifier)
+        if !ids.isEmpty { center.removeDeliveredNotifications(withIdentifiers: ids) }
+    }
+
     func clearAll() {
         center?.removeAllDeliveredNotifications()
         center?.removeAllPendingNotificationRequests()
@@ -75,7 +83,9 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification)
         async -> UNNotificationPresentationOptions {
-        [.banner, .sound, .list]
+        // A wake-up push arriving while Pulshade is open is redundant: the app fetches the mail itself.
+        if notification.request.trigger is UNPushNotificationTrigger { return [] }
+        return [.banner, .sound, .list]
     }
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {

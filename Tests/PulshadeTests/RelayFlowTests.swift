@@ -1,5 +1,7 @@
 import Testing
 import Foundation
+import ImageIO
+import CoreGraphics
 @testable import Pulshade
 import PulshadeShared
 import CryptoKit
@@ -20,7 +22,7 @@ struct RelayFlowTests {
         for _ in 0..<rounds { for m in models { await m.syncOnce() } }
     }
 
-    /// An announcement the operator signed reaches every account as a chat from @announcements, a forged one
+    /// An announcement the admin app signed reaches every account as a chat from @announcements, a forged one
     /// never does, and one taken back goes away.
     @Test func announcementsReachEveryoneAndOnlyGenuineOnes() async throws {
         let admin = Curve25519.Signing.PrivateKey()
@@ -595,6 +597,17 @@ struct RelayFlowTests {
         await settle(alice, bob)
         #expect(bob.friendStories.first?.stories.first?.style == .image(photo, caption: "two"))
 
+        // A full-size clip travels too, in pieces, and is put back together.
+        let clip = Data((0..<StoryVideo.maxBytes).map { _ in UInt8.random(in: 0...255) })
+        alice.postStory(.video(clip, caption: "clip"), audience: .everyone)
+        await settle(alice, bob, cara)
+        #expect(bob.friendStories.first?.stories.contains { $0.style == .video(clip, caption: "clip") } == true)
+        // A new caption doesn't send the clip again.
+        let clipStory = try #require(alice.myStories.first { if case .video = $0.style { true } else { false } })
+        alice.editStory(clipStory.id, style: .video(Data(), caption: "again"), audience: .everyone, lifetime: StoryLifetime.day.rawValue)
+        await settle(alice, bob)
+        #expect(bob.friendStories.first?.stories.contains { $0.style == .video(clip, caption: "again") } == true)
+
         // Deleting reaches the people who could see it.
         alice.deleteStory(story.id)
         await settle(alice, bob, cara)
@@ -813,6 +826,202 @@ struct RelayFlowTests {
         #expect(reply.preview?.title == "Example")
     }
 
+    /// A mod can post when only admins can and take an ordinary member out, but nothing else.
+    @Test func modsPostAndRemoveOrdinaryMembersOnly() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        let cara = try await makeUser("Cara")
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        _ = try #require(cara.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, bob, cara)
+        let bobFP = try #require(alice.visibleContacts.first { $0.name == "Bob" }).fingerprint
+        let caraFP = try #require(alice.visibleContacts.first { $0.name == "Cara" }).fingerprint
+        let aliceFP = try #require(bob.visibleContacts.first { $0.name == "Alice" }).fingerprint
+
+        let group = alice.startConversation(kind: .group, title: "Crew", members: [bobFP, caraFP])
+        await settle(alice, bob, cara, rounds: 8)
+        alice.setPostPolicy(group.id, .admins)
+        await settle(alice, bob, cara, rounds: 8)
+        #expect(bob.conversation(group.id).map(bob.canPost(in:)) == false)
+
+        // Bob becomes a mod: he sees the tag, can post, and Cara accepts it.
+        alice.setMod(group.id, bobFP, true)
+        await settle(alice, bob, cara, rounds: 8)
+        #expect(bob.conversation(group.id)?.amMod == true)
+        #expect(cara.role(of: bobFP, in: try #require(cara.conversation(group.id))) == "Mod")
+        bob.send("mod post", in: group.id)
+        await settle(alice, bob, cara, rounds: 8)
+        #expect(cara.conversation(group.id)?.messages.last?.text == "mod post")
+
+        // He can't appoint anyone, and can't remove the owner.
+        bob.setMod(group.id, caraFP, true)
+        bob.setAdmin(group.id, caraFP, true)
+        bob.removeMember(group.id, aliceFP)
+        await settle(alice, bob, cara, rounds: 8)
+        #expect(alice.conversation(group.id)?.mods == [bobFP] && alice.conversation(group.id)?.admins.isEmpty == true)
+        #expect(alice.conversation(group.id) != nil)
+
+        // He can take Cara out; she loses the group, and Alice's member list drops her.
+        bob.removeMember(group.id, caraFP)
+        await settle(alice, bob, cara, rounds: 8)
+        #expect(cara.conversation(group.id) == nil)
+        #expect(alice.conversation(group.id)?.members.contains(caraFP) == false)
+
+        // The owner takes the tag away again.
+        alice.setMod(group.id, bobFP, false)
+        await settle(alice, bob, rounds: 8)
+        #expect(bob.conversation(group.id)?.amMod == false)
+        #expect(bob.conversation(group.id).map(bob.canPost(in:)) == false)
+    }
+
+    /// Someone who becomes a contact while a story is up gets it too, whichever side scanned the other's invite,
+    /// as long as they're in its audience.
+    @Test func newContactsGetStoriesAlreadyUp() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        let cara = try await makeUser("Cara")
+        let dan = try await makeUser("Dan")
+        defer { for m in [alice, bob, cara, dan] { m.lock() } }
+        alice.postStory(.text("already up", palette: 1))
+        alice.postStory(.text("nobody yet", palette: 2), audience: .only([]))
+
+        // They scan Alice's invite after she posted.
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        // Alice scans theirs.
+        _ = try #require(alice.addContact(code: cara.makeInviteCode(), nickname: ""))
+        await settle(alice, bob, cara, rounds: 10)
+        for viewer in [bob, cara] {
+            let seen = viewer.friendStories.flatMap(\.stories).map(\.style)
+            #expect(seen == [.text("already up", palette: 1)], "Only the story shared with everyone arrives")
+        }
+
+        // And so does one who joins later still.
+        _ = try #require(dan.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, dan, rounds: 10)
+        #expect(dan.friendStories.flatMap(\.stories).map(\.style) == [.text("already up", palette: 1)])
+    }
+
+    /// People you scanned a moment ago, with no chat yet, still get a group you make straight away, and one you
+    /// add to it later.
+    @Test func groupsReachNewContactsAndLaterAdditions() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        let cara = try await makeUser("Cara")
+        let dan = try await makeUser("Dan")
+        defer { for m in [alice, bob, cara, dan] { m.lock() } }
+        let b = try #require(alice.addContact(code: bob.makeInviteCode(), nickname: ""))
+        let c = try #require(alice.addContact(code: cara.makeInviteCode(), nickname: ""))
+        let group = alice.startConversation(kind: .group, title: "Now", members: [b.fingerprint, c.fingerprint])
+        await settle(alice, bob, cara, rounds: 12)
+        #expect(bob.conversation(group.id)?.members.count == 2)
+        #expect(cara.conversation(group.id)?.members.count == 2)
+
+        let d = try #require(alice.addContact(code: dan.makeInviteCode(), nickname: ""))
+        await settle(alice, bob, cara, dan, rounds: 6)
+        alice.addMembers(group.id, [d.fingerprint])
+        await settle(alice, bob, cara, dan, rounds: 12)
+        #expect(dan.conversation(group.id)?.members.count == 3)
+        #expect(bob.conversation(group.id)?.members.count == 3, "Existing members hear about the new one")
+    }
+
+    /// A group announcement carries everyone's avatar. With full-size ones it was hundreds of kilobytes, far
+    /// bigger than any message, and the one a slow Tor circuit fails to carry; shrunk, it's an ordinary size.
+    @Test func groupAnnouncementsStaySmallWithRealAvatars() async throws {
+        func picture() throws -> Data {
+            let ctx = try #require(CGContext(data: nil, width: 512, height: 512, bitsPerComponent: 8, bytesPerRow: 0,
+                                             space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+            // Soft overlapping shapes, which compress like a photo does (noise would not shrink when resized).
+            for _ in 0..<400 {
+                ctx.setFillColor(red: .random(in: 0...1), green: .random(in: 0...1), blue: .random(in: 0...1), alpha: 0.45)
+                let size = CGFloat.random(in: 20...200)
+                ctx.fillEllipse(in: CGRect(x: .random(in: -50...450), y: .random(in: -50...450), width: size, height: size))
+            }
+            let data = NSMutableData()
+            let dest = try #require(CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil))
+            CGImageDestinationAddImage(dest, try #require(ctx.makeImage()), [kCGImageDestinationLossyCompressionQuality: 0.82] as CFDictionary)
+            #expect(CGImageDestinationFinalize(dest))
+            return data as Data
+        }
+        func user(_ name: String) async throws -> AppModel {
+            let model = testModel("pulshade-test")
+            try await model.create(identity: .generate(), profile: Profile(name: name, avatar: try picture()), passcode: "test-passcode")
+            return model
+        }
+        let alice = try await user("Alice"), bob = try await user("Bob"), cara = try await user("Cara")
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        _ = try #require(cara.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, bob, cara)
+        let full = try picture()
+        #expect(full.count > 20_000, "The test picture should be a realistic size")
+        let before = Set(alice.data.outbox.map(\.id))
+        let group = alice.startConversation(kind: .group, title: "Av", members: alice.visibleContacts.map(\.fingerprint), avatar: full)
+        let sizes = alice.data.outbox.filter { !before.contains($0.id) }.map(\.blob.count)
+        // Before the shrink the same two announcements were 524,349 bytes each.
+        #expect(sizes.count == 2 && sizes.allSatisfy { $0 < 300_000 }, "Announcement sizes: \(sizes)")
+        #expect((AppModel.thumbnail(full, side: 96)?.count ?? .max) < full.count / 3)
+        #expect(AppModel.thumbnail(Data([1, 2, 3]), side: 96) == Data([1, 2, 3]), "Small ones go as they are")
+        #expect(AppModel.thumbnail(Data(count: 20_000), side: 96) == nil, "What isn't a picture isn't sent")
+        await settle(alice, bob, cara, rounds: 12)
+        #expect(bob.conversation(group.id)?.members.count == 2 && cara.conversation(group.id)?.members.count == 2)
+        #expect(bob.conversation(group.id)?.avatar != nil)
+    }
+
+    /// A deleted story goes from everyone it was shown to, and each of them remembers it was taken back, so a late
+    /// or repeated copy can't bring it back.
+    @Test func deletedStoriesGoAndStayGone() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, bob)
+        alice.postStory(.text("here and gone", palette: 1))
+        await settle(alice, bob)
+        let story = try #require(alice.myStories.first)
+        #expect(bob.friendStories.flatMap(\.stories).map(\.id) == [story.id])
+
+        alice.deleteStory(story.id)
+        await settle(alice, bob)
+        #expect(bob.friendStories.isEmpty && alice.myStories.isEmpty)
+        let aliceFP = try #require(bob.visibleContacts.first).fingerprint
+        #expect(bob.removedStories["\(aliceFP)|\(story.id)"] != nil, "Bob remembers it was taken back")
+        #expect(alice.removedStories["me|\(story.id)"] != nil)
+    }
+
+    /// One envelope the relay refuses (too large) at the front of the queue must not hold up the ones behind it.
+    @Test func aFailingLargeEnvelopeDoesNotBlockTheQueue() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, bob)
+        // Over what the relay takes, first in line.
+        alice.data.outbox.insert(Outgoing(sendID: Data(repeating: 7, count: 32), blob: Data(count: 5 * 1024 * 1024), relay: nil), at: 0)
+        let chat = try #require(alice.data.conversations.first { $0.kind == .direct })
+        alice.send("not held up", in: chat.id)
+        await settle(alice, bob, rounds: 8)
+        #expect(bob.data.conversations.first { $0.kind == .direct }?.messages.last?.text == "not held up")
+    }
+
+    /// A burst to many mailboxes all goes out, and in order for each.
+    @Test func aBurstOfSendsAllArrivesInOrder() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        let cara = try await makeUser("Cara")
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        _ = try #require(cara.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, bob, cara)
+        let toBob = try #require(alice.data.conversations.first { $0.kind == .direct && $0.title == "Bob" })
+        let toCara = try #require(alice.data.conversations.first { $0.kind == .direct && $0.title == "Cara" })
+        for n in 1...5 { alice.send("b\(n)", in: toBob.id); alice.send("c\(n)", in: toCara.id) }
+        await settle(alice, bob, cara, rounds: 10)
+        let b = bob.data.conversations.first { $0.kind == .direct }?.messages.map(\.text)
+        let c = cara.data.conversations.first { $0.kind == .direct }?.messages.map(\.text)
+        #expect(b == ["b1", "b2", "b3", "b4", "b5"] && c == ["c1", "c2", "c3", "c4", "c5"])
+    }
+
     /// Links a second device to `model`'s account through the real relay, like scanning the QR code.
     private func linkNewDevice(to model: AppModel) async throws -> AppModel {
         let code = model.makeLinkCode()
@@ -1017,6 +1226,38 @@ struct RelayFlowTests {
         await settle(mac, phone)
         #expect(phone.activeProfile.bio == "set on the mac" && phone.activeProfile.handle == phoneHandle)
         await mac.unpublishProfile()
+    }
+
+    /// A device on an older version of PULSHADE doesn't know every profile field. It must neither wipe them from a
+    /// newer device by sending its own profile back, nor take a profile it can't read in full.
+    @Test func anOlderDeviceCantWipeWhatANewerOneHas() async throws {
+        let mac = try await makeUser("Mac")
+        defer { mac.lock() }
+        let phone = try await linkNewDevice(to: mac)
+        defer { phone.lock() }
+        await settle(mac, phone, rounds: 6)
+        phone.profileFormat = AppData.currentFormat - 1
+
+        let link = ProfileLink(kind: .website, value: "https://example.com")
+        mac.updateProfile { $0.links = [link]; $0.bio = "from the newer device" }
+        try await Task.sleep(for: .seconds(2))
+        await settle(mac, phone)
+        #expect(phone.profileNeedsUpdate, "it knows a newer profile exists that it can't read")
+        #expect(phone.activeProfile.bio != "from the newer device", "and doesn't take it")
+
+        // The older device edits something, which the newer one must not accept over its links.
+        phone.updateProfile { $0.bio = "from the older device" }
+        try await Task.sleep(for: .seconds(2))
+        await settle(mac, phone)
+        #expect(mac.activeProfile.links == [link], "the links survive")
+        #expect(mac.activeProfile.bio == "from the newer device")
+
+        // Same version on both: edits go both ways, as before.
+        phone.profileFormat = AppData.currentFormat
+        mac.updateProfile { $0.bio = "settled" }
+        try await Task.sleep(for: .seconds(2))
+        await settle(mac, phone)
+        #expect(phone.activeProfile.bio == "settled" && phone.activeProfile.links == [link])
     }
 
     @Test func detachingOneDeviceLeavesTheAccountOnTheOthers() async throws {
@@ -1381,7 +1622,7 @@ struct RelayFlowTests {
         #expect(try await friend.findProfile(leftover) == nil)
     }
 
-    /// An operator action with the throwaway relay's admin token, as `pulshade-server` sends it.
+    /// An operator action with the throwaway relay's admin token, as `pulshade-server` sends it for the admin app.
     private func operate(_ action: String, _ arg: String = "", token: String? = nil) async throws -> (status: Int, body: Any?) {
         let env = ProcessInfo.processInfo.environment
         let dir = try #require(env["PULSHADE_TEST_DIR"]), base = try #require(env["PULSHADE_TEST_RELAY"])
@@ -1413,7 +1654,7 @@ struct RelayFlowTests {
         let bob = try await makeUser("Bob")
         let carol = try await makeUser("Carol")
         defer { for m in [bob, carol] { m.lock() } }
-        // The operator's keys, and the app built to trust them.
+        // The admin app's keys, and the app built to trust them.
         let admin = Curve25519.Signing.PrivateKey(), reportsKey = Curve25519.KeyAgreement.PrivateKey(), mailbox = Mailbox.make()
         AppModel.adminKey = admin.publicKey.rawRepresentation
         defer { AppModel.adminKey = nil }
@@ -1424,7 +1665,7 @@ struct RelayFlowTests {
         try await bob.publishProfile(handle: spam)
         let listed = try #require(try await carol.findProfile(spam))
 
-        // Until the operator publishes their mailbox, or if someone else signs one, nothing is sent.
+        // Until the admin app publishes its mailbox, or if someone else signs one, nothing is sent.
         var forged = ReportInbox(sendID: mailbox.sendID.base64EncodedString(), agreementKey: reportsKey.publicKey.rawRepresentation.base64EncodedString(),
                                  signingKey: Curve25519.Signing.PrivateKey().publicKey.rawRepresentation.base64EncodedString())
         forged.sig = "bad"
@@ -1437,7 +1678,7 @@ struct RelayFlowTests {
         inbox.sig = try admin.signature(for: ReportInbox.signedPart(inbox)).base64EncodedString()
         #expect(try await operate("set-report-inbox", String(decoding: try JSONEncoder().encode(inbox), as: UTF8.self)).status == 200)
 
-        // Carol reports Bob; only the operator's key opens it, and it doesn't say it's from Carol.
+        // Carol reports Bob; only the admin app's key opens it, and it doesn't say it's from Carol.
         try await carol.report(subjectKey: listed.signingKey, handle: spam, name: listed.name,
                                reason: "Spam or scams", details: "sends links to everyone")
         let sealed = try await waiting(in: mailbox.receiveKey)
@@ -1467,6 +1708,218 @@ struct RelayFlowTests {
         // Service names belong to the creator.
         await #expect(throws: AppModel.DirectoryError.self) { try await bob.publishProfile(handle: "abuse") }
         _ = try await operate("unban-handle", spam)
+
+        // Collectibles: signed by the admin key, numbered, and only the owner can wear one.
+        let bobKey = try #require(bob.me(nil)).card.signing
+        let given = try #require(try await operate("collectibles").body as? [String: Any])
+        let next = UInt32((given["partyhat"] as? Int) ?? 0) + 1
+        let first = try Collectible.make(.partyHat, serial: next, owner: bobKey, signedBy: admin)
+        #expect(try await operate("give-collectible", String(decoding: try JSONEncoder().encode(first), as: UTF8.self)).status == 200)
+        #expect(try await operate("give-collectible", String(decoding: try JSONEncoder().encode(first), as: UTF8.self)).status == 400, "a number is never reused")
+        try await bob.refreshCollectibles()
+        #expect(bob.activeProfile.collectibles?.contains(first) == true)
+        #expect(first.isGenuine(for: bobKey))
+        #expect(!first.isGenuine(for: try #require(carol.me(nil)).card.signing), "worn by someone else, it doesn't check out")
+        let homemade = try Collectible.make(.partyHat, serial: 999, owner: bobKey, signedBy: .init())
+        #expect(!homemade.isGenuine(for: bobKey), "only the admin key makes them")
+        try await carol.refreshCollectibles()
+        #expect(carol.activeProfile.collectibles?.isEmpty == true)
+        bob.wear(first)
+        #expect(bob.activeProfile.badge == first)
+
+        // Taken back, it's gone from the owner's app, and stops showing after their name.
+        #expect(try await operate("take-collectible", "partyhat \(first.serial)").status == 200)
+        try await bob.refreshCollectibles()
+        #expect(bob.activeProfile.collectibles?.contains(first) == false && bob.activeProfile.badge == nil)
+    }
+
+    /// A giveaway: the operator opens one with a code (only its hash reaches the relay), the first people to enter it
+    /// get a place in line, the admin app signs each in order, and it shows up in their app as a genuine collectible.
+    @Test func aGiveawayGivesEachCollectibleToTheFirstPeopleToEnterTheCode() async throws {
+        let admin = Curve25519.Signing.PrivateKey()
+        let previous = AppModel.adminKey
+        AppModel.adminKey = admin.publicKey.rawRepresentation
+        defer { AppModel.adminKey = previous }
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        let carol = try await makeUser("Carol")
+        defer { for m in [alice, bob, carol] { m.lock() } }
+        let id = "bonfire-\(UUID().uuidString.prefix(8).lowercased())"
+        let now = Int(Date().timeIntervalSince1970)
+        let code = "Remember Remember"
+        let giveaway: [String: Any] = ["id": id, "item": "bonfire", "hash": Collectible.codeHash(code).base64EncodedString(),
+                                       "opens": now - 60, "closes": now + 3600, "max": 2]
+        let json = String(decoding: try JSONSerialization.data(withJSONObject: giveaway), as: UTF8.self)
+        #expect(try await operate("add-giveaway", json).status == 200)
+        #expect(try await operate("add-giveaway", json).status == 400, "the name is taken")
+        #expect(!json.contains(code), "only a hash is ever sent")
+
+        // Typed loosely, in order, and a third finds it full.
+        let first = try await alice.enterCollectibleCode("remember, remember!")
+        guard case let .giveaway(item, place) = first else { Issue.record("expected a giveaway"); return }
+        #expect(item == "bonfire" && place == 1)
+        guard case let .giveaway(_, again) = try await alice.enterCollectibleCode(code) else { Issue.record("expected a giveaway"); return }
+        #expect(again == 1, "entering it twice only says its place")
+        guard case let .giveaway(_, second) = try await bob.enterCollectibleCode(code) else { Issue.record("expected a giveaway"); return }
+        #expect(second == 2)
+        await #expect(throws: RelayClient.GiveawayError.self) { _ = try await carol.enterCollectibleCode(code) }
+        await #expect(throws: (any Error).self) { _ = try await carol.enterCollectibleCode("not the code") }
+
+        // The admin app signs them in the order they entered.
+        let waiting = try #require(try await operate("giveaways-waiting").body as? [[String: Any]]).filter { $0["giveaway"] as? String == id }
+        #expect(waiting.count == 2)
+        var owners: [String: Collectible] = [:]
+        for row in waiting {
+            let key = try #require((row["key"] as? String).flatMap { Data(base64Encoded: $0) })
+            let counts = try #require(try await operate("collectibles").body as? [String: Any])
+            let serial = UInt32((counts["bonfire"] as? Int) ?? 0) + 1
+            let made = try Collectible.make(.bonfire, serial: serial, owner: key, signedBy: admin)
+            let grant = try JSONSerialization.jsonObject(with: try JSONEncoder().encode(made))
+            let body = String(decoding: try JSONSerialization.data(withJSONObject: ["giveaway": id, "grant": grant]), as: UTF8.self)
+            #expect(try await operate("give-giveaway", body).status == 200)
+            owners[key.base64EncodedString()] = made
+        }
+        let aliceKey = try #require(alice.me(nil)).card.signing, bobKey = try #require(bob.me(nil)).card.signing
+        #expect(owners[aliceKey.base64EncodedString()]!.serial < owners[bobKey.base64EncodedString()]!.serial, "first in, lowest number")
+        #expect(try await operate("giveaways-waiting").status == 200)
+
+        try await alice.refreshCollectibles()
+        let mine = try #require(alice.activeProfile.collectibles?.first { $0.item == "bonfire" })
+        #expect(mine.isGenuine(for: aliceKey) && mine.kind == .bonfire)
+        try await carol.refreshCollectibles()
+        #expect(carol.activeProfile.collectibles?.contains { $0.item == "bonfire" } != true)
+    }
+
+    /// One backup code covers every collectible an account has, new ones included, and brings them all back to a new
+    /// account after the old one burns, with the same numbers, once the admin app signs them over. A code works once,
+    /// and only for the account that signs the claim.
+    @Test func oneBackupCodeBringsEveryCollectibleBackAfterABurn() async throws {
+        let admin = Curve25519.Signing.PrivateKey()
+        let previous = AppModel.adminKey
+        AppModel.adminKey = admin.publicKey.rawRepresentation
+        defer { AppModel.adminKey = previous }
+        let old = try await makeUser("Old")
+        let reborn = try await makeUser("Reborn")
+        let thief = try await makeUser("Thief")
+        defer { for m in [reborn, thief] { m.lock() } }
+        let oldKey = try #require(old.me(nil)).card.signing
+        func give(_ kind: Collectible.Kind, to owner: Data) async throws -> Collectible {
+            let given = try #require(try await operate("collectibles").body as? [String: Any])
+            let item = try Collectible.make(kind, serial: UInt32((given[kind.rawValue] as? Int) ?? 0) + 1, owner: owner, signedBy: admin)
+            #expect(try await operate("give-collectible", String(decoding: try JSONEncoder().encode(item), as: UTF8.self)).status == 200)
+            return item
+        }
+
+        let hat = try await give(.topHat, to: oldKey)
+        let can = try await give(.pulsePop, to: oldKey)
+        try await old.refreshCollectibles()
+        let first = try #require(old.codeAlert)
+        #expect(first.newCode && Set(first.items) == [hat, can], "one new code, covering both")
+        let code = try #require(old.collectionCode)
+        #expect(Collectible.normalisedCode(code).count == 16)
+        old.codeAlert = nil
+        try await old.refreshCollectibles()
+        #expect(old.codeAlert == nil, "asked once")
+
+        // A later one joins the same code: nothing new to write down.
+        let pumpkin = try await give(.pumpkin, to: oldKey)
+        try await old.refreshCollectibles()
+        let later = try #require(old.codeAlert)
+        #expect(!later.newCode && later.items == [pumpkin] && old.collectionCode == code)
+
+        try await old.burn()
+        let claimed = try await reborn.claimCollectibles(code: code.lowercased().replacingOccurrences(of: "-", with: " "))
+        #expect(Set(claimed.map { "\($0.item)#\($0.serial)" }) == Set([hat, can, pumpkin].map(\.id)), "all of them, with one code")
+        await #expect(throws: RelayClient.ClaimError.self) { try await thief.claimCollectibles(code: code) }
+
+        // The admin app signs each over to the account that claimed them.
+        let rebornKey = try #require(reborn.me(nil)).card.signing
+        let claims = try #require(try await operate("claims").body as? [[String: Any]])
+        var moved: [Collectible] = []
+        for item in [hat, can, pumpkin] {
+            let waiting = try #require(claims.first { $0["item"] as? String == item.item && $0["serial"] as? Int == Int(item.serial) })
+            #expect(waiting["to"] as? String == rebornKey.base64EncodedString())
+            let signed = try Collectible.make(try #require(item.kind), serial: item.serial, owner: rebornKey, signedBy: admin)
+            #expect(try await operate("reissue", String(decoding: try JSONEncoder().encode(signed), as: UTF8.self)).status == 200)
+            moved.append(signed)
+        }
+
+        try await reborn.refreshCollectibles()
+        #expect(Set(reborn.activeProfile.collectibles ?? []) == Set(moved), "same items, same numbers")
+        #expect(reborn.codeAlert?.newCode == true && reborn.collectionCode != code, "with a fresh code of its own")
+        try await thief.refreshCollectibles()
+        #expect(thief.activeProfile.collectibles?.isEmpty == true)
+
+        // A new code replaces the old one for all of them.
+        let replaced = try await reborn.makeNewCollectionCode()
+        let rebornCode = try #require(reborn.collectionCode)
+        #expect(replaced == rebornCode)
+    }
+
+    /// Resetting takes every collectible back from everyone, takes the worn one off their name, and the next one given
+    /// of each is #1 again.
+    @Test func resettingCollectiblesClearsEveryoneAndStartsAtOne() async throws {
+        let admin = Curve25519.Signing.PrivateKey()
+        let previous = AppModel.adminKey
+        AppModel.adminKey = admin.publicKey.rawRepresentation
+        defer { AppModel.adminKey = previous }
+        let ann = try await makeUser("Ann")
+        defer { ann.lock() }
+        let key = try #require(ann.me(nil)).card.signing
+        let given = try #require(try await operate("collectibles").body as? [String: Any])
+        let hat = try Collectible.make(.partyHat, serial: UInt32((given["partyhat"] as? Int) ?? 0) + 1, owner: key, signedBy: admin)
+        #expect(try await operate("give-collectible", String(decoding: try JSONEncoder().encode(hat), as: UTF8.self)).status == 200)
+        try await ann.refreshCollectibles()
+        ann.wear(hat)
+        #expect(ann.activeProfile.badge == hat)
+
+        #expect(try await operate("reset-collectibles", "").status == 400, "only when spelled out")
+        #expect(try await operate("reset-collectibles", "everyone").status == 200)
+        try await ann.refreshCollectibles()
+        #expect(ann.activeProfile.collectibles?.isEmpty == true && ann.activeProfile.badge == nil)
+        #expect((try await operate("collectibles").body as? [String: Any])?.isEmpty == true)
+        let fresh = try Collectible.make(.partyHat, serial: 1, owner: key, signedBy: admin)
+        #expect(try await operate("give-collectible", String(decoding: try JSONEncoder().encode(fresh), as: UTF8.self)).status == 200, "#1 again")
+    }
+
+    /// The operator can change how many of a collectible there can be. The relay holds to it, never lets it drop below
+    /// what's been given out, and tells the app the size of the run so the last number can be marked.
+    @Test func theOperatorCanChangeHowManyOfACollectibleThereAre() async throws {
+        let admin = Curve25519.Signing.PrivateKey()
+        let previous = AppModel.adminKey
+        AppModel.adminKey = admin.publicKey.rawRepresentation
+        defer { AppModel.adminKey = previous }
+        let ann = try await makeUser("Ann")
+        defer { ann.lock() }
+        let key = try #require(ann.me(nil)).card.signing
+        func give(_ serial: UInt32) async throws -> Int {
+            let item = try Collectible.make(.pulze, serial: serial, owner: key, signedBy: admin)
+            return try await operate("give-collectible", String(decoding: try JSONEncoder().encode(item), as: UTF8.self)).status
+        }
+        let before = try #require(try await operate("collectibles").body as? [String: Any])
+        let start = UInt32((before["greendragon"] as? Int) ?? 0)
+
+        #expect(try await operate("set-collectible-limit", "greendragon \(start + 2)").status == 200)
+        let listed = try #require(try await operate("collectible-limits").body as? [String: Any])
+        #expect((listed["limits"] as? [String: Any])?["greendragon"] as? Int == Int(start) + 2 && listed["default"] as? Int == 100)
+        #expect(try await give(start + 1) == 200)
+        #expect(try await give(start + 2) == 200)
+        #expect(try await give(start + 3) == 400, "only as many as were set")
+        #expect(try await operate("set-collectible-limit", "greendragon \(start + 1)").status == 400, "not below what's given")
+        #expect(try await operate("set-collectible-limit", "greendragon 0").status == 400)
+        #expect(try await operate("set-collectible-limit", "greendragon abc").status == 400)
+
+        try await ann.refreshCollectibles()
+        let mine = try #require(ann.activeProfile.collectibles?.filter { $0.kind == .pulze }.sorted { $0.serial < $1.serial })
+        #expect(mine.last?.edition == start + 2 && mine.last?.serial == start + 2, "the app is told how big the run is")
+        if start + 2 > 25 { #expect(mine.last?.rarity == .last && mine.first?.rarity == .common) }
+
+        // More: room for the next one, and nobody's number moves.
+        #expect(try await operate("set-collectible-limit", "greendragon \(start + 5)").status == 200)
+        #expect(try await give(start + 3) == 200)
+        #expect(try await operate("set-collectible-limit", "greendragon 100").status == 200, "back to the usual")
+        let after = try #require(try await operate("collectible-limits").body as? [String: Any])
+        #expect((after["limits"] as? [String: Any])?.isEmpty == true)
     }
 
     /// Burning one persona deletes it for its contacts and from your devices, while the main identity's contact with the

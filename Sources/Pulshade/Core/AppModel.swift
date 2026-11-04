@@ -24,9 +24,18 @@ final class AppModel {
     private(set) var slot = 0
     var isPrimary: Bool { slot == 0 }
     var data = AppData()
+    /// Stories taken back, as "author|id" ("me" for your own) with when. A story that turns up after its removal
+    /// (the two arriving out of order, or sent again) is dropped instead of coming back. Kept for three days,
+    /// longer than any story lasts. Held in memory only: saving it would change what's saved, and builds that
+    /// don't know the change would refuse the data.
+    @ObservationIgnored var removedStories: [String: Date] = [:]
     var failedAttempts = 0
     /// The passcode was right but the account's data wouldn't open, so nothing was opened (or touched).
     private(set) var dataUnreadable = false
+    /// Another of your devices has a newer profile than this version can read. Set until PULSHADE is updated.
+    private(set) var profileNeedsUpdate = false
+    /// The format this build saves profiles in. Only tests change it, to stand in for an older or newer version.
+    var profileFormat = AppData.currentFormat
     /// The chat on screen, so incoming messages there don't count as unread.
     var openConversation: Conversation.ID?
     /// A chat something outside the window (a notification, the menu bar) asked to show.
@@ -59,8 +68,12 @@ final class AppModel {
     private var relayFailures = 0
     private var lastRelayContact = Date()
     private var unlockedAt = Date()
-    /// The operator's key, built into the app: announcements and the reports mailbox count only if it signed them.
+    /// The Pulshade Admin app's key, built into the app: collectibles and the reports mailbox count only if it signed
+    /// them.
     static var adminKey: Data? = (Bundle.main.object(forInfoDictionaryKey: "PulshadeAdminKey") as? String)
+        .flatMap { Data(base64Encoded: $0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+    /// The relay's own key, built into the app: the pets it hatches and the collectibles people gift count if it signed them.
+    static var petKey: Data? = (Bundle.main.object(forInfoDictionaryKey: "PulshadePetKey") as? String)
         .flatMap { Data(base64Encoded: $0.trimmingCharacters(in: .whitespacesAndNewlines)) }
     private var openAfterUnlock: Conversation.ID?
     /// Reopens the main window if it was closed. Set by the window itself.
@@ -207,6 +220,11 @@ final class AppModel {
         reconnect()
         #endif
         if phase == .locked { warmUp() }
+        refreshPush()
+        #if os(iOS)
+        // The wake-up banner has done its job once Pulshade is open.
+        Task { await Notifier.shared.clearWakeBanners() }
+        #endif
         guard phase == .unlocked, let since = backgroundedAt else { return }
         let minutes = data.security.autoLockMinutes
         if minutes > 0, Date().timeIntervalSince(since) > Double(minutes) * 60 { lock() } else { lastActivity = Date() }
@@ -289,12 +307,16 @@ final class AppModel {
                 // becomes the main one, so nothing about it looks like a disguise afterwards.
                 try? await Task.detached { try vault.panic(keeping: landing, slot: slot, passcode: passcode) }.value
                 Notifier.shared.clearAll()
+                // The real account's mailboxes can't be named any more: take this phone's token off the relay instead.
+                withdrawPush()
                 self.identity = landing
                 self.slot = 0
                 data = (try? vault.load(with: landing)) ?? AppData()
             }
             failedAttempts = 0
             didUnlock()
+            // A decoy is an empty account: the real one's wake-ups stop until the real one is unlocked again.
+            if !isPrimary { withdrawPush() }
             await bindToDevice(passcode: passcode)
             return true
         } catch {
@@ -367,6 +389,7 @@ final class AppModel {
         startSync()
         startTicking()
         nextAnnouncementCheck = Date().addingTimeInterval(trafficShaping ? 5 : 0)
+        nextCollectibleCheck = Date().addingTimeInterval(trafficShaping ? 40 : 3600)
         announcementsVersion = nil
         announceProfiles()
         relistStrandedProfiles()
@@ -375,10 +398,12 @@ final class AppModel {
             data.handlesTidied = true
             Task { await releaseLeftoverHandles() }
         }
-        if data.profileShared < 2 {
-            data.profileShared = 2
+        // Once more now that profiles can carry links and wallets, so contacts who had no way to ask get them.
+        if data.profileShared < 3 {
+            data.profileShared = 3
             for persona in [nil] + data.personas.map(\.id)
-            where !(profile(for: persona).bio ?? "").isEmpty || profile(for: persona).handle != nil {
+            where !(profile(for: persona).bio ?? "").isEmpty || profile(for: persona).handle != nil
+                || !ProfileLink.cleaned(profile(for: persona).links).isEmpty {
                 for c in contacts(of: persona) { enqueue(profilePayload(persona), to: c) }
             }
         }
@@ -420,6 +445,9 @@ final class AppModel {
         data.outbox.removeAll { $0.ephemeral == true }
         pendingReceipts = []
         Notifier.shared.clearAll()
+        // Its mailbox keys must not stay in memory for whoever unlocks next. The relay keeps the registration, so a
+        // locked Pulshade is still woken for new mail.
+        pushTold = nil
         save()
         refreshDisguises()
         vault.rotate()
@@ -439,6 +467,17 @@ final class AppModel {
     func destroyEverything(leavingNoTrace: Bool = false) {
         if call != nil { hangUp() }
         Notifier.shared.clearAll()
+        // This account's mailboxes stop waking the phone. Done first, while the account's keys are still known.
+        let hadPush = pushTold != nil || data.security.pushWake
+        if hadPush, case let keys = currentLanes()[Lane(relay: nil, name: "main")] ?? [], !keys.isEmpty {
+            let named = Array(keys)
+            Task {
+                for start in stride(from: 0, to: named.count, by: 256) {
+                    try? await client(nil, lane: "push")?.unregisterPush(keys: Array(named[start..<min(start + 256, named.count)]))
+                }
+            }
+        }
+        if hadPush { withdrawPush() }
         syncTask?.cancel()
         tickTask?.cancel()
         vault.destroy(leavingNoTrace: leavingNoTrace)
@@ -565,6 +604,7 @@ final class AppModel {
         upsert(contact)
         syncContact(contact.fingerprint, contact.persona)
         seal(.hello(card(sendID: mailbox.sendID, persona: owner), request), to: contact.fingerprint, persona: owner)
+        shareStories(with: contact)
         save()
         return contact
     }
@@ -624,10 +664,31 @@ final class AppModel {
                         signingKey: keys.signing, agreementKey: keys.agreement, sendID: sendID, device: deviceID(for: persona))
     }
 
+    /// The notes of a profile that are worth sending: checked again, none if there are none.
+    static func sharedNotes(_ profile: Profile) -> [ProfileNote]? {
+        let notes = ProfileNote.cleaned(profile.notes)
+        return notes.isEmpty ? nil : notes
+    }
+
+    /// The links and wallets of a profile that are worth sending: checked again, none if there are none.
+    static func sharedLinks(_ profile: Profile) -> [ProfileLink]? {
+        let links = ProfileLink.cleaned(profile.links)
+        return links.isEmpty ? nil : links
+    }
+
+    /// What a profile shows contacts of its collectibles: the genuine ones, never the backup code or anything else.
+    static func sharedCollectibles(_ profile: Profile) -> [Collectible]? {
+        // Each was checked against this account's key when it was fetched, and the receiver checks again.
+        let mine = (profile.collectibles ?? []).prefix(40)
+        return mine.isEmpty ? nil : Array(mine)
+    }
+
     private func profilePayload(_ persona: UUID?) -> Payload {
         let profile = profile(for: persona)
         return .profile(name: profile.name, avatar: profile.avatar, color: profile.color, banner: profile.banner,
-                        bio: profile.bio.flatMap { $0.isEmpty ? nil : $0 }, handle: profile.handle)
+                        bio: profile.bio.flatMap { $0.isEmpty ? nil : $0 }, handle: profile.handle, badge: profile.badge,
+                        links: Self.sharedLinks(profile), collectibles: Self.sharedCollectibles(profile),
+                        notes: Self.sharedNotes(profile))
     }
 
     /// Someone's signature colour: what they chose, or one picked from their fingerprint.
@@ -853,6 +914,16 @@ final class AppModel {
             withAnimation(.smooth) { data.conversations[i].messages.removeAll { ($0.expiresAt ?? .distantFuture) <= now } }
             changed = true
         }
+        // Stories past their time go from the vault too, not just from view, and so do old removal notes.
+        if data.stories.contains(where: { !$0.isLive }) {
+            withAnimation(.smooth) { data.stories.removeAll { !$0.isLive } }
+            changed = true
+        }
+        let stale = now.addingTimeInterval(-3 * 24 * 3600)
+        if removedStories.values.contains(where: { $0 < stale }) {
+            removedStories = removedStories.filter { $0.value >= stale }
+            changed = true
+        }
         if changed { save() }
     }
 
@@ -962,6 +1033,30 @@ final class AppModel {
         .story(id: story.id, style: story.style, date: RelayClock.relay(story.date), lasts: story.lifetime)
     }
 
+    /// Sends a story to one contact. A video goes as the story with an empty clip, then (for people who don't
+    /// have the clip yet) the clip in pieces that each fit one relay message.
+    private func sendStory(_ story: Story, to contact: Contact, withClip: Bool) {
+        guard case let .video(clip, caption) = story.style else { enqueue(storyPayload(story), to: contact); return }
+        enqueue(.story(id: story.id, style: .video(Data(), caption: caption), date: RelayClock.relay(story.date),
+                       lasts: story.lifetime), to: contact)
+        guard withClip else { return }
+        let pieces = StoryClipPieces.split(clip)
+        for (i, bytes) in pieces.enumerated() {
+            enqueue(.storyPart(id: story.id, index: i, of: pieces.count, bytes: bytes), to: contact)
+        }
+    }
+
+    /// Joins a clip's pieces into its story once the story and every piece are here.
+    private func assembleClip(_ id: UUID) {
+        guard let pending = data.clipParts[id], pending.isComplete,
+              let i = data.stories.firstIndex(where: { $0.id == id && $0.author == pending.author && $0.persona == pending.persona }),
+              case let .video(have, caption) = data.stories[i].style, have.isEmpty else { return }
+        let joined = (0..<pending.of).reduce(into: Data()) { $0.append(pending.parts[$1] ?? Data()) }
+        data.clipParts[id] = nil
+        guard !joined.isEmpty else { return }
+        withAnimation(.snappy) { data.stories[i].style = .video(joined, caption: caption) }
+    }
+
     func postStory(_ style: StoryStyle, audience: StoryAudience = .everyone, lifetime: TimeInterval = StoryLifetime.day.rawValue) {
         var story = Story(author: "me", style: style)
         story.persona = activePersona
@@ -969,18 +1064,30 @@ final class AppModel {
         story.lifetime = lifetime
         data.storyChoices[choiceKey(activePersona)] = StoryChoice(audience: audience, lifetime: lifetime)
         withAnimation(.snappy) { data.stories.insert(story, at: 0) }
-        for c in self.audience(of: story) { enqueue(storyPayload(story), to: c) }
-        sync(.story(story))
+        for c in self.audience(of: story) { sendStory(story, to: c, withClip: true) }
+        trackUpload(of: story.id)
+        if story.isSyncable { sync(.story(story)) }
         save()
     }
 
+    /// Sends the stories you still have up to someone who has just become a contact, if they're in each one's
+    /// audience. Otherwise they'd only ever see stories posted after they arrived.
+    private func shareStories(with contact: Contact) {
+        guard !contact.isSelf, !contact.hidden else { return }
+        for story in data.stories where story.author == "me" && story.isLive && story.persona == contact.persona
+            && story.shownTo.includes(contact.fingerprint) {
+            sendStory(story, to: contact, withClip: true)
+        }
+    }
+
     /// Changes a story you posted: its words, who sees it and how long it lasts (from when it was posted). A photo
-    /// stays the same photo. People taken out of the audience lose it, and everyone in it gets the new version.
+    /// or clip stays the same one. People taken out of the audience lose it, and everyone in it gets the new version.
     func editStory(_ id: Story.ID, style: StoryStyle, audience: StoryAudience, lifetime: TimeInterval) {
         guard let i = data.stories.firstIndex(where: { $0.id == id && $0.author == "me" }) else { return }
         let before = self.audience(of: data.stories[i])
         switch (data.stories[i].style, style) {
         case let (.image(photo, _), .image(_, caption)): data.stories[i].style = .image(photo, caption: caption)
+        case let (.video(clip, _), .video(_, caption)): data.stories[i].style = .video(clip, caption: caption)
         case (.text, .text): data.stories[i].style = style
         default: break
         }
@@ -990,14 +1097,16 @@ final class AppModel {
         let story = data.stories[i]
         let after = self.audience(of: story)
         for c in before where !after.contains(where: { $0.fingerprint == c.fingerprint }) { enqueue(.storyRemoved(id: id), to: c) }
-        for c in after { enqueue(storyPayload(story), to: c) }
-        sync(.story(story))
+        for c in after { sendStory(story, to: c, withClip: !before.contains { $0.fingerprint == c.fingerprint }) }
+        trackUpload(of: id)
+        if story.isSyncable { sync(.story(story)) }
         save()
     }
 
     func deleteStory(_ id: Story.ID) {
         guard let story = data.stories.first(where: { $0.id == id && $0.author == "me" }) else { return }
         withAnimation(.snappy) { data.stories.removeAll { $0.id == id } }
+        removedStories["me|\(id)"] = Date()
         for c in audience(of: story) { enqueue(.storyRemoved(id: id), to: c) }
         sync(.storyRemoved(id))
         save()
@@ -1014,6 +1123,40 @@ final class AppModel {
             enqueue(.storyViewed(id: id), to: author)
         }
         save()
+    }
+
+    /// How many copies of a story were waiting to go out when it was posted or last changed.
+    private var storyUploadTotal: [Story.ID: Int] = [:]
+
+    /// Copies of a story not yet handed to the relay: still waiting for a session, or sealed and queued.
+    private func unsentCopies(of id: Story.ID) -> Int {
+        let waiting = data.contacts.reduce(0) { n, c in
+            n + c.devices.reduce(0) { $0 + $1.pending.filter { $0.payload.storyID == id }.count }
+        }
+        return waiting + data.outbox.filter { $0.story == id }.count
+    }
+
+    private func trackUpload(of id: Story.ID) {
+        let n = unsentCopies(of: id)
+        if n > 0 { storyUploadTotal[id] = n } else { storyUploadTotal[id] = nil }
+    }
+
+    /// How far a story you posted has got to its audience, 0...1, or nil once it's all gone (or never needed to).
+    func uploadProgress(of id: Story.ID) -> Double? {
+        guard let total = storyUploadTotal[id] else { return nil }
+        let left = unsentCopies(of: id)
+        guard left > 0 else { return nil }
+        return 1 - Double(left) / Double(max(total, left))
+    }
+
+    /// Your stories on screen: any still going out, and whether any has yet to be viewed by anyone.
+    var storyUpload: Double? {
+        let all = myStories.compactMap { uploadProgress(of: $0.id) }
+        return all.isEmpty ? nil : all.reduce(0, +) / Double(all.count)
+    }
+
+    var hasUnviewedStory: Bool {
+        data.security.storyViews && myStories.contains { ($0.viewers ?? [:]).isEmpty && !audience(of: $0).isEmpty }
     }
 
     /// A story audience in a few words: "All contacts", "3 people", "All except 2".
@@ -1033,11 +1176,11 @@ final class AppModel {
         return (story.viewers ?? [:]).map { ($0.key, $0.value) }.sorted { $0.at > $1.at }
     }
 
-    var myStories: [Story] { data.stories.filter { $0.author == "me" && $0.isLive && $0.persona == activePersona } }
+    var myStories: [Story] { data.stories.filter { $0.author == "me" && $0.isLive && $0.isReady && $0.persona == activePersona } }
 
     /// Other people's live stories, newest author first.
     var friendStories: [(author: String, stories: [Story])] {
-        let live = data.stories.filter { $0.author != "me" && $0.isLive && $0.persona == activePersona }
+        let live = data.stories.filter { $0.author != "me" && $0.isLive && $0.isReady && $0.persona == activePersona }
         let grouped = Dictionary(grouping: live, by: \.author)
         return grouped.map { ($0.key, $0.value.sorted { $0.date < $1.date }) }
             .sorted { ($0.stories.last?.date ?? .distantPast) > ($1.stories.last?.date ?? .distantPast) }
@@ -1064,6 +1207,8 @@ final class AppModel {
     }
 
     private func setProfile(_ profile: Profile, for persona: UUID?) {
+        var profile = profile
+        profile.format = profileFormat
         if let persona {
             guard let i = data.personas.firstIndex(where: { $0.id == persona }) else { return }
             data.personas[i].profile = profile
@@ -1185,9 +1330,11 @@ final class AppModel {
         guard let me = me(persona) else { throw DirectoryError.invalid }
         let invite = publicInvite(for: persona, handle: handle, me: me)
         let profile = profile(for: persona)
-        let card = DirectoryProfile(handle: handle, name: profile.name, bio: profile.bio ?? "", avatar: profile.avatar,
+        var card = DirectoryProfile(handle: handle, name: profile.name, bio: profile.bio ?? "", avatar: profile.avatar,
                                     banner: profile.banner, color: profile.color, signingKey: me.card.signing, agreementKey: me.card.agreement,
-                                    sendID: Mailbox.sendID(for: invite.receiveKey), relay: invite.relay)
+                                    sendID: Mailbox.sendID(for: invite.receiveKey), relay: invite.relay, badge: profile.badge)
+        card.links = Self.sharedLinks(profile)
+        card.notes = Self.sharedNotes(profile)
         let blob = try JSONEncoder.pulshade.encode(card)
         // Milliseconds, so quick successive edits are still each "newer" than the last.
         let updated = UInt64(Date().timeIntervalSince1970 * 1000)
@@ -1274,7 +1421,8 @@ final class AppModel {
         let found: RelayClient.DirectoryEntry?
         do { found = try await client.lookup(handle) } catch { throw DirectoryError.unreachable }
         guard let entry = found else { return nil }
-        guard let profile = verified(entry, handle: handle) else { throw DirectoryError.invalid }
+        guard var profile = verified(entry, handle: handle) else { throw DirectoryError.invalid }
+        if profile.badge?.isGenuine(for: profile.signingKey) != true { profile.badge = nil }
         return profile
     }
 
@@ -1336,6 +1484,185 @@ final class AppModel {
         do { try await client.unhold(handle, key: key, sig: sig, ts: ts) } catch { throw DirectoryError.unreachable }
     }
 
+    // MARK: Collectibles
+
+    /// What the backup code alert shows: collectibles the code now covers, and whether the code itself is new.
+    struct CodeAlert: Identifiable, Equatable {
+        var id = UUID()
+        var items: [Collectible]
+        var newCode: Bool
+    }
+    /// Set when the backup code starts covering something, so an alert can say so. Memory only.
+    var codeAlert: CodeAlert?
+    /// The next time to look for new collectibles: soon after unlocking, then every half hour.
+    private var nextCollectibleCheck = Date.distantFuture
+    /// After entering a giveaway code, looking for the new collectible more often until this time.
+    private var collectibleWatchUntil = Date.distantPast
+
+    /// Asks the relay which collectibles the active persona has been given, keeping only ones that check out.
+    /// If the one shown after its name is no longer among them, it stops being shown. A new one joins the backup code
+    /// (made the first time), and an alert asks you to keep the code safe.
+    func refreshCollectibles() async throws {
+        let persona = activePersona
+        guard let me = me(persona), let client = client(nil) else { throw DirectoryError.unreachable }
+        let (key, sig, ts) = try ownerProof("pulshade.collect.mine.v1", about: me.card.signing, by: me)
+        let given: [(collectible: Collectible, coded: Bool)]
+        do { given = try await client.collectibles(key: key, sig: sig, ts: ts) } catch { throw DirectoryError.unreachable }
+        guard activePersona == persona else { return }
+        let genuine = given.filter { $0.collectible.isGenuine(for: me.card.signing) }
+            .sorted { ($0.collectible.item, $0.collectible.serial) < ($1.collectible.item, $1.collectible.serial) }
+        updateProfile { profile in
+            profile.collectibles = genuine.map(\.collectible)
+            if let badge = profile.badge, !genuine.contains(where: { $0.collectible == badge }) { profile.badge = nil }
+        }
+        let known = activeProfile.collectibleCodes ?? [:]
+        // A code on the relay this device doesn't know was set by another of your devices: wait for its profile to
+        // arrive rather than make a second code that would break that one.
+        if activeProfile.collectionCode == nil, genuine.contains(where: { $0.coded && known[$0.collectible.id] == nil }) { return }
+        let code = activeProfile.collectionCode
+        let uncovered = genuine.map(\.collectible).filter { ($0.kind?.transferable ?? true) && (code == nil || known[$0.id] != code) }
+        guard !uncovered.isEmpty else { return }
+        let fresh = code == nil
+        let covered = (try? await cover(uncovered, with: code ?? Collectible.newBackupCode())) ?? []
+        if !covered.isEmpty {
+            codeAlert = CodeAlert(items: fresh ? genuine.map(\.collectible) : (codeAlert?.items ?? []) + covered, newCode: fresh || codeAlert?.newCode == true)
+        }
+    }
+
+    // MARK: Eggs
+
+    /// The eggs the active persona holds, and when they were last asked about (for counting down). Memory only.
+    private(set) var eggs: [RelayClient.EggInfo] = []
+    private var eggsAsked = Date()
+
+    func refreshEggs() async {
+        let persona = activePersona
+        guard let me = me(persona), let client = client(nil),
+              let (key, sig, ts) = try? ownerProof("pulshade.eggs.mine.v1", about: me.card.signing, by: me),
+              let list = try? await client.eggs(key: key, sig: sig, ts: ts), activePersona == persona else { return }
+        eggsAsked = Date()
+        withAnimation(.smooth) { eggs = list }
+    }
+
+    /// Seconds until an egg is ready, by the relay's clock: nil if it hasn't been started, 0 when it's ready.
+    func secondsLeft(_ egg: RelayClient.EggInfo, at date: Date = Date()) -> TimeInterval? {
+        guard let at = egg.hatches_at else { return nil }
+        let relayNow = Double(egg.now) + date.timeIntervalSince(eggsAsked)
+        return max(0, Double(at) - relayNow)
+    }
+
+    /// Starts an egg's clock.
+    func startEgg(_ id: String) async throws {
+        guard let me = me(activePersona), let client = client(nil) else { throw DirectoryError.unreachable }
+        let (key, sig, ts) = try ownerProof("pulshade.eggs.start.v1", about: Data(id.utf8), by: me)
+        let started: RelayClient.EggInfo
+        do { started = try await client.startEgg(key: key, sig: sig, ts: ts, id: id) } catch { throw DirectoryError.unreachable }
+        eggsAsked = Date()
+        withAnimation(.smooth) { eggs = eggs.map { $0.id == id ? started : $0 } }
+    }
+
+    /// Opens an egg that's ready. The pet inside is the relay's roll, signed by its key, so this checks that before
+    /// showing it.
+    func hatchEgg(_ id: String) async throws -> Collectible {
+        let persona = activePersona
+        guard let me = me(persona), let client = client(nil) else { throw RelayClient.HatchError.unreachable }
+        let (key, sig, ts) = try ownerProof("pulshade.eggs.hatch.v1", about: Data(id.utf8), by: me)
+        let pet = try await client.hatchEgg(key: key, sig: sig, ts: ts, id: id)
+        guard pet.isGenuine(for: me.card.signing) else { throw RelayClient.HatchError.unreachable }
+        withAnimation(.smooth) { eggs.removeAll { $0.id == id } }
+        try? await refreshCollectibles()
+        return pet
+    }
+
+    /// Gives a collectible to a contact. They see it the next time their app checks.
+    func gift(_ item: Collectible, to contact: Contact) async throws {
+        guard let me = me(activePersona), let client = client(nil) else { throw DirectoryError.unreachable }
+        let to = contact.signingKey
+        let about = Data(item.item.utf8) + Data([0]) + withUnsafeBytes(of: item.serial.bigEndian) { Data($0) } + to
+        let (key, sig, ts) = try ownerProof("pulshade.collect.gift.v1", about: about, by: me)
+        do { try await client.giftCollectible(key: key, sig: sig, ts: ts, item: item.item, serial: item.serial, to: to.base64EncodedString()) }
+        catch { throw DirectoryError.unreachable }
+        try? await refreshCollectibles()
+    }
+
+    /// Lets a collectible go. It goes back into circulation, and its number can hatch again for someone else.
+    func release(_ item: Collectible) async throws {
+        guard let me = me(activePersona), let client = client(nil) else { throw DirectoryError.unreachable }
+        let about = Data(item.item.utf8) + Data([0]) + withUnsafeBytes(of: item.serial.bigEndian) { Data($0) }
+        let (key, sig, ts) = try ownerProof("pulshade.collect.release.v1", about: about, by: me)
+        do { try await client.releaseCollectible(key: key, sig: sig, ts: ts, item: item.item, serial: item.serial) }
+        catch { throw DirectoryError.unreachable }
+        try? await refreshCollectibles()
+    }
+
+    /// The backup code for all of the active persona's collectibles, if this device has it.
+    var collectionCode: String? { activeProfile.collectionCode }
+
+    /// Replaces the backup code with a new one for every collectible. The old code stops working.
+    @discardableResult
+    func makeNewCollectionCode() async throws -> String {
+        let code = Collectible.newBackupCode()
+        let all = (activeProfile.collectibles ?? []).filter { $0.kind?.transferable ?? true }
+        let covered = try await cover(all, with: code)
+        if covered.count < all.count { throw DirectoryError.unreachable }
+        return code
+    }
+
+    /// Sets `code` on the relay for each collectible (only its hash travels) and keeps it as the collection code.
+    /// Returns the ones it reached.
+    private func cover(_ items: [Collectible], with code: String) async throws -> [Collectible] {
+        let persona = activePersona
+        guard let me = me(persona), let client = client(nil) else { throw DirectoryError.unreachable }
+        let hash = Collectible.codeHash(code)
+        var covered: [Collectible] = []
+        for item in items {
+            let about = Data(item.item.utf8) + Data([0]) + withUnsafeBytes(of: item.serial.bigEndian) { Data($0) } + hash
+            let (key, sig, ts) = try ownerProof("pulshade.collect.code.v1", about: about, by: me)
+            guard (try? await client.setCollectibleCode(key: key, sig: sig, ts: ts, item: item.item, serial: item.serial, hash: hash)) != nil
+            else { continue }
+            covered.append(item)
+        }
+        guard !covered.isEmpty || items.isEmpty else { throw DirectoryError.unreachable }
+        // Kept like the rest of your profile, and passed to your other devices, but never to contacts.
+        var profile = self.profile(for: persona)
+        profile.collectionCode = code
+        profile.collectibleCodes = (profile.collectibleCodes ?? [:]).merging(covered.map { ($0.id, code) }) { $1 }
+        profile.updatedAt = Date()
+        setProfile(profile, for: persona)
+        sync(.profile(persona: persona, profile))
+        save()
+        return covered
+    }
+
+    /// Brings collectibles back with a backup code from another account (one that burned, say). PULSHADE then signs
+    /// them over to this account, numbers unchanged; they show up here once it has. Returns what the code was for.
+    func claimCollectibles(code: String) async throws -> [(item: String, serial: UInt32)] {
+        guard let me = me(activePersona), let client = client(nil) else { throw RelayClient.ClaimError.unreachable }
+        let (key, sig, ts) = try ownerProof("pulshade.collect.claim.v1", about: Collectible.codeHash(code), by: me)
+        return try await client.claimCollectibles(key: key, sig: sig, ts: ts, code: code)
+    }
+
+    /// What entering a code did: brought collectibles back, or won a place in a giveaway.
+    enum CodeResult {
+        case restored([(item: String, serial: UInt32)])
+        case giveaway(item: String, place: Int)
+    }
+
+    /// A code typed into the Collectibles tab: a backup code, or one for a giveaway. Tries the backup code first.
+    func enterCollectibleCode(_ code: String) async throws -> CodeResult {
+        do {
+            return .restored(try await claimCollectibles(code: code))
+        } catch RelayClient.ClaimError.unknownCode {
+            guard let me = me(activePersona), let client = client(nil) else { throw RelayClient.GiveawayError.unreachable }
+            let (key, sig, ts) = try ownerProof("pulshade.collect.giveaway.v1", about: Collectible.codeHash(code), by: me)
+            let place = try await client.claimGiveaway(key: key, sig: sig, ts: ts, code: code)
+            // Look for it every 45 seconds for a quarter of an hour, so it shows up soon after the operator signs it.
+            collectibleWatchUntil = Date().addingTimeInterval(15 * 60)
+            nextCollectibleCheck = Date().addingTimeInterval(45)
+            return .giveaway(item: place.item, place: place.place)
+        }
+    }
+
     // MARK: Announcements
 
     /// The next time to ask the relay for announcements: shortly after unlocking, then every minute, and 15 seconds
@@ -1347,7 +1674,7 @@ final class AppModel {
     private var announcementsVersion: String?
 
     /// Asks the relay what Pulshade has told everyone and shows anything new and signed by the admin key in the
-    /// Announcements chat. One the operator took back is removed. Every app asks the same question with no account
+    /// Announcements chat. One the admin app took back is removed. Every app asks the same question with no account
     /// attached, so this says nothing about who you are.
     func refreshAnnouncements() async {
         guard !checkingAnnouncements, let client = client(nil, lane: "announcements") else { return }
@@ -1406,6 +1733,11 @@ final class AppModel {
             changed = true
         }
         if changed { save() }
+    }
+
+    /// Shows a collectible after the active persona's name, or none. Contacts and the public profile hear of it.
+    func wear(_ collectible: Collectible?) {
+        updateProfile { $0.badge = collectible }
     }
 
     /// `label | about | ts`, signed with the identity's key, as the relay asks for to act on its handles.
@@ -1488,6 +1820,7 @@ final class AppModel {
             acceptSession(request.handshake, contact: i, device: 0)
         }
         enqueue(.accepted(sendID: mailbox.sendID), to: peer)
+        shareStories(with: peer)
         syncContact(peer.fingerprint, peer.persona)
         let convo = startConversation(kind: .direct, title: peer.displayName, members: [peer.fingerprint],
                                       persona: .some(request.persona))
@@ -1578,7 +1911,7 @@ final class AppModel {
         let (receiveKey, seal) = await Task.detached { code.keys() }.value
         // Sent like any message, on the sending lane, whose circuit is usually ready: a fresh one to an onion
         // relay can take a while, more so just after Tor starts. A few tries before giving up.
-        guard let client = client(nil, lane: "send"), let blob = ChatCode.seal(link, with: seal) else { return nil }
+        guard let client = client(nil, lane: "chatcode-send"), let blob = ChatCode.seal(link, with: seal) else { return nil }
         var sent = false
         for attempt in 0..<3 where !sent {
             if attempt > 0 { try? await Task.sleep(for: .seconds(2)) }
@@ -1734,6 +2067,7 @@ final class AppModel {
             if !data.security.tor { data.security.torFromStart = false }
         }
         if data.security.notifications && !before.notifications { Notifier.shared.start() }
+        if pushWanted != (before.pushWake && before.notifications) { refreshPush(turningOff: !pushWanted) }
         if data.security.notificationContent != before.notificationContent || !data.security.notifications {
             Notifier.shared.clearAll()
         }
@@ -1906,7 +2240,8 @@ final class AppModel {
             for item in data.contacts[i].devices[d].pending {
                 guard let plain = try? JSONEncoder.pulshade.encode(item.payload),
                       let message = try? session.encrypt(plain) else { continue }
-                seal(.ratchet(message), contact: i, device: d, message: item.message, ephemeral: item.payload.isEphemeral)
+                seal(.ratchet(message), contact: i, device: d, message: item.message, ephemeral: item.payload.isEphemeral,
+                     story: item.payload.storyID)
             }
             data.contacts[i].devices[d].session = session
             data.contacts[i].devices[d].pending = []
@@ -1942,14 +2277,16 @@ final class AppModel {
     }
 
     /// Seals a payload to one of a contact's devices, as the persona that knows them, and queues it.
-    private func seal(_ payload: Payload, contact i: Int, device d: Int, message: UUID? = nil, ephemeral: Bool = false) {
+    private func seal(_ payload: Payload, contact i: Int, device d: Int, message: UUID? = nil, ephemeral: Bool = false,
+                      story: UUID? = nil) {
         let c = data.contacts[i]
         guard c.devices.indices.contains(d), let me = me(c.persona),
               let blob = try? Envelope.seal(payload, from: me, device: deviceID(for: c.persona), to: c.agreementKey) else { return }
         let sendID = c.devices[d].sendID
         // Only the newest of these waits for a mailbox.
         if ephemeral { data.outbox.removeAll { $0.ephemeral == true && $0.sendID == sendID } }
-        data.outbox.append(Outgoing(sendID: sendID, blob: blob, relay: c.relay, message: message, ephemeral: ephemeral ? true : nil))
+        data.outbox.append(Outgoing(sendID: sendID, blob: blob, relay: c.relay, message: message, ephemeral: ephemeral ? true : nil,
+                                  story: story, lane: c.persona == nil ? nil : Outgoing.lane(for: c.persona)))
         kick()
     }
 
@@ -2033,6 +2370,10 @@ final class AppModel {
             typing = typing.mapValues { $0.filter { $0.value >= cutoff } }.filter { !$0.value.isEmpty }
         }
         checkAutoLock()
+        if Date() >= nextCollectibleCheck {
+            nextCollectibleCheck = Date().addingTimeInterval(Date() < collectibleWatchUntil ? 45 : 30 * 60)
+            Task { try? await refreshCollectibles(); await refreshEggs() }
+        }
         if Date() >= nextAnnouncementCheck {
             nextAnnouncementCheck = Date().addingTimeInterval(60)
             Task { await refreshAnnouncements() }
@@ -2087,7 +2428,7 @@ final class AppModel {
     /// Mailboxes being fetched right now, so two fetches never collect (and handle) the same envelope.
     private var fetching: Set<Data> = []
     /// The last time something was sent, to keep the sending lane's circuit from going cold.
-    private var lastSent = Date.distantPast
+    private var lastSent: [String: Date] = [:]
 
     /// Mailboxes grouped by relay and by who they belong to. Each persona, each public profile's request
     /// mailbox and the reports mailbox is its own lane, so the relay can't tell from one request that
@@ -2160,12 +2501,21 @@ final class AppModel {
     /// Sending, retries and receipts, every couple of seconds. Also keeps the sending lane's circuit warm, so
     /// pressing send doesn't wait for Tor to build one.
     private func housekeep() async {
+        refreshPush()
         retryStaleHandshakes()
+        data.clipParts = data.clipParts.filter { $0.value.date.addingTimeInterval(StoryLifetime.twoDays.rawValue + 3600) > Date() }
         sendDueReceipts()
         await flush()
-        if trafficShaping, Date().timeIntervalSince(lastSent) > 45, let client = client(nil, lane: "send") {
-            lastSent = Date()
-            Task { _ = await client.health() }
+        if trafficShaping {
+            // Each sending lane that's been used lately is kept warm on its own, so no two personas share a connection.
+            // The main persona's lane is always kept warm; another's only while it's being used.
+            lastSent = lastSent.filter { $0.key == Outgoing.lane(for: nil) || Date().timeIntervalSince($0.value) < 600 }
+            if lastSent[Outgoing.lane(for: nil)] == nil { lastSent[Outgoing.lane(for: nil)] = .distantPast }
+            for (lane, at) in lastSent where Date().timeIntervalSince(at) > 45 {
+                guard let client = client(nil, lane: lane) else { continue }
+                lastSent[lane] = Date()
+                Task { _ = await client.health() }
+            }
         }
     }
 
@@ -2223,6 +2573,110 @@ final class AppModel {
 
     /// A client for a contact's relay, or the default relay when nil. Each lane has its own connections, so
     /// requests on different lanes don't arrive together over one.
+    // MARK: Wake-up pushes
+
+    /// What the relay was last told about this phone's push, so it's only told again when something changed. Dropped
+    /// at lock: it holds this account's mailbox keys, which a decoy or another account must never see or act on.
+    private var pushTold: (token: String, keys: Set<Data>, sound: Bool, at: Date)?
+    private var pushBusy = false
+    /// Where push stands, in words, for Settings: off, waiting for Apple, refused by the relay, or registered.
+    private(set) var pushStatus = ""
+    /// Asked Apple for a token this launch, so it isn't asked again every couple of seconds.
+    private var pushAsked = false
+    /// A device token to take off the relay as soon as Apple hands this launch one, after a wipe, a panic passcode
+    /// or a decoy, where there's no account to say whose mailboxes they were.
+    private var pushForgetPending = false
+
+    /// Whether this phone should be woken through Apple when mail lands.
+    private var pushWanted: Bool { data.security.pushWake && data.security.notifications }
+
+    /// Keeps the relay's idea of this phone's push in step with the setting, the token and the mailboxes. Only the
+    /// default identity's mailboxes: one token on two identities' mailboxes would let the relay link them.
+    func refreshPush(turningOff: Bool = false) {
+        #if os(iOS)
+        if pushForgetPending {
+            if let token = Push.token {
+                pushForgetPending = false
+                Task { try? await client(nil, lane: "push")?.forgetPush(token: token) }
+                UIApplication.shared.unregisterForRemoteNotifications()
+                Push.token = nil
+                pushAsked = false
+            } else if !pushAsked {
+                pushAsked = true
+                UIApplication.shared.registerForRemoteNotifications()
+            }
+            return
+        }
+        guard phase == .unlocked, !pushBusy, pushWanted || pushTold != nil || turningOff else {
+            if !pushWanted { pushStatus = data.security.notifications ? "Off" : "Turn notifications on first" }
+            return
+        }
+        let keys = currentLanes()[Lane(relay: nil, name: "main")] ?? []
+        if pushWanted {
+            if Push.token == nil, !pushAsked { pushAsked = true; UIApplication.shared.registerForRemoteNotifications() }
+            guard let token = Push.token else {
+                pushStatus = Push.failure.map { "Apple didn't give this phone a token: \($0)" } ?? "Waiting for Apple to give this phone a token"
+                return
+            }
+            guard !keys.isEmpty else { pushStatus = "No mailboxes to register yet"; return }
+            let sound = data.security.notificationSound
+            if let told = pushTold, told.token == token, told.keys == keys, told.sound == sound,
+               Date().timeIntervalSince(told.at) < 15 * 60 { return }
+            pushBusy = true
+            Task {
+                defer { pushBusy = false }
+                // The relay forgets registrations when it restarts and can't say so, so they're renewed every 15 minutes.
+                guard let client = client(nil, lane: "push"), await client.pushEnabled() else {
+                    pushStatus = "The server isn't set up for wake-ups"
+                    return
+                }
+                // A phone's mailboxes go in a few calls; the relay takes 256 at a time.
+                let all = keys.sorted { $0.hex < $1.hex }
+                var ok = true
+                for start in stride(from: 0, to: all.count, by: 256) {
+                    let chunk = Array(all[start..<min(start + 256, all.count)])
+                    do {
+                        try await client.registerPush(keys: chunk, token: token, sandbox: Push.sandbox, sound: sound)
+                    } catch {
+                        ok = false
+                        pushStatus = (error as? PushRefused).map { "The server refused the registration (\($0.status))" } ?? "Couldn't reach the server to register"
+                        break
+                    }
+                }
+                if ok {
+                    pushTold = (token, keys, sound, Date())
+                    pushStatus = "Registered \(keys.count) mailbox\(keys.count == 1 ? "" : "es") at \(Date().formatted(date: .omitted, time: .shortened)), token ending \(token.suffix(4))"
+                }
+            }
+        } else {
+            let forgotten = keys.union(pushTold?.keys ?? [])
+            pushTold = nil
+            pushAsked = false
+            UIApplication.shared.unregisterForRemoteNotifications()
+            guard !forgotten.isEmpty else { return }
+            pushBusy = true
+            Task {
+                defer { pushBusy = false }
+                let all = Array(forgotten)
+                for start in stride(from: 0, to: all.count, by: 256) {
+                    try? await client(nil, lane: "push")?.unregisterPush(keys: Array(all[start..<min(start + 256, all.count)]))
+                }
+            }
+        }
+        #endif
+    }
+
+    /// Takes this phone's wake-ups off the relay without needing to know whose mailboxes they were. Used when an
+    /// account is wiped, and when a decoy opens (whose empty account must not buzz for the real one). The real account
+    /// registers again the next time it's unlocked.
+    private func withdrawPush() {
+        #if os(iOS)
+        pushTold = nil
+        pushForgetPending = true
+        refreshPush()
+        #endif
+    }
+
     func client(_ relay: String?, lane: String = "main") -> RelayClient? {
         guard let address = reachable(relay), let url = URL(string: address) else { return nil }
         return RelayClient(base: url, lane: lane)
@@ -2238,34 +2692,74 @@ final class AppModel {
     /// One fetch at a time: two overlapping ones could both collect, and handle, the same envelope.
     private var syncing = false
 
-    /// Sends queued envelopes, oldest first. A relay that's down only holds up its own envelopes.
+    /// Sends queued envelopes, oldest first, a few mailboxes at a time. Each round sends the oldest waiting one for
+    /// up to `Self.sendLanes` different mailboxes at once, so a burst (one story to thirty people) doesn't go out
+    /// one slow round trip after another, and what's written to one mailbox still goes out in order.
+    /// One that fails holds up only its own mailbox, and a relay that's down only its own envelopes. A large one
+    /// that fails (a slow upload, not a relay that's gone) doesn't stop the small ones behind it.
     private func flush() async {
         guard !flushing else { return }
         flushing = true
         defer { flushing = false }
         let owner = identity?.fingerprint
         var down: Set<String> = []
-        // A full mailbox holds up only what's written to it.
-        var full: Set<Data> = []
-        for item in data.outbox {
-            let relay = item.relay ?? data.relay
-            guard !down.contains(relay), !full.contains(item.sendID), let client = client(item.relay, lane: "send") else { continue }
-            do {
-                try await client.deposit(item.blob, to: item.sendID)
-                lastSent = Date()
-            } catch {
-                if error is RelayMailboxFull { full.insert(item.sendID) } else { down.insert(relay) }
-                // A signal that couldn't be sent is not worth sending later.
-                if item.ephemeral == true { data.outbox.removeAll { $0.id == item.id } }
-                continue
+        // Mailboxes that failed or are full this time: what's written to them waits, nothing else does.
+        var held: Set<Data> = []
+        var tried: Set<UUID> = []
+        while true {
+            var wave: [(item: Outgoing, client: RelayClient, lane: String)] = []
+            var inWave: Set<Data> = []
+            for item in data.outbox where !tried.contains(item.id) {
+                let relay = item.relay ?? data.relay
+                let lane = item.lane ?? Outgoing.lane(for: nil)
+                guard !down.contains(relay), !held.contains(item.sendID), !inWave.contains(item.sendID),
+                      let client = client(item.relay, lane: lane) else { continue }
+                wave.append((item, client, lane))
+                inWave.insert(item.sendID)
+                tried.insert(item.id)
+                if wave.count == Self.sendLanes { break }
+            }
+            if wave.isEmpty { break }
+            var failures: [UUID: Error] = [:]
+            await withTaskGroup(of: (UUID, Error?).self) { group in
+                for (item, client, _) in wave {
+                    group.addTask {
+                        do { try await client.deposit(item.blob, to: item.sendID, wake: item.message != nil); return (item.id, nil) } catch { return (item.id, error) }
+                    }
+                }
+                for await (id, error) in group { if let error { failures[id] = error } }
             }
             guard identity?.fingerprint == owner else { return }
-            data.outbox.removeAll { $0.id == item.id }
-            if let message = item.message { setStatus(.sent, for: [message]) }
+            for (item, _, lane) in wave {
+                if let error = failures[item.id] {
+                    if error is RelayTooLarge {
+                        // Too big for the relay, now and always: waiting would hold up everything behind it.
+                        data.outbox.removeAll { $0.id == item.id }
+                        continue
+                    }
+                    if error is RelayMailboxFull || item.blob.count > Self.largeEnvelope {
+                        held.insert(item.sendID)
+                    } else {
+                        down.insert(item.relay ?? data.relay)
+                    }
+                    // A signal that couldn't be sent is not worth sending later.
+                    if item.ephemeral == true { data.outbox.removeAll { $0.id == item.id } }
+                } else {
+                    lastSent[lane] = Date()
+                    data.outbox.removeAll { $0.id == item.id }
+                    if let message = item.message { setStatus(.sent, for: [message]) }
+                }
+            }
         }
         if !down.isEmpty { link = .offline }
         save()
     }
+
+    /// Mailboxes written to at once when sending.
+    private static let sendLanes = 6
+    /// Above this an envelope is a photo or a group's details, not a short message: if it fails, it's more likely
+    /// a slow upload than the relay being gone.
+    private static let largeEnvelope = 65_536
 
     /// One full round: send, then check every lane in a random order. Tests and Retry use it; normally each
     /// lane runs on its own (see `startSync`).
@@ -2423,7 +2917,7 @@ final class AppModel {
         guard var sender = contact(fp, in: persona) else { return }
         switch payload {
         case .report:
-            // Reports go to the operator, sealed on their own; one arriving here means nothing.
+            // Reports go to the Pulshade Admin app, sealed on their own; one arriving here means nothing.
             break
         case .deviceRemoved:
             guard let i = contactIndex(fp, persona), data.contacts[i].devices.count > 1 else { break }
@@ -2445,9 +2939,18 @@ final class AppModel {
         case let .callEnd(id):
             guard call?.invite.id == id, call?.peer == fp, call?.persona == persona else { break }
             endCall(note: call?.phase == .ringing && call?.outgoing == false ? "Missed call" : nil, tell: false)
-        case let .profile(name, avatar, color, banner, bio, handle):
+        case let .profile(name, avatar, color, banner, bio, handle, badge, links, collectibles, notes):
             sender.name = String(name.prefix(64))
+            sender.badge = badge.flatMap { $0.isGenuine(for: sender.signingKey) ? $0 : nil }
+            sender.collectibles = collectibles.map { Array($0.prefix(40).filter { $0.isGenuine(for: sender.signingKey) }) }.flatMap { $0.isEmpty ? nil : $0 }
             sender.bio = bio.map { String($0.prefix(160)) }
+            // Never trust what arrives: keep only entries that pass the same checks as ours.
+            let newLinks = Optional(ProfileLink.cleaned(links)).flatMap { $0.isEmpty ? nil : $0 }
+            // A wallet they already showed that now reads differently: remember when, so the sheet can warn.
+            let wallets = { (list: [ProfileLink]?) in Set((list ?? []).filter(\.kind.isWallet).map { $0.kind.rawValue + ":" + $0.value }) }
+            if !wallets(sender.links).isEmpty, wallets(sender.links) != wallets(newLinks) { sender.walletChangedAt = Date() }
+            sender.links = newLinks
+            sender.notes = Optional(ProfileNote.cleaned(notes)).flatMap { $0.isEmpty ? nil : $0 }
             let claimed = handle.flatMap(DirectoryProfile.validHandle)
             if claimed != sender.handle { sender.handle = nil }
             if let claimed, claimed != sender.handle { confirmHandle(claimed, of: sender) }
@@ -2465,10 +2968,17 @@ final class AppModel {
         case let .group(info):
             joinGroup(info, from: sender)
         case let .story(id, style, date, lasts):
+            // Already taken back: a late or repeated copy mustn't bring it back.
+            guard removedStories["\(fp)|\(id)"] == nil else { break }
             let lifetime = lasts.map { min(max($0, 3600), StoryLifetime.twoDays.rawValue) }
             if let i = data.stories.firstIndex(where: { $0.id == id }) {
                 // A new version of one they sent before.
                 guard data.stories[i].author == fp, data.stories[i].persona == persona else { break }
+                var style = style
+                // A new caption on a clip they already sent comes without the clip.
+                if case let .video(bytes, caption) = style, bytes.isEmpty, case let .video(have, _) = data.stories[i].style, !have.isEmpty {
+                    style = .video(have, caption: caption)
+                }
                 data.stories[i].style = style
                 data.stories[i].lifetime = lifetime
                 if !data.stories[i].isLive { data.stories.remove(at: i) }
@@ -2478,12 +2988,24 @@ final class AppModel {
             story.persona = persona
             story.lifetime = lifetime
             if story.isLive { withAnimation(.snappy) { data.stories.append(story) } }
+            assembleClip(id)
+        case let .storyPart(id, index, of, bytes):
+            guard removedStories["\(fp)|\(id)"] == nil else { break }
+            guard (1...StoryClipPieces.maxPieces).contains(of), (0..<of).contains(index), bytes.count <= StoryClipPieces.size,
+                  data.clipParts[id] != nil || data.clipParts.count < 32 else { break }
+            var pending = data.clipParts[id] ?? ClipParts(author: fp, persona: persona, of: of)
+            guard pending.author == fp, pending.persona == persona, pending.of == of else { break }
+            pending.parts[index] = bytes
+            data.clipParts[id] = pending
+            assembleClip(id)
         case let .storyViewed(id):
             guard data.security.storyViews,
                   let i = data.stories.firstIndex(where: { $0.id == id && $0.author == "me" && $0.persona == persona }),
                   data.stories[i].shownTo.includes(fp), data.stories[i].viewers?[fp] == nil else { break }
             data.stories[i].viewers = (data.stories[i].viewers ?? [:]).merging([fp: min(deposited ?? Date(), Date())]) { old, _ in old }
         case let .storyRemoved(id):
+            if data.clipParts[id]?.author == fp { data.clipParts[id] = nil }
+            removedStories["\(fp)|\(id)"] = Date()
             withAnimation { data.stories.removeAll { $0.id == id && $0.author == fp && $0.persona == persona } }
         case let .unsend(ids):
             applyUnsend(ids, from: sender)
@@ -2530,7 +3052,9 @@ final class AppModel {
             guard let i = conversationIndex(shared, from: sender) else { break }
             dropMember(fp, at: i)
         case let .removed(shared):
-            guard let i = conversationIndex(shared, from: sender), data.conversations[i].isAdmin(fp) else { break }
+            guard let i = conversationIndex(shared, from: sender) else { break }
+            let c = data.conversations[i]
+            guard c.isAdmin(fp) || c.canRemove("me", by: fp) else { break }
             removeLocally(data.conversations[i].id)
         case let .moved(card):
             // They opened a mailbox just for us after we said hello through a group introduction.
@@ -2546,6 +3070,7 @@ final class AppModel {
             upsert(sender)
             syncContact(fp, persona)
             _ = startConversation(kind: .direct, title: sender.displayName, members: [fp], persona: .some(persona))
+            shareStories(with: sender)
         }
     }
 
@@ -2584,6 +3109,7 @@ final class AppModel {
             answer()
             syncContact(fp, persona)
             _ = startConversation(kind: .direct, title: peer.displayName, members: [fp], persona: .some(persona))
+            shareStories(with: peer)
         }
     }
 
@@ -2743,17 +3269,30 @@ final class AppModel {
         }
         let owner = info.owner.map(fingerprint) ?? sender.fingerprint
         let admins = (info.admins ?? []).map(fingerprint).filter { $0 != owner }
+        let mods = info.mods.map { $0.map(fingerprint).filter { $0 != owner && !admins.contains($0) } }
         let version = info.version ?? 0
 
         if let i = index(of: info.id) {
             let current = data.conversations[i]
-            guard current.persona == persona, current.isAdmin(sender.fingerprint) else { return }
+            let fromAdmin = current.isAdmin(sender.fingerprint)
+            guard current.persona == persona, fromAdmin || (current.kind == .group && current.mods.contains(sender.fingerprint)) else { return }
             keep(intro, at: i)
             guard version > current.version else { return }
+            if !fromAdmin {
+                // A mod's update only counts if it takes ordinary members out and changes nothing else.
+                let gone = current.members.filter { !members.contains($0) }
+                guard String(info.title.prefix(80)) == current.title, info.avatar == current.avatar,
+                      info.about.map({ String($0.prefix(500)) }) == current.about, owner == current.owner,
+                      Set(admins) == Set(current.admins), Set(mods ?? current.mods) == Set(current.mods),
+                      (info.postPolicy ?? current.postPolicy) == current.postPolicy,
+                      members.allSatisfy({ current.members.contains($0) }),
+                      gone.allSatisfy({ current.canRemove($0, by: sender.fingerprint) }) else { return }
+            }
             data.conversations[i].title = String(info.title.prefix(80))
             data.conversations[i].avatar = info.avatar
             data.conversations[i].about = info.about.map { String($0.prefix(500)) }
             data.conversations[i].admins = admins
+            data.conversations[i].mods = mods ?? current.mods
             data.conversations[i].postPolicy = info.postPolicy ?? current.postPolicy
             data.conversations[i].members = members
             data.conversations[i].version = version
@@ -2765,6 +3304,7 @@ final class AppModel {
         convo.about = info.about.map { String($0.prefix(500)) }
         convo.owner = owner
         convo.admins = admins
+        convo.mods = mods ?? []
         convo.postPolicy = info.postPolicy ?? (info.kind == .channel ? .admins : .everyone)
         convo.version = version
         convo.introsMine = intro.map { [$0] } ?? []
@@ -2774,6 +3314,7 @@ final class AppModel {
     private func dropMember(_ fingerprint: String, at i: Int) {
         data.conversations[i].members.removeAll { $0 == fingerprint }
         data.conversations[i].admins.removeAll { $0 == fingerprint }
+        data.conversations[i].mods.removeAll { $0 == fingerprint }
         data.conversations[i].introsMade[fingerprint] = nil
     }
 
@@ -2807,15 +3348,25 @@ final class AppModel {
         }
         let roster = people.compactMap { contact($0, in: persona) }.map { member in
             let devices = introDevices(of: member, in: convo.id)
-            return PeerCard(name: member.name, avatar: member.avatar, color: member.color, signingKey: member.signingKey,
+            return PeerCard(name: member.name, avatar: Self.thumbnail(member.avatar, side: 96), color: member.color, signingKey: member.signingKey,
                             agreementKey: member.agreementKey, sendID: devices.first?.sendID ?? Data(), relay: member.relay,
                             devices: devices)
         }
         if let them = contact(recipient, in: persona) { _ = introDevices(of: them, in: convo.id) }
-        return GroupInfo(id: convo.id, kind: convo.kind, title: convo.title, avatar: convo.avatar, roster: roster,
+        return GroupInfo(id: convo.id, kind: convo.kind, title: convo.title, avatar: Self.thumbnail(convo.avatar, side: 320), roster: roster,
                          about: convo.about, owner: signingKey(convo.owner, in: persona),
-                         admins: convo.admins.compactMap { signingKey($0, in: persona) }, postPolicy: convo.postPolicy,
+                         admins: convo.admins.compactMap { signingKey($0, in: persona) },
+                         mods: convo.mods.compactMap { signingKey($0, in: persona) }, postPolicy: convo.postPolicy,
                          version: convo.version, intros: index(of: convo.id).flatMap { data.conversations[$0].introsMade[recipient] })
+    }
+
+    /// A picture shrunk for a group announcement. Every member's avatar and the group's own travel in each
+    /// announcement, and full-size ones make it hundreds of kilobytes, many times any message, which is the
+    /// one a slow Tor circuit fails to carry. Small ones, and anything that can't be read as a picture, as is.
+    static func thumbnail(_ picture: Data?, side: CGFloat) -> Data? {
+        guard let picture, picture.count > 12_000 else { return picture }
+        guard let image = PlatformImage(data: picture) else { return nil }
+        return cleanJPEG(image, maxSide: side) ?? nil
     }
 
     /// Where the other members first reach `member`: a mailbox made for each of their devices, kept as long as
@@ -2869,7 +3420,19 @@ final class AppModel {
     func setAdmin(_ id: Conversation.ID, _ fingerprint: String, _ on: Bool) {
         guard let i = index(of: id), data.conversations[i].amOwner, data.conversations[i].members.contains(fingerprint) else { return }
         data.conversations[i].admins.removeAll { $0 == fingerprint }
-        if on { data.conversations[i].admins.append(fingerprint) }
+        if on {
+            data.conversations[i].admins.append(fingerprint)
+            data.conversations[i].mods.removeAll { $0 == fingerprint }
+        }
+        publishChange(i)
+    }
+
+    /// Only the owner appoints or removes mods, and only in groups. An admin is already more than a mod.
+    func setMod(_ id: Conversation.ID, _ fingerprint: String, _ on: Bool) {
+        guard let i = index(of: id), data.conversations[i].amOwner, data.conversations[i].kind == .group,
+              data.conversations[i].members.contains(fingerprint), !data.conversations[i].isAdmin(fingerprint) else { return }
+        data.conversations[i].mods.removeAll { $0 == fingerprint }
+        if on { data.conversations[i].mods.append(fingerprint) }
         publishChange(i)
     }
 
@@ -2884,11 +3447,11 @@ final class AppModel {
         publishChange(i, alsoTell: new, channelAdminsOnly: true)
     }
 
-    /// Owners can remove anyone; admins can remove people who aren't admins.
+    /// Owners can remove anyone; admins can remove people who aren't admins; mods only ordinary members.
     func removeMember(_ id: Conversation.ID, _ fingerprint: String) {
         guard let i = index(of: id) else { return }
         let c = data.conversations[i]
-        guard c.amAdmin, fingerprint != c.owner, c.amOwner || !c.isAdmin(fingerprint),
+        guard c.canRemove(fingerprint, by: "me"),
               let peer = contact(fingerprint, in: c.persona) else { return }
         enqueue(.removed(conversation: id), to: peer)
         dropMember(fingerprint, at: i)
@@ -2898,6 +3461,7 @@ final class AppModel {
     func role(of fingerprint: String, in convo: Conversation) -> String? {
         if convo.owner == fingerprint { return "Owner" }
         if convo.admins.contains(fingerprint) { return "Admin" }
+        if convo.mods.contains(fingerprint) { return "Mod" }
         return nil
     }
 }
@@ -2959,7 +3523,7 @@ extension AppModel {
     private func card(of c: Conversation) -> ConversationCard {
         ConversationCard(id: c.id, kind: c.kind, title: c.title, avatar: c.avatar, about: c.about, owner: c.owner,
                          admins: c.admins, postPolicy: c.postPolicy, version: c.version, members: c.members,
-                         persona: c.persona, disappearAfter: c.disappearAfter, pinned: c.pinned, muted: c.muted)
+                         persona: c.persona, disappearAfter: c.disappearAfter, pinned: c.pinned, muted: c.muted, mods: c.mods)
     }
 
     private func conversationIndex(for ref: ConvoRef, create: Bool) -> Int? {
@@ -3018,6 +3582,7 @@ extension AppModel {
             data.conversations[i].about = card.about
             data.conversations[i].owner = card.owner
             data.conversations[i].admins = card.admins
+            data.conversations[i].mods = card.mods ?? data.conversations[i].mods
             data.conversations[i].postPolicy = card.postPolicy
             data.conversations[i].version = card.version
             data.conversations[i].members = card.members
@@ -3028,6 +3593,7 @@ extension AppModel {
         convo.about = card.about
         convo.owner = card.owner
         convo.admins = card.admins
+        convo.mods = card.mods ?? []
         convo.postPolicy = card.postPolicy
         convo.version = card.version
         convo.persona = card.persona
@@ -3078,13 +3644,21 @@ extension AppModel {
         case let .conversation(card):
             adopt(card)
         case let .profile(persona, incoming):
-            // Newest wins, so devices that drifted apart settle on the same profile.
+            // Newest wins, so devices that drifted apart settle on the same profile. But not one from a device that
+            // knows fewer fields than this one (it would wipe the rest), and one from a newer device can't be read in
+            // full, so it waits for an update.
             let current = self.profile(for: persona)
+            let theirFormat = incoming.format ?? 0
+            guard theirFormat <= profileFormat else { profileNeedsUpdate = true; break }
+            guard theirFormat >= (current.format ?? 0) else { break }
             guard (incoming.updatedAt ?? .distantPast) > (current.updatedAt ?? .distantPast) else { break }
             if let old = current.handle, old != incoming.handle {
                 // Another device chose a different handle for this account: let go of the one this device held.
                 Task { await self.release(old, persona: persona) }
             }
+            var incoming = incoming
+            incoming.links = Optional(ProfileLink.cleaned(incoming.links)).flatMap { $0.isEmpty ? nil : $0 }
+            incoming.notes = Optional(ProfileNote.cleaned(incoming.notes)).flatMap { $0.isEmpty ? nil : $0 }
             setProfile(incoming, for: persona)
         case let .persona(persona):
             if let i = data.personas.firstIndex(where: { $0.id == persona.id }) {
@@ -3095,6 +3669,7 @@ extension AppModel {
         case let .personaDeleted(id):
             deletePersona(id)
         case let .story(story):
+            guard removedStories["me|\(story.id)"] == nil else { break }
             if let i = data.stories.firstIndex(where: { $0.id == story.id }) {
                 // An edit made on another device. Each device hears about views itself, so keep both lists.
                 guard story.author == "me", data.stories[i].author == "me" else { break }
@@ -3107,6 +3682,7 @@ extension AppModel {
         case let .contactRemoved(fingerprint, persona):
             if let c = contact(fingerprint, in: persona), !c.isSelf { forget(c) }
         case let .storyRemoved(id):
+            removedStories["me|\(id)"] = Date()
             data.stories.removeAll { $0.id == id && $0.author == "me" }
         case let .blocked(fp):
             if !data.blocked.contains(fp) { data.blocked.append(fp) }
@@ -3308,7 +3884,7 @@ extension AppModel {
             }
             if !chunk.isEmpty { events.append(.history(conversation: convo.id, messages: chunk)) }
         }
-        events += data.stories.filter(\.isLive).map { .story($0) }
+        events += data.stories.filter { $0.isLive && $0.isSyncable }.map { .story($0) }
         return events
     }
 
@@ -3425,7 +4001,7 @@ extension AppModel {
 
     /// Burns one persona for good, leaving your main identity and other personas as they are: its @handles are
     /// retired, its chats deleted for both sides, its contacts told to forget it, and once that's sent, its keys and
-    /// everything else of it go from all your devices.
+    /// everything else of it go from all your devices. Its collectibles stay claimable with its backup code.
     func burnPersona(_ id: UUID) async throws {
         guard data.personas.contains(where: { $0.id == id }), let client = client(nil), await client.health() else {
             throw LeaveError.offline
@@ -3564,6 +4140,7 @@ extension AppModel {
                 }
                 data.conversations[i].members.removeAll { $0 == fp }
                 data.conversations[i].admins.removeAll { $0 == fp }
+                data.conversations[i].mods.removeAll { $0 == fp }
             }
             data.contacts.removeAll { $0.fingerprint == fp && !$0.isSelf }
         }
@@ -3576,8 +4153,8 @@ extension AppModel {
 extension AppModel {
     enum ReportError: Error { case notSetUp, unreachable }
 
-    /// Sends a report to the Pulshade team, sealed to the operator's key so the relay can't read it. The relay
-    /// says where the operator's mailbox is, but only an address signed by the admin key built into the app is used.
+    /// Sends a report to the Pulshade team, sealed to the admin app's key so the relay can't read it. The relay
+    /// says where the admin app's mailbox is, but only an address signed by the admin key built into the app is used.
     /// It's sent from a throwaway identity, so the report says nothing about who you are unless you add your
     /// @handle.
     func report(subjectKey: Data, handle: String?, name: String, reason: String, details: String,
@@ -3596,7 +4173,7 @@ extension AppModel {
         await flush()
     }
 
-    /// Whether a reports mailbox really is the operator's: signed by the admin key built into the app.
+    /// Whether a reports mailbox really is the admin app's: signed by the admin key built into the app.
     private static func genuine(_ inbox: ReportInbox) -> Bool {
         inbox.isGenuine(adminKey: adminKey)
     }

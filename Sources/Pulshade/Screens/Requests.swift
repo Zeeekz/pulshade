@@ -340,6 +340,7 @@ private struct ContactRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 5) {
                     Text(contact.displayName).font(.system(size: 15)).foregroundStyle(Ink.text).lineLimit(1)
+                    BadgeMark(badge: contact.badge, size: 15)
                     if contact.verified {
                         Image(systemName: "checkmark.seal.fill").font(.system(size: 11)).foregroundStyle(theme.accent)
                     }
@@ -376,6 +377,7 @@ private struct ProfileCard: View {
                 Text(profile.name.isEmpty ? "Anonymous" : profile.name)
                     .font(.system(size: 20, weight: .semibold))
                     .foregroundStyle(Ink.text)
+                BadgeMark(badge: profile.badge, size: 20)
             }
             HStack(spacing: 6) {
                 Text("@\(profile.handle)")
@@ -398,6 +400,8 @@ private struct ProfileCard: View {
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 300)
             }
+            ProfileLinkList(links: profile.links ?? [], tint: tint)
+            ProfileNoteList(notes: profile.notes ?? [], tint: tint)
         }
         .padding(24)
         .frame(maxWidth: Platform.isPhone ? .infinity : 340)

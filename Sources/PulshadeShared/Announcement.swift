@@ -1,8 +1,8 @@
 import Foundation
 import CryptoKit
 
-/// A message from Pulshade to everyone, shown as a chat from @announcements. Signed by the operator's key over
-/// `"pulshade.announcement.v1" | id | 0 | date (u64 BE) | text`, so only the operator can write one and the relay
+/// A message from Pulshade to everyone, shown as a chat from @announcements. Signed by the Pulshade Admin key over
+/// `"pulshade.announcement.v1" | id | 0 | date (u64 BE) | text`, so only the admin app can write one and the relay
 /// can't change a word of it.
 public struct Announcement: Codable, Equatable, Identifiable, Sendable {
     public var id: String
@@ -30,14 +30,14 @@ public struct Announcement: Codable, Equatable, Identifiable, Sendable {
             + withUnsafeBytes(of: date.bigEndian) { Data($0) } + Data(text.utf8)
     }
 
-    /// Written by the operator.
+    /// Written by the admin app.
     public static func make(_ text: String, signedBy admin: Curve25519.Signing.PrivateKey, at date: Date = Date()) throws -> Announcement {
         let id = UUID().uuidString, seconds = UInt64(date.timeIntervalSince1970)
         let sig = try admin.signature(for: signedPart(id: id, text: text, date: seconds))
         return Announcement(id: id, text: text, date: seconds, sig: sig.base64EncodedString())
     }
 
-    /// Signed by `adminKey`, the operator's key a build carries.
+    /// Signed by `adminKey`, the Pulshade Admin key a build carries.
     public func isGenuine(adminKey: Data?) -> Bool {
         guard let adminKey, UUID(uuidString: id) != nil, let sig = Data(base64Encoded: sig),
               let key = try? Curve25519.Signing.PublicKey(rawRepresentation: adminKey) else { return false }

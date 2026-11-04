@@ -147,6 +147,7 @@ else
 fi
 chown -R "$user:$user" "$data" "$keys" && chmod 700 "$data" "$keys" && chmod 600 "$keys/storage.key"
 [[ -f "$data/creator.key" ]] || warn "No creator.key in $data: your creator account has no admin powers until you put it there."
+[[ -f "$data/pet.key" ]] || warn "No pet.key in $data: eggs can't hatch and collectibles can't be gifted until you put it there."
 
 step "The background service"
 cat > "$unit" <<UNIT

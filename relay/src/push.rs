@@ -1,0 +1,441 @@
+//! Wake-up pushes through Apple, so a locked iPhone hears about new mail.
+//!
+//! A phone that opts in registers its Apple device token against the mailboxes it reads, proving it owns
+//! them with their receive keys. When an envelope is deposited, the relay sends Apple one push with no
+//! message in it: only "New message". The phone then fetches the real thing over Tor as usual.
+//!
+//! What the relay holds is a token per mailbox, in memory only (a restart forgets them until the phone next
+//! opens Pulshade and registers again, and so does a week without it opening). Apple learns that a device was
+//! woken, and when. Nothing else leaves.
+//!
+//! The limits are there so this can't be turned on the relay or on Apple: a token can hold only so many mailboxes,
+//! the table has a ceiling (the oldest registrations make way), a device is woken at most once in a while however
+//! much mail lands, and the relay as a whole sends only so many pushes a second.
+
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
+use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+use p256::pkcs8::DecodePrivateKey;
+use serde::Deserialize;
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+type Id = [u8; 32];
+
+/// A phone is not woken more often than this, however much mail lands or in how many of its mailboxes. Short, so
+/// each message gets its own banner; it only stops a burst (a story's pieces, say) becoming a stream of them. The
+/// relay can't tell a message from a receipt, so some banners are for mail that isn't one.
+const COOLDOWN: Duration = Duration::from_secs(3);
+/// A registration is forgotten after this long without being renewed (phones renew at every launch, and every few
+/// hours while Pulshade is open). Short, so a wiped account's pushes stop on their own.
+const TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+const MAX_TARGETS: usize = 100_000;
+/// One device has this many mailboxes at most: more is not a phone.
+const MAX_PER_TOKEN: usize = 2_048;
+/// Pushes the relay sends to Apple in a second, all devices together. Mail past it is delivered as ever; its
+/// phones just aren't woken for it.
+const MAX_SENDS_PER_SECOND: u32 = 30;
+/// Apple accepts a signed token for up to an hour; this one is renewed well inside that.
+const JWT_LIFE: Duration = Duration::from_secs(40 * 60);
+
+#[derive(Clone, Deserialize)]
+pub struct Config {
+    pub key_id: String,
+    pub team_id: String,
+    #[serde(default = "default_topic")]
+    pub topic: String,
+    /// The `.p8` file, relative to where the relay runs.
+    #[serde(default = "default_key_file")]
+    pub key_file: String,
+    #[serde(skip)]
+    pub production_url: String,
+    #[serde(skip)]
+    pub sandbox_url: String,
+}
+
+fn default_topic() -> String {
+    "app.pulshade.ios".into()
+}
+
+fn default_key_file() -> String {
+    "apns.p8".into()
+}
+
+impl Config {
+    /// From `apns.json` next to the relay, with the key in the file it names. None when push isn't set up.
+    pub fn load() -> Option<(Config, SigningKey)> {
+        let mut config: Config = serde_json::from_str(&std::fs::read_to_string("apns.json").ok()?).ok()?;
+        config.production_url = "https://api.push.apple.com".into();
+        config.sandbox_url = "https://api.sandbox.push.apple.com".into();
+        let pem = std::fs::read_to_string(&config.key_file).ok()?;
+        let key = SigningKey::from_pkcs8_pem(&pem).ok()?;
+        Some((config, key))
+    }
+}
+
+struct Target {
+    token: String,
+    sandbox: bool,
+    sound: bool,
+    at: Instant,
+}
+
+struct Signed {
+    jwt: String,
+    made: Instant,
+}
+
+pub struct Push {
+    config: Option<(Config, SigningKey)>,
+    targets: Mutex<HashMap<Id, Target>>,
+    /// When each device was last woken.
+    last: Mutex<HashMap<String, Instant>>,
+    /// The second being counted, and how many pushes went out in it.
+    rate: Mutex<(Instant, u32)>,
+    jwt: Mutex<Option<Signed>>,
+    http: reqwest::Client,
+}
+
+/// The one the relay runs with, set up from `apns.json` when there is one.
+static GLOBAL: LazyLock<Arc<Push>> = LazyLock::new(|| Arc::new(Push::new(Config::load())));
+
+pub fn global() -> Arc<Push> {
+    GLOBAL.clone()
+}
+
+impl Push {
+    pub fn new(config: Option<(Config, SigningKey)>) -> Push {
+        Push {
+            config,
+            targets: Mutex::default(),
+            last: Mutex::default(),
+            rate: Mutex::new((Instant::now(), 0)),
+            jwt: Mutex::default(),
+            http: reqwest::Client::builder().timeout(Duration::from_secs(15)).build().expect("http client"),
+        }
+    }
+
+    /// Whether the operator has put an APNs key beside the relay.
+    pub fn enabled(&self) -> bool {
+        self.config.is_some()
+    }
+
+    /// Remembers `token` for these mailboxes (by send id), replacing any earlier one. False if the token already holds
+    /// as many mailboxes as a device can. When the table is full, the oldest registrations make way.
+    pub fn register(&self, mailboxes: &[Id], token: &str, sandbox: bool, sound: bool) -> bool {
+        let mut targets = self.targets.lock().unwrap();
+        let held = targets.values().filter(|t| t.token == token).count();
+        let new = mailboxes.iter().filter(|id| targets.get(*id).is_none_or(|t| t.token != token)).count();
+        if held + new > MAX_PER_TOKEN {
+            return false;
+        }
+        if targets.len() + new > MAX_TARGETS {
+            let now = Instant::now();
+            targets.retain(|_, t| now.duration_since(t.at) < TTL);
+            if targets.len() + new > MAX_TARGETS {
+                let mut ages: Vec<(Instant, Id)> = targets.iter().map(|(id, t)| (t.at, *id)).collect();
+                ages.sort();
+                for (_, id) in ages.into_iter().take(targets.len() + new - MAX_TARGETS) {
+                    targets.remove(&id);
+                }
+            }
+        }
+        for id in mailboxes {
+            targets.insert(*id, Target { token: token.to_string(), sandbox, sound, at: Instant::now() });
+        }
+        true
+    }
+
+    pub fn remove(&self, mailboxes: &[Id]) {
+        self.targets.lock().unwrap().retain(|id, _| !mailboxes.contains(id));
+    }
+
+    /// Everything registered for a device token, for a phone that has no keys to name its mailboxes with.
+    pub fn forget(&self, token: &str) {
+        self.targets.lock().unwrap().retain(|_, t| t.token != token);
+        self.last.lock().unwrap().remove(token);
+    }
+
+    /// Drops registrations that were never renewed, and cooldown records that no longer matter.
+    pub fn sweep(&self) {
+        let now = Instant::now();
+        self.targets.lock().unwrap().retain(|_, t| now.duration_since(t.at) < TTL);
+        self.last.lock().unwrap().retain(|_, at| now.duration_since(*at) < COOLDOWN);
+    }
+
+    pub fn registered(&self) -> usize {
+        self.targets.lock().unwrap().len()
+    }
+
+    /// Mail landed in this mailbox: wake its phone, if it has one registered and wasn't woken a moment ago.
+    pub fn notify(self: &Arc<Self>, mailbox: Id) {
+        if self.config.is_none() {
+            return;
+        }
+        let (token, sandbox, sound) = {
+            let targets = self.targets.lock().unwrap();
+            let Some(target) = targets.get(&mailbox) else { return };
+            (target.token.clone(), target.sandbox, target.sound)
+        };
+        {
+            let mut last = self.last.lock().unwrap();
+            if last.get(&token).is_some_and(|at| at.elapsed() < COOLDOWN) {
+                return;
+            }
+            // Over the relay's own ceiling this second: skip, and the next deposit tries again.
+            let mut rate = self.rate.lock().unwrap();
+            if rate.0.elapsed() >= Duration::from_secs(1) {
+                *rate = (Instant::now(), 0);
+            }
+            if rate.1 >= MAX_SENDS_PER_SECOND {
+                return;
+            }
+            rate.1 += 1;
+            last.insert(token.clone(), Instant::now());
+        }
+        let this = self.clone();
+        tokio::spawn(async move { this.send(&token, sandbox, sound).await });
+    }
+
+    fn authorization(&self) -> Option<String> {
+        let (config, key) = self.config.as_ref()?;
+        let mut cached = self.jwt.lock().unwrap();
+        if let Some(signed) = cached.as_ref().filter(|s| s.made.elapsed() < JWT_LIFE) {
+            return Some(signed.jwt.clone());
+        }
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+        let header = B64URL.encode(format!(r#"{{"alg":"ES256","kid":"{}"}}"#, config.key_id));
+        let claims = B64URL.encode(format!(r#"{{"iss":"{}","iat":{now}}}"#, config.team_id));
+        let signing_input = format!("{header}.{claims}");
+        let signature: Signature = key.sign(signing_input.as_bytes());
+        let jwt = format!("{signing_input}.{}", B64URL.encode(signature.to_bytes()));
+        *cached = Some(Signed { jwt: jwt.clone(), made: Instant::now() });
+        Some(jwt)
+    }
+
+    async fn send(&self, token: &str, sandbox: bool, sound: bool) {
+        let Some((config, _)) = self.config.as_ref() else { return };
+        let Some(jwt) = self.authorization() else { return };
+        let base = if sandbox { &config.sandbox_url } else { &config.production_url };
+        // The same text for everyone. No collapse id: each push is a banner of its own, as in any messenger.
+        let body = if sound {
+            r#"{"aps":{"alert":{"title":"PULSHADE","body":"New message"},"sound":"default","thread-id":"pulshade"}}"#
+        } else {
+            r#"{"aps":{"alert":{"title":"PULSHADE","body":"New message"},"thread-id":"pulshade"}}"#
+        };
+        let response = self
+            .http
+            .post(format!("{base}/3/device/{token}"))
+            .header("authorization", format!("bearer {jwt}"))
+            .header("apns-topic", &config.topic)
+            .header("apns-push-type", "alert")
+            .header("apns-priority", "10")
+            .body(body)
+            .send()
+            .await;
+        match response {
+            // Apple says the token is dead (app deleted, or a token from the other environment): stop using it.
+            Ok(r) if r.status().as_u16() == 410 || r.status().as_u16() == 400 => {
+                let text = r.text().await.unwrap_or_default();
+                if text.contains("Unregistered") || text.contains("BadDeviceToken") || text.contains("DeviceTokenNotForTopic") {
+                    self.forget(token);
+                }
+            }
+            Ok(r) if r.status().as_u16() == 403 => {
+                // A bad key: renew the signed token next time rather than keep sending a rejected one.
+                *self.jwt.lock().unwrap() = None;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether `token` looks like an Apple device token: hex, a sensible length.
+pub fn valid_token(token: &str) -> bool {
+    (32..=200).contains(&token.len()) && token.len() % 2 == 0 && token.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Router, extract::State, http::HeaderMap, routing::post};
+
+    const TEST_KEY: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgmXmBFK/NqQdTqP7W\n\
+nmevMW3kLDVTNTor/tUpF8glb8KhRANCAATot/75BQS0g3J2HIMjwtbQKN33eVC8\n\
+nOl4KCikUySqK0sLiU3iyHn+a7zanVQQhi8scw4f4gBEnLmamXFj8G0c\n\
+-----END PRIVATE KEY-----\n";
+
+    #[derive(Clone, Default)]
+    struct Seen(Arc<Mutex<Vec<(String, HeaderMap, String)>>>, Arc<Mutex<u16>>);
+
+    async fn fake_apple(State(seen): State<Seen>, axum::extract::Path(token): axum::extract::Path<String>,
+                        headers: HeaderMap, body: String) -> (axum::http::StatusCode, String) {
+        seen.0.lock().unwrap().push((token, headers, body));
+        let status = *seen.1.lock().unwrap();
+        if status == 410 {
+            (axum::http::StatusCode::GONE, r#"{"reason":"Unregistered"}"#.into())
+        } else {
+            (axum::http::StatusCode::OK, String::new())
+        }
+    }
+
+    async fn start() -> (Arc<Push>, Seen) {
+        let seen = Seen::default();
+        *seen.1.lock().unwrap() = 200;
+        let app = Router::new().route("/3/device/{token}", post(fake_apple)).with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let config = Config {
+            key_id: "KEY1234567".into(),
+            team_id: "TEAM123456".into(),
+            topic: "app.pulshade.ios".into(),
+            key_file: String::new(),
+            production_url: url.clone(),
+            sandbox_url: url,
+        };
+        let key = SigningKey::from_pkcs8_pem(TEST_KEY).unwrap();
+        (Arc::new(Push::new(Some((config, key)))), seen)
+    }
+
+    const TOKEN: &str = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+
+    #[tokio::test]
+    async fn a_deposit_wakes_the_registered_phone_with_no_message_in_it() {
+        let (push, seen) = start().await;
+        push.register(&[[1; 32]], TOKEN, false, true);
+        push.notify([1; 32]);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let got = seen.0.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        let (token, headers, body) = &got[0];
+        assert_eq!(token, TOKEN);
+        assert_eq!(headers["apns-topic"], "app.pulshade.ios");
+        assert_eq!(headers["apns-push-type"], "alert");
+        assert!(headers["authorization"].to_str().unwrap().starts_with("bearer "));
+        assert!(body.contains("New message"));
+        // Nothing about who it's from or what it says.
+        assert!(!body.contains("sealed") && !body.contains("from"));
+    }
+
+    #[tokio::test]
+    async fn the_signed_token_is_a_real_es256_jwt_apple_can_check() {
+        let (push, _) = start().await;
+        let jwt = push.authorization().unwrap();
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        let header = String::from_utf8(B64URL.decode(parts[0]).unwrap()).unwrap();
+        assert!(header.contains(r#""alg":"ES256""#) && header.contains("KEY1234567"));
+        let claims = String::from_utf8(B64URL.decode(parts[1]).unwrap()).unwrap();
+        assert!(claims.contains("TEAM123456") && claims.contains("iat"));
+        // The signature verifies against the key's public half.
+        use p256::ecdsa::signature::Verifier;
+        let key = SigningKey::from_pkcs8_pem(TEST_KEY).unwrap();
+        let sig = Signature::from_slice(&B64URL.decode(parts[2]).unwrap()).unwrap();
+        key.verifying_key().verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_mail_is_one_push_and_unregistered_mailboxes_get_none() {
+        let (push, seen) = start().await;
+        push.register(&[[2; 32]], TOKEN, true, true);
+        for _ in 0..5 { push.notify([2; 32]); }
+        push.notify([3; 32]);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(seen.0.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_token_apple_calls_dead_is_dropped() {
+        let (push, seen) = start().await;
+        *seen.1.lock().unwrap() = 410;
+        push.register(&[[4; 32]], TOKEN, false, true);
+        push.notify([4; 32]);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(push.registered(), 0);
+    }
+
+    #[test]
+    fn registrations_can_be_removed_and_nothing_is_sent_without_a_key() {
+        let push = Arc::new(Push::new(None));
+        assert!(!push.enabled());
+        push.register(&[[5; 32]], TOKEN, false, true);
+        assert_eq!(push.registered(), 1);
+        push.remove(&[[5; 32]]);
+        assert_eq!(push.registered(), 0);
+        assert!(valid_token(TOKEN));
+        assert!(!valid_token("not hex"));
+    }
+
+    #[tokio::test]
+    async fn a_device_that_turned_sound_off_is_woken_silently() {
+        let (push, seen) = start().await;
+        push.register(&[[6; 32]], TOKEN, false, false);
+        push.notify([6; 32]);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let got = seen.0.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(!got[0].2.contains("sound"), "{}", got[0].2);
+    }
+
+    #[tokio::test]
+    async fn a_device_is_woken_once_however_many_of_its_mailboxes_get_mail() {
+        let (push, seen) = start().await;
+        push.register(&[[7; 32], [8; 32], [9; 32]], TOKEN, false, true);
+        for id in [[7; 32], [8; 32], [9; 32]] { push.notify(id); }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(seen.0.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn one_token_cannot_hold_more_mailboxes_than_a_device_could() {
+        let push = Arc::new(Push::new(None));
+        let many: Vec<Id> = (0..MAX_PER_TOKEN as u32).map(|n| { let mut id = [0u8; 32]; id[..4].copy_from_slice(&n.to_be_bytes()); id }).collect();
+        assert!(push.register(&many, TOKEN, false, true));
+        assert!(!push.register(&[[255; 32]], TOKEN, false, true), "one more is refused");
+        // Registering again what it already holds is fine, and another device is unaffected.
+        assert!(push.register(&many[..10], TOKEN, false, true));
+        assert!(push.register(&[[255; 32]], &"cd".repeat(32), false, true));
+    }
+
+    #[test]
+    fn forgetting_a_token_takes_all_its_mailboxes_and_only_its_own() {
+        let push = Arc::new(Push::new(None));
+        let other = "cd".repeat(32);
+        push.register(&[[1; 32], [2; 32]], TOKEN, false, true);
+        push.register(&[[3; 32]], &other, false, true);
+        push.forget(TOKEN);
+        assert_eq!(push.registered(), 1);
+    }
+
+    #[test]
+    fn when_the_table_is_full_the_oldest_registrations_make_way() {
+        let push = Arc::new(Push::new(None));
+        // Fill it with other devices' mailboxes (a few per token, as a phone would), oldest first.
+        let mut n = 0u32;
+        while push.registered() < MAX_TARGETS {
+            let mut ids = Vec::new();
+            for _ in 0..100 { let mut id = [0u8; 32]; id[..4].copy_from_slice(&n.to_be_bytes()); id[4] = 1; ids.push(id); n += 1; }
+            assert!(push.register(&ids, &format!("{:064x}", n), false, true));
+        }
+        assert!(push.register(&[[9; 32]], TOKEN, false, true), "a newcomer isn't turned away");
+        assert_eq!(push.registered(), MAX_TARGETS);
+        assert!(push.targets.lock().unwrap().contains_key(&[9; 32]));
+    }
+
+    #[tokio::test]
+    async fn the_relay_as_a_whole_sends_only_so_many_pushes_a_second() {
+        let (push, seen) = start().await;
+        for n in 0..(MAX_SENDS_PER_SECOND + 20) {
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&n.to_be_bytes());
+            push.register(&[id], &format!("{:064x}", n), false, true);
+            push.notify(id);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(seen.0.lock().unwrap().len() as u32, MAX_SENDS_PER_SECOND);
+    }
+}
