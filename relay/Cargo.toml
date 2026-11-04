@@ -1,0 +1,26 @@
+[package]
+name = "pulshade-relay"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+arti-client = { version = "0.47", default-features = false, features = ["tokio", "native-tls", "compression", "onion-service-service", "static-sqlite"] }
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+ed25519-dalek = "2"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+hex = "0.4"
+libc = "0.2"
+safelog = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+tor-cell = "0.47"
+tor-hsservice = "0.47"
+tor-proto = "0.47"
+
+[dev-dependencies]
+tokio-tungstenite = "0.26"

@@ -1,0 +1,754 @@
+//! Pulshade relay: a dumb post office for sealed envelopes.
+//!
+//! It knows no users, no names and no keys. A mailbox is two random values:
+//! the owner keeps a secret *receive key* and hands out its SHA-256 hash as the
+//! *send id*. Anyone with the send id can drop envelopes in; only the holder of
+//! the receive key can read them out. Envelopes are opaque, kept in memory only,
+//! deleted on acknowledgement or after seven days, and nothing is ever logged.
+
+mod admin;
+mod backup;
+mod caller;
+mod calls;
+mod directory;
+mod onion;
+mod pow;
+mod release;
+mod sealed;
+
+use axum::{
+    Json, Router,
+    body::Bytes,
+    extract::{DefaultBodyLimit, FromRef, Path, State, WebSocketUpgrade},
+    http::{HeaderMap, StatusCode},
+    routing::{get, post, put},
+};
+use backup::Backups;
+use directory::{Directory, Entry, HeldFor, Limiter, Owned, OwnerProof, Removal};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::io::Read;
+use std::{
+    collections::{HashMap, VecDeque},
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, LazyLock, Mutex},
+    time::{Duration, Instant},
+};
+use tokio::sync::Notify;
+
+const MAX_ENVELOPE: usize = 4 * 1024 * 1024;
+const MAX_QUEUE: usize = 2_000;
+const MAX_KEYS_PER_FETCH: usize = 512;
+const MAX_ITEMS_PER_KEY: usize = 64;
+const TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+/// The longest a fetch may wait for mail.
+const MAX_WAIT: u64 = 25;
+
+/// Wakes waiting fetches whenever anything is deposited, so mail goes out the moment it lands.
+static ARRIVALS: LazyLock<Notify> = LazyLock::new(Notify::new);
+
+type Id = [u8; 32];
+
+struct Item {
+    id: u64,
+    at: Instant,
+    blob: Bytes,
+}
+
+struct Store {
+    queues: HashMap<Id, VecDeque<Item>>,
+    /// Envelope ids are unpredictable, so they say nothing about how busy the relay is.
+    id_seed: [u8; 32],
+    counter: u64,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        let mut id_seed = [0u8; 32];
+        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut id_seed)).expect("no randomness");
+        Store { queues: HashMap::new(), id_seed, counter: 0 }
+    }
+}
+
+impl Store {
+    /// A fresh id below 2^53, so it survives any JSON reader.
+    fn next_id(&mut self) -> u64 {
+        self.counter += 1;
+        let digest = Sha256::new().chain_update(self.id_seed).chain_update(self.counter.to_be_bytes()).finalize();
+        u64::from_be_bytes(digest[..8].try_into().unwrap()) & ((1 << 53) - 1)
+    }
+}
+
+type Shared = Arc<Mutex<Store>>;
+
+#[derive(Clone)]
+struct AppState {
+    store: Shared,
+    directory: Arc<Mutex<Directory>>,
+    backups: Arc<Backups>,
+    releases: Arc<release::Releases>,
+    calls: Arc<calls::Rooms>,
+    limits: Arc<Mutex<Limiter>>,
+    /// The operator's token, from `admin.token` beside the relay.
+    admin_token: Arc<String>,
+    started: Instant,
+}
+
+impl FromRef<AppState> for Shared {
+    fn from_ref(state: &AppState) -> Shared {
+        state.store.clone()
+    }
+}
+
+fn parse_id(hex_str: &str) -> Option<Id> {
+    let raw = hex::decode(hex_str).ok()?;
+    raw.try_into().ok()
+}
+
+fn send_id_for(receive_key: &Id) -> Id {
+    Sha256::digest(receive_key).into()
+}
+
+async fn deposit(State(store): State<Shared>, Path(send_id): Path<String>, body: Bytes) -> StatusCode {
+    let Some(id) = parse_id(&send_id) else { return StatusCode::BAD_REQUEST };
+    if body.is_empty() || body.len() > MAX_ENVELOPE {
+        return StatusCode::PAYLOAD_TOO_LARGE;
+    }
+    let mut store = store.lock().unwrap();
+    let item = Item { id: store.next_id(), at: Instant::now(), blob: body };
+    let queue = store.queues.entry(id).or_default();
+    if queue.len() >= MAX_QUEUE {
+        return StatusCode::INSUFFICIENT_STORAGE;
+    }
+    queue.push_back(item);
+    drop(store);
+    ARRIVALS.notify_waiters();
+    StatusCode::ACCEPTED
+}
+
+#[derive(Deserialize)]
+struct FetchRequest {
+    keys: Vec<String>,
+    /// Seconds to wait for mail when there's none yet (capped at `MAX_WAIT`). Older apps leave it out and get
+    /// an answer straight away.
+    #[serde(default)]
+    wait: u64,
+}
+
+#[derive(Serialize)]
+struct Envelope {
+    /// Index into the request's `keys`.
+    k: usize,
+    id: u64,
+    blob: String,
+    /// Seconds since it was deposited, so the receiver can date it without trusting the sender's clock.
+    age: u64,
+}
+
+#[derive(Serialize)]
+struct FetchResponse {
+    items: Vec<Envelope>,
+}
+
+async fn fetch(State(store): State<Shared>, Json(req): Json<FetchRequest>) -> Result<Json<FetchResponse>, StatusCode> {
+    if req.keys.len() > MAX_KEYS_PER_FETCH {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mailboxes: Vec<Option<Id>> = req.keys.iter().map(|key| parse_id(key).map(|k| send_id_for(&k))).collect();
+    let deadline = Instant::now() + Duration::from_secs(req.wait.min(MAX_WAIT));
+    loop {
+        // Listening before looking, so a deposit in between still wakes us.
+        let arrived = ARRIVALS.notified();
+        tokio::pin!(arrived);
+        arrived.as_mut().enable();
+        let items = collect(&store, &mailboxes);
+        let now = Instant::now();
+        if !items.is_empty() || now >= deadline {
+            return Ok(Json(FetchResponse { items }));
+        }
+        let _ = tokio::time::timeout(deadline - now, arrived).await;
+    }
+}
+
+fn collect(store: &Shared, mailboxes: &[Option<Id>]) -> Vec<Envelope> {
+    let store = store.lock().unwrap();
+    let mut items = Vec::new();
+    for (k, mailbox) in mailboxes.iter().enumerate() {
+        let Some(queue) = mailbox.and_then(|id| store.queues.get(&id)) else { continue };
+        for item in queue.iter().take(MAX_ITEMS_PER_KEY) {
+            items.push(Envelope { k, id: item.id, blob: B64.encode(&item.blob), age: item.at.elapsed().as_secs() });
+        }
+    }
+    items
+}
+
+#[derive(Deserialize)]
+struct Ack {
+    key: String,
+    ids: Vec<u64>,
+}
+
+#[derive(Deserialize)]
+struct AckRequest {
+    acks: Vec<Ack>,
+}
+
+async fn ack(State(store): State<Shared>, Json(req): Json<AckRequest>) -> StatusCode {
+    let mut store = store.lock().unwrap();
+    for a in req.acks {
+        let Some(receive_key) = parse_id(&a.key) else { continue };
+        let send_id = send_id_for(&receive_key);
+        if let Some(queue) = store.queues.get_mut(&send_id) {
+            queue.retain(|item| !a.ids.contains(&item.id));
+            if queue.is_empty() {
+                store.queues.remove(&send_id);
+            }
+        }
+    }
+    StatusCode::NO_CONTENT
+}
+
+// MARK: Directory
+
+async fn lookup(
+    State(state): State<AppState>,
+    caller::Caller(ip): caller::Caller,
+    Path(handle): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Entry>, StatusCode> {
+    let who = pow::rate_key(ip, &headers, &format!("lookup|{handle}"));
+    if !state.limits.lock().unwrap().allow(who, "lookup", 60, Duration::from_secs(60)) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    state.directory.lock().unwrap().get(&handle.to_lowercase()).map(Json).ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn claim(
+    State(state): State<AppState>,
+    caller::Caller(ip): caller::Caller,
+    Path(handle): Path<String>,
+    headers: HeaderMap,
+    Json(entry): Json<Entry>,
+) -> StatusCode {
+    let who = pow::rate_key(ip, &headers, &format!("claim|{handle}"));
+    if !state.limits.lock().unwrap().allow(who, "claim", 30, Duration::from_secs(3600)) {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    let mut directory = state.directory.lock().unwrap();
+    directory.adopt_creator(creator_key());
+    match directory.put(&handle, entry) {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(code) => code,
+    }
+}
+
+async fn mine(
+    State(state): State<AppState>,
+    caller::Caller(ip): caller::Caller,
+    headers: HeaderMap,
+    Json(proof): Json<OwnerProof>,
+) -> Result<Json<Vec<Owned>>, StatusCode> {
+    let who = pow::rate_key(ip, &headers, "mine");
+    if !state.limits.lock().unwrap().allow(who, "mine", 60, Duration::from_secs(3600)) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    state.directory.lock().unwrap().owned(&proof).map(Json)
+}
+
+/// The handles held for a key it no longer lists, for its owner's Settings.
+async fn held(
+    State(state): State<AppState>,
+    caller::Caller(ip): caller::Caller,
+    headers: HeaderMap,
+    Json(proof): Json<OwnerProof>,
+) -> Result<Json<Vec<HeldFor>>, StatusCode> {
+    let who = pow::rate_key(ip, &headers, "held");
+    if !state.limits.lock().unwrap().allow(who, "held", 60, Duration::from_secs(3600)) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    state.directory.lock().unwrap().held_for(&proof).map(Json)
+}
+
+async fn unhold(State(state): State<AppState>, Path(handle): Path<String>, Json(proof): Json<OwnerProof>) -> StatusCode {
+    match state.directory.lock().unwrap().unhold(&handle, &proof) {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(code) => code,
+    }
+}
+
+/// An account burning: its handles stay unclaimable for a while, but no longer point back to it.
+async fn retire(
+    State(state): State<AppState>,
+    caller::Caller(ip): caller::Caller,
+    headers: HeaderMap,
+    Json(proof): Json<OwnerProof>,
+) -> StatusCode {
+    let who = pow::rate_key(ip, &headers, "retire");
+    if !state.limits.lock().unwrap().allow(who, "retire", 30, Duration::from_secs(3600)) {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    match state.directory.lock().unwrap().retire(&proof) {
+        Ok(_) => StatusCode::NO_CONTENT,
+        Err(code) => code,
+    }
+}
+
+async fn admin(
+    State(state): State<AppState>,
+    caller::Caller(ip): caller::Caller,
+    headers: HeaderMap,
+    Json(req): Json<admin::AdminRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !state.limits.lock().unwrap().allow(ip, "admin", 240, Duration::from_secs(3600)) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "slow down".into()));
+    }
+    let token = headers.get("x-pulshade-admin-token").and_then(|v| v.to_str().ok());
+    let traffic = {
+        let store = state.store.lock().unwrap();
+        admin::Traffic {
+            mailboxes: store.queues.len(),
+            waiting: store.queues.values().map(VecDeque::len).sum(),
+            uptime_secs: state.started.elapsed().as_secs(),
+            calls: state.calls.active(),
+        }
+    };
+    let mut directory = state.directory.lock().unwrap();
+    if !admin::authorised(token, &state.admin_token) {
+        return Err((StatusCode::UNAUTHORIZED, "not the operator".into()));
+    }
+    admin::run(&mut directory, &req, traffic).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, e))
+}
+
+/// Where to send abuse reports: the Pulshade Admin app's mailbox and keys, signed by its key, if set up.
+async fn report_inbox(State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
+    state.directory.lock().unwrap().moderation.report_inbox.clone().map(Json).ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Everything Pulshade has told everyone, signed by the admin app. The same answer for every app. Apps check every
+/// minute, so one that already has the current list (`x-pulshade-version`) gets a bare 304 instead of all of it.
+async fn announcements(
+    State(state): State<AppState>,
+    caller::Caller(ip): caller::Caller,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let who = pow::rate_key(ip, &headers, "announcements");
+    if !state.limits.lock().unwrap().allow(who, "announcements", 120, Duration::from_secs(3600)) {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    let dir = state.directory.lock().unwrap();
+    let version = dir.announcements_version();
+    let header = [(axum::http::HeaderName::from_static("x-pulshade-version"), version.clone())];
+    if headers.get("x-pulshade-version").and_then(|v| v.to_str().ok()) == Some(version.as_str()) {
+        return (StatusCode::NOT_MODIFIED, header).into_response();
+    }
+    (header, Json(dir.announcements().to_vec())).into_response()
+}
+
+/// The operator token, made on first run and readable only by this machine's user.
+fn admin_token() -> String {
+    if let Ok(existing) = std::fs::read_to_string("admin.token") {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() { return existing; }
+    }
+    let mut raw = [0u8; 32];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut raw)).expect("no randomness");
+    let token = hex::encode(raw);
+    std::fs::write("admin.token", &token).expect("could not write admin.token");
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions("admin.token", std::fs::Permissions::from_mode(0o600));
+    token
+}
+
+async fn release(State(state): State<AppState>, Path(handle): Path<String>, Json(removal): Json<Removal>) -> StatusCode {
+    match state.directory.lock().unwrap().remove(&handle, removal) {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(code) => code,
+    }
+}
+
+async fn backup_put(
+    State(state): State<AppState>,
+    caller::Caller(ip): caller::Caller,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    let who = pow::rate_key(ip, &headers, &format!("backup|{key}"));
+    if !state.limits.lock().unwrap().allow(who, "backup", 20, Duration::from_secs(3600)) {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let (Some(sig), Some(ts)) = (header("x-pulshade-sig"), header("x-pulshade-ts").and_then(|t| t.parse().ok())) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    match state.backups.put(&key, &sig, ts, &body) {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(code) => code,
+    }
+}
+
+async fn backup_get(
+    State(state): State<AppState>,
+    caller::Caller(ip): caller::Caller,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+    Json(proof): Json<backup::Proof>,
+) -> Result<Vec<u8>, StatusCode> {
+    let who = pow::rate_key(ip, &headers, &format!("backup-read|{key}"));
+    if !state.limits.lock().unwrap().allow(who, "backup-read", 60, Duration::from_secs(3600)) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    state.backups.get(&key, &proof)
+}
+
+async fn backup_remove(State(state): State<AppState>, Path(key): Path<String>, Json(proof): Json<backup::Proof>) -> StatusCode {
+    match state.backups.remove(&key, &proof) {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(code) => code,
+    }
+}
+
+async fn call(
+    State(state): State<AppState>,
+    caller::Caller(ip): caller::Caller,
+    Path(room): Path<String>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !calls::valid_room(&room) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let who = pow::rate_key(ip, &headers, &format!("call|{room}"));
+    if !state.limits.lock().unwrap().allow(who, "call", 120, Duration::from_secs(3600)) {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    let rooms = state.calls.clone();
+    upgrade.max_message_size(calls::MAX_FRAME * 2)
+        .on_upgrade(move |socket| rooms.join(room.to_lowercase(), socket))
+        .into_response()
+}
+
+/// The latest Mac release's description and signature, if the operator has published one.
+async fn update_manifest(
+    State(state): State<AppState>,
+    caller::Caller(ip): caller::Caller,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let who = pow::rate_key(ip, &headers, "update");
+    if !state.limits.lock().unwrap().allow(who, "update", 20, Duration::from_secs(3600)) {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    match state.releases.manifest() {
+        Some(json) => ([(axum::http::header::CONTENT_TYPE, "application/json")], json).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// The zipped app itself. Limited, since each download is large.
+async fn update_archive(
+    State(state): State<AppState>,
+    caller::Caller(ip): caller::Caller,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let who = pow::rate_key(ip, &headers, "update");
+    if !state.limits.lock().unwrap().allow(who, "update", 20, Duration::from_secs(3600)) {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    match state.releases.archive() {
+        Some(zip) => ([(axum::http::header::CONTENT_TYPE, "application/zip")], zip).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+fn purge(store: &Shared) {
+    let mut store = store.lock().unwrap();
+    let now = Instant::now();
+    store.queues.retain(|_, queue| {
+        queue.retain(|item| now.duration_since(item.at) < TTL);
+        !queue.is_empty()
+    });
+}
+
+fn app(state: AppState) -> Router {
+    Router::new()
+        .route("/v1/health", get(|| async { "ok" }))
+        // The address this request came from, for the app's anonymity report. Answered, never kept.
+        .route("/v1/seen", get(|caller::Caller(ip): caller::Caller| async move { ip.to_string() }))
+        .route("/v1/q/{send_id}", put(deposit))
+        .route("/v1/fetch", post(fetch))
+        .route("/v1/ack", post(ack))
+        .route("/v1/dir/{handle}", get(lookup).put(claim))
+        .route("/v1/dir/{handle}/delete", post(release))
+        .route("/v1/mine", post(mine))
+        .route("/v1/retire", post(retire))
+        .route("/v1/held", post(held))
+        .route("/v1/dir/{handle}/unhold", post(unhold))
+        .route("/v1/backup/{key}", put(backup_put).layer(DefaultBodyLimit::max(backup::MAX_BACKUP)))
+        .route("/v1/backup/{key}/get", post(backup_get))
+        .route("/v1/backup/{key}/delete", post(backup_remove))
+        .route("/v1/call/{room}", get(call))
+        .route("/v1/admin", post(admin))
+        .route("/v1/report-inbox", get(report_inbox))
+        .route("/v1/announcements", get(announcements))
+        .route("/v1/update/mac", get(update_manifest))
+        .route("/v1/update/mac.zip", get(update_archive))
+        .layer(DefaultBodyLimit::max(MAX_ENVELOPE + 1024))
+        .with_state(state)
+}
+
+/// The creator's public key, from `PULSHADE_CREATOR_KEY` or a `creator.key` file next to the relay.
+fn creator_key() -> Option<String> {
+    std::env::var("PULSHADE_CREATOR_KEY").ok()
+        .or_else(|| std::fs::read_to_string("creator.key").ok())
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+}
+
+/// Keeps memory off the disk: no core file if the relay crashes, and (on Linux) no other process of this user
+/// may read its memory. Waiting envelopes and the addresses counted for rate limits only ever live there.
+fn no_core_dumps() {
+    let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: plain system calls with valid arguments.
+    unsafe {
+        libc::setrlimit(libc::RLIMIT_CORE, &none);
+        #[cfg(target_os = "linux")]
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+    }
+}
+
+/// `pulshade-relay seal` and `unseal`: standard input to standard output under the storage key, for the operator's
+/// backups of the onion service's keys.
+fn seal_command(command: &str, directory_path: &str) -> ! {
+    let sealer = sealed::Sealer::standard(&PathBuf::from(directory_path));
+    let mut input = Vec::new();
+    std::io::stdin().read_to_end(&mut input).expect("could not read standard input");
+    let output = if command == "seal" {
+        sealer.seal(&input)
+    } else {
+        match sealed::Sealer::is_sealed(&input).then(|| sealer.open(&input)).flatten() {
+            Some(plain) => plain,
+            None => { eprintln!("not sealed with this relay's storage key"); std::process::exit(1) }
+        }
+    };
+    use std::io::Write;
+    std::io::stdout().write_all(&output).expect("could not write standard output");
+    std::process::exit(0)
+}
+
+#[tokio::main]
+async fn main() {
+    no_core_dumps();
+    let directory_path = std::env::var("PULSHADE_DIRECTORY").unwrap_or_else(|_| "pulshade-directory.json".into());
+    if let Some(command) = std::env::args().nth(1).filter(|c| c == "seal" || c == "unseal") {
+        seal_command(&command, &directory_path);
+    }
+    let bind = std::env::var("PULSHADE_BIND").unwrap_or_else(|_| "127.0.0.1:7878".into());
+    let store: Shared = Arc::default();
+    let state = AppState {
+        store: store.clone(),
+        calls: Arc::default(),
+        backups: Arc::new(Backups::at(PathBuf::from(&directory_path).with_file_name("pulshade-backups"))),
+        releases: Arc::new(release::Releases::at(PathBuf::from(&directory_path).with_file_name("pulshade-release"))),
+        directory: Arc::new(Mutex::new(Directory::load(PathBuf::from(&directory_path), creator_key(),
+                                                       sealed::Sealer::standard(&PathBuf::from(&directory_path))))),
+        limits: Arc::default(),
+        admin_token: Arc::new(admin_token()),
+        started: Instant::now(),
+    };
+
+    let (sweeper, backups) = (store.clone(), state.backups.clone());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(600));
+        loop {
+            tick.tick().await;
+            purge(&sweeper);
+            backups.sweep(backup::BACKUP_TTL);
+        }
+    });
+    // Addresses are only kept while they count towards a limit, checked every minute.
+    let limits = state.limits.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            limits.lock().unwrap().sweep();
+        }
+    });
+
+    let app = app(state);
+    // Also an onion service, unless PULSHADE_ONION=0 (tests). It takes a moment to reach the Tor network.
+    if std::env::var("PULSHADE_ONION").as_deref() != Ok("0") {
+        let (app, folder) = (app.clone(), onion::folder(&PathBuf::from(&directory_path)));
+        tokio::spawn(async move {
+            match onion::serve(app, folder).await {
+                Ok(address) => eprintln!("pulshade relay onion address: http://{address} (reachable once published, about a minute)"),
+                Err(e) => eprintln!("onion service failed: {e}"),
+            }
+        });
+    }
+
+    let listener = tokio::net::TcpListener::bind(&bind).await.expect("could not bind");
+    eprintln!("pulshade relay listening on {bind}");
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(async { tokio::signal::ctrl_c().await.ok(); })
+        .await
+        .unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    #[tokio::test]
+    async fn call_rooms_pass_packets_between_two_devices_only() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{connect_async, tungstenite::Message as Ws};
+        let dir = std::env::temp_dir().join(format!("pulshade-call-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = AppState {
+            store: Arc::default(),
+            calls: Arc::default(),
+            backups: Arc::new(Backups::at(dir.join("backups"))),
+            releases: Arc::new(release::Releases::at(dir.join("release"))),
+            directory: Arc::new(Mutex::new(Directory::default())),
+            limits: Arc::default(),
+                admin_token: Arc::new("t".into()),
+            started: Instant::now(),
+        };
+        let calls = state.calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+        });
+        let room = "ab".repeat(32);
+        let url = format!("ws://{addr}/v1/call/{room}");
+        let (mut a, _) = connect_async(&url).await.unwrap();
+        let (mut b, _) = connect_async(&url).await.unwrap();
+        let (mut c, _) = connect_async(&url).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(calls.active(), 1);
+
+        a.send(Ws::Binary(vec![1, 2, 3].into())).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), b.next()).await.unwrap().unwrap().unwrap();
+        assert_eq!(got.into_data().as_ref(), &[1, 2, 3]);
+        b.send(Ws::Binary(vec![9].into())).await.unwrap();
+        let back = tokio::time::timeout(Duration::from_secs(2), a.next()).await.unwrap().unwrap().unwrap();
+        assert_eq!(back.into_data().as_ref(), &[9]);
+        // A third device is turned away.
+        let third = tokio::time::timeout(Duration::from_millis(300), c.next()).await;
+        assert!(matches!(third, Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Ws::Close(_))))), "third device got {third:?}");
+
+        // One side hanging up closes the other and clears the room.
+        a.close(None).await.unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(2), b.next()).await.unwrap();
+        assert!(matches!(closed, None | Some(Ok(Ws::Close(_))) | Some(Err(_))));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(calls.active(), 0);
+        let bad = connect_async(format!("ws://{addr}/v1/call/not-a-room")).await;
+        assert!(bad.is_err(), "rooms must be 64 hex characters");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn key(n: u8) -> Id {
+        [n; 32]
+    }
+
+    #[tokio::test]
+    async fn deposit_fetch_ack_round_trip() {
+        let store: Shared = Arc::default();
+        let receive = key(7);
+        let send = hex::encode(send_id_for(&receive));
+
+        assert_eq!(deposit(State(store.clone()), Path(send.clone()), Bytes::from_static(b"sealed")).await, StatusCode::ACCEPTED);
+
+        let Json(res) = fetch(State(store.clone()), Json(FetchRequest { keys: vec![hex::encode(receive)], wait: 0 })).await.unwrap();
+        assert_eq!(res.items.len(), 1);
+        assert_eq!(B64.decode(&res.items[0].blob).unwrap(), b"sealed");
+        assert_eq!(res.items[0].age, 0);
+
+        let id = res.items[0].id;
+        ack(State(store.clone()), Json(AckRequest { acks: vec![Ack { key: hex::encode(receive), ids: vec![id] }] })).await;
+        let Json(res) = fetch(State(store.clone()), Json(FetchRequest { keys: vec![hex::encode(receive)], wait: 0 })).await.unwrap();
+        assert!(res.items.is_empty());
+        assert!(store.lock().unwrap().queues.is_empty());
+    }
+
+    /// A fetch that waits answers the moment mail lands, and gives up empty at its deadline.
+    #[tokio::test]
+    async fn a_waiting_fetch_answers_when_mail_lands() {
+        let store: Shared = Arc::default();
+        let receive = key(11);
+        let send = hex::encode(send_id_for(&receive));
+        let started = Instant::now();
+        let waiting = tokio::spawn(fetch(State(store.clone()), Json(FetchRequest { keys: vec![hex::encode(receive)], wait: 10 })));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(deposit(State(store.clone()), Path(send), Bytes::from_static(b"now")).await, StatusCode::ACCEPTED);
+        let Json(res) = waiting.await.unwrap().unwrap();
+        assert_eq!(res.items.len(), 1);
+        assert!(started.elapsed() < Duration::from_secs(2), "answered when the mail landed, not at the deadline");
+
+        let other = key(12);
+        let started = Instant::now();
+        let Json(res) = fetch(State(store), Json(FetchRequest { keys: vec![hex::encode(other)], wait: 1 })).await.unwrap();
+        assert!(res.items.is_empty());
+        assert!(started.elapsed() >= Duration::from_secs(1), "nothing for it: waited out the second");
+    }
+
+    #[tokio::test]
+    async fn send_id_cannot_read() {
+        let store: Shared = Arc::default();
+        let receive = key(9);
+        let send = hex::encode(send_id_for(&receive));
+        deposit(State(store.clone()), Path(send.clone()), Bytes::from_static(b"x")).await;
+        // Someone holding only the send id gets nothing back.
+        let Json(res) = fetch(State(store), Json(FetchRequest { keys: vec![send], wait: 0 })).await.unwrap();
+        assert!(res.items.is_empty());
+    }
+
+    /// The manifest endpoint has to be rate-limited too: without it, it's a free way to hammer the relay
+    /// (and, over Tor, to probe at timing) with no proof of work and no cost at all.
+    #[tokio::test]
+    async fn update_manifest_is_rate_limited_per_caller() {
+        let dir = std::env::temp_dir().join(format!("pulshade-update-manifest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = AppState {
+            store: Arc::default(),
+            calls: Arc::default(),
+            backups: Arc::new(Backups::at(dir.join("backups"))),
+            releases: Arc::new(release::Releases::at(dir.join("release"))),
+            directory: Arc::new(Mutex::new(Directory::default())),
+            limits: Arc::default(),
+                admin_token: Arc::new("t".into()),
+            started: Instant::now(),
+        };
+        let ip: IpAddr = "203.0.113.5".parse().unwrap();
+        for _ in 0..20 {
+            let response = update_manifest(State(state.clone()), caller::Caller(ip), HeaderMap::new()).await;
+            assert_ne!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        let response = update_manifest(State(state.clone()), caller::Caller(ip), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // A different caller gets its own allowance.
+        let other: IpAddr = "203.0.113.6".parse().unwrap();
+        let response = update_manifest(State(state), caller::Caller(other), HeaderMap::new()).await;
+        assert_ne!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rejects_bad_input() {
+        let store: Shared = Arc::default();
+        assert_eq!(deposit(State(store.clone()), Path("nothex".into()), Bytes::from_static(b"x")).await, StatusCode::BAD_REQUEST);
+        let send = hex::encode(send_id_for(&key(1)));
+        assert_eq!(deposit(State(store), Path(send), Bytes::new()).await, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+}

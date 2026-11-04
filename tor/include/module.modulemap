@@ -1,0 +1,4 @@
+module PulshadeTor {
+    header "PulshadeTor.h"
+    export *
+}
