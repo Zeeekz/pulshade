@@ -239,15 +239,19 @@ struct RelayClient {
         return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    func deposit(_ blob: Data, to sendID: Data) async throws {
+    /// `wake` says whether this is a real message, which may wake a locked iPhone; typing signals, receipts and
+    /// the rest say no, so they don't make a banner. A relay from before this ignores it.
+    func deposit(_ blob: Data, to sendID: Data, wake: Bool = false) async throws {
         var request = URLRequest(url: base.appending(path: "v1/q/\(sendID.hex)"))
         request.httpMethod = "PUT"
         // A send stuck on a slow circuit gives up sooner and is tried again on the next beat.
         request.timeoutInterval = 20
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        request.setValue(wake ? "1" : "0", forHTTPHeaderField: "X-Pulshade-Wake")
         let (_, response) = try await load(request, body: blob)
         let status = (response as? HTTPURLResponse)?.statusCode
         if status == 507 { throw RelayMailboxFull() }
+        if status == 413 { throw RelayTooLarge() }
         guard status == 202 else { throw URLError(.badServerResponse) }
     }
 
@@ -280,6 +284,40 @@ struct RelayClient {
         let grouped = Dictionary(grouping: envelopes, by: \.receiveKey)
         let acks = grouped.map { Ack(key: $0.key.hex, ids: $0.value.map(\.id)) }
         _ = try await post("v1/ack", JSONEncoder().encode(["acks": acks]))
+    }
+
+    // MARK: Push
+
+    /// Whether this relay can send wake-up pushes at all.
+    func pushEnabled() async -> Bool {
+        var request = URLRequest(url: base.appending(path: "v1/push"))
+        request.timeoutInterval = Tor.uses(base) ? 45 : 15
+        guard let (data, response) = try? await load(request), (response as? HTTPURLResponse)?.statusCode == 200,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return object["enabled"] as? Bool ?? false
+    }
+
+    /// Asks the relay to wake this phone, through Apple, when mail lands in these mailboxes (256 at most per call).
+    /// Holding the receive keys is what proves they're ours.
+    func registerPush(keys: [Data], token: String, sandbox: Bool, sound: Bool) async throws {
+        struct Body: Encodable { var keys: [String]; var token: String; var sandbox: Bool; var sound: Bool }
+        var request = URLRequest(url: base.appending(path: "v1/push"))
+        request.httpMethod = "PUT"
+        await prove(&request, "push")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body = try JSONEncoder().encode(Body(keys: keys.map(\.hex), token: token, sandbox: sandbox, sound: sound))
+        let (_, response) = try await load(request, body: body)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 204 else { throw PushRefused(status: status) }
+    }
+
+    func unregisterPush(keys: [Data]) async throws {
+        _ = try await post("v1/push/off", JSONEncoder().encode(["keys": keys.map(\.hex)]), work: "push")
+    }
+
+    /// Everything the relay holds for this device's token, for when there are no keys to name mailboxes with.
+    func forgetPush(token: String) async throws {
+        _ = try await post("v1/push/forget", JSONEncoder().encode(["token": token]), work: "push")
     }
 
     // MARK: Directory
@@ -328,7 +366,7 @@ struct RelayClient {
         return try JSONDecoder().decode(DirectoryEntry.self, from: data)
     }
 
-    /// Where abuse reports go, if the operator has set it up.
+    /// Where abuse reports go, if the admin app has set it up.
     func reportInbox() async throws -> ReportInbox? {
         guard let (data, response) = try? await load(URLRequest(url: base.appending(path: "v1/report-inbox"))),
               let status = (response as? HTTPURLResponse)?.statusCode else { throw DirectoryError.unreachable }
@@ -372,6 +410,119 @@ struct RelayClient {
         struct Held: Decodable { var handle: String; var until: UInt64 }
         let (data, _) = try await post("v1/held", JSONEncoder().encode(Proof(key: key, sig: sig, ts: ts)), work: "held")
         return try JSONDecoder().decode([Held].self, from: data).map { ($0.handle, Date(timeIntervalSince1970: TimeInterval($0.until))) }
+    }
+
+    /// The collectibles the creator gave this key, and whether each has a backup code set.
+    func collectibles(key: String, sig: String, ts: UInt64) async throws -> [(collectible: Collectible, coded: Bool)] {
+        struct Proof: Encodable { var key: String; var sig: String; var ts: UInt64 }
+        struct Mine: Decodable { var item: String; var serial: UInt32; var owner: Data; var sig: Data; var coded: Bool?; var limit: UInt32? }
+        let (data, _) = try await post("v1/collectibles", JSONEncoder().encode(Proof(key: key, sig: sig, ts: ts)), work: "collectibles")
+        return try JSONDecoder().decode([Mine].self, from: data).map {
+            (Collectible(item: $0.item, serial: $0.serial, owner: $0.owner, sig: $0.sig, edition: $0.limit), $0.coded ?? false)
+        }
+    }
+
+    /// Sets the backup code (only its hash travels) for one of this key's collectibles.
+    func setCollectibleCode(key: String, sig: String, ts: UInt64, item: String, serial: UInt32, hash: Data) async throws {
+        struct Set: Encodable { var key: String; var sig: String; var ts: UInt64; var item: String; var serial: UInt32; var hash: String }
+        _ = try await post("v1/collectibles/code", JSONEncoder().encode(Set(key: key, sig: sig, ts: ts, item: item, serial: serial,
+                                                                              hash: hash.base64EncodedString())))
+    }
+
+    enum ClaimError: Error { case unknownCode, unreachable }
+
+    /// Brings back what a backup code belongs to, for this key. Returns the item and number of each.
+    func claimCollectibles(key: String, sig: String, ts: UInt64, code: String) async throws -> [(item: String, serial: UInt32)] {
+        struct Claim: Encodable { var key: String; var sig: String; var ts: UInt64; var code: String }
+        struct Claimed: Decodable { var item: String; var serial: UInt32 }
+        var request = URLRequest(url: base.appending(path: "v1/collectibles/claim"))
+        await prove(&request, "collectible-claim")
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        guard let (data, response) = try? await load(request, body: JSONEncoder().encode(Claim(key: key, sig: sig, ts: ts, code: code))),
+              let status = (response as? HTTPURLResponse)?.statusCode else { throw ClaimError.unreachable }
+        if status == 404 { throw ClaimError.unknownCode }
+        guard status == 200 else { throw ClaimError.unreachable }
+        return try JSONDecoder().decode([Claimed].self, from: data).map { ($0.item, $0.serial) }
+    }
+
+    enum GiveawayError: Error { case unknownCode, full, unreachable }
+
+    /// Enters a giveaway code for this key: which collectible it's for, and the place in line. The admin app then signs
+    /// it over, in that order.
+    func claimGiveaway(key: String, sig: String, ts: UInt64, code: String) async throws -> (item: String, place: Int) {
+        struct Entry: Encodable { var key: String; var sig: String; var ts: UInt64; var code: String }
+        struct Place: Decodable { var item: String; var place: Int }
+        var request = URLRequest(url: base.appending(path: "v1/collectibles/giveaway"))
+        await prove(&request, "giveaway-claim")
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        guard let (data, response) = try? await load(request, body: JSONEncoder().encode(Entry(key: key, sig: sig, ts: ts, code: code))),
+              let status = (response as? HTTPURLResponse)?.statusCode else { throw GiveawayError.unreachable }
+        if status == 404 || status == 403 { throw GiveawayError.unknownCode }
+        if status == 410 { throw GiveawayError.full }
+        guard status == 200 else { throw GiveawayError.unreachable }
+        let place = try JSONDecoder().decode(Place.self, from: data)
+        return (place.item, place.place)
+    }
+
+    /// An egg the creator gave this key, as the relay reports it. It never says what's inside.
+    struct EggInfo: Decodable, Identifiable, Equatable {
+        var id: String
+        var kind: String
+        /// When it will be ready, on the relay's clock (seconds since 1970), once it has been started.
+        var hatches_at: UInt64?
+        var seconds: UInt64
+        /// The relay's clock when this was said.
+        var now: UInt64
+    }
+
+    enum HatchError: Error { case notStarted, notReady, soldOut, unreachable }
+
+    /// The eggs this key holds.
+    func eggs(key: String, sig: String, ts: UInt64) async throws -> [EggInfo] {
+        struct Proof: Encodable { var key: String; var sig: String; var ts: UInt64 }
+        let (data, _) = try await post("v1/eggs", JSONEncoder().encode(Proof(key: key, sig: sig, ts: ts)), work: "eggs")
+        return try JSONDecoder().decode([EggInfo].self, from: data)
+    }
+
+    private struct EggAction: Encodable { var key: String; var sig: String; var ts: UInt64; var id: String }
+
+    /// Puts an egg to hatch.
+    func startEgg(key: String, sig: String, ts: UInt64, id: String) async throws -> EggInfo {
+        let (data, _) = try await post("v1/eggs/start", JSONEncoder().encode(EggAction(key: key, sig: sig, ts: ts, id: id)))
+        return try JSONDecoder().decode(EggInfo.self, from: data)
+    }
+
+    /// Opens an egg that's ready, and returns the pet inside (checked by the caller against the relay's key).
+    func hatchEgg(key: String, sig: String, ts: UInt64, id: String) async throws -> Collectible {
+        struct Mine: Decodable { var item: String; var serial: UInt32; var owner: Data; var sig: Data; var limit: UInt32? }
+        var request = URLRequest(url: base.appending(path: "v1/eggs/hatch"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        guard let (data, response) = try? await load(request, body: JSONEncoder().encode(EggAction(key: key, sig: sig, ts: ts, id: id))),
+              let status = (response as? HTTPURLResponse)?.statusCode else { throw HatchError.unreachable }
+        switch status {
+        case 200:
+            let m = try JSONDecoder().decode(Mine.self, from: data)
+            return Collectible(item: m.item, serial: m.serial, owner: m.owner, sig: m.sig, edition: m.limit)
+        case 409: throw HatchError.notStarted
+        case 425: throw HatchError.notReady
+        case 410: throw HatchError.soldOut
+        default: throw HatchError.unreachable
+        }
+    }
+
+    /// Gives one of this key's collectibles to another account.
+    func giftCollectible(key: String, sig: String, ts: UInt64, item: String, serial: UInt32, to: String) async throws {
+        struct Gift: Encodable { var key: String; var sig: String; var ts: UInt64; var item: String; var serial: UInt32; var to: String }
+        _ = try await post("v1/collectibles/gift", JSONEncoder().encode(Gift(key: key, sig: sig, ts: ts, item: item, serial: serial, to: to)))
+    }
+
+    /// Lets one of this key's collectibles go for good.
+    func releaseCollectible(key: String, sig: String, ts: UInt64, item: String, serial: UInt32) async throws {
+        struct Release: Encodable { var key: String; var sig: String; var ts: UInt64; var item: String; var serial: UInt32 }
+        _ = try await post("v1/collectibles/release", JSONEncoder().encode(Release(key: key, sig: sig, ts: ts, item: item, serial: serial)))
     }
 
     /// Lets go of a handle held for this key before its three months are up.
@@ -474,3 +625,8 @@ extension Data {
 
 /// The mailbox being written to is full. Says nothing about the relay as a whole.
 struct RelayMailboxFull: Error {}
+/// The relay refuses this envelope for its size, and always will.
+struct RelayTooLarge: Error {}
+
+/// The relay said no to a push registration; `status` is its answer.
+struct PushRefused: Error { var status: Int }

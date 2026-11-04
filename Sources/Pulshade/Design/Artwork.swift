@@ -213,15 +213,41 @@ struct StoryRing<Content: View>: View {
     @Environment(\.theme) private var theme
     var active: Bool
     var size: CGFloat
+    /// 0...1 while the story is still going out: an arc fills slowly round the picture. Nil when it isn't.
+    var uploading: Double?
+    /// Nobody has viewed it yet: the ring glows.
+    var glow = false
     @ViewBuilder var content: Content
+    @State private var spin = false
+    @State private var pulse = false
 
     var body: some View {
         ZStack {
-            Circle()
-                .strokeBorder(active ? AnyShapeStyle(theme.accent) : AnyShapeStyle(Ink.line), lineWidth: 2)
+            if let uploading {
+                Circle().strokeBorder(Ink.line, lineWidth: 2.5)
+                Circle()
+                    .trim(from: 0, to: max(uploading, 0.06))
+                    .stroke(theme.accent, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                    .padding(1.25)
+                    .rotationEffect(.degrees(-90))
+                    .animation(.smooth(duration: 0.6), value: uploading)
+                    .rotationEffect(.degrees(spin ? 360 : 0))
+                    .animation(.linear(duration: 2.4).repeatForever(autoreverses: false), value: spin)
+            } else {
+                Circle()
+                    .strokeBorder(active ? AnyShapeStyle(theme.accent) : AnyShapeStyle(Ink.line), lineWidth: glow ? 2.5 : 2)
+                    .shadow(color: theme.accent.opacity(glow ? (pulse ? 0.95 : 0.45) : 0), radius: glow ? (pulse ? 9 : 4) : 0)
+                    .shadow(color: theme.accent.opacity(glow ? 0.5 : 0), radius: glow ? 3 : 0)
+            }
             content.padding(4)
         }
         .frame(width: size, height: size)
+        .animation(.smooth(duration: 0.4), value: uploading == nil)
+        .onAppear { spin = true }
+        .task(id: glow) {
+            guard glow else { pulse = false; return }
+            withAnimation(.easeInOut(duration: 1.3).repeatForever(autoreverses: true)) { pulse = true }
+        }
     }
 }
 

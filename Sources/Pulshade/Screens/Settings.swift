@@ -5,7 +5,7 @@ import PulshadeShared
 
 /// The pages Settings opens, each from a row on the main list.
 enum SettingsPage: String, Hashable {
-    case profile, handles, privacy, notifications, appearance, devices, network, anonymity, account, updates
+    case profile, handles, collectibles, privacy, notifications, appearance, devices, network, anonymity, account, updates
 }
 
 /// Settings, laid out like a phone's own: your profile on top, then a short list of rows,
@@ -29,6 +29,11 @@ struct SettingsView: View {
                     SettingsGroup {
                         MenuRow(page: .profile, symbol: "person.crop.circle.fill", color: .hex(0x3D8BFF), title: "Profile",
                                 value: model.activeProfile.handle.map { "@\($0)" } ?? "Private")
+                        if Platform.isPhone {
+                            RowDivider(inset: 54)
+                            MenuRow(page: .collectibles, symbol: "crown.fill", color: .hex(0xE5383B), title: "Collectibles",
+                                    value: model.activeProfile.badge?.kind?.name)
+                        }
                     }
                     SettingsGroup {
                         MenuRow(page: .privacy, symbol: "lock.fill", color: .hex(0x8E8E93), title: "Privacy & Security")
@@ -88,6 +93,7 @@ struct SettingsView: View {
                     switch page {
                     case .profile: ProfileSettings()
                     case .handles: HandleSettings()
+                    case .collectibles: CollectiblesView(inSettings: true)
                     case .privacy: PrivacySettings()
                     case .notifications: NotificationSettings()
                     case .appearance: AppearanceSettings()
@@ -147,6 +153,7 @@ struct SettingsView: View {
                 Text(model.activeProfile.displayName)
                     .font(.system(size: 22, weight: .semibold))
                     .foregroundStyle(Ink.text)
+                BadgeMark(badge: model.activeProfile.badge, size: 22)
             }
             Text(model.activeProfile.handle.map { "@\($0)" } ?? "Private profile")
                 .font(.system(size: 14))
@@ -463,6 +470,8 @@ private struct ProfileSettings: View {
                     .padding(.vertical, 15)
                     .onChange(of: bio) { model.updateProfile { $0.bio = String(bio.prefix(160)) } }
             }
+            ProfileLinksEditor()
+            ProfileNotesEditor()
             SettingsGroup("Signature colour", footer: "How your messages glow on other people's screens.") {
                 HStack(spacing: 0) {
                     ForEach(Signature.colors.indices, id: \.self) { i in
@@ -747,6 +756,19 @@ private struct NotificationSettings: View {
                     }
                 }
             }
+            #if os(iOS)
+            if on {
+                SettingsGroup("When locked",
+                              footer: "Lets the relay wake this iPhone through Apple when mail arrives, so you hear about it while the phone is locked. The wake-up only says \"New message\". Apple learns that your iPhone was woken, and when, and the relay keeps its push token. Only your main identity is covered.") {
+                    SecurityToggle(title: "Wake when locked", key: \.pushWake)
+                    if !model.pushStatus.isEmpty {
+                        RowDivider()
+                        Text(model.pushStatus).font(.system(size: 12)).foregroundStyle(Ink.dim)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+            #endif
             #if os(macOS)
             SettingsGroup("Mac", footer: "Keeps PULSHADE, and its menu bar icon, running from when you log in.") {
                 SecurityToggle(title: "Menu bar icon", key: \.menuBarIcon)

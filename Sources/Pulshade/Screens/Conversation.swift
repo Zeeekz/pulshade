@@ -20,6 +20,9 @@ struct ConversationView: View {
     @State private var dismissedPreview: String?
     @State private var previewTask: Task<Void, Never>?
     @State private var flash: UUID?
+    /// The chat follows the bottom as it fills and settles, until you scroll away from it yourself.
+    @State private var pinnedToEnd = true
+    @State private var distanceFromEnd: CGFloat = 0
     @State private var hovered: UUID?
     @State private var swipe: (id: UUID, dx: CGFloat)?
     #if os(macOS)
@@ -94,6 +97,7 @@ struct ConversationView: View {
                             Text(c.title)
                                 .font(.system(size: 14, weight: .semibold))
                                 .foregroundStyle(Ink.text)
+                            if c.kind == .direct { BadgeMark(badge: model.contact(c.members.first ?? "")?.badge, size: 14) }
                             if c.isAnnouncements { Image(systemName: "checkmark.seal.fill").font(.system(size: 11)).foregroundStyle(theme.accent) }
                             if c.kind == .direct, model.contact(c.members.first ?? "")?.verified == true {
                                 Image(systemName: "checkmark.seal.fill").font(.system(size: 11)).foregroundStyle(theme.accent)
@@ -203,16 +207,31 @@ struct ConversationView: View {
                     .padding(.horizontal, Platform.isPhone ? 10 : 20)
                     .padding(.bottom, 8)
                     .id("typing")
+                Color.clear.frame(height: 1).id("end")
             }
             .scrollIndicators(.automatic)
             .defaultScrollAnchor(.bottom)
+            // Rows are only measured as they come into view, so a chat opened at the bottom can grow under you
+            // (photos, previews) and end up scrolled up. While it's following the bottom, it stays there.
+            .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height - $0.contentOffset.y - $0.containerSize.height } action: { _, new in
+                distanceFromEnd = new
+            }
+            .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height } action: { old, new in
+                if pinnedToEnd, new != old { proxy.scrollTo("end", anchor: .bottom) }
+            }
+            .onScrollPhaseChange { old, new in
+                if new == .interacting { pinnedToEnd = false }
+                if new == .idle, old == .interacting || old == .decelerating { pinnedToEnd = distanceFromEnd < 80 }
+            }
             #if os(iOS)
             .scrollDismissesKeyboard(.interactively)
             .onTapGesture { focused = false }
             #endif
             .onChange(of: c.messages.count) {
-                if let last = c.messages.last {
-                    withAnimation(.smooth(duration: 0.3)) { proxy.scrollTo(last.id, anchor: .bottom) }
+                // A new message follows you down, unless you've scrolled up to read: then it waits, except yours.
+                if let last = c.messages.last, pinnedToEnd || last.isMine {
+                    pinnedToEnd = true
+                    withAnimation(.smooth(duration: 0.3)) { proxy.scrollTo("end", anchor: .bottom) }
                 }
             }
         }
@@ -518,6 +537,7 @@ private struct Bubble: View {
     var hover: (Bool) -> Void
     @State private var hovering = false
     @State private var picking = false
+    @State private var viewingImage = false
 
     static let quick = ["❤️", "😂", "🔥", "😮", "😢", "👍"]
 
@@ -614,6 +634,11 @@ private struct Bubble: View {
                 Image(platformImage: img).resizable().scaledToFit()
                     .frame(maxWidth: Platform.isPhone ? 250 : 320, maxHeight: 340)
                     .clipShape(.rect(cornerRadius: 10))
+                    .contentShape(.rect(cornerRadius: 10))
+                    .onTapGesture { viewingImage = true }
+                    .modifier(ImageViewerCover(isPresented: $viewingImage, data: data))
+                    .accessibilityLabel("Photo")
+                    .accessibilityAddTraits(.isButton)
             }
             if let voice = message.voice {
                 VoiceBubble(note: voice, id: message.id, mine: mine)
@@ -1091,6 +1116,7 @@ private struct ConversationInfo: View {
                     Text(peer.nickname.isEmpty ? theirName : peer.nickname)
                         .font(.system(size: 21, weight: .semibold))
                         .foregroundStyle(Ink.text)
+                    BadgeMark(badge: peer.badge, size: 21)
                     if peer.verified {
                         Image(systemName: "checkmark.seal.fill").font(.system(size: 14)).foregroundStyle(theme.accent)
                             .help("You checked their safety code in person")
@@ -1123,6 +1149,9 @@ private struct ConversationInfo: View {
                     .frame(maxWidth: 320)
                     .textSelection(.enabled)
             }
+            ContactCollectibles(items: peer.collectibles ?? [], tint: tint)
+            ProfileLinkList(links: peer.links ?? [], tint: tint, walletChangedAt: peer.walletChangedAt, isMine: peer.isSelf)
+            ProfileNoteList(notes: peer.notes ?? [], tint: tint)
             HStack(spacing: 10) {
                 Button { dismiss() } label: { Label("Message", systemImage: "bubble.left.fill") }
                     .buttonStyle(ProfileActionStyle())
@@ -1241,7 +1270,7 @@ private struct ConversationInfo: View {
             }
             Divider().overlay(Ink.line)
             Field(label: "Your role") {
-                Text(c.amOwner ? "Owner" : c.amAdmin ? "Admin" : c.kind == .channel ? "Follower" : "Member")
+                Text(c.amOwner ? "Owner" : c.amAdmin ? "Admin" : c.amMod ? "Mod" : c.kind == .channel ? "Follower" : "Member")
                     .foregroundStyle(Ink.dim)
             }
         }
@@ -1312,7 +1341,7 @@ private struct ConversationInfo: View {
                     .padding(.horizontal, 6).padding(.vertical, 2)
                     .background(theme.wash, in: .rect(cornerRadius: 4))
             }
-            if fp != "me", c.kind != .broadcast, c.amAdmin, fp != c.owner {
+            if fp != "me", c.kind != .broadcast, c.amAdmin || (c.amMod && c.canRemove(fp, by: "me")), fp != c.owner {
                 Menu {
                     if c.amOwner {
                         if c.admins.contains(fp) {
@@ -1320,8 +1349,15 @@ private struct ConversationInfo: View {
                         } else {
                             Button("Make admin") { model.setAdmin(c.id, fp, true) }
                         }
+                        if c.kind == .group, !c.isAdmin(fp) {
+                            if c.mods.contains(fp) {
+                                Button("Remove as mod") { model.setMod(c.id, fp, false) }
+                            } else {
+                                Button("Make mod") { model.setMod(c.id, fp, true) }
+                            }
+                        }
                     }
-                    if c.amOwner || !c.isAdmin(fp) {
+                    if c.canRemove(fp, by: "me") {
                         Button("Remove from \(c.kind == .channel ? "channel" : "group")", role: .destructive) {
                             model.removeMember(c.id, fp)
                         }
@@ -1524,7 +1560,7 @@ private struct PhoneSwipe<G: Gesture>: ViewModifier {
 }
 
 /// The Message and Call buttons on a person's profile.
-private struct ProfileActionStyle: ButtonStyle {
+struct ProfileActionStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 13, weight: .semibold))

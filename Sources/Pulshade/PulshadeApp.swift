@@ -14,6 +14,7 @@ struct PulshadeApp: App {
     }()
     #if os(iOS)
     @Environment(\.scenePhase) private var scenePhase
+    @UIApplicationDelegateAdaptor(PushDelegate.self) private var pushDelegate
     #endif
 
     init() {
@@ -71,6 +72,7 @@ struct PulshadeApp: App {
                 .preferredColorScheme(model.theme.scheme)
                 // A code scanned with the Camera app. It waits here if Pulshade is locked.
                 .onOpenURL { model.open($0) }
+                .onReceive(NotificationCenter.default.publisher(for: .pulshadePushToken)) { _ in model.refreshPush() }
                 .onChange(of: scenePhase) { _, phase in
                     switch phase {
                     case .background: model.didEnterBackground()

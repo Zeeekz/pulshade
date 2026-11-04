@@ -22,7 +22,8 @@ struct StoryStrip: View {
             HStack(alignment: .top, spacing: 14) {
                 Button { model.myStories.isEmpty ? (composing = true) : (viewing = StoryReel(stories: model.myStories)) } label: {
                     StoryBubble(image: model.activeProfile.avatar, seed: model.fingerprint, name: "Your story",
-                                active: !model.myStories.isEmpty, adding: model.myStories.isEmpty)
+                                active: !model.myStories.isEmpty, adding: model.myStories.isEmpty,
+                                uploading: model.storyUpload, glow: model.hasUnviewedStory)
                 }
                 .buttonStyle(.plain)
                 .contextMenu {
@@ -68,11 +69,13 @@ private struct StoryBubble: View {
     var name: String
     var active: Bool
     var adding: Bool
+    var uploading: Double?
+    var glow = false
     @State private var hover = false
 
     var body: some View {
         VStack(spacing: 5) {
-            StoryRing(active: active, size: 60) {
+            StoryRing(active: active, size: 60, uploading: uploading, glow: glow) {
                 ZStack(alignment: .bottomTrailing) {
                     Avatar(image: image, seed: seed, size: 50)
                     if adding { SymbolBadge(symbol: "plus", size: 18) }
@@ -93,6 +96,8 @@ private struct StoryBubble: View {
 struct StoryFace: View {
     var story: Story
     var compact = false
+    /// Set while a video story is playing.
+    var clip: StoryClip?
 
     var body: some View {
         ZStack {
@@ -111,20 +116,31 @@ struct StoryFace: View {
                 if let img = PlatformImage(data: data) {
                     Image(platformImage: img).resizable().scaledToFill()
                 }
-                if !caption.isEmpty {
-                    VStack {
-                        Spacer()
-                        Text(caption)
-                            .font(.system(size: compact ? 13 : 18, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 14).padding(.vertical, 8)
-                            .background(.black.opacity(0.45), in: .capsule)
-                            .padding(.bottom, compact ? 36 : 60)
-                    }
-                }
+                if !caption.isEmpty { StoryCaption(text: caption, compact: compact) }
+            case let .video(data, caption):
+                Color.black
+                if let clip { LayerView(layer: clip.layer).frame(maxWidth: .infinity, maxHeight: .infinity) } else { StoryPoster(data: data) }
+                if !caption.isEmpty { StoryCaption(text: caption, compact: compact) }
             }
         }
         .clipped()
+    }
+}
+
+struct StoryCaption: View {
+    var text: String
+    var compact: Bool
+
+    var body: some View {
+        VStack {
+            Spacer()
+            Text(text)
+                .font(.system(size: compact ? 13 : 18, weight: .semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 14).padding(.vertical, 8)
+                .background(.black.opacity(0.45), in: .capsule)
+                .padding(.bottom, compact ? 36 : 60)
+        }
     }
 }
 
@@ -135,9 +151,20 @@ struct StoryComposer: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var text = ""
     @State private var palette = 0
     @State private var image: Data?
+    /// A recorded or picked clip, not yet compressed. The composer deletes the file when it goes away.
+    @State private var clip: URL?
+    /// Zoom recorded with the clip, for cameras that couldn't zoom for real.
+    @State private var clipZoom = ZoomTrack.none
+    @State private var clipPreview: ClipPreview?
+    @State private var filter = StoryFilter.none
+    /// The photo with the look applied, for the preview.
+    @State private var looked: Data?
+    @State private var exporting = false
+    @State private var failure: String?
     @State private var audience: StoryAudience = .everyone
     @State private var lifetime = StoryLifetime.day.rawValue
     @State private var choosingAudience = false
@@ -146,8 +173,11 @@ struct StoryComposer: View {
     /// After posting, so the camera behind closes too.
     var posted: () -> Void = {}
 
-    init(image: Data? = nil, posted: @escaping () -> Void = {}) {
+    init(image: Data? = nil, clip: URL? = nil, zoom: ZoomTrack = .none, filter: StoryFilter = .none, posted: @escaping () -> Void = {}) {
         _image = State(initialValue: image)
+        _clip = State(initialValue: clip)
+        _clipZoom = State(initialValue: zoom)
+        _filter = State(initialValue: filter)
         self.posted = posted
     }
 
@@ -160,28 +190,38 @@ struct StoryComposer: View {
         case let .image(data, caption):
             _image = State(initialValue: data)
             _text = State(initialValue: caption)
+        case let .video(_, caption):
+            _text = State(initialValue: caption)
         }
         _audience = State(initialValue: story.shownTo)
         _lifetime = State(initialValue: story.lifetime ?? StoryLifetime.day.rawValue)
     }
 
+    /// Whether the picture or clip can still change its look (a posted story keeps the one it was posted with).
+    private var canFilter: Bool { editing == nil && (image != nil || clip != nil) }
+
     private var preview: Story {
-        Story(id: editing?.id ?? UUID(), author: "me",
-              style: image.map { .image($0, caption: text) } ?? .text(text.isEmpty ? "✦" : text, palette: palette))
+        if let editing, case let .video(clip, _) = editing.style {
+            return Story(id: editing.id, author: "me", style: .video(clip, caption: text))
+        }
+        return Story(id: editing?.id ?? UUID(), author: "me",
+                     style: (looked ?? image).map { .image($0, caption: text) } ?? .text(text.isEmpty ? "✦" : text, palette: palette))
     }
 
     var body: some View {
         SheetBody(width: 440) {
             VStack(spacing: 18) {
                 SheetHeader(symbol: "circle.dashed.inset.filled", title: editing == nil ? "Story" : "Edit story")
-                StoryFace(story: preview)
+                face
                     .frame(width: 260, height: 400)
                     .clipShape(.rect(cornerRadius: 26))
                     .shadow(color: theme.accent.opacity(0.35), radius: 30)
                     .animation(.smooth, value: palette)
                     .animation(.smooth, value: image)
+                    .modifier(OptionalFilterSwipe(filter: $filter, enabled: canFilter))
+                if canFilter { FilterDots(filter: $filter) }
 
-                if image == nil {
+                if image == nil && clip == nil && !isVideoEdit {
                     HStack(spacing: 10) {
                         ForEach(0..<StoryPalette.all.count, id: \.self) { i in
                             Circle().fill(StoryPalette.gradient(i))
@@ -193,7 +233,7 @@ struct StoryComposer: View {
                     }
                 }
 
-                TextField(image == nil ? "Say something" : "Caption", text: $text)
+                TextField(image == nil && clip == nil && !isVideoEdit ? "Say something" : "Caption", text: $text)
                     .textFieldStyle(PulseFieldStyle())
 
                 SettingsGroup {
@@ -216,30 +256,42 @@ struct StoryComposer: View {
                     }
                 }
 
+                if let failure {
+                    Text(failure).font(.system(size: 13)).foregroundStyle(Ink.dim).multilineTextAlignment(.center)
+                }
+
                 HStack(spacing: 12) {
                     if editing == nil {
-                        if image != nil {
-                            Button { withAnimation { image = nil } } label: { Image(systemName: "textformat") }
+                        if image != nil || clip != nil {
+                            Button { withAnimation { image = nil; clip = nil; looked = nil; filter = .none } } label: { Image(systemName: "textformat") }
                                 .buttonStyle(IconButtonStyle(size: 46))
+                                .disabled(exporting)
+                                .accessibilityLabel("Write a text story instead")
                         } else {
-                            ImagePickButton(maxSide: 1600, crop: .story, picked: { data in withAnimation { image = data } }) {
+                            StoryMediaPicker(picked: { kind in
+                                withAnimation {
+                                    switch kind {
+                                    case let .photo(data): image = data
+                                    case let .clip(url, zoom): clip = url; clipZoom = zoom
+                                    }
+                                }
+                            }) {
                                 Image(systemName: "photo.fill")
                             }
                             .buttonStyle(IconButtonStyle(size: 46))
+                            .accessibilityLabel("Choose a photo or video")
                         }
                     }
-                    Button {
-                        if let editing {
-                            model.editStory(editing.id, style: preview.style, audience: audience, lifetime: lifetime)
+                    Button { post() } label: {
+                        if exporting {
+                            ProgressView().controlSize(.small).tint(.white)
                         } else {
-                            model.postStory(preview.style, audience: audience, lifetime: lifetime)
+                            Image(systemName: editing == nil ? "arrow.up" : "checkmark")
                         }
-                        dismiss()
-                        posted()
-                    } label: { Image(systemName: editing == nil ? "arrow.up" : "checkmark") }
-                        .buttonStyle(GlowButtonStyle(size: 46))
-                        .disabled(image == nil && text.trimmingCharacters(in: .whitespaces).isEmpty)
-                        .accessibilityLabel(editing == nil ? "Post" : "Save")
+                    }
+                    .buttonStyle(GlowButtonStyle(size: 46))
+                    .disabled(exporting || (image == nil && clip == nil && !isVideoEdit && text.trimmingCharacters(in: .whitespaces).isEmpty))
+                    .accessibilityLabel(exporting ? "Preparing video" : editing == nil ? "Post" : "Save")
                 }
             }
         }
@@ -248,7 +300,95 @@ struct StoryComposer: View {
             audience = model.storyChoice.audience
             lifetime = model.storyChoice.lifetime
         }
+        .task(id: clip) { openClip() }
+        .task(id: [filter.rawValue, String(image?.count ?? 0)]) { await look() }
+        .onChange(of: filter) { _, new in clipPreview?.set(new) }
+        .onDisappear {
+            clipPreview?.close()
+            if let clip { try? FileManager.default.removeItem(at: clip) }
+        }
         .sheet(isPresented: $choosingAudience) { StoryAudiencePicker(audience: $audience) }
+    }
+
+    private var isVideoEdit: Bool {
+        if let editing, case .video = editing.style { return true }
+        return false
+    }
+
+    @ViewBuilder private var face: some View {
+        if clip != nil, let clipPreview {
+            ZStack {
+                Color.black
+                LayerView(layer: clipPreview.layer)
+                if !text.isEmpty { StoryCaption(text: text, compact: false) }
+            }
+            .accessibilityLabel("Video preview")
+        } else if clip != nil {
+            Color.black.overlay { ProgressView().tint(.white) }
+        } else {
+            StoryFace(story: preview)
+        }
+    }
+
+    private func openClip() {
+        clipPreview?.close()
+        clipPreview = nil
+        guard let clip else { return }
+        clipPreview = ClipPreview(url: clip, filter: filter, zoom: clipZoom)
+    }
+
+    /// Colours the photo for the preview.
+    private func look() async {
+        guard let image, editing == nil else { looked = nil; return }
+        if filter == .none { looked = nil; return }
+        let look = filter
+        let made = await Task.detached(priority: .userInitiated) { look.bake(into: image, maxSide: 900) }.value
+        guard look == filter else { return }
+        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.18)) { looked = made }
+    }
+
+    private func post() {
+        if let editing {
+            model.editStory(editing.id, style: preview.style, audience: audience, lifetime: lifetime)
+            finish()
+        } else if let clip {
+            exporting = true
+            failure = nil
+            let look = filter, caption = text, track = clipZoom
+            Task {
+                do {
+                    let data = try await StoryVideo.export(from: clip, filter: look, zoom: track)
+                    model.postStory(.video(data, caption: caption), audience: audience, lifetime: lifetime)
+                    exporting = false
+                    finish()
+                } catch {
+                    exporting = false
+                    failure = (error as? LocalizedError)?.errorDescription ?? "The video couldn't be prepared."
+                }
+            }
+        } else if let image {
+            // The look is baked into the pixels that are sent, not just the preview.
+            let sent = filter == .none ? image : (filter.bake(into: image) ?? image)
+            model.postStory(.image(sent, caption: text), audience: audience, lifetime: lifetime)
+            finish()
+        } else {
+            model.postStory(preview.style, audience: audience, lifetime: lifetime)
+            finish()
+        }
+    }
+
+    private func finish() {
+        dismiss()
+        posted()
+    }
+}
+
+/// Adds the swipe-to-change-look gesture only when there's something to colour.
+private struct OptionalFilterSwipe: ViewModifier {
+    @Binding var filter: StoryFilter
+    var enabled: Bool
+    func body(content: Content) -> some View {
+        if enabled { content.filterSwipe($filter) } else { content }
     }
 }
 
@@ -419,37 +559,82 @@ extension View {
     }
 }
 
-/// Where a new story starts: the camera, with the photo library and text stories a tap away. A photo is
-/// framed to the story's shape, then captioned and posted.
+/// Where a new story starts: the camera, with the library and text stories a tap away. Tap the button for a
+/// photo, hold it for a video (drag up and down while holding to zoom, up to 15 seconds). Swipe left or right on
+/// the picture to change the look, pinch to zoom. A photo is framed to the story's shape, then captioned and
+/// posted; a clip goes straight to the composer.
 struct StoryCamera: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.theme) private var theme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var camera = Camera()
     @State private var ready: Bool?
     @State private var pending: PendingCrop?
-    @State private var framed: FramedPhoto?
+    @State private var framed: StoryPick?
     @State private var writing = false
-
-    private struct FramedPhoto: Identifiable {
-        let id = UUID()
-        let data: Data
-    }
+    @State private var filter = StoryFilter.none
+    // The shutter: a press that lasts becomes a clip.
+    @State private var pressStart: Date?
+    @State private var holdTask: Task<Void, Never>?
+    @State private var holdRecording = false
+    @State private var zoomAtPress: CGFloat = 1
+    // Pinching to zoom.
+    @State private var pinchBase: CGFloat?
+    @State private var pinching = false
+    @State private var zoomShown = false
+    @State private var zoomToken = UUID()
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             if ready == true {
                 LayerView(layer: camera.preview).ignoresSafeArea()
+                    .filterSwipe($filter, enabled: !pinching && pressStart == nil)
+                    .simultaneousGesture(MagnifyGesture()
+                        .onChanged { value in
+                            pinching = true
+                            if pinchBase == nil { pinchBase = camera.zoom }
+                            camera.setZoom((pinchBase ?? 1) * value.magnification)
+                        }
+                        .onEnded { _ in pinchBase = nil; pinching = false })
+                    #if os(macOS)
+                    .background(ScrollZoom { dy in camera.setZoom(camera.zoom * exp(dy * 0.03)) })
+                    #endif
+                    .accessibilityLabel("Camera preview")
             } else if ready == false {
                 VStack(spacing: 10) {
                     Image(systemName: "camera.fill").font(.system(size: 34)).foregroundStyle(Ink.faint)
                     Text("No camera available").font(.system(size: 15, weight: .semibold)).foregroundStyle(Ink.text)
-                    Text("Choose a photo, or write a text story.").font(.system(size: 13)).foregroundStyle(Ink.dim)
+                    Text("Choose a photo or video, or write a text story.").font(.system(size: 13)).foregroundStyle(Ink.dim)
                 }
+            }
+            if zoomShown {
+                Text(ZoomMath.label(camera.zoom))
+                    .font(.system(size: 14, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12).frame(height: 30)
+                    .background(.black.opacity(0.45), in: .capsule)
+                    .frame(maxHeight: .infinity, alignment: .bottom)
+                    .padding(.bottom, 190)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+                    .accessibilityHidden(true)
             }
             VStack {
                 HStack {
                     control("xmark", label: "Close") { dismiss() }
+                    Spacer()
+                    if camera.recording, let start = camera.recordingStart {
+                        TimelineView(.periodic(from: start, by: 0.25)) { context in
+                            let seconds = min(Int(context.date.timeIntervalSince(start)), Int(StoryVideo.maxSeconds))
+                            Text("0:" + String(format: "%02d", seconds))
+                                .font(.system(size: 14, weight: .semibold).monospacedDigit())
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 12).frame(height: 32)
+                                .background(.red.opacity(0.85), in: .capsule)
+                                .accessibilityLabel("Recording, \(seconds) seconds")
+                        }
+                    }
                     Spacer()
                     if camera.hasFlash && ready == true {
                         control(camera.flash ? "bolt.fill" : "bolt.slash.fill", label: camera.flash ? "Flash on" : "Flash off") {
@@ -458,50 +643,148 @@ struct StoryCamera: View {
                     }
                 }
                 Spacer()
+                FilterDots(filter: $filter).padding(.bottom, 6)
+                    .opacity(camera.recording ? 0 : 1)
                 HStack(alignment: .center) {
-                    ImagePickButton(maxSide: CropFrame.story.maxSide, crop: .story, picked: { data in framed = FramedPhoto(data: data) }) {
+                    StoryMediaPicker(picked: { kind in framed = StoryPick(kind: kind, filter: filter) }) {
                         controlFace("photo.on.rectangle")
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Choose a photo")
+                    .accessibilityLabel("Choose a photo or video")
+                    .disabled(camera.recording)
+                    .opacity(camera.recording ? 0.35 : 1)
                     Spacer()
-                    Button {
-                        camera.capture { image in pending = PendingCrop(image: image) }
-                    } label: {
-                        Circle().fill(.white).frame(width: 66, height: 66)
-                            .overlay(Circle().strokeBorder(.white.opacity(0.5), lineWidth: 4).padding(-8))
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(ready != true)
-                    .opacity(ready == true ? 1 : 0.35)
-                    .accessibilityLabel("Take photo")
+                    shutter
                     Spacer()
                     #if os(iOS)
                     control("arrow.triangle.2.circlepath.camera", label: "Switch camera") { camera.flip() }
-                        .disabled(ready != true)
+                        .disabled(ready != true || camera.recording)
                     #else
                     controlFace("camera").opacity(0)
                     #endif
                 }
                 .padding(.horizontal, 28)
-                Button { writing = true } label: {
-                    Text("Aa  Text story")
-                        .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
-                        .padding(.horizontal, 14).padding(.vertical, 8)
-                        .background(.white.opacity(0.15), in: .capsule)
+                HStack(spacing: 12) {
+                    Text("Tap for photo · Hold for video")
+                        .font(.system(size: 12, weight: .medium)).foregroundStyle(.white.opacity(0.7))
+                    Button { writing = true } label: {
+                        Text("Aa  Text")
+                            .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
+                            .padding(.horizontal, 14).padding(.vertical, 8)
+                            .background(.white.opacity(0.15), in: .capsule)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Text story")
                 }
-                .buttonStyle(.plain)
                 .padding(.top, 14)
+                .opacity(camera.recording ? 0 : 1)
+                .disabled(camera.recording)
             }
             .padding(.vertical, 18)
             .padding(.horizontal, 16)
         }
         .preferredColorScheme(.dark)
-        .task { ready = await camera.start() }
+        .task {
+            ready = await camera.start()
+            if ready == true { await camera.allowSound() }
+        }
         .onDisappear { camera.stop() }
-        .cropper($pending, frame: .story) { data in framed = FramedPhoto(data: data) }
-        .sheet(item: $framed) { photo in StoryComposer(image: photo.data, posted: { dismiss() }) }
+        .onChange(of: filter) { _, new in camera.filter = new }
+        .onChange(of: camera.zoom) { _, _ in
+            withAnimation(.easeOut(duration: 0.15)) { zoomShown = true }
+            zoomToken = UUID()
+        }
+        .onChange(of: camera.recording) { _, now in if !now { holdRecording = false } }
+        .task(id: zoomToken) {
+            try? await Task.sleep(for: .seconds(1.2))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.3)) { zoomShown = false }
+        }
+        .cropper($pending, frame: .story) { data in framed = StoryPick(kind: .photo(data), filter: filter) }
+        .sheet(item: $framed) { pick in
+            switch pick.kind {
+            case let .photo(data): StoryComposer(image: data, filter: pick.filter, posted: { dismiss() })
+            case let .clip(url, zoom): StoryComposer(clip: url, zoom: zoom, filter: pick.filter, posted: { dismiss() })
+            }
+        }
         .sheet(isPresented: $writing) { StoryComposer(posted: { dismiss() }) }
+    }
+
+    // MARK: Shutter
+
+    /// Down starts the clock; a press that lasts starts a clip, and dragging up or down then zooms.
+    private func shutterMoved(_ drag: DragGesture.Value) {
+        guard ready == true else { return }
+        if pressStart == nil {
+            pressStart = Date()
+            zoomAtPress = camera.zoom
+            holdTask = Task {
+                try? await Task.sleep(for: .seconds(ShutterTiming.holdAfter))
+                guard !Task.isCancelled else { return }
+                startClip()
+            }
+        }
+        if holdRecording {
+            camera.setZoom(ZoomMath.zoom(start: zoomAtPress, drag: drag.translation.height, max: camera.maxZoom))
+        }
+    }
+
+    /// Up: stops the clip, or, if it was only a tap, takes the photo.
+    private func shutterLifted(_ drag: DragGesture.Value) {
+        holdTask?.cancel()
+        let start = pressStart
+        pressStart = nil
+        if holdRecording {
+            holdRecording = false
+            camera.finishRecording()
+        } else if let start, ready == true,
+                  ShutterTiming.isTap(duration: Date().timeIntervalSince(start), travel: hypot(drag.translation.width, drag.translation.height)) {
+            Haptics.tick()
+            camera.capture { image in pending = PendingCrop(image: image) }
+        }
+    }
+
+    private func startClip() {
+        guard !holdRecording, !camera.recording else { return }
+        holdRecording = true
+        Haptics.tick()
+        camera.record { url, track in
+            if let url { framed = StoryPick(kind: .clip(url, track), filter: filter) }
+        }
+    }
+
+    /// The button: white for a photo, and while you hold it a red square inside a ring that fills over the 15
+    /// seconds.
+    private var shutter: some View {
+        ZStack {
+            Circle().strokeBorder(.white.opacity(0.5), lineWidth: 4).frame(width: 82, height: 82)
+            if camera.recording, let start = camera.recordingStart {
+                TimelineView(.animation(minimumInterval: 1 / 20)) { context in
+                    Circle()
+                        .trim(from: 0, to: min(context.date.timeIntervalSince(start) / StoryVideo.maxSeconds, 1))
+                        .stroke(.red, style: StrokeStyle(lineWidth: 5, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                        .frame(width: 82, height: 82)
+                }
+            }
+            RoundedRectangle(cornerRadius: camera.recording ? 10 : 33)
+                .fill(camera.recording ? Color.red : .white)
+                .frame(width: camera.recording ? 36 : 66, height: camera.recording ? 36 : 66)
+                .animation(reduceMotion ? nil : .snappy, value: camera.recording)
+        }
+        .frame(width: 90, height: 90)
+        .contentShape(Circle())
+        .gesture(DragGesture(minimumDistance: 0).onChanged(shutterMoved).onEnded(shutterLifted))
+        .opacity(ready == true ? 1 : 0.35)
+        .accessibilityElement()
+        .accessibilityLabel(camera.recording ? "Stop recording" : "Take photo")
+        .accessibilityHint("Hold to record a video")
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction {
+            if camera.recording { camera.finishRecording() } else { camera.capture { image in pending = PendingCrop(image: image) } }
+        }
+        .accessibilityAction(named: camera.recording ? "Stop recording" : "Record video") {
+            if camera.recording { camera.finishRecording() } else { startClip() }
+        }
     }
 
     private func control(_ symbol: String, label: String, action: @escaping () -> Void) -> some View {
@@ -524,6 +807,7 @@ struct StoryCamera: View {
 struct StoryViewer: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var stories: [Story]
     var start = 0
     @State private var index = 0
@@ -531,25 +815,37 @@ struct StoryViewer: View {
     @State private var editing: Story?
     @State private var showingViewers: Story?
     @State private var confirmDelete = false
+    /// How far the story has been dragged down, on its way to closing.
+    @State private var dragY: CGFloat = 0
     /// Stories deleted while the viewer is open.
     @State private var gone: Set<Story.ID> = []
+    /// The video of the story on screen, if it is one.
+    @State private var clip: StoryClip?
+    /// A finger is held down: the story waits.
+    @State private var holding = false
+    @State private var touching = false
+    @State private var holdTask: Task<Void, Never>?
     private let duration: Double = 5
     private let tick = Timer.publish(every: 1 / 30, on: .main, in: .common).autoconnect()
 
     /// The stories still up, as they are now (one may have been edited since the viewer opened).
     private var current: [Story] {
-        stories.filter { !gone.contains($0.id) }.map { s in model.data.stories.first { $0.id == s.id } ?? s }
+        // Only what's still up: one deleted or expired elsewhere while this is open goes from it too.
+        stories.filter { !gone.contains($0.id) }.compactMap { s in model.data.stories.first { $0.id == s.id } }
     }
 
-    private var paused: Bool { editing != nil || showingViewers != nil || confirmDelete }
+    private var paused: Bool { editing != nil || showingViewers != nil || confirmDelete || holding }
+
+    private var currentID: Story.ID? { current.indices.contains(index) ? current[index].id : nil }
 
     var body: some View {
         let stories = current
         ZStack(alignment: .top) {
             if stories.indices.contains(index) {
-                StoryFace(story: stories[index])
+                StoryFace(story: stories[index], clip: clip)
                     .id(stories[index].id)
-                    .transition(.asymmetric(insertion: .move(edge: .trailing), removal: .move(edge: .leading)))
+                    .transition(reduceMotion ? .opacity
+                                : .asymmetric(insertion: .move(edge: .trailing), removal: .move(edge: .leading)))
             }
             HStack(spacing: 4) {
                 ForEach(stories.indices, id: \.self) { i in
@@ -564,29 +860,67 @@ struct StoryViewer: View {
                 }
             }
             .padding(14)
-            HStack(spacing: 0) {
-                Color.clear.contentShape(Rectangle()).onTapGesture { step(-1) }
-                Color.clear.contentShape(Rectangle()).onTapGesture { step(1) }
+            .opacity(holding ? 0 : 1)
+            GeometryReader { geo in
+                Color.clear.contentShape(Rectangle())
+                    .gesture(DragGesture(minimumDistance: 0)
+                        .onChanged { drag in touchBegan(); dragMoved(drag) }
+                        .onEnded { drag in touchEnded(drag, width: geo.size.width) })
+                    .accessibilityElement()
+                    .accessibilityLabel("Story")
+                    .accessibilityAction(named: "Next story") { step(1) }
+                    .accessibilityAction(named: "Previous story") { step(-1) }
             }
-            if stories.indices.contains(index), stories[index].author == "me" {
+            if clip != nil, !holding {
+                HStack {
+                    Spacer()
+                    Button { clip?.muted.toggle() } label: {
+                        Image(systemName: clip?.muted == true ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                            .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
+                            .frame(width: 32, height: 32)
+                            .background(.black.opacity(0.45), in: .circle)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(clip?.muted == true ? "Unmute" : "Mute")
+                }
+                .padding(.top, 26).padding(.horizontal, 14)
+            }
+            if stories.indices.contains(index), stories[index].author == "me", !holding {
                 VStack {
                     Spacer()
                     ownerBar(stories[index])
                 }
             }
         }
-        .frame(maxWidth: Platform.isPhone ? .infinity : 400, maxHeight: Platform.isPhone ? .infinity : 680)
-        .background(.black)
+        .scaleEffect(1 - min(dragY, 400) / 2000, anchor: .top)
+        .offset(y: dragY)
+        // A video has no size of its own, so on the Mac the window is given the story's shape outright.
+        .frame(minWidth: Platform.isPhone ? nil : 400, maxWidth: Platform.isPhone ? .infinity : 400,
+               minHeight: Platform.isPhone ? nil : 680, maxHeight: Platform.isPhone ? .infinity : 680)
+        .background(.black.opacity(1 - Double(min(dragY, 300)) / 600))
         .onAppear { index = min(start, max(stories.count - 1, 0)) }
         .onChange(of: index, initial: true) { if current.indices.contains(index) { model.markSeen(current[index].id) } }
+        .onChange(of: currentID, initial: true) { openClip() }
+        .onChange(of: paused) { _, now in
+            if now { clip?.pause() } else { clip?.play() }
+        }
+        .onDisappear { clip?.close(); clip = nil }
         .onReceive(tick) { _ in
             guard !paused else { return }
+            if let clip {
+                progress = clip.progress
+                if clip.finished { step(1) }
+                return
+            }
             progress += 1 / (duration * 30)
             if progress >= 1 { step(1) }
         }
         .onKeyPress(.leftArrow) { step(-1); return .handled }
         .onKeyPress(.rightArrow) { step(1); return .handled }
         .onKeyPress(.escape) { dismiss(); return .handled }
+        .onChange(of: current.isEmpty) { _, empty in if empty { dismiss() } }
+        // The drag down closes it, so the sheet's own swipe doesn't fight it.
+        .interactiveDismissDisabled()
         .sheet(item: $editing) { StoryComposer(editing: $0) }
         .sheet(item: $showingViewers) { StoryViewers(story: $0) }
         .confirmationDialog("Delete this story?", isPresented: $confirmDelete, titleVisibility: .visible) {
@@ -594,6 +928,47 @@ struct StoryViewer: View {
         } message: {
             Text("It disappears for everyone who can see it.")
         }
+    }
+
+    /// Plays the video of the story now on screen, and lets go of the last one.
+    private func openClip() {
+        clip?.close()
+        clip = nil
+        progress = 0
+        guard current.indices.contains(index), case let .video(data, _) = current[index].style else { return }
+        clip = StoryClip(data: data)
+        if !paused { clip?.play() }
+    }
+
+    /// Touch down starts a hold (the story waits); a quick tap on the left or right side steps.
+    private func touchBegan() {
+        guard !touching else { return }
+        touching = true
+        holdTask = Task {
+            try? await Task.sleep(for: .milliseconds(220))
+            if !Task.isCancelled { holding = true }
+        }
+    }
+
+    /// A drag that is mostly downward pulls the story down with the finger.
+    private func dragMoved(_ drag: DragGesture.Value) {
+        let down = drag.translation.height
+        dragY = down > abs(drag.translation.width) ? max(down, 0) : 0
+    }
+
+    private func touchEnded(_ drag: DragGesture.Value, width: Double) {
+        holdTask?.cancel()
+        touching = false
+        let wasHolding = holding
+        holding = false
+        // Pulled down far enough, or flicked: close it. Otherwise it springs back.
+        if drag.translation.height > abs(drag.translation.width), drag.translation.height > 120 || drag.predictedEndTranslation.height > 400 {
+            dismiss()
+            return
+        }
+        withAnimation(.smooth(duration: 0.25)) { dragY = 0 }
+        guard !wasHolding, abs(drag.translation.width) < 24, abs(drag.translation.height) < 24 else { return }
+        step(drag.startLocation.x < width / 2 ? -1 : 1)
     }
 
     /// Under your own story: who viewed it, and editing or deleting it.
@@ -641,10 +1016,13 @@ struct StoryViewer: View {
     private func step(_ d: Int) {
         let next = index + d
         guard current.indices.contains(next) else {
-            if d > 0 { dismiss() } else { progress = 0 }
+            if d > 0 { dismiss() } else { progress = 0; clip?.restart() }
             return
         }
-        withAnimation(.smooth(duration: 0.35)) { index = next }
+        // Let go of this clip now, so a late tick can't step twice.
+        clip?.close()
+        clip = nil
+        withAnimation(reduceMotion ? .easeInOut(duration: 0.2) : .smooth(duration: 0.35)) { index = next }
         progress = 0
     }
 }

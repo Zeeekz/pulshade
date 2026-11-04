@@ -21,7 +21,7 @@ public struct ReportCard: Codable, Equatable, Sendable {
     }
 }
 
-/// Where reports go: the operator's mailbox, published through the relay.
+/// Where reports go: the Pulshade Admin app's mailbox, published through the relay.
 public struct ReportInbox: Codable, Equatable, Sendable {
     public var sendID: String
     public var agreementKey: String
@@ -41,7 +41,7 @@ public struct ReportInbox: Codable, Equatable, Sendable {
             + Data(inbox.signingKey.utf8)
     }
 
-    /// Published by the operator whose key this build carries.
+    /// Published by the admin app whose key this build carries.
     public func isGenuine(adminKey: Data?) -> Bool {
         guard let adminKey, Data(base64Encoded: signingKey) == adminKey,
               let key = try? Curve25519.Signing.PublicKey(rawRepresentation: adminKey),
@@ -50,7 +50,7 @@ public struct ReportInbox: Codable, Equatable, Sendable {
     }
 }
 
-/// A report sealed to the operator's reports key from a throwaway key, so only the operator can open it and
+/// A report sealed to the admin app's reports key from a throwaway key, so only the admin app can open it and
 /// nothing in it says who sent it. `"pulshade.report.v2" | throwaway X25519 key | ChaChaPoly box`, the box holding
 /// the length and the report padded to whole KiB, so its size says little about what it says.
 public enum ReportSeal {

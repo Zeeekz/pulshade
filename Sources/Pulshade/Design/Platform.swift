@@ -51,6 +51,19 @@ enum Platform {
         #endif
     }
 
+    /// Copies a picture, staying on this device (no Universal Clipboard), and asks clipboard managers not to keep it.
+    @MainActor static func copyImage(_ jpeg: Data) {
+        #if os(macOS)
+        let board = NSPasteboard.general
+        board.prepareForNewContents(with: .currentHostOnly)
+        board.setData(jpeg, forType: NSPasteboard.PasteboardType(UTType.jpeg.identifier))
+        board.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
+        board.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.TransientType"))
+        #else
+        UIPasteboard.general.setItems([[UTType.jpeg.identifier: jpeg]], options: [.localOnly: true])
+        #endif
+    }
+
     /// Copies text and wipes it from the clipboard later, if nothing else was copied since. It stays on this
     /// device (no Universal Clipboard), and clipboard managers are asked not to keep it.
     @MainActor static func copy(_ text: String, clearAfter seconds: Double? = nil) {

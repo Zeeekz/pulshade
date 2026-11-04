@@ -38,19 +38,20 @@ cat > "$app/Contents/Info.plist" <<PLIST
     <key>NSHighResolutionCapable</key><true/>
     <key>NSHumanReadableCopyright</key><string>Built by Zeekz</string>
     <key>ITSAppUsesNonExemptEncryption</key><true/>
-    <key>NSCameraUsageDescription</key><string>Scan codes to link your devices, add friends and verify them. Frames are never saved.</string>
+    <key>NSCameraUsageDescription</key><string>Scan codes to link your devices, add friends and verify them, and take photos and videos for stories. Frames are never saved.</string>
     <key>CFBundleURLTypes</key>
     <array><dict>
         <key>CFBundleURLName</key><string>app.pulshade.link</string>
         <key>CFBundleURLSchemes</key><array><string>pulshade</string></array>
     </dict></array>
-    <key>NSMicrophoneUsageDescription</key><string>Record voice notes and make calls. Audio is encrypted before it leaves your Mac.</string>
+    <key>NSMicrophoneUsageDescription</key><string>Record voice notes, videos and make calls. Audio is encrypted before it leaves your Mac.</string>
     <key>NSRequiresAquaSystemAppearance</key><false/>
     <key>LSApplicationCategoryType</key><string>public.app-category.social-networking</string>
     <key>PulshadeRelay</key><string>$(sed 's|^|http://|' relay/pulshade-onion/hostname 2>/dev/null)</string>
     <key>PulshadeRelayDirect</key><string>${PULSHADE_RELAY_DIRECT:-$(cat relay/direct-address 2>/dev/null)}</string>
     <key>PulshadeRelayPin</key><string>${PULSHADE_RELAY_PIN:-$(cat relay/relay-pin 2>/dev/null)}</string>
     <key>PulshadeAdminKey</key><string>$(cat relay/admin-key.pub 2>/dev/null)</string>
+    <key>PulshadePetKey</key><string>$(cat relay/pet-key.pub 2>/dev/null)</string>
     <key>PulshadeReleaseKey</key><string>$(cat relay/release.pub 2>/dev/null)</string>
     <key>NSAppTransportSecurity</key>
     <dict>

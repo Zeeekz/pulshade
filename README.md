@@ -28,9 +28,8 @@ Built by Zeekz.
 
 ## What the server sees
 
-Pulshade runs its own servers, and the official app talks only to them, through Tor. (The exceptions are ones you
-choose: a link preview fetches that site, and turning on Snowflake bridges contacts Tor's bridge infrastructure.)
-The servers are built to know as little as possible:
+Pulshade runs its own servers, and the official app talks to nothing else. They're built to know as little as
+possible:
 
 - **Not what you say.** Messages, calls, profiles and backups are encrypted on your device, and the server only
   passes on sealed envelopes, padded to a few set sizes. (A public @handle is the exception, by choice: its name and
@@ -55,16 +54,19 @@ An honest list. More detail is in [How Pulshade works](docs/how-it-works.md).
   Pulshade.
 - **Turning Tor off is a real step down.** It's allowed, for speed, and the app explains first: the server then sees
   your IP address, and your personas can be tied together by it.
-- **Disappearing messages trust the other device.** A modified app could keep them, and anyone can photograph a
-  screen.
+- **Disappearing messages and deleted stories trust the other device.** A modified app could keep them, and anyone
+  can photograph a screen. A story deleted or expired is gone from every unmodified app, but one posted before
+  deleting existed can't be recalled and just runs out its time.
 - **One operator.** Everything goes through Pulshade's servers, which can see when and how much traffic flows, but
   never what it says, or who you are behind Tor.
 - **Post-quantum keys refresh every 50 messages or a day**, not on every reply, and a refresh makes that message
   larger.
 - **Old files on an SSD.** Pulshade replaces its keys every time it locks, but the operating system, not the app,
   decides when old disk blocks are truly erased.
-- **iPhone:** messages arrive while the app is open (waking it needs Apple's push service). Screenshots come out
-  blank through iOS behaviour Apple doesn't document, so an update could undo that.
+- **iPhone:** messages arrive while the app is open, unless you turn on **Wake when locked** (Settings →
+  Notifications), which lets the relay wake your phone through Apple. Apple then learns that it was woken, and when
+  (see [wake-up pushes](docs/push-notifications.md)). Screenshots come out blank through iOS behaviour Apple
+  doesn't document, so an update could undo that.
 - **Outside the app,** your IP address still reaches wherever you downloaded it, and Apple when a Mac first checks
   the app.
 
@@ -72,14 +74,29 @@ An honest list. More detail is in [How Pulshade works](docs/how-it-works.md).
 
 macOS 26 or later, or iOS 26 or later.
 
-## Open source
+## Building from source
 
-The code is open so anyone can read it and check what the app and the server do. Pulshade is made for people to
-use, not to build themselves: get the app from the App Store.
+The code is open so anyone can check what the app and the server do. A build you make yourself is for reading,
+testing and auditing: development builds can talk to a relay on your own Mac, while the official app only ever
+talks to Pulshade's servers.
+
+You'll need Xcode, Rust (`rustup`), Go and, for the iPhone, [XcodeGen](https://github.com/yonaskolb/XcodeGen). The first
+build compiles Tor ([Arti](https://gitlab.torproject.org/tpo/core/arti)) and its bridge transports (Snowflake and
+webtunnel, from Tor Project's [lyrebird](https://gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird)),
+which takes a few minutes.
+
+```bash
+./scripts/run-relay.sh            # a relay on this Mac, at 127.0.0.1:7878
+./scripts/build-app.sh debug      # builds build/Pulshade.app, a development build
+open build/Pulshade.app
+```
+
+```bash
+./scripts/test.sh                 # every test, against a throwaway relay
+```
 
 The apps are in `Sources/Pulshade` (the Mac and iPhone share all their code), the server in `relay/`, and the Tor
-bridge in `tor/`. A build or fork someone runs for themselves must use its own servers, as the official app only ever
-talks to Pulshade's.
+bridge in `tor/`.
 
 ## Security
 

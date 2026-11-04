@@ -15,8 +15,25 @@ struct Profile: Codable, Equatable {
     var handle: String?
     /// A line about you, shown on your public profile.
     var bio: String?
+    /// Links and wallets, each shown as an icon on your profile.
+    var links: [ProfileLink]?
+    /// Text notes on your profile, public or locked with a password.
+    var notes: [ProfileNote]?
+    /// The collectibles given to this identity, and the one shown after its name.
+    var collectibles: [Collectible]?
+    var badge: Collectible?
+    /// The backup code for all of this persona's collectibles. Only ever on your own devices: entered in another
+    /// account, it brings every one of them back, even after this one burns.
+    var collectionCode: String?
+    /// Which code each collectible is set to on the relay, by its id ("item#serial"). One that isn't the collection
+    /// code yet gets added to it.
+    var collectibleCodes: [String: String]?
     /// When any of this last changed, so your devices can agree on the newest version.
     var updatedAt: Date?
+    /// The `AppData.currentFormat` of the build that last saved this profile. Devices of one account pass profiles
+    /// round, and a build that doesn't know every field would send one back without them, so a profile is only
+    /// taken from a device on the same format or newer, never an older one.
+    var format: Int?
 
     var displayName: String { name.isEmpty ? "Anonymous" : name }
 }
@@ -78,10 +95,20 @@ struct Contact: Codable, Identifiable {
     var color: Int?
     /// A line about them, from their profile.
     var bio: String?
+    /// Their links and wallets, checked when they arrived.
+    var links: [ProfileLink]?
+    /// When a wallet address they had already shown last changed. Nil if it never has.
+    var walletChangedAt: Date?
+    /// Their text notes, checked when they arrived.
+    var notes: [ProfileNote]?
     /// Their public @handle, shown only once the directory confirmed it's signed by their key.
     var handle: String?
     /// You checked their safety code in person.
     var verified = false
+    /// The collectible they show after their name, checked against the creator key when it arrived.
+    var badge: Collectible?
+    /// Everything they own, each checked against the creator key and their account when it arrived.
+    var collectibles: [Collectible]?
     var signingKey: Data
     var agreementKey: Data
     /// Their devices. The first one is where a new contact starts.
@@ -124,7 +151,7 @@ struct Contact: Codable, Identifiable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case fingerprint, name, nickname, avatar, banner, color, bio, handle, verified, signingKey, agreementKey, devices, receiveKey, relay
+        case fingerprint, name, nickname, avatar, banner, color, bio, links, walletChangedAt, notes, handle, verified, badge, collectibles, signingKey, agreementKey, devices, receiveKey, relay
         case hidden, isSelf, awaitingAcceptance, addedAt, persona, wantsMyPresence, toldPresence
         // Single-device fields from before linked devices.
         case sendID, session, handshake, pending
@@ -142,8 +169,13 @@ struct Contact: Codable, Identifiable {
         banner = try c.decodeIfPresent(Data.self, forKey: .banner)
         color = try c.decodeIfPresent(Int.self, forKey: .color)
         bio = try c.decodeIfPresent(String.self, forKey: .bio)
+        links = try? c.decodeIfPresent([ProfileLink].self, forKey: .links)
+        walletChangedAt = try? c.decodeIfPresent(Date.self, forKey: .walletChangedAt)
+        notes = try? c.decodeIfPresent([ProfileNote].self, forKey: .notes)
         handle = try c.decodeIfPresent(String.self, forKey: .handle)
         verified = try c.decodeIfPresent(Bool.self, forKey: .verified) ?? false
+        badge = try? c.decodeIfPresent(Collectible.self, forKey: .badge)
+        collectibles = try? c.decodeIfPresent([Collectible].self, forKey: .collectibles)
         receiveKey = try c.decodeIfPresent(Data.self, forKey: .receiveKey)
         relay = try c.decodeIfPresent(String.self, forKey: .relay)
         hidden = try c.decodeIfPresent(Bool.self, forKey: .hidden) ?? false
@@ -174,8 +206,13 @@ struct Contact: Codable, Identifiable {
         try c.encodeIfPresent(banner, forKey: .banner)
         try c.encodeIfPresent(color, forKey: .color)
         try c.encodeIfPresent(bio, forKey: .bio)
+        try c.encodeIfPresent(links, forKey: .links)
+        try c.encodeIfPresent(walletChangedAt, forKey: .walletChangedAt)
+        try c.encodeIfPresent(notes, forKey: .notes)
         try c.encodeIfPresent(handle, forKey: .handle)
         try c.encode(verified, forKey: .verified)
+        try c.encodeIfPresent(badge, forKey: .badge)
+        try c.encodeIfPresent(collectibles, forKey: .collectibles)
         try c.encode(signingKey, forKey: .signingKey)
         try c.encode(agreementKey, forKey: .agreementKey)
         try c.encode(devices, forKey: .devices)
@@ -466,6 +503,9 @@ struct Conversation: Codable, Identifiable, Equatable {
     var owner = "me"
     /// Admins besides the owner: fingerprints, and "me" if you're one.
     var admins: [String] = []
+    /// Moderators in a group: fingerprints, and "me" if you're one. They can post when only admins can, and take
+    /// ordinary members out, nothing else.
+    var mods: [String] = []
     var postPolicy: PostPolicy = .everyone
     /// Bumped on every change to details or membership, so stale updates are ignored.
     var version = 0
@@ -491,7 +531,7 @@ struct Conversation: Codable, Identifiable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case id, kind, title, avatar, members, messages, createdAt, pinned, muted, unread, disappearAfter, persona
-        case about, owner, admins, postPolicy, version, isOwner, introsMade, introsMine
+        case about, owner, admins, mods, postPolicy, version, isOwner, introsMade, introsMine
     }
 
     init(from decoder: Decoder) throws {
@@ -510,6 +550,7 @@ struct Conversation: Codable, Identifiable, Equatable {
         persona = try c.decodeIfPresent(UUID.self, forKey: .persona)
         about = try c.decodeIfPresent(String.self, forKey: .about)
         admins = try c.decodeIfPresent([String].self, forKey: .admins) ?? []
+        mods = try c.decodeIfPresent([String].self, forKey: .mods) ?? []
         version = try c.decodeIfPresent(Int.self, forKey: .version) ?? 0
         introsMade = try c.decodeIfPresent([String: [String: Data]].self, forKey: .introsMade) ?? [:]
         introsMine = try c.decodeIfPresent([IntroMailbox].self, forKey: .introsMine) ?? []
@@ -541,6 +582,7 @@ struct Conversation: Codable, Identifiable, Equatable {
         try c.encodeIfPresent(about, forKey: .about)
         try c.encode(owner, forKey: .owner)
         try c.encode(admins, forKey: .admins)
+        if !mods.isEmpty { try c.encode(mods, forKey: .mods) }
         try c.encode(postPolicy, forKey: .postPolicy)
         try c.encode(version, forKey: .version)
         if !introsMade.isEmpty { try c.encode(introsMade, forKey: .introsMade) }
@@ -553,11 +595,22 @@ struct Conversation: Codable, Identifiable, Equatable {
     var amAdmin: Bool { amOwner || admins.contains("me") }
 
     func isAdmin(_ fingerprint: String) -> Bool { owner == fingerprint || admins.contains(fingerprint) }
+    var amMod: Bool { mods.contains("me") }
+
+    /// Whether `actor` may take `target` out. The owner can't be removed; the owner removes anyone else, admins
+    /// remove anyone who isn't an admin, and mods (groups only) remove only ordinary members.
+    func canRemove(_ target: String, by actor: String) -> Bool {
+        guard target != owner, target != actor else { return false }
+        if actor == owner { return true }
+        if admins.contains(actor) { return !isAdmin(target) }
+        if kind == .group, mods.contains(actor) { return !isAdmin(target) && !mods.contains(target) }
+        return false
+    }
 
     func canPost(_ fingerprint: String) -> Bool {
         switch postPolicy {
         case .everyone: true
-        case .admins: isAdmin(fingerprint)
+        case .admins: isAdmin(fingerprint) || mods.contains(fingerprint)
         case .owner: owner == fingerprint
         }
     }
@@ -592,6 +645,8 @@ struct Conversation: Codable, Identifiable, Equatable {
 enum StoryStyle: Codable, Equatable {
     case text(String, palette: Int)
     case image(Data, caption: String)
+    /// A short H.264 clip (MP4 bytes), with its look already baked in.
+    case video(Data, caption: String)
 }
 
 /// Who sees a story you post. Fingerprints of the persona's contacts.
@@ -656,6 +711,27 @@ struct Story: Codable, Identifiable, Equatable {
     var expires: Date { date.addingTimeInterval(lifetime ?? StoryLifetime.day.rawValue) }
     var isLive: Bool { expires > Date() }
     var shownTo: StoryAudience { audience ?? .everyone }
+    /// Whether it can ride along in a device sync, which fits a story only as small as a photo.
+    var isSyncable: Bool {
+        if case .video = style { return false }
+        return true
+    }
+
+    /// A video story is only shown once its whole clip has arrived.
+    var isReady: Bool {
+        if case let .video(clip, _) = style { return !clip.isEmpty }
+        return true
+    }
+}
+
+/// The pieces of a clip that have arrived so far, waiting for the rest.
+struct ClipParts: Codable {
+    var author: String
+    var persona: UUID?
+    var date = Date()
+    var of: Int
+    var parts: [Int: Data] = [:]
+    var isComplete: Bool { parts.count == of }
 }
 
 struct PendingPayload: Codable {
@@ -674,6 +750,16 @@ struct Outgoing: Codable, Identifiable {
     var message: UUID?
     /// A signal that's worthless late (see `Payload.isEphemeral`): dropped if it can't be sent.
     var ephemeral: Bool?
+    /// The story this carries, so its upload can show progress.
+    var story: UUID?
+    /// The connection it's sent on. Each persona sends on its own, as it reads on its own, so the relay can't tell
+    /// from one connection that two personas are the same person. Nil is the main persona's.
+    var lane: String?
+
+    /// The sending lane for a persona (nil is the main one).
+    static func lane(for persona: UUID?) -> String {
+        persona.map { "send|" + $0.uuidString } ?? "send"
+    }
 }
 
 /// How much a notification reveals. macOS keeps notifications outside our encryption, so less is safer.
@@ -700,6 +786,9 @@ struct SecuritySettings: Codable, Equatable {
     var notifications = true
     var notificationContent: NotificationContent = .hidden
     var notificationSound = true
+    /// Let the relay wake this iPhone through Apple when mail arrives, so a locked phone hears about it. Off by
+    /// default: Apple learns that the device was woken and when, and the relay holds its push token.
+    var pushWake = false
     /// Build a preview when you send a link. Off by default: building one visits the website from your own
     /// connection. Received previews never contact the website.
     var linkPreviews = false
@@ -744,6 +833,7 @@ struct SecuritySettings: Codable, Equatable {
         notifications = try c.decodeIfPresent(Bool.self, forKey: .notifications) ?? d.notifications
         notificationContent = (try? c.decodeIfPresent(NotificationContent.self, forKey: .notificationContent)) ?? d.notificationContent
         notificationSound = try c.decodeIfPresent(Bool.self, forKey: .notificationSound) ?? d.notificationSound
+        pushWake = try c.decodeIfPresent(Bool.self, forKey: .pushWake) ?? d.pushWake
         linkPreviews = try c.decodeIfPresent(Bool.self, forKey: .linkPreviews) ?? d.linkPreviews
         menuBarIcon = try c.decodeIfPresent(Bool.self, forKey: .menuBarIcon) ?? d.menuBarIcon
         deliveryReceipts = try c.decodeIfPresent(Bool.self, forKey: .deliveryReceipts) ?? d.deliveryReceipts
@@ -764,6 +854,13 @@ struct Facade: Codable, Equatable {
 }
 
 struct AppData: Codable {
+    /// Which shape this data was saved in. Bumped whenever a field is added, so a build that doesn't know the newest
+    /// fields refuses the data instead of opening it, dropping them and saving it back without. Data from before
+    /// this was written has none, which reads as 0.
+    var format = AppData.currentFormat
+    /// The newest shape this build understands. Raise it, and update `AppDataFormatTests`, with any change to what
+    /// `AppData`, `Profile` or `Contact` save.
+    static let currentFormat = 2
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []
@@ -802,9 +899,10 @@ struct AppData: Codable {
     var profileShared = 0
     /// The audience and lifetime last chosen for a story, by persona ("main" for your main identity).
     var storyChoices: [String: StoryChoice] = [:]
+    /// Video clips still arriving, by story.
+    var clipParts: [UUID: ClipParts] = [:]
     /// Announcements already shown, so one deleted here doesn't come back.
     var announcementsSeen: [String] = []
-
     init() {}
 
     /// The relay new identities use. A build can set `PulshadeRelay` in its Info.plist (the iPhone
@@ -832,6 +930,12 @@ struct AppData: Codable {
     /// Tolerates fields added after a vault was written.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Saved by a newer build: leave it exactly as it is rather than lose what this one can't read.
+        let written = try c.decodeIfPresent(Int.self, forKey: .format) ?? 0
+        guard written <= Self.currentFormat else {
+            throw DecodingError.dataCorruptedError(forKey: .format, in: c, debugDescription: "Saved by a newer version of PULSHADE")
+        }
+        format = Self.currentFormat
         profile = try c.decodeIfPresent(Profile.self, forKey: .profile) ?? Profile()
         contacts = try c.decodeIfPresent([Contact].self, forKey: .contacts) ?? []
         invites = try c.decodeIfPresent([OpenInvite].self, forKey: .invites) ?? []
@@ -856,12 +960,38 @@ struct AppData: Codable {
         handlesTidied = (try? c.decodeIfPresent(Bool.self, forKey: .handlesTidied)) ?? false
         profileShared = (try? c.decodeIfPresent(Int.self, forKey: .profileShared)) ?? 0
         storyChoices = (try? c.decodeIfPresent([String: StoryChoice].self, forKey: .storyChoices)) ?? [:]
+        clipParts = (try? c.decodeIfPresent([UUID: ClipParts].self, forKey: .clipParts)) ?? [:]
         announcementsSeen = (try? c.decodeIfPresent([String].self, forKey: .announcementsSeen)) ?? []
     }
 }
 
 extension Announcement {
-    /// Signed by the operator's key this build carries.
+    /// Signed by the Pulshade Admin key this build carries.
     @MainActor var isGenuine: Bool { isGenuine(adminKey: AppModel.adminKey) }
 }
 
+extension Collectible {
+    /// Letters and digits nobody misreads: no I, L, O or U.
+    private static let codeAlphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+
+    /// A fresh backup code: 80 random bits, as XXXX-XXXX-XXXX-XXXX.
+    static func newBackupCode() -> String {
+        let chars = (0..<16).map { _ in codeAlphabet[Int.random(in: 0..<codeAlphabet.count)] }
+        return stride(from: 0, to: 16, by: 4).map { String(chars[$0..<$0 + 4]) }.joined(separator: "-")
+    }
+
+    /// A code as typed: capitals, no spaces or dashes, and O, I and L read as the digits they look like. The relay
+    /// does the same.
+    static func normalisedCode(_ code: String) -> String {
+        String(code.uppercased().filter { $0.isASCII && ($0.isLetter || $0.isNumber) }.map { c -> Character in
+            switch c { case "O": "0"; case "I", "L": "1"; default: c }
+        })
+    }
+
+    static func codeHash(_ code: String) -> Data { Data(SHA256.hash(data: Data(normalisedCode(code).utf8))) }
+
+    /// Signed by the Pulshade Admin key this build carries, for the account with `owner`'s key.
+    @MainActor func isGenuine(for owner: Data) -> Bool {
+        isGenuine(for: owner, adminKey: AppModel.adminKey, petKey: AppModel.petKey)
+    }
+}

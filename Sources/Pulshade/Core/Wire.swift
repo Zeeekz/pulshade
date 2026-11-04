@@ -62,6 +62,8 @@ struct GroupInfo: Codable, Equatable {
     var owner: Data?
     /// Signing keys of the admins besides the owner.
     var admins: [Data]?
+    /// Signing keys of the moderators. Absent from apps that don't know the role.
+    var mods: [Data]?
     var postPolicy: PostPolicy?
     var version: Int?
     /// The recipient's own introduction mailboxes, by device id (hex). Only the recipient gets these keys; the
@@ -85,7 +87,10 @@ enum Payload: Codable, Equatable {
     case ratchet(RatchetMessage)
 
     /// `handle` is only a claim: the receiver checks it against the directory before showing it.
-    case profile(name: String, avatar: Data?, color: Int?, banner: Data? = nil, bio: String? = nil, handle: String? = nil)
+    /// `badge` too: the receiver checks it against the creator key.
+    case profile(name: String, avatar: Data?, color: Int?, banner: Data? = nil, bio: String? = nil, handle: String? = nil,
+                 badge: Collectible? = nil, links: [ProfileLink]? = nil, collectibles: [Collectible]? = nil,
+                 notes: [ProfileNote]? = nil)
     case message(WireMessage)
     /// The messages reached the device (`read` nil or false), or were seen in the open chat. Older apps ignore
     /// `read`, so a read receipt still counts as delivered there.
@@ -97,6 +102,9 @@ enum Payload: Codable, Equatable {
     case storyRemoved(id: UUID)
     /// The sender viewed this story of yours.
     case storyViewed(id: UUID)
+    /// One piece of a video story's clip (the story itself, sent first, has an empty clip). Pieces are small enough
+    /// for one relay message each, and the receiver puts them together once all `of` have arrived.
+    case storyPart(id: UUID, index: Int, of: Int, bytes: Data)
     /// Delete for everyone: the sender takes their own messages back.
     case unsend(ids: [UUID])
     /// Nil emoji clears your reaction.
@@ -147,6 +155,15 @@ enum Payload: Codable, Equatable {
         }
     }
 
+    /// The story this carries, so its upload can be followed.
+    var storyID: UUID? {
+        switch self {
+        case let .story(id, _, _, _): id
+        case let .storyPart(id, _, _, _): id
+        default: nil
+        }
+    }
+
     /// Setup messages are sealed to the identity key directly; the rest need a session.
     var isSetup: Bool {
         switch self {
@@ -169,6 +186,12 @@ struct DirectoryProfile: Codable, Equatable {
     /// The public request mailbox.
     var sendID: Data
     var relay: String?
+    /// Links and wallets this profile shows as icons. Checked again by whoever reads them.
+    var links: [ProfileLink]? = nil
+    /// Text notes this profile shows, public or locked with a password. Checked again by whoever reads them.
+    var notes: [ProfileNote]? = nil
+    /// Shown after the name once it checks out against the creator key and this profile's key.
+    var badge: Collectible? = nil
 
     var fingerprint: String { Identity.fingerprint(of: signingKey) }
 
@@ -256,6 +279,7 @@ struct ConversationCard: Codable, Equatable {
     var disappearAfter: TimeInterval?
     var pinned: Bool? = nil
     var muted: Bool? = nil
+    var mods: [String]? = nil
 }
 
 /// What one of your devices tells the others when you act on it.

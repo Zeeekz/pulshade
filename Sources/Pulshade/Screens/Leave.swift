@@ -141,6 +141,11 @@ struct BurnSheet: View {
                     .font(.system(size: 14, weight: .medium)).foregroundStyle(Ink.text)
                     .fixedSize(horizontal: false, vertical: true)
                 BurnPoints()
+                if !(model.activeProfile.collectibles ?? []).isEmpty {
+                    Label("Your collectibles can come back in a new account with your backup code. Write it down from Collectibles before you burn.", systemImage: "key.horizontal")
+                        .font(.system(size: 13)).foregroundStyle(Ink.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 BurnConfirmField(confirm: $confirm)
                 if let problem {
                     Text(branded: problem).font(.system(size: 13, weight: .medium)).foregroundStyle(.orange)
@@ -174,6 +179,7 @@ struct PersonaBurnSheet: View {
     @State private var problem: String?
 
     private var name: String { model.activeProfile.displayName }
+    private var hasCollectibles: Bool { !(model.activeProfile.collectibles ?? []).isEmpty }
 
     var body: some View {
         SheetBody(width: 460) {
@@ -187,6 +193,9 @@ struct PersonaBurnSheet: View {
                     BurnPoint(symbol: "person.crop.circle.badge.xmark", text: "Its contacts forget it, along with its messages, stories and requests.")
                     BurnPoint(symbol: "at", text: "Its @handles can't be claimed for 3 months, and the relay forgets they were its.")
                     BurnPoint(symbol: "laptopcomputer.and.iphone", text: "It's removed from every device on your account.")
+                    if hasCollectibles {
+                        BurnPoint(symbol: "key.horizontal", text: "Its collectibles can come back in another persona or account with its backup code. Write it down from Collectibles first.")
+                    }
                 }
                 BurnConfirmField(confirm: $confirm)
                 if let problem {

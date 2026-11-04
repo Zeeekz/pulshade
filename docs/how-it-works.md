@@ -42,7 +42,7 @@ file. Screenshots and screen recordings of the Mac window come out blank unless 
 has no way to block screenshots, Pulshade draws itself in the layer iOS keeps out of them (the one behind password
 fields), so they come out blank too, and it covers itself while the screen is recorded, mirrored or shared. The message box
 has autocorrect off, so the keyboard doesn't learn what you type. Copies stay on the device they were made on (no
-Universal Clipboard), and the recovery code is never offered for copying. Notifications say only "New message"
+Universal Clipboard), and the recovery code is never offered for copying. Saving a picture from a chat adds it to Photos, which the app can only add to, never read. Notifications say only "New message"
 unless you choose otherwise, because the system stores notification text in its own database, outside Pulshade's
 encryption, and may keep it after Pulshade clears them, which it does whenever it locks.
 
@@ -97,7 +97,7 @@ the server over its own circuit, from its own exit. A burner is a persona with a
 Burn now), its keys, contacts and chats are destroyed and the other side is told to forget it. Any persona can be burned
 the same way from its profile in Settings: its @handles are retired as in Burn, its chats are deleted for both sides,
 its contacts forget it, and it's removed from every device on the account. The main identity and other personas are
-untouched.
+untouched, and its collectibles stay claimable with its backup code.
 
 **Announcements.** The operator writes them in Pulshade Admin and every account gets them in a read-only chat from
 @announcements. Each is signed by the admin key over its id, date and text, and every app checks that signature before
@@ -105,6 +105,34 @@ showing it, so the relay can't write one or change a word. The relay keeps the l
 anyone who asks, about once a minute, with no account attached, so fetching them says nothing about who you
 are. The @announcements handle is reserved, so no account can pass itself off as it. One taken back disappears from the
 apps the next time they check.
+
+**Collectibles.** Numbered items (a Party Hat under falling confetti, a candle-lit Halloween Pumpkin, a Top Hat that keeps changing colour, a can of Pulse Pop that pops itself open, a Bonfire Night bonfire under fireworks a Christmas Tree with twinkling lights and snow, and Pulze The Dragon, a dark blue pet crackling with electricity, so far, all drawn in code in the same animated style; Pulze is a real 3D model built in code that you can open, turn all the way round, zoom and tap to make it zap, and pets are kept in their own group in the Collectibles tab) that the operator gives to an account
+from Pulshade Admin, a separate Mac app. Each is signed by the admin key, which never leaves that Mac, over the item,
+its number and the owner's key. Pulshade carries the admin key's public half, so no app can make its own and nobody can
+show one given to someone else: every app checks the signature before showing it. The relay keeps them for their owner
+to fetch with a fresh signature, sealed like the directory. One taken back stops showing the next time its owner's app
+checks. You choose one to show after your name, to your contacts and on your public profile.
+
+One **backup code** covers all of an account's collectibles. The app makes it with the first collectible and adds each
+later one to it (an alert says so, and Collectibles shows the code any time). It stays on your own devices; the relay
+keeps only its hash, beside each collectible it covers. When an account burns, the relay forgets whose its
+collectibles were and keeps only the coded ones' hashes and numbers. Entering the code in another account (signed by
+that account's key, limited to a few tries an hour) claims them all for it, and Pulshade Admin signs each over by
+itself, same item and number; they then join that account's own code. A code works once, and making a new one stops
+the old one working. Burned collectibles keep their numbers, so a number is never given out twice.
+
+**Giveaways.** Pulshade Admin can open a giveaway: a collectible, a code, a window of time and a number to give. The
+relay keeps only a hash of the code (typed any way: case, spaces and dashes don't matter), the window and the claims in
+the order they came. Entering the code in the Collectibles tab sends a proof signed by the account's key, so it can only
+be claimed for that account; each account gets one place, and a banned one can't enter. The admin app signs a collectible
+for each claim in order, one number at a time, as for any other, and the app checks it like the rest. A burned account's
+place stays used but names nobody. A **Guardian** can't be moved with a backup code (the relay refuses to code it, and a
+code claim skips it): it's earned by the account that wears it. The first ten numbers of any collectible, the first
+twenty-five and the last of a hundred are marked as rare in the app, from the number alone.
+
+There are 100 of each collectible unless the operator changes it, #1 to #100; the relay refuses one past the limit. Pulshade Admin's "Amount in rotation" sets how many of each there can be, from 1 to 10,000, up or down but never below how many are already given out, and nobody's number changes; the relay tells the app the size of the run so the last number is marked "Last one". Pulshade Admin can also reset them
+all: every collectible is taken back from everyone, backup codes stop working, and each item's numbering starts again
+at #1. Apps drop them, and take the one shown after your name off, the next time they check.
 
 **One-time chats.** New chat → one-time chat makes a throwaway identity for both sides that ends after the time you
 pick, and works for the first person in. Share it as a QR code, a link, or a 12-digit code to read out or type, so
@@ -149,7 +177,9 @@ them.
 contacts are kept as hidden peers, used only inside that group. Each has an owner, optional admins and a posting
 rule (everyone, admins, or owner only). Changes carry a version number and only count when they come from an admin.
 Admins add people from their contacts and remove members; only the owner appoints admins, changes the posting rule
-or deletes it for everyone; anyone else who deletes it leaves. Channel followers only learn who can post, not who
+or deletes it for everyone; anyone else who deletes it leaves. In a group the owner can also make someone a mod: a
+Mod tag, posting when only admins can, and taking ordinary members out (never admins, the owner or other mods),
+nothing else. Everyone else only accepts a mod's update if it removes members and changes nothing besides. Channel followers only learn who can post, not who
 else follows. A broadcast is the same message sent privately to each person.
 
 Members who don't know each other first meet through introduction mailboxes. Whoever sends out the group's details
@@ -248,7 +278,8 @@ kept in memory only.
   messages to avoid that; Pulshade doesn't yet. A chat with someone on an older version never refreshes.
 - **Signatures are gone from messages, not from the directory.** Public profiles, handle claims and admin actions are
   signed, because they're meant to be checked by anyone.
-- **Disappearing messages trust the other device.** A modified app could ignore the timer, and anyone can photograph
+- **Disappearing messages and deleted stories trust the other device.** A modified app could ignore the timer or the
+  removal, and anyone can photograph
   a screen. That's true of every messenger.
 - **The Keychain is on the same disk.** An old `identity.lock` left in the SSD's spare blocks no longer opens once its
   Keychain key has been replaced. But the Keychain's own database is stored on that disk too, so someone who
@@ -267,7 +298,8 @@ kept in memory only.
 - **One operator.** The official app only uses Pulshade's servers, which can see when and how much traffic flows
   (never what it says, or who you are behind Tor). A modified app could still point at them; that's held back by rate
   limits and the terms of use, not by anything the code can prove.
-- **iPhone:** messages arrive while the app is open, since waking it needs Apple's push service. Blank screenshots
+- **iPhone:** messages arrive while the app is open, unless **Wake when locked** is on, since waking a closed app needs
+  Apple's push service (see [wake-up pushes](push-notifications.md)). Blank screenshots
   rely on iOS behaviour Apple doesn't document; if an update changes it, screenshots would show the app again.
 - **Groups cap out at 300 members.** Every message goes out as one envelope per member, so that's the most an owner can
   add: fine for friends and communities, not for 10,000-person channels.

@@ -27,3 +27,6 @@ website/
 relay/server-host
 relay/release.pub
 relay/admin-key.pub
+relay/pet.key
+relay/pet-key.pub
+ios/name-check.txt
