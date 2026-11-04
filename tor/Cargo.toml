@@ -1,0 +1,29 @@
+[package]
+name = "pulshade-tor"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Built into the Mac and iPhone apps by scripts/build-tor.sh.
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+arti-client = { version = "0.47", default-features = false, features = [
+    "tokio", "native-tls", "compression", "onion-service-client", "static-sqlite", "pt-client",
+] }
+tor-rtcompat = { version = "0.47", default-features = false, features = ["tokio", "native-tls"] }
+tor-proto = { version = "0.47", default-features = false, features = ["stream-ctrl"] }
+tor-linkspec = "0.47"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
+
+# sysinfo 0.38.4 (pulled in by Arti) doesn't build for iOS; this copy has the one-function fix.
+[patch.crates-io]
+sysinfo = { path = "vendor/sysinfo" }

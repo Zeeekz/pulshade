@@ -1,0 +1,97 @@
+# Pulshade
+
+Anonymous, end-to-end encrypted messaging for Mac and iPhone. No phone number, no email, no username.
+
+Built by Zeekz.
+
+> **Pulshade hasn't had an independent security audit yet.** Its encryption is our own code following published
+> designs. Until it's been audited, please don't rely on it where your safety depends on it.
+
+## What it does
+
+- **Nothing to sign up with.** Your account is a set of keys made on your device. A recovery code is the only way
+  back in.
+- **Tor, built in.** From the first launch, before there's even an account, everything goes through Tor to
+  Pulshade's onion server, so the server never learns your IP address. Nothing to install.
+- **End-to-end encrypted, with post-quantum protection.** Every chat uses a Double Ratchet (the design Signal uses),
+  started with a handshake that mixes X25519 and ML-KEM-768 and refreshed with new post-quantum keys as you chat.
+  Nothing you say is signed, so a message can't be proven to anyone else.
+- **Personas and burners.** Separate identities that can't be tied together, and throwaway ones that destroy
+  themselves on a timer.
+- **One-time chats.** A chat for a single conversation, shared by QR code, link or a 12-digit code you read out.
+- **Decoy and panic passcodes.** One opens a harmless empty account; the other quietly destroys the real one.
+- **Lock, Detach and Burn.** Lock the app; detach the account from a device, keeping everything but your chats; or
+  burn it everywhere, as if it never existed.
+- **The rest of a messenger.** Groups, channels, broadcasts, voice notes, calls, reactions, replies, disappearing
+  messages, linked devices, and in-person verification (Pulse check). Stories you choose the audience and length of,
+  can edit after posting, and see who viewed, with the views encrypted like messages.
+
+## What the server sees
+
+Pulshade runs its own servers, and the official app talks only to them, through Tor. (The exceptions are ones you
+choose: a link preview fetches that site, and turning on Snowflake bridges contacts Tor's bridge infrastructure.)
+The servers are built to know as little as possible:
+
+- **Not what you say.** Messages, calls, profiles and backups are encrypted on your device, and the server only
+  passes on sealed envelopes, padded to a few set sizes. (A public @handle is the exception, by choice: its name and
+  picture are there for anyone to look up.)
+- **Not who you are.** There are no accounts on the server, only mailboxes named by random numbers, and envelopes
+  don't carry their sender.
+- **Not where you are.** Over Tor the server sees a made-up address for each connection, never your IP address.
+  Each persona and inbox uses its own Tor circuit, so they can't be linked by address.
+- **Nothing for long.** Envelopes live in memory only and are deleted once collected, or after 7 days. Nothing is
+  logged. A detached account's sealed backup waits at most 180 days for its recovery code.
+
+The full design, from the key derivations to the decoy passcode's disk layout, is in
+[How Pulshade works](docs/how-it-works.md).
+
+## Known limits
+
+An honest list. More detail is in [How Pulshade works](docs/how-it-works.md).
+
+- **Not yet audited** (see above).
+- **Tor hides addresses, not timing.** Someone watching both ends of the network could still line up when things
+  happen. Unless you turn on bridges (Settings → Network), your network can see you use Tor, though not that it's
+  Pulshade.
+- **Turning Tor off is a real step down.** It's allowed, for speed, and the app explains first: the server then sees
+  your IP address, and your personas can be tied together by it.
+- **Disappearing messages trust the other device.** A modified app could keep them, and anyone can photograph a
+  screen.
+- **One operator.** Everything goes through Pulshade's servers, which can see when and how much traffic flows, but
+  never what it says, or who you are behind Tor.
+- **Post-quantum keys refresh every 50 messages or a day**, not on every reply, and a refresh makes that message
+  larger.
+- **Old files on an SSD.** Pulshade replaces its keys every time it locks, but the operating system, not the app,
+  decides when old disk blocks are truly erased.
+- **iPhone:** messages arrive while the app is open (waking it needs Apple's push service). Screenshots come out
+  blank through iOS behaviour Apple doesn't document, so an update could undo that.
+- **Outside the app,** your IP address still reaches wherever you downloaded it, and Apple when a Mac first checks
+  the app.
+
+## Requirements
+
+macOS 26 or later, or iOS 26 or later.
+
+## Open source
+
+The code is open so anyone can read it and check what the app and the server do. Pulshade is made for people to
+use, not to build themselves: get the app from the App Store.
+
+The apps are in `Sources/Pulshade` (the Mac and iPhone share all their code), the server in `relay/`, and the Tor
+bridge in `tor/`. A build or fork someone runs for themselves must use its own servers, as the official app only ever
+talks to Pulshade's.
+
+## Security
+
+Found a vulnerability? Please report it privately, not in a public issue: see [SECURITY.md](SECURITY.md).
+
+## License
+
+Pulshade (the apps, the relay and the Tor bridge) is open source under the [MIT License](LICENSE). You can use,
+study, change and share it, as long as you keep the copyright and license notice.
+Bundled third-party code keeps its own license (`tor/vendor/sysinfo` is MIT).
+
+The license covers the code, not the name: a build or fork you run yourself must use its own servers and a name of
+its own, not "Pulshade".
+
+Copyright © 2026 Zeekz.

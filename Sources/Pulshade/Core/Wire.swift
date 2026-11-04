@@ -1,0 +1,297 @@
+import Foundation
+#if canImport(PulshadeShared)
+import PulshadeShared
+#endif
+
+/// One device: its id and the mailbox it reads.
+struct DeviceCard: Codable, Equatable {
+    var id: Data
+    var sendID: Data
+    /// What the device calls itself, for your own linked devices.
+    var name: String?
+}
+
+/// How to reach someone: their public keys and the send id of a mailbox they read.
+struct PeerCard: Codable, Equatable {
+    var name: String
+    var avatar: Data?
+    var color: Int?
+    var signingKey: Data
+    var agreementKey: Data
+    var sendID: Data
+    /// The relay `sendID` lives on, when it says one (only ever Pulshade's own in the official app).
+    var relay: String?
+    /// The device `sendID` belongs to.
+    var device: Data?
+    /// All their devices, when known (in group rosters).
+    var devices: [DeviceCard]?
+
+    /// Every device this card describes.
+    var allDevices: [DeviceCard] {
+        if let devices, !devices.isEmpty { return devices }
+        return [DeviceCard(id: device ?? Data(), sendID: sendID)]
+    }
+}
+
+struct WireMessage: Codable, Equatable {
+    var id: UUID
+    /// Nil for one-to-one chats; the shared id for groups and channels.
+    var conversation: UUID?
+    var kind: ConversationKind
+    var text: String
+    var image: Data?
+    var voice: VoiceNote?
+    var date: Date
+    /// Seconds until it disappears, if the chat has a timer.
+    var expiresIn: TimeInterval?
+    /// The quoted message; `author` is a fingerprint, never "me".
+    var reply: ReplyRef?
+    var preview: LinkPreview?
+}
+
+struct GroupInfo: Codable, Equatable {
+    var id: UUID
+    var kind: ConversationKind
+    var title: String
+    var avatar: Data?
+    /// The people the recipient should know about, minus the sender and the recipient. In a channel,
+    /// followers only get the admins; admins get everyone.
+    var roster: [PeerCard]
+    var about: String?
+    /// Signing key of the owner.
+    var owner: Data?
+    /// Signing keys of the admins besides the owner.
+    var admins: [Data]?
+    var postPolicy: PostPolicy?
+    var version: Int?
+    /// The recipient's own introduction mailboxes, by device id (hex). Only the recipient gets these keys; the
+    /// other members only get where to write.
+    var intros: [String: Data]?
+}
+
+/// Everything that can travel inside an envelope.
+///
+/// Only the session setup cases travel bare. Everything people actually say goes inside
+/// `.ratchet`, so it gets a fresh key per message.
+enum Payload: Codable, Equatable {
+    /// First message on a new invite: "this is me, write back here, and here's a handshake".
+    case hello(PeerCard, SessionInit)
+    /// A friend request to a public profile: like hello, with a note, and nothing happens until accepted.
+    case request(PeerCard, SessionInit, note: String)
+    case sessionInit(SessionInit)
+    /// A device introducing itself and opening a session: "I'm this device of the account you know; reach me here".
+    case deviceHello(DeviceCard, SessionInit)
+    case sessionAccept(SessionAccept)
+    case ratchet(RatchetMessage)
+
+    /// `handle` is only a claim: the receiver checks it against the directory before showing it.
+    case profile(name: String, avatar: Data?, color: Int?, banner: Data? = nil, bio: String? = nil, handle: String? = nil)
+    case message(WireMessage)
+    /// The messages reached the device (`read` nil or false), or were seen in the open chat. Older apps ignore
+    /// `read`, so a read receipt still counts as delivered there.
+    case receipt(ids: [UUID], read: Bool? = nil)
+    case group(GroupInfo)
+    /// A story, or a new version of one already sent (same id, edited text or lifetime). `lasts` is in seconds;
+    /// older apps leave it out, meaning a day.
+    case story(id: UUID, style: StoryStyle, date: Date, lasts: TimeInterval? = nil)
+    case storyRemoved(id: UUID)
+    /// The sender viewed this story of yours.
+    case storyViewed(id: UUID)
+    /// Delete for everyone: the sender takes their own messages back.
+    case unsend(ids: [UUID])
+    /// Nil emoji clears your reaction.
+    case reaction(message: UUID, emoji: String?)
+    /// "I'm typing" in a direct chat (nil) or a group. Never stored.
+    case typing(conversation: UUID?)
+    /// "I'm here" about once a minute while the sender has Pulshade open, and "I've gone" when they leave. Never stored.
+    case presence(online: Bool)
+    /// "Send me your online status" (true) or "don't" (false). Presence only goes to contacts who asked for it,
+    /// so an app that doesn't know it is never sent it.
+    case wantsPresence(Bool)
+    /// Turns the disappearing timer on (seconds) or off (nil) for a direct chat (nil) or group.
+    case disappearing(conversation: UUID?, seconds: TimeInterval?)
+    /// Forget the sender and your chat with them: their burner self-destructed, or they removed you as a contact.
+    case burn
+    /// "Request accepted: from now on, write to this mailbox instead of my public one."
+    case accepted(sendID: Data)
+    /// "You reached this device of mine through a group introduction: write to it here from now on."
+    case moved(DeviceCard)
+    /// Between your own devices only: keep each other up to date.
+    case sync(SyncEvent)
+    /// The sender deleted this chat (nil for your direct chat with them). For groups and channels
+    /// it only counts from the owner.
+    case chatDeleted(conversation: UUID?)
+    /// The sender left a group or channel.
+    case left(conversation: UUID)
+    /// An admin removed you from a group or channel.
+    case removed(conversation: UUID)
+    /// The sender logged out of the device this came from: stop sending to it.
+    case deviceRemoved
+    /// The sender erased their account: forget them completely, with everything they ever sent.
+    case erased
+    /// An abuse report, sent only to the operator's report mailbox.
+    case report(ReportCard)
+    /// Ringing: where to meet on the relay and the key for the audio.
+    case callOffer(CallInvite)
+    /// Picked up, or declined (or busy).
+    case callAnswer(id: UUID, accepted: Bool)
+    /// Hung up, or stopped ringing.
+    case callEnd(id: UUID)
+
+    /// Signals that are worthless late: only the newest one waiting for a mailbox is kept, and one that fails
+    /// to send is dropped, not retried.
+    var isEphemeral: Bool {
+        switch self {
+        case .typing, .presence: true
+        default: false
+        }
+    }
+
+    /// Setup messages are sealed to the identity key directly; the rest need a session.
+    var isSetup: Bool {
+        switch self {
+        case .hello, .request, .sessionInit, .deviceHello, .sessionAccept, .ratchet: true
+        default: false
+        }
+    }
+}
+
+/// What a public profile says. Signed by the identity's Ed25519 key and stored, opaque, by the relay.
+struct DirectoryProfile: Codable, Equatable {
+    var handle: String
+    var name: String
+    var bio: String
+    var avatar: Data?
+    var banner: Data? = nil
+    var color: Int?
+    var signingKey: Data
+    var agreementKey: Data
+    /// The public request mailbox.
+    var sendID: Data
+    var relay: String?
+
+    var fingerprint: String { Identity.fingerprint(of: signingKey) }
+
+    /// Short handles and brand names can only be claimed by the creator's key, which the relay enforces.
+    static let reservedNames: Set<String> = ["zeekz", "pulshade", "official", "admin", "support", "help", "team", "security",
+                                             "abuse", "report", "safety", "moderation"]
+    /// Handles that mean "I want to report someone": searching one opens the report form.
+    static let reportHandles: Set<String> = ["abuse", "report", "safety", "moderation"]
+    static func isReserved(_ handle: String) -> Bool { handle.count < 3 || reservedNames.contains(handle) }
+    var isCreator: Bool { Self.isReserved(handle) }
+
+    var card: PeerCard {
+        PeerCard(name: name, avatar: avatar, color: color, signingKey: signingKey, agreementKey: agreementKey,
+                 sendID: sendID, relay: relay)
+    }
+
+    /// The link that opens this handle's profile in Pulshade, for a website's button: `pulshade://u/<handle>`.
+    /// With the owner's key it ends `?k=<key check>`, so the link only ever opens that account's profile.
+    static func link(_ handle: String, key: Data? = nil) -> String {
+        "pulshade://u/" + handle + (key.map { "?k=" + keyCheck(of: $0) } ?? "")
+    }
+
+    /// The start of the key's fingerprint: too long to find another key that shares it.
+    static func keyCheck(of key: Data) -> String { String(Identity.fingerprint(of: key).prefix(16)) }
+
+    /// Whether this profile is the account a link's key check names.
+    func matches(keyCheck: String) -> Bool { Self.keyCheck(of: signingKey) == keyCheck }
+
+    /// The handle in a profile link and its key check, if it has one, or nil if it isn't a profile link.
+    static func handle(fromLink url: URL) -> (handle: String, keyCheck: String?)? {
+        guard url.scheme?.lowercased() == "pulshade", url.host()?.lowercased() == "u", url.pathComponents.count == 2,
+              let handle = validHandle(url.lastPathComponent) else { return nil }
+        let check = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "k" }?.value?.lowercased()
+        return (handle, check)
+    }
+
+    static func validHandle(_ raw: String) -> String? {
+        let handle = raw.trimmingCharacters(in: .whitespaces).lowercased().replacingOccurrences(of: "@", with: "")
+        guard (1...24).contains(handle.count), handle.allSatisfy({ $0.isLetter && $0.isASCII || $0.isNumber && $0.isASCII || $0 == "_" })
+        else { return nil }
+        return handle
+    }
+}
+
+// MARK: - Keeping your own devices in sync
+
+/// Which conversation something happened in: a shared group or channel id, or the direct chat with someone.
+struct ConvoRef: Codable, Equatable {
+    var shared: UUID?
+    var peer: String?
+    var persona: UUID?
+}
+
+/// Everything one of your devices knows about a contact, minus its own mailboxes and sessions.
+struct ContactCard: Codable, Equatable {
+    var fingerprint: String
+    var name: String
+    var nickname: String
+    var avatar: Data?
+    var banner: Data? = nil
+    var color: Int?
+    var verified: Bool
+    var signingKey: Data
+    var agreementKey: Data
+    var devices: [DeviceCard]
+    var relay: String?
+    var hidden: Bool
+    var awaitingAcceptance: Bool
+    var persona: UUID?
+}
+
+/// A group, channel or list as your other devices should know it (without its messages).
+struct ConversationCard: Codable, Equatable {
+    var id: UUID
+    var kind: ConversationKind
+    var title: String
+    var avatar: Data?
+    var about: String?
+    var owner: String
+    var admins: [String]
+    var postPolicy: PostPolicy
+    var version: Int
+    var members: [String]
+    var persona: UUID?
+    var disappearAfter: TimeInterval?
+    var pinned: Bool? = nil
+    var muted: Bool? = nil
+}
+
+/// What one of your devices tells the others when you act on it.
+enum SyncEvent: Codable, Equatable {
+    /// The first message on a new session between two of your devices.
+    case hello
+    case sent(ConvoRef, WireMessage)
+    case reaction(message: UUID, emoji: String?)
+    case unsend(ids: [UUID])
+    case deleted(ConvoRef)
+    case disappearing(ConvoRef, seconds: TimeInterval?)
+    case contact(ContactCard)
+    case conversation(ConversationCard)
+    case profile(persona: UUID?, Profile)
+    case persona(Persona)
+    case personaDeleted(UUID)
+    case story(Story)
+    case storyRemoved(UUID)
+    /// A contact was removed on another device: forget them here too.
+    case contactRemoved(fingerprint: String, persona: UUID?)
+    case blocked(String)
+    case read(ConvoRef)
+    /// The mailbox behind a persona's public @handle, shared so every device receives requests. Nil when unlisted.
+    case publicInvite(persona: UUID?, receiveKey: Data?, relay: String?)
+    /// A friend request one device received, so the others show it too.
+    case requestReceived(FriendRequest)
+    /// A request was accepted, declined or blocked on another device.
+    case requestResolved(fingerprint: String, persona: UUID?)
+    /// One of your devices logged out.
+    case deviceLoggedOut(Data)
+    /// The account was burned: wipe this device too, leaving no trace.
+    case accountErased
+    /// The account was detached from every device: say goodbye to contacts, then wipe this device.
+    case accountDetached
+    /// Past messages from one chat, sent to a newly linked device in pieces.
+    case history(conversation: UUID, messages: [Message])
+    /// A call was answered or declined on one of your devices: the others stop ringing.
+    case callHandled(UUID)
+}

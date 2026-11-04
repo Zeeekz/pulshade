@@ -1,0 +1,378 @@
+import SwiftUI
+import CryptoKit
+
+/// Slowly drifting glow orbs behind every screen.
+struct Backdrop: View {
+    @Environment(\.theme) private var theme
+    var intensity: Double = 1
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1 / 30)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            Canvas { ctx, size in
+                ctx.fill(Path(CGRect(origin: .zero, size: size)), with: .color(Ink.void))
+                let orbs: [(Double, Double, Double, Int)] = [
+                    (0.13, 0.0, 0.62, 0), (0.09, 2.1, 0.5, 1), (0.11, 4.2, 0.55, 2), (0.07, 1.3, 0.4, 0),
+                ]
+                ctx.addFilter(.blur(radius: min(size.width, size.height) * 0.12))
+                for (speed, phase, scale, color) in orbs {
+                    let x = size.width * (0.5 + 0.38 * cos(t * speed + phase))
+                    let y = size.height * (0.5 + 0.34 * sin(t * speed * 1.3 + phase * 0.7))
+                    let r = max(size.width, size.height) * scale * 0.5
+                    ctx.opacity = 0.2 * intensity
+                    ctx.fill(Path(ellipseIn: CGRect(x: x - r, y: y - r, width: r * 2, height: r * 2)),
+                             with: .color(theme.colors[color % theme.colors.count]))
+                }
+            }
+        }
+        .overlay(Grain().opacity(0.025))
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+    }
+}
+
+/// The signed-out screens' background: near-black with one soft light falling from above in the theme's
+/// colour, a faint dot grid that fades out toward the edges, and a slow breath so it never feels static.
+struct Aurora: View {
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1 / 20)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            let breath = 0.5 + 0.5 * sin(t * 0.35)
+            GeometryReader { geo in
+                let size = geo.size
+                let reach = max(size.width, size.height)
+                ZStack {
+                    Ink.void
+                    // The main light, falling from just above the top edge and fading out with no edge of its own.
+                    Rectangle()
+                        .fill(EllipticalGradient(colors: [theme.accent.opacity(0.20 + 0.05 * breath),
+                                                          theme.accent.opacity(0.06), .clear],
+                                                 center: UnitPoint(x: 0.5, y: -0.08),
+                                                 startRadiusFraction: 0, endRadiusFraction: 0.85))
+                    // A cooler second tone low on the opposite side, barely there.
+                    Circle()
+                        .fill(RadialGradient(colors: [theme.colors[theme.colors.count - 1].opacity(0.07), .clear],
+                                             center: .center, startRadius: 0, endRadius: reach * 0.45))
+                        .frame(width: reach * 0.9, height: reach * 0.9)
+                        .position(x: size.width * 0.85, y: size.height * 1.02)
+                    DotGrid(spacing: 22)
+                        .mask(RadialGradient(colors: [.white, .white.opacity(0.35), .clear],
+                                             center: UnitPoint(x: 0.5, y: 0.22), startRadius: 0, endRadius: reach * 0.62))
+                        .opacity(0.9)
+                    // A hairline of light where the glow meets the dark.
+                    LinearGradient(colors: [.clear, theme.accent.opacity(0.35), .clear], startPoint: .leading, endPoint: .trailing)
+                        .frame(height: 1)
+                        .frame(width: size.width * 0.7)
+                        .blur(radius: 0.5)
+                        .position(x: size.width * 0.5, y: 0.5)
+                }
+            }
+        }
+        .background(Ink.void)
+        .overlay(Grain().opacity(0.02))
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+    }
+}
+
+/// A grid of very faint dots, like graph paper in the dark.
+struct DotGrid: View {
+    var spacing: CGFloat
+
+    var body: some View {
+        Canvas { ctx, size in
+            let dot: CGFloat = 1.2
+            var y = spacing / 2
+            while y < size.height {
+                var x = spacing / 2
+                while x < size.width {
+                    ctx.fill(Path(ellipseIn: CGRect(x: x - dot / 2, y: y - dot / 2, width: dot, height: dot)),
+                             with: .color(Ink.text.opacity(0.1)))
+                    x += spacing
+                }
+                y += spacing
+            }
+        }
+    }
+}
+
+/// Fine static noise that stops gradients looking flat.
+struct Grain: View {
+    var body: some View {
+        Canvas { ctx, size in
+            var rng = SeededRandom(seed: 7)
+            for _ in 0..<Int(size.width * size.height / 90) {
+                let p = CGPoint(x: rng.next() * size.width, y: rng.next() * size.height)
+                ctx.fill(Path(CGRect(origin: p, size: CGSize(width: 1, height: 1))),
+                         with: .color(.white.opacity(rng.next())))
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+/// Deterministic abstract art drawn from a fingerprint: no two identities look alike.
+struct GenerativeArt: View {
+    let seed: String
+
+    var body: some View {
+        Canvas { ctx, size in
+            var rng = SeededRandom(seed: UInt64(truncatingIfNeeded: seed.stableHash))
+            let hue = rng.next()
+            let c1 = Color(hue: hue, saturation: 0.75, brightness: 0.95)
+            let c2 = Color(hue: (hue + 0.18 + rng.next() * 0.2).truncatingRemainder(dividingBy: 1), saturation: 0.8, brightness: 0.7)
+            let c3 = Color(hue: (hue + 0.5).truncatingRemainder(dividingBy: 1), saturation: 0.6, brightness: 1)
+            let rect = CGRect(origin: .zero, size: size)
+            ctx.fill(Path(rect), with: .linearGradient(Gradient(colors: [c1, c2]),
+                                                       startPoint: .zero, endPoint: CGPoint(x: size.width, y: size.height)))
+            for i in 0..<5 {
+                let r = size.width * (0.18 + rng.next() * 0.45)
+                let center = CGPoint(x: rng.next() * size.width, y: rng.next() * size.height)
+                let shape = CGRect(x: center.x - r / 2, y: center.y - r / 2, width: r, height: r)
+                ctx.opacity = 0.25 + rng.next() * 0.45
+                let color = [c1, c2, c3, .white, .black][i % 5]
+                if rng.next() > 0.5 {
+                    ctx.fill(Path(ellipseIn: shape), with: .color(color))
+                } else {
+                    var path = Path()
+                    path.addArc(center: center, radius: r / 2, startAngle: .degrees(rng.next() * 360),
+                                endAngle: .degrees(rng.next() * 360 + 120), clockwise: false)
+                    ctx.stroke(path, with: .color(color), style: StrokeStyle(lineWidth: size.width * 0.07, lineCap: .round))
+                }
+            }
+        }
+    }
+}
+
+/// A profile picture if there is one. Otherwise the PULSHADE heartbeat (or a group's or channel's symbol) in the
+/// owner's signature colour on a quiet disc, so a default picture looks like part of the app, not a placeholder.
+struct Avatar: View {
+    @Environment(AppModel.self) private var model: AppModel?
+    var image: Data?
+    var seed: String
+    var size: CGFloat = 44
+    var symbol: String?
+
+    var body: some View {
+        ZStack {
+            if let image, let ns = PlatformImage(data: image) {
+                Image(platformImage: ns).resizable().scaledToFill()
+            } else {
+                PulseArt(tint: Signature.tint(for: seed, model: model), size: size, symbol: symbol)
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(Circle())
+        .overlay(Circle().strokeBorder(Ink.line))
+    }
+}
+
+/// The default picture itself: a disc washed in `tint`, lit softly from above, with the heartbeat or a symbol.
+struct PulseArt: View {
+    var tint: Color
+    var size: CGFloat
+    var symbol: String?
+
+    var body: some View {
+        ZStack {
+            Ink.raised
+            tint.opacity(Ink.scheme == .light ? 0.12 : 0.10)
+            RadialGradient(colors: [tint.opacity(0.28), .clear], center: UnitPoint(x: 0.5, y: -0.1),
+                           startRadius: 0, endRadius: size * 0.85)
+            if let symbol {
+                Image(systemName: symbol)
+                    .font(.system(size: size * 0.36, weight: .semibold))
+                    .foregroundStyle(tint)
+            } else {
+                PulseLine()
+                    .stroke(tint, style: StrokeStyle(lineWidth: max(1.2, size * 0.055), lineCap: .round, lineJoin: .round))
+                    .frame(width: size * 0.6, height: size * 0.4)
+            }
+        }
+    }
+}
+
+extension Signature {
+    /// Whose colour a picture's seed stands for: your own chosen colour for your own fingerprint, a contact's chosen
+    /// one, or one picked from the seed. Darkened a little on the light theme, where the brightest ones would wash out.
+    @MainActor static func tint(for seed: String, model: AppModel?) -> Color {
+        let color: Color
+        if let model {
+            color = seed == model.fingerprint ? model.signature("me") : model.signature(seed)
+        } else {
+            color = Signature.color(nil, seed: seed)
+        }
+        return Ink.scheme == .light ? color.mix(with: .black, by: 0.3) : color
+    }
+}
+
+/// Spinning gradient ring around an avatar that has a story waiting.
+struct StoryRing<Content: View>: View {
+    @Environment(\.theme) private var theme
+    var active: Bool
+    var size: CGFloat
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .strokeBorder(active ? AnyShapeStyle(theme.accent) : AnyShapeStyle(Ink.line), lineWidth: 2)
+            content.padding(4)
+        }
+        .frame(width: size, height: size)
+    }
+}
+
+/// The Pulshade mark, the same as the app icon: a speech bubble with a heartbeat cut through it.
+/// Animated, the beat traces across like a heart monitor and the bubble thumps as the spike passes.
+struct PulseMark: View {
+    @Environment(\.theme) private var theme
+    var size: CGFloat = 120
+    var animated = false
+
+    var body: some View {
+        if animated {
+            TimelineView(.animation(minimumInterval: 1 / 60)) { context in
+                mark(phase: context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 2.6) / 2.6)
+            }
+        } else {
+            mark(phase: nil)
+        }
+    }
+
+    /// `phase` runs 0...1 once per beat: the trace draws in, the spike thumps, then the trace fades from the start.
+    private func mark(phase: Double?) -> some View {
+        let line = size * 0.087
+        let head = phase.map { min(1, $0 / 0.5) } ?? 1
+        let tail = phase.map { max(0, ($0 - 0.55) / 0.4) } ?? 0
+        // The spike sits a little before the middle of the beat's length.
+        let thump = phase.map { exp(-pow(($0 - 0.22) / 0.045, 2)) } ?? 0
+        let ripple = phase.map { max(0, min(1, ($0 - 0.2) / 0.55)) } ?? 0
+        return ZStack {
+            if phase != nil {
+                Circle()
+                    .fill(RadialGradient(colors: [theme.accent.opacity(0.22 + 0.25 * thump), .clear],
+                                         center: .center, startRadius: 0, endRadius: size * 0.85))
+                    .frame(width: size * 1.7, height: size * 1.7)
+                Circle()
+                    .strokeBorder(theme.accent.opacity(0.55 * (1 - ripple)), lineWidth: 1.5)
+                    .frame(width: size, height: size)
+                    .scaleEffect(1 + ripple * 0.55)
+                    .opacity(ripple > 0 ? 1 : 0)
+            }
+            ZStack {
+                MarkBubble().fill(theme.gradient)
+                if phase != nil {
+                    // A faint resting line so the mark always reads, with the live trace on top.
+                    PulseLine()
+                        .stroke(Ink.mark.opacity(0.22), style: StrokeStyle(lineWidth: line, lineCap: .round, lineJoin: .round))
+                        .frame(width: size * 0.667, height: size * 0.45)
+                }
+                PulseLine()
+                    .trim(from: tail, to: head)
+                    .stroke(Ink.mark, style: StrokeStyle(lineWidth: line, lineCap: .round, lineJoin: .round))
+                    .frame(width: size * 0.667, height: size * 0.45)
+            }
+            .frame(width: size, height: size)
+            .scaleEffect(1 + 0.045 * thump)
+        }
+        .frame(width: size, height: size)
+        .accessibilityHidden(true)
+    }
+}
+
+/// A round speech bubble with a short tail at the bottom left.
+struct MarkBubble: Shape {
+    func path(in r: CGRect) -> Path {
+        var tail = Path()
+        tail.move(to: CGPoint(x: r.minX + r.width * 0.10, y: r.minY + r.height * 0.64))
+        tail.addLine(to: CGPoint(x: r.minX + r.width * 0.02, y: r.minY + r.height * 0.98))
+        tail.addLine(to: CGPoint(x: r.minX + r.width * 0.38, y: r.minY + r.height * 0.92))
+        tail.closeSubpath()
+        return Path(ellipseIn: r).union(tail)
+    }
+}
+
+/// A banner-wide heartbeat: a flat line with one beat at `at` (0...1 across), the beat as wide as it is tall.
+struct WidePulseLine: Shape {
+    var at: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        let beat = min(rect.height * 1.1, rect.width * 0.3)
+        let start = rect.minX + (rect.width - beat) * at
+        let mid = rect.midY
+        let points: [(CGFloat, CGFloat)] = [(0.0, 0.5), (0.24, 0.06), (0.56, 0.94), (0.76, 0.5)]
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: mid))
+        path.addLine(to: CGPoint(x: start, y: mid))
+        for p in points { path.addLine(to: CGPoint(x: start + p.0 * beat, y: rect.minY + p.1 * rect.height)) }
+        path.addLine(to: CGPoint(x: rect.maxX, y: mid))
+        return path
+    }
+}
+
+/// A single heartbeat: flat, one sharp spike, flat again.
+struct PulseLine: Shape {
+    func path(in rect: CGRect) -> Path {
+        let points: [(CGFloat, CGFloat)] = [(0, 0.5), (0.3, 0.5), (0.42, 0.06), (0.58, 0.94), (0.7, 0.5), (1, 0.5)]
+        var path = Path()
+        for (i, p) in points.enumerated() {
+            let pt = CGPoint(x: rect.minX + p.0 * rect.width, y: rect.minY + p.1 * rect.height)
+            i == 0 ? path.move(to: pt) : path.addLine(to: pt)
+        }
+        return path
+    }
+}
+
+/// PULSHADE in small, widely spaced capitals.
+struct Wordmark: View {
+    var size: CGFloat = 20
+    var color: Color = Ink.text
+
+    var body: some View {
+        Text(verbatim: brandName)
+            .font(.system(size: size, weight: .semibold))
+            .tracking(size * 0.18)
+            .foregroundStyle(color)
+    }
+}
+
+/// A calm empty state: a soft icon and, optionally, one line.
+struct Constellation: View {
+    var symbol: String
+    var text: String?
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Image(systemName: symbol)
+                .font(.system(size: 26, weight: .regular))
+                .foregroundStyle(Ink.faint)
+                .frame(width: 72, height: 72)
+                .background(Circle().fill(Ink.surface))
+                .overlay(Circle().strokeBorder(Ink.line))
+            if let text {
+                Text(text).font(.system(size: 13)).foregroundStyle(Ink.faint)
+            }
+        }
+        .frame(maxWidth: 300)
+    }
+}
+
+// MARK: - Deterministic randomness for art
+
+struct SeededRandom {
+    private var state: UInt64
+    init(seed: UInt64) { state = seed &+ 0x9E3779B97F4A7C15 }
+    mutating func next() -> Double {
+        state = state &* 6364136223846793005 &+ 1442695040888963407
+        return Double((state >> 11) & ((1 << 53) - 1)) / Double(1 << 53)
+    }
+}
+
+extension String {
+    var stableHash: Int {
+        Int(truncatingIfNeeded: SHA256.hash(data: Data(utf8)).prefix(8).reduce(UInt64(0)) { $0 << 8 | UInt64($1) })
+    }
+}
