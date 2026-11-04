@@ -224,6 +224,10 @@ final class CallAudio: @unchecked Sendable {
     /// Buffers handed to the player and not yet played, so the delay never builds up.
     private var queued = 0
     private var restarter: NSObjectProtocol?
+    private var routeWatcher: NSObjectProtocol?
+    /// Loudspeaker (iPhone) rather than the earpiece. The system forgets the override whenever the audio route
+    /// changes or echo cancelling comes on, so it's kept here and applied again each time.
+    private var speaker = false
     var muted = false
 
     init?(onPacket: @escaping (Data) -> Void) {
@@ -263,6 +267,14 @@ final class CallAudio: @unchecked Sendable {
         // The system can stop the engine mid-call (a route change, say). Start it again.
         restarter = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine,
                                                            queue: nil) { [weak self] _ in self?.resume() }
+        #if os(iOS)
+        // A route change (Bluetooth, headphones, echo cancelling settling) can put the sound back on the earpiece.
+        routeWatcher = NotificationCenter.default.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil,
+                                                              queue: nil) { [weak self] note in
+            let reason = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt).flatMap(AVAudioSession.RouteChangeReason.init)
+            if reason != .override { self?.applyRoute() }
+        }
+        #endif
         resume()
     }
 
@@ -278,11 +290,14 @@ final class CallAudio: @unchecked Sendable {
             return
         }
         player.play()
+        applyRoute()
     }
 
     func stop() {
         if let restarter { NotificationCenter.default.removeObserver(restarter) }
         restarter = nil
+        if let routeWatcher { NotificationCenter.default.removeObserver(routeWatcher) }
+        routeWatcher = nil
         engine.inputNode.removeTap(onBus: 0)
         player.stop()
         engine.stop()
@@ -292,8 +307,19 @@ final class CallAudio: @unchecked Sendable {
     }
 
     func setSpeaker(_ on: Bool) {
+        lock.withLock { speaker = on }
+        applyRoute()
+    }
+
+    private func applyRoute() {
         #if os(iOS)
-        try? AVAudioSession.sharedInstance().overrideOutputAudioPort(on ? .speaker : .none)
+        let on = lock.withLock { speaker }
+        let session = AVAudioSession.sharedInstance()
+        // Only touch the route when it isn't already what was asked for, so this can't loop on its own change.
+        let onSpeaker = session.currentRoute.outputs.contains { $0.portType == .builtInSpeaker }
+        let toBuiltIn = session.currentRoute.outputs.allSatisfy { [.builtInSpeaker, .builtInReceiver].contains($0.portType) }
+        guard toBuiltIn, onSpeaker != on else { return }
+        try? session.overrideOutputAudioPort(on ? .speaker : .none)
         #endif
     }
 
