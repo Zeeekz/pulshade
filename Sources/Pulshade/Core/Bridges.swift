@@ -11,9 +11,13 @@ import PulshadeTor
 /// a Keychain key: on its own the file shows only that a choice was made, not which bridges.
 enum Bridges: String, CaseIterable, Codable {
     case off, snowflake, custom
+    /// Connects directly, and switches to Snowflake by itself when that doesn't get through (and back when it
+    /// does), remembering what worked.
+    case auto
 
     var title: String {
         switch self {
+        case .auto: "Automatic"
         case .off: "Off"
         case .snowflake: "Snowflake"
         case .custom: "Your own"
@@ -28,15 +32,31 @@ enum Bridges: String, CaseIterable, Codable {
         ],
     ]
 
+    /// The choices as offered, Automatic first.
+    static let choices: [Bridges] = [.auto, .off, .snowflake, .custom]
+
     static var current: Bridges { saved.choice }
 
     /// Bridge lines someone gave you (from bridges.torproject.org, say), one per line.
     static var customLines: String { saved.custom }
 
+    /// Whether Automatic is on Snowflake right now: it got through when plain Tor didn't.
+    static var autoUsesSnowflake: Bool { saved.fallback ?? false }
+
+    /// Whether Tor is going out through bridges at all right now.
+    static var active: Bool {
+        switch current {
+        case .off: false
+        case .auto: autoUsesSnowflake
+        default: true
+        }
+    }
+
     /// The lines Tor is given for the current choice.
     static var lines: String {
         switch current {
         case .off: ""
+        case .auto: autoUsesSnowflake ? (builtIn[.snowflake] ?? []).joined(separator: "\n") : ""
         case .custom: customLines
         default: (builtIn[current] ?? []).joined(separator: "\n")
         }
@@ -57,11 +77,26 @@ enum Bridges: String, CaseIterable, Codable {
         return applied
     }
 
+    /// Under Automatic: moves Tor onto Snowflake, or back to going direct, because the other one isn't getting
+    /// through. Remembered for the next launch, so a network that needs Snowflake doesn't wait for it every time.
+    @discardableResult
+    static func switchAuto(toSnowflake: Bool) -> Bool {
+        guard current == .auto else { return false }
+        let now = Saved(choice: .auto, custom: customLines, fallback: toSnowflake)
+        lock.withLock { cached = now }
+        try? write(now)
+        let applied = pulshade_tor_set_bridges(Self.lines) >= 0
+        RelayClient.closeAll()
+        return applied
+    }
+
     // MARK: Saved choice
 
     private struct Saved: Codable {
-        var choice: Bridges = .off
+        var choice: Bridges = .auto
         var custom = ""
+        /// Under Automatic, whether Snowflake is what last worked. Optional so files from before it still open.
+        var fallback: Bool?
     }
 
     private static let lock = NSLock()
@@ -100,7 +135,7 @@ enum Bridges: String, CaseIterable, Codable {
     /// Keeps a choice for the next launch. Without a Keychain it holds until Pulshade quits, rather than going
     /// down unsealed.
     static func remember(_ choice: Bridges, custom lines: String? = nil) {
-        let saved = Saved(choice: choice, custom: lines ?? customLines)
+        let saved = Saved(choice: choice, custom: lines ?? customLines, fallback: choice == .auto ? autoUsesSnowflake : nil)
         lock.withLock { cached = saved }
         try? write(saved)
     }

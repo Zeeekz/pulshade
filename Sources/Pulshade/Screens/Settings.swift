@@ -49,10 +49,7 @@ struct SettingsView: View {
                     }
                     SettingsGroup {
                         MenuRow(page: .network, symbol: "antenna.radiowaves.left.and.right", color: .hex(0x30D158), title: "Network",
-                                value: model.link == .online ? "Connected" : "Offline")
-                        RowDivider(inset: 54)
-                        MenuRow(page: .anonymity, symbol: "eye.slash.fill", color: .hex(0x64D2FF), title: "Anonymity Report",
-                                value: anonymityValue)
+                                value: model.link == .online ? anonymityValue : model.connecting ? "Connecting…" : "Offline")
                         RowDivider(inset: 54)
                         MenuRow(page: .account, symbol: "key.fill", color: .hex(0xBF5AF2), title: "Account & Recovery")
                     }
@@ -699,6 +696,22 @@ private struct PrivacySettings: View {
                 RowDivider()
                 SecurityToggle(title: "Story views", key: \.storyViews)
             }
+            SettingsGroup("Blocked",
+                          footer: "Anything blocked people send is dropped without telling them. Unblocking lets them send you a new request; your old chat doesn't come back.") {
+                if model.data.blocked.isEmpty {
+                    SettingRow("Nobody") { EmptyView() }
+                } else {
+                    ForEach(Array(model.data.blocked.enumerated()), id: \.element) { i, fp in
+                        if i > 0 { RowDivider() }
+                        SettingRow(model.data.blockedNames[fp] ?? "Unknown · \(fp.prefix(8))") {
+                            Button("Unblock") { model.unblock(fp) }
+                                .buttonStyle(.plain)
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(model.theme.accent)
+                        }
+                    }
+                }
+            }
             SettingsGroup("Disguise",
                           footer: "A decoy passcode opens an empty PULSHADE. A panic passcode silently erases everything, then does the same.") {
                 disguiseRow(.decoy, title: "Decoy passcode", isSet: model.hasDecoy)
@@ -851,8 +864,26 @@ private struct NetworkSettings: View {
 
     var body: some View {
         SettingsScreen(title: "Network") {
-            SettingsGroup {
+            SettingsGroup("Connection", footer: connectionFooter) {
                 SettingRow("Status") { LinkBadge() }
+                RowDivider()
+                SettingRow("Route") { Text(routeText).font(.system(size: 14)).foregroundStyle(Ink.dim) }
+                if torLocked || model.data.security.tor {
+                    RowDivider()
+                    SettingRow("Tor") { TorProgress() }
+                }
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    VStack(spacing: 0) {
+                        RowDivider()
+                        SettingRow("Relay answered") { Self.dim(Self.ago(model.lastRelayReached)) }
+                        RowDivider()
+                        SettingRow("Mail received") { Self.dim(Self.ago(model.lastMailReceived)) }
+                        RowDivider()
+                        SettingRow("Waiting to send") { Self.dim(waitingText) }
+                    }
+                }
+                RowDivider()
+                ActionRow(title: model.retryingRelay ? "Checking…" : "Check connection") { Task { await model.retryRelay() } }
             }
             SettingsGroup("Relay", footer: "The server that passes on your encrypted messages. It can't read them.") {
                 SettingRow("Server") {
@@ -873,14 +904,10 @@ private struct NetworkSettings: View {
                         .toggleStyle(GlowToggleStyle())
                         .disabled(torLocked)
                 }
-                if torLocked || model.data.security.tor {
-                    RowDivider()
-                    SettingRow("Tor") { TorProgress() }
-                }
             }
             if torLocked || model.data.security.tor {
                 SettingsGroup("Bridges", footer: bridgesFooter) {
-                    ChoiceRows(values: Bridges.allCases, selected: bridges, label: \.title) { choice in
+                    ChoiceRows(values: Bridges.choices, selected: bridges, label: \.title) { choice in
                         if choice == .custom { editingBridges = true; return }
                         bridges = choice
                         bridgesPending = !Bridges.choose(choice)
@@ -896,6 +923,10 @@ private struct NetworkSettings: View {
                         .buttonStyle(.plain)
                     }
                 }
+            }
+            SettingsGroup(footer: "The route your messages took to the relay, hop by hop, and what the relay can and can't see.") {
+                MenuRow(page: .anonymity, symbol: "eye.slash.fill", color: .hex(0x64D2FF), title: "Anonymity Report",
+                        value: nil)
             }
         }
         .sheet(isPresented: $editingBridges) {
@@ -929,11 +960,49 @@ private struct NetworkSettings: View {
     private var bridgesFooter: String {
         let what: String
         switch bridges {
+        case .auto: what = "Connects to Tor directly. If that doesn't get through within about 40 seconds, PULSHADE switches to Snowflake by itself and remembers it for next time."
+            + (Bridges.autoUsesSnowflake ? " Using Snowflake now." : "")
         case .off: what = "For networks that block Tor or watch for it. PULSHADE connects to Tor directly when they're off."
         case .snowflake: what = "Snowflake disguises Tor as a video call, through volunteers. Works on most networks."
         case .custom: what = "Your own bridges, for example from bridges.torproject.org. Private bridges are the hardest for a network to block."
         }
         return bridgesPending ? what + " PULSHADE will use them from the next time it opens." : what
+    }
+
+    private var routeText: String {
+        guard torLocked || model.data.security.tor else { return "Direct" }
+        switch bridges {
+        case .off: return "Tor"
+        case .auto: return Bridges.autoUsesSnowflake ? "Tor via Snowflake" : "Tor"
+        case .snowflake: return "Tor via Snowflake"
+        case .custom: return "Tor via your bridges"
+        }
+    }
+
+    private var connectionFooter: String {
+        if model.link == .online { return "Everything is reaching the relay." }
+        if !(torLocked || model.data.security.tor) { return "The relay isn't answering. Messages wait on this device and go out when it does." }
+        return "Tor can take a minute or two to connect on a slow or restricted network, longer through a bridge. Messages wait on this device and go out as soon as it does."
+    }
+
+    private var waitingText: String {
+        let (count, oldest) = model.waitingToSend
+        guard count > 0 else { return "Nothing" }
+        let age = oldest.map { " · oldest \(Self.ago($0, suffix: ""))" } ?? ""
+        return "\(count)" + age
+    }
+
+    private static func dim(_ text: String) -> some View {
+        Text(text).font(.system(size: 14)).foregroundStyle(Ink.dim).monospacedDigit()
+    }
+
+    private static func ago(_ date: Date?, suffix: String = " ago") -> String {
+        guard let date else { return "Not yet" }
+        let seconds = Int(Date().timeIntervalSince(date))
+        if seconds < 5 { return "Just now" }
+        if seconds < 60 { return "\(seconds) s" + suffix }
+        if seconds < 3600 { return "\(seconds / 60) min" + suffix }
+        return "\(seconds / 3600) h" + suffix
     }
 
     private var torFooter: String {

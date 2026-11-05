@@ -774,6 +774,8 @@ struct Outgoing: Codable, Identifiable {
     /// The connection it's sent on. Each persona sends on its own, as it reads on its own, so the relay can't tell
     /// from one connection that two personas are the same person. Nil is the main persona's.
     var lane: String?
+    /// When it was queued, for the Network page. Nil for those queued by builds from before.
+    var queued: Date? = Date()
 
     /// The sending lane for a persona (nil is the main one).
     static func lane(for persona: UUID?) -> String {
@@ -884,7 +886,7 @@ struct AppData: Codable {
     var format = AppData.currentFormat
     /// The newest shape this build understands. Raise it, and update `AppDataFormatTests`, with any change to what
     /// `AppData`, `Profile` or `Contact` save.
-    static let currentFormat = 2
+    static let currentFormat = 3
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []
@@ -907,6 +909,8 @@ struct AppData: Codable {
     var requests: [FriendRequest] = []
     /// Fingerprints whose requests are dropped without a trace.
     var blocked: [String] = []
+    /// The names people had when you blocked them, so the blocked list can show who they are.
+    var blockedNames: [String: String] = [:]
     /// The persona you're currently acting as. Nil is your main identity.
     var activePersona: UUID?
     var decoySeed: Data?
@@ -977,6 +981,7 @@ struct AppData: Codable {
         personas = try c.decodeIfPresent([Persona].self, forKey: .personas) ?? []
         requests = (try? c.decodeIfPresent([FriendRequest].self, forKey: .requests)) ?? []
         blocked = try c.decodeIfPresent([String].self, forKey: .blocked) ?? []
+        blockedNames = (try? c.decodeIfPresent([String: String].self, forKey: .blockedNames)) ?? [:]
         activePersona = try c.decodeIfPresent(UUID.self, forKey: .activePersona)
         panicSeed = try c.decodeIfPresent(Data.self, forKey: .panicSeed)
         facade = (try? c.decodeIfPresent(Facade.self, forKey: .facade)) ?? Facade()
