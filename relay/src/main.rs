@@ -768,8 +768,38 @@ fn spool_path(directory_path: &str) -> PathBuf {
     PathBuf::from(directory_path).with_file_name("pulshade-spool.sealed")
 }
 
-/// Writes the spool if anything changed since the last time (or always, with `force`), sealed in memory and swapped in
-/// whole, so nothing readable ever reaches the disk.
+/// The spool on disk is a short marker, then records, each a length and a sealed piece of JSON: first the header,
+/// then waiting mail in pieces of a few megabytes. Written and read a piece at a time, so a relay holding hundreds
+/// of megabytes of mail needs only a few more to save it or load it. (The first format was one sealed file of
+/// everything, which took three times the mail in memory to write, and a small server killed the relay for it.)
+const SPOOL_MARKER: &[u8; 4] = b"PSP2";
+/// About how much waiting mail goes into one record.
+const SPOOL_CHUNK: usize = 4 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "t")]
+enum SpoolRecord {
+    #[serde(rename = "h")]
+    Header {
+        id_seed: String,
+        counter: u64,
+        #[serde(default)]
+        push: Vec<push::Saved>,
+    },
+    #[serde(rename = "q")]
+    Queue { mailbox: String, items: Vec<SpooledItem> },
+}
+
+fn write_record(out: &mut impl std::io::Write, sealer: &sealed::Sealer, record: &SpoolRecord) -> std::io::Result<()> {
+    let raw = serde_json::to_vec(record).map_err(std::io::Error::other)?;
+    let sealed = sealer.seal(&raw);
+    out.write_all(&(sealed.len() as u32).to_be_bytes())?;
+    out.write_all(&sealed)
+}
+
+/// Writes the spool if anything changed since the last time (or always, with `force`), sealed a piece at a time and
+/// swapped in whole, so nothing readable ever reaches the disk. The mail is only copied by reference while the lock is
+/// held, so the relay isn't kept waiting while it is written.
 fn save_spool(store: &Shared, path: &std::path::Path, sealer: &sealed::Sealer, force: bool) {
     let mail_changed = MAIL_CHANGED.swap(false, Ordering::SeqCst);
     let (push, push_changed) = push::global().saved();
@@ -777,37 +807,129 @@ fn save_spool(store: &Shared, path: &std::path::Path, sealer: &sealed::Sealer, f
         return;
     }
     let now = unix_now();
-    let spool = {
+    let (id_seed, counter, queues) = {
         let store = store.lock().unwrap();
-        Spool {
-            id_seed: hex::encode(store.id_seed),
-            counter: store.counter,
-            queues: store.queues.iter().map(|(id, queue)| SpooledQueue {
-                mailbox: hex::encode(id),
-                items: queue.iter().map(|item| SpooledItem {
-                    id: item.id,
-                    deposited: now.saturating_sub(item.at.elapsed().as_secs()),
-                    blob: B64.encode(&item.blob),
-                }).collect(),
-            }).collect(),
-            push,
-        }
+        let queues: Vec<(Id, Vec<(u64, u64, Bytes)>)> = store.queues.iter().map(|(id, queue)| {
+            (*id, queue.iter().map(|item| (item.id, now.saturating_sub(item.at.elapsed().as_secs()), item.blob.clone())).collect())
+        }).collect();
+        (hex::encode(store.id_seed), store.counter, queues)
     };
-    let Ok(raw) = serde_json::to_vec(&spool) else { return };
     let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, sealer.seal(&raw)).is_ok() {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        if std::fs::rename(&tmp, path).is_ok() {
-            return;
+    let written = (|| -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        let mut out = std::io::BufWriter::new(file);
+        std::io::Write::write_all(&mut out, SPOOL_MARKER)?;
+        write_record(&mut out, sealer, &SpoolRecord::Header { id_seed, counter, push })?;
+        for (id, items) in queues {
+            let mailbox = hex::encode(id);
+            let mut piece: Vec<SpooledItem> = Vec::new();
+            let mut size = 0;
+            for (item_id, deposited, blob) in items {
+                size += blob.len();
+                piece.push(SpooledItem { id: item_id, deposited, blob: B64.encode(&blob) });
+                if size >= SPOOL_CHUNK {
+                    write_record(&mut out, sealer, &SpoolRecord::Queue { mailbox: mailbox.clone(), items: std::mem::take(&mut piece) })?;
+                    size = 0;
+                }
+            }
+            if !piece.is_empty() {
+                write_record(&mut out, sealer, &SpoolRecord::Queue { mailbox, items: piece })?;
+            }
         }
+        std::io::Write::flush(&mut out)?;
+        out.into_inner().map_err(|e| e.into_error())?.sync_all()
+    })();
+    if written.is_ok() && std::fs::rename(&tmp, path).is_ok() {
+        return;
     }
     // Not written: try again next time.
+    let _ = std::fs::remove_file(&tmp);
     MAIL_CHANGED.store(true, Ordering::SeqCst);
+}
+
+/// Puts a mailbox's saved mail back, dropping what is past its week. Mail already there keeps its place in front.
+fn restore_queue(store: &mut Store, mailbox: &str, items: Vec<SpooledItem>, now: u64) -> usize {
+    let Some(id) = parse_id(mailbox) else { return 0 };
+    let items: Vec<Item> = items.into_iter().filter_map(|item| {
+        let age = Duration::from_secs(now.saturating_sub(item.deposited));
+        if age >= TTL {
+            return None;
+        }
+        let blob = Bytes::from(B64.decode(item.blob).ok()?);
+        Some(Item { id: item.id, at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now), blob })
+    }).collect();
+    if items.is_empty() || (!store.queues.contains_key(&id) && store.queues.len() >= MAX_MAILBOXES) {
+        return 0;
+    }
+    let queue = store.queues.entry(id).or_default();
+    let room = MAX_QUEUE.saturating_sub(queue.len());
+    let kept: Vec<Item> = items.into_iter().take(room).collect();
+    let count = kept.len();
+    queue.extend(kept);
+    count
 }
 
 /// Brings back what the last run left waiting. Mail past its week, and anything unreadable, stays behind.
 fn load_spool(store: &Shared, path: &std::path::Path, sealer: &sealed::Sealer) -> (usize, usize) {
+    let Ok(file) = std::fs::File::open(path) else { return (0, 0) };
+    let mut input = std::io::BufReader::new(file);
+    let mut marker = [0u8; 4];
+    if input.read_exact(&mut marker).is_ok() && &marker == SPOOL_MARKER {
+        return load_pieces(store, &mut input, sealer);
+    }
+    drop(input);
+    load_whole(store, path, sealer)
+}
+
+fn load_pieces(store: &Shared, input: &mut impl Read, sealer: &sealed::Sealer) -> (usize, usize) {
+    let now = unix_now();
+    let (mut count, mut push) = (0, Vec::new());
+    loop {
+        let mut len = [0u8; 4];
+        if input.read_exact(&mut len).is_err() {
+            break;
+        }
+        let len = u32::from_be_bytes(len) as usize;
+        // A piece is a few megabytes at most; anything larger is damage, and not worth reading on.
+        if len > 64 * 1024 * 1024 {
+            eprintln!("the spool has a piece that is too large; the rest is left behind");
+            break;
+        }
+        let mut sealed_piece = vec![0u8; len];
+        if input.read_exact(&mut sealed_piece).is_err() {
+            eprintln!("the spool ends part-way; the rest is left behind");
+            break;
+        }
+        let Some(record) = sealer.open(&sealed_piece).and_then(|plain| serde_json::from_slice::<SpoolRecord>(&plain).ok()) else {
+            eprintln!("a piece of the spool couldn't be opened; it is left behind");
+            continue;
+        };
+        match record {
+            SpoolRecord::Header { id_seed, counter, push: saved } => {
+                let mut store = store.lock().unwrap();
+                if let Some(seed) = hex::decode(&id_seed).ok().and_then(|raw| <[u8; 32]>::try_from(raw).ok()) {
+                    store.id_seed = seed;
+                    store.counter = counter;
+                }
+                push = saved;
+            }
+            SpoolRecord::Queue { mailbox, items } => {
+                count += restore_queue(&mut store.lock().unwrap(), &mailbox, items, now);
+            }
+        }
+    }
+    {
+        let mut store = store.lock().unwrap();
+        store.bytes = store.queues.values().flat_map(|q| q.iter()).map(|item| item.blob.len()).sum();
+    }
+    let woken = push::global().restore(push);
+    (count, woken)
+}
+
+/// The first format: one sealed file holding everything. Still read, so the first start after an update finds
+/// what was waiting; it is written in the new format from then on.
+fn load_whole(store: &Shared, path: &std::path::Path, sealer: &sealed::Sealer) -> (usize, usize) {
     let Ok(raw) = std::fs::read(path) else { return (0, 0) };
     if !sealed::Sealer::is_sealed(&raw) {
         return (0, 0);
@@ -816,6 +938,7 @@ fn load_spool(store: &Shared, path: &std::path::Path, sealer: &sealed::Sealer) -
         eprintln!("the spool at {} couldn't be opened; starting without it", path.display());
         return (0, 0);
     };
+    drop(raw);
     let now = unix_now();
     let mut count = 0;
     {
@@ -825,20 +948,7 @@ fn load_spool(store: &Shared, path: &std::path::Path, sealer: &sealed::Sealer) -
             store.counter = spool.counter;
         }
         for queue in spool.queues {
-            let Some(id) = parse_id(&queue.mailbox) else { continue };
-            let items: VecDeque<Item> = queue.items.into_iter().filter_map(|item| {
-                let age = Duration::from_secs(now.saturating_sub(item.deposited));
-                if age >= TTL {
-                    return None;
-                }
-                let blob = Bytes::from(B64.decode(item.blob).ok()?);
-                Some(Item { id: item.id, at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now), blob })
-            }).take(MAX_QUEUE).collect();
-            if items.is_empty() || store.queues.len() >= MAX_MAILBOXES {
-                continue;
-            }
-            count += items.len();
-            store.queues.insert(id, items);
+            count += restore_queue(&mut store, &queue.mailbox, queue.items, now);
         }
         store.bytes = store.queues.values().flat_map(|q| q.iter()).map(|item| item.blob.len()).sum();
     }
@@ -1166,7 +1276,7 @@ mod tests {
 
         save_spool(&store, &path, &sealer, true);
         let raw = std::fs::read(&path).unwrap();
-        assert!(sealed::Sealer::is_sealed(&raw), "sealed on disk");
+        assert!(raw.starts_with(SPOOL_MARKER), "written a piece at a time");
         assert!(!raw.windows(5).any(|w| w == b"first") && !raw.windows(token.len()).any(|w| w == token.as_bytes()), "nothing readable");
 
         // The next run starts empty, and the spool brings it back.
@@ -1185,6 +1295,115 @@ mod tests {
         let (saved, _) = push::global().saved();
         assert!(saved.iter().any(|s| s.token == token && s.mailbox == hex::encode(send_id_for(&receive))));
         push::global().forget(&token);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The first format of the spool, as the relay wrote it before: one sealed file of everything.
+    fn save_spool_first_format(store: &Shared, path: &std::path::Path, sealer: &sealed::Sealer) {
+        let now = unix_now();
+        let (push, _) = push::global().saved();
+        let spool = {
+            let store = store.lock().unwrap();
+            Spool {
+                id_seed: hex::encode(store.id_seed),
+                counter: store.counter,
+                queues: store.queues.iter().map(|(id, queue)| SpooledQueue {
+                    mailbox: hex::encode(id),
+                    items: queue.iter().map(|item| SpooledItem {
+                        id: item.id,
+                        deposited: now.saturating_sub(item.at.elapsed().as_secs()),
+                        blob: B64.encode(&item.blob),
+                    }).collect(),
+                }).collect(),
+                push,
+            }
+        };
+        std::fs::write(path, sealer.seal(&serde_json::to_vec(&spool).unwrap())).unwrap();
+    }
+
+    /// An update must find the mail the old format left behind, and write the new one from then on.
+    #[tokio::test]
+    async fn a_spool_in_the_first_format_still_loads() {
+        let dir = std::env::temp_dir().join(format!("pulshade-spool-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pulshade-spool.sealed");
+        let sealer = sealed::Sealer::with_key([8; 32]);
+        let store: Shared = Arc::default();
+        let receive = key(41);
+        let send = hex::encode(send_id_for(&receive));
+        for body in [&b"one"[..], b"two", b"three"] {
+            assert_eq!(deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), Bytes::copy_from_slice(body)).await, StatusCode::ACCEPTED);
+        }
+        save_spool_first_format(&store, &path, &sealer);
+        assert!(sealed::Sealer::is_sealed(&std::fs::read(&path).unwrap()));
+
+        let next: Shared = Arc::default();
+        let (waiting, _) = load_spool(&next, &path, &sealer);
+        assert_eq!(waiting, 3);
+        assert_eq!(next.lock().unwrap().bytes, 3 + 3 + 5);
+        MAIL_CHANGED.store(true, Ordering::SeqCst);
+        save_spool(&next, &path, &sealer, true);
+        assert!(std::fs::read(&path).unwrap().starts_with(SPOOL_MARKER), "written in the new format now");
+        let again: Shared = Arc::default();
+        assert_eq!(load_spool(&again, &path, &sealer).0, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lots of mail comes back whole and in order, from a file written in several pieces, and an unreadable piece costs
+    /// only itself.
+    #[tokio::test]
+    async fn a_large_spool_is_written_in_pieces_and_comes_back_in_order() {
+        let dir = std::env::temp_dir().join(format!("pulshade-spool-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pulshade-spool.sealed");
+        let sealer = sealed::Sealer::with_key([9; 32]);
+        let store: Shared = Arc::default();
+        let mailboxes = [key(51), key(52)];
+        for (n, receive) in mailboxes.iter().enumerate() {
+            let items: VecDeque<Item> = (0..7u64).map(|i| Item {
+                id: n as u64 * 100 + i,
+                at: Instant::now(),
+                blob: Bytes::from(vec![(n as u8) * 16 + i as u8; 1_500_000]),
+            }).collect();
+            store.lock().unwrap().queues.insert(send_id_for(receive), items);
+        }
+        store.lock().unwrap().bytes = 2 * 7 * 1_500_000;
+        save_spool(&store, &path, &sealer, true);
+
+        // Several pieces, none of them the size of everything.
+        let raw = std::fs::read(&path).unwrap();
+        assert!(raw.starts_with(SPOOL_MARKER));
+        let (mut at, mut pieces, mut largest) = (4, 0, 0);
+        while at + 4 <= raw.len() {
+            let len = u32::from_be_bytes(raw[at..at + 4].try_into().unwrap()) as usize;
+            at += 4 + len;
+            pieces += 1;
+            largest = largest.max(len);
+        }
+        assert!(pieces >= 5, "{pieces} pieces");
+        assert!(largest < 12 * 1024 * 1024, "the largest piece is {largest} bytes");
+
+        let next: Shared = Arc::default();
+        let (waiting, _) = load_spool(&next, &path, &sealer);
+        assert_eq!(waiting, 14);
+        assert_eq!(next.lock().unwrap().bytes, 2 * 7 * 1_500_000);
+        for (n, receive) in mailboxes.iter().enumerate() {
+            let guard = next.lock().unwrap();
+            let queue = guard.queues.get(&send_id_for(receive)).unwrap();
+            let ids: Vec<u64> = queue.iter().map(|i| i.id).collect();
+            assert_eq!(ids, (0..7u64).map(|i| n as u64 * 100 + i).collect::<Vec<_>>(), "same order");
+            assert!(queue.iter().enumerate().all(|(i, item)| item.blob.iter().all(|b| *b == (n as u8) * 16 + i as u8)), "same bytes");
+        }
+
+        // Damage to one piece loses that piece only.
+        let mut damaged = raw.clone();
+        let first_len = u32::from_be_bytes(damaged[4..8].try_into().unwrap()) as usize;
+        let second = 4 + 4 + first_len;
+        damaged[second + 4 + 30] ^= 0xff;
+        std::fs::write(&path, &damaged).unwrap();
+        let hurt: Shared = Arc::default();
+        let (waiting, _) = load_spool(&hurt, &path, &sealer);
+        assert!(waiting > 0 && waiting < 14, "{waiting} came back");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
