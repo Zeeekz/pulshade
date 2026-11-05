@@ -7,7 +7,18 @@ struct Backdrop: View {
     var intensity: Double = 1
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1 / 30)) { context in
+        // Themes without a glow get a flat fill: nothing animates or blurs behind the chats and the keyboard.
+        if theme.glow == 0 {
+            Ink.void.ignoresSafeArea().allowsHitTesting(false)
+        } else {
+            glowing
+        }
+    }
+
+    /// The slow moving glow. The orbs drift a few pixels a second, so 12 frames a second looks the same as 30
+    /// while costing far less to blur.
+    private var glowing: some View {
+        TimelineView(.animation(minimumInterval: 1 / 12)) { context in
             let t = context.date.timeIntervalSinceReferenceDate
             Canvas { ctx, size in
                 ctx.fill(Path(CGRect(origin: .zero, size: size)), with: .color(Ink.void))
@@ -25,7 +36,7 @@ struct Backdrop: View {
                 }
             }
         }
-        .overlay(Grain().opacity(0.025))
+        .overlay(Grain().drawingGroup().opacity(0.025))
         .ignoresSafeArea()
         .allowsHitTesting(false)
     }

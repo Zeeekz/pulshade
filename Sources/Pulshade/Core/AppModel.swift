@@ -1,6 +1,8 @@
 import Foundation
 import CryptoKit
 import AVFoundation
+import ImageIO
+import UniformTypeIdentifiers
 import SwiftUI
 #if canImport(PulshadeShared)
 import PulshadeShared
@@ -29,6 +31,13 @@ final class AppModel {
     /// longer than any story lasts. Held in memory only: saving it would change what's saved, and builds that
     /// don't know the change would refuse the data.
     @ObservationIgnored var removedStories: [String: Date] = [:]
+    /// A friend's video still arriving: when its last piece (or the story itself) came in. In memory only.
+    @ObservationIgnored private var clipActivity: [UUID: Date] = [:]
+    /// How often a stalled video has been asked for again, and when last.
+    @ObservationIgnored private var clipAsks: [UUID: (count: Int, at: Date)] = [:]
+    /// When a video was last sent again on someone's asking, as "fingerprint|id", so one asking can't make it
+    /// go over and over.
+    @ObservationIgnored private var clipResent: [String: Date] = [:]
     var failedAttempts = 0
     /// The passcode was right but the account's data wouldn't open, so nothing was opened (or touched).
     private(set) var dataUnreadable = false
@@ -554,6 +563,11 @@ final class AppModel {
         let convo = data.conversations[i]
         guard data.security.notifications, !convo.muted else { return }
         if appActive && openConversation == convo.id { return }
+        #if os(iOS)
+        // On the phone, a message that lands while Pulshade is open is already in front of you (and counted on the
+        // list). A banner on top of that, after the wake-up banner from the lock screen, would be a second one.
+        if appActive { return }
+        #endif
         let content = Notifier.content(for: message, in: convo, sender: displayName(message.sender),
                                        style: data.security.notificationContent)
         Notifier.shared.post(content, conversation: convo.id, sound: data.security.notificationSound)
@@ -738,14 +752,14 @@ final class AppModel {
     }
 
     func send(_ text: String, image: Data? = nil, voice: VoiceNote? = nil, replyTo: Message? = nil,
-              preview: LinkPreview? = nil, in id: Conversation.ID) {
+              quote: ReplyRef? = nil, preview: LinkPreview? = nil, in id: Conversation.ID) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || image != nil || voice != nil, let i = index(of: id) else { return }
         let convo = data.conversations[i]
         guard canPost(in: convo) else { return }
 
         let now = Date()
-        let reply = replyTo.map { ReplyRef(id: $0.id, author: $0.sender, snippet: Self.snippet(of: $0)) }
+        let reply = replyTo.map { ReplyRef(id: $0.id, author: $0.sender, snippet: Self.snippet(of: $0)) } ?? quote
         let message = Message(sender: "me", text: trimmed, image: image, voice: voice, date: now,
                               expiresAt: convo.disappearAfter.map { now.addingTimeInterval($0) }, reply: reply,
                               preview: preview)
@@ -754,7 +768,7 @@ final class AppModel {
         let wire = WireMessage(id: message.id, conversation: sharedID(convo), kind: convo.kind == .broadcast ? .direct : convo.kind,
                                text: trimmed, image: image, voice: voice, date: RelayClock.relay(now), expiresIn: convo.disappearAfter,
                                reply: reply.map { ReplyRef(id: $0.id, author: $0.author == "me" ? (me(convo.persona)?.fingerprint ?? "") : $0.author,
-                                                           snippet: $0.snippet) },
+                                                           snippet: $0.snippet, picture: $0.picture) },
                                preview: preview)
         let recipients = audience(convo)
         for member in recipients { enqueue(.message(wire), to: member, message: message.id) }
@@ -762,6 +776,67 @@ final class AppModel {
         if recipients.isEmpty { setStatus(.sent, for: [message.id]) }
         lastTypingSent[id] = nil
         save()
+    }
+
+    /// Answers a friend's story in your chat with them: a like, or words. It arrives as an ordinary message
+    /// quoting the story, so the relay sees nothing new and older builds show it too.
+    func answerStory(_ story: Story, like: Bool = false, text: String = "") async {
+        let words = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard story.author != "me", like || !words.isEmpty, contact(story.author, in: story.persona) != nil else { return }
+        let picture = await Self.storyPicture(story)
+        let convo = startConversation(kind: .direct, title: "", members: [story.author], persona: .some(story.persona))
+        let quote = ReplyRef(id: story.id, author: story.author, snippet: Self.snippet(of: story), picture: picture)
+        send(like ? "❤️ Liked your story" : words, quote: quote, in: convo.id)
+        if like, let i = data.stories.firstIndex(where: { $0.id == story.id }) {
+            data.stories[i].liked = true
+            save()
+        }
+    }
+
+    /// A small picture of a story for the quote above a like or a reply: the photo shrunk, a video's first
+    /// frame, or the text card drawn small.
+    static func storyPicture(_ story: Story) async -> Data? {
+        let side: CGFloat = 200
+        let image: PlatformImage?
+        switch story.style {
+        case let .image(data, _):
+            image = PlatformImage(data: data)
+        case let .video(data, _):
+            guard !data.isEmpty, let url = StoryVideo.tempFile(for: data) else { return nil }
+            defer { try? FileManager.default.removeItem(at: url) }
+            image = await StoryVideo.poster(of: url).map { PlatformImage.from(cgImage: $0) }
+        case .text:
+            let renderer = ImageRenderer(content: StoryFace(story: story, compact: true).frame(width: 90, height: 160))
+            renderer.scale = 2
+            image = renderer.cgImage.map { PlatformImage.from(cgImage: $0) }
+        }
+        guard let image, let jpeg = cleanJPEG(image, maxSide: side), jpeg.count <= ReplyRef.maxPicture else { return nil }
+        return jpeg
+    }
+
+    /// The soft bell for something you've just sent, when sounds are on and no call is using the audio.
+    @ObservationIgnored var sendSounds = true
+
+    func playSendSound() {
+        guard sendSounds, data.security.notificationSound, call == nil else { return }
+        SendSound.play()
+    }
+
+    /// A short line describing a story, for the quote above a like or a reply.
+    static func snippet(of story: Story) -> String {
+        let words: String
+        switch story.style {
+        case let .text(text, _): words = text
+        case let .image(_, caption), let .video(_, caption): words = caption
+        }
+        let kind: String
+        switch story.style {
+        case .text: kind = "Story"
+        case .image: kind = "Photo story"
+        case .video: kind = "Video story"
+        }
+        let trimmed = words.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? kind : "\(kind): \(trimmed.prefix(100))"
     }
 
     /// A short line describing a message, for quotes and previews.
@@ -1046,6 +1121,48 @@ final class AppModel {
         }
     }
 
+    /// Sends a story again to someone whose copy stalled: the story itself (in case that was what went
+    /// missing), then the pieces of its clip they asked for, or all of them.
+    private func resendStory(_ story: Story, to contact: Contact, pieces wanted: [Int]?) {
+        guard case let .video(clip, caption) = story.style, !clip.isEmpty else { enqueue(storyPayload(story), to: contact); return }
+        enqueue(.story(id: story.id, style: .video(Data(), caption: caption), date: RelayClock.relay(story.date),
+                       lasts: story.lifetime), to: contact)
+        let pieces = StoryClipPieces.split(clip)
+        let indices = wanted.map { Set($0).filter(pieces.indices.contains).sorted() } ?? Array(pieces.indices)
+        for i in indices {
+            enqueue(.storyPart(id: story.id, index: i, of: pieces.count, bytes: pieces[i]), to: contact)
+        }
+    }
+
+    /// A video that has stopped arriving part-way: with nothing new for a while, whoever posted it is asked for
+    /// what's missing. A few times at most, further apart each time, while the story is still up.
+    private func askForStalledClips() {
+        let now = Date()
+        var stalled = Set(data.clipParts.keys)
+        for story in data.stories where story.author != "me" && story.isLive && !story.isReady { stalled.insert(story.id) }
+        for id in stalled {
+            let story = data.stories.first { $0.id == id }
+            let parts = data.clipParts[id]
+            guard let author = story?.author ?? parts?.author, author != "me",
+                  removedStories["\(author)|\(id)"] == nil else { continue }
+            if story.map({ $0.isLive && !$0.isReady }) == false { continue }
+            // Seen for the first time since launch: the wait starts now.
+            guard let last = clipActivity[id] else { clipActivity[id] = now; continue }
+            let asked = clipAsks[id]
+            let tries = asked?.count ?? 0
+            guard tries < Self.clipAskLimit, now.timeIntervalSince(last) >= clipQuiet,
+                  now.timeIntervalSince(asked?.at ?? .distantPast) >= clipQuiet * Double(1 << tries),
+                  let contact = contact(author, in: story?.persona ?? parts?.persona) else { continue }
+            let missing = parts.map { p in (0..<p.of).filter { p.parts[$0] == nil } }
+            clipAsks[id] = (tries + 1, now)
+            enqueue(.storyWant(id: id, parts: missing), to: contact)
+        }
+    }
+
+    /// How long a video has to go without a new piece before it's asked for again, and how many times it is.
+    @ObservationIgnored var clipQuiet: TimeInterval = 90
+    static let clipAskLimit = 4
+
     /// Joins a clip's pieces into its story once the story and every piece are here.
     private func assembleClip(_ id: UUID) {
         guard let pending = data.clipParts[id], pending.isComplete,
@@ -1053,8 +1170,45 @@ final class AppModel {
               case let .video(have, caption) = data.stories[i].style, have.isEmpty else { return }
         let joined = (0..<pending.of).reduce(into: Data()) { $0.append(pending.parts[$1] ?? Data()) }
         data.clipParts[id] = nil
+        clipActivity[id] = nil
+        clipAsks[id] = nil
         guard !joined.isEmpty else { return }
         withAnimation(.snappy) { data.stories[i].style = .video(joined, caption: caption) }
+        acknowledgeStory(id, author: pending.author, persona: pending.persona)
+    }
+
+    /// Tells the author a story reached this device whole (a video: with its clip), so their app stops sending it
+    /// again. Only with delivery receipts on: it says when this device was online, which is what turning those off
+    /// keeps back.
+    private func acknowledgeStory(_ id: UUID, author: String, persona: UUID?) {
+        guard data.security.deliveryReceipts,
+              let story = data.stories.first(where: { $0.id == id && $0.author == author && $0.persona == persona }) else { return }
+        if case let .video(clip, _) = story.style, clip.isEmpty { return }
+        guard let c = contact(author, in: persona), !c.hidden, !c.isSelf else { return }
+        enqueue(.storyReceived(id: id), to: c)
+    }
+
+    /// How long after a story was last sent to send it again to anyone who hasn't said they have it. A message lost
+    /// on the way (a relay restart empties what it holds) would otherwise stay lost. Four tries, then it's left.
+    private static let storyRetry: [TimeInterval] = [2 * 60, 15 * 60, 3600, 6 * 3600]
+    @ObservationIgnored var lastResendCheck = Date.distantPast
+
+    private func resendUnconfirmedStories() {
+        let now = Date()
+        guard now.timeIntervalSince(lastResendCheck) > 30 else { return }
+        lastResendCheck = now
+        for i in data.stories.indices {
+            let story = data.stories[i]
+            guard story.author == "me", story.isLive, var delivery = story.delivery, delivery.resends < Self.storyRetry.count,
+                  now.timeIntervalSince(delivery.last ?? story.date) >= Self.storyRetry[delivery.resends] else { continue }
+            let waiting = audience(of: story).filter { !delivery.confirmed.contains($0.fingerprint) }
+            delivery.last = now
+            // Everyone has it: nothing left to do for this one.
+            delivery.resends = waiting.isEmpty ? Self.storyRetry.count : delivery.resends + 1
+            data.stories[i].delivery = delivery
+            // A video's clip is heavy: it goes again only the first couple of times.
+            for c in waiting { sendStory(story, to: c, withClip: delivery.resends <= 2) }
+        }
     }
 
     func postStory(_ style: StoryStyle, audience: StoryAudience = .everyone, lifetime: TimeInterval = StoryLifetime.day.rawValue) {
@@ -1062,12 +1216,22 @@ final class AppModel {
         story.persona = activePersona
         story.audience = audience
         story.lifetime = lifetime
+        story.delivery = StoryDelivery()
         data.storyChoices[choiceKey(activePersona)] = StoryChoice(audience: audience, lifetime: lifetime)
         withAnimation(.snappy) { data.stories.insert(story, at: 0) }
         for c in self.audience(of: story) { sendStory(story, to: c, withClip: true) }
         trackUpload(of: story.id)
-        if story.isSyncable { sync(.story(story)) }
+        if story.isSyncable { var shared = story; shared.delivery = nil; sync(.story(shared)) }
         save()
+    }
+
+    /// Remembers a story was taken back, keeping only the newest thousand: a contact can send as many removals as
+    /// they like.
+    private func noteRemoved(_ key: String) {
+        removedStories[key] = Date()
+        if removedStories.count > 1000 {
+            for old in removedStories.sorted(by: { $0.value < $1.value }).prefix(removedStories.count - 1000) { removedStories[old.key] = nil }
+        }
     }
 
     /// Sends the stories you still have up to someone who has just become a contact, if they're in each one's
@@ -1094,19 +1258,20 @@ final class AppModel {
         data.stories[i].audience = audience
         data.stories[i].lifetime = lifetime
         data.storyChoices[choiceKey(data.stories[i].persona)] = StoryChoice(audience: audience, lifetime: lifetime)
+        if data.stories[i].delivery != nil { data.stories[i].delivery = StoryDelivery() }
         let story = data.stories[i]
         let after = self.audience(of: story)
         for c in before where !after.contains(where: { $0.fingerprint == c.fingerprint }) { enqueue(.storyRemoved(id: id), to: c) }
         for c in after { sendStory(story, to: c, withClip: !before.contains { $0.fingerprint == c.fingerprint }) }
         trackUpload(of: id)
-        if story.isSyncable { sync(.story(story)) }
+        if story.isSyncable { var shared = story; shared.delivery = nil; sync(.story(shared)) }
         save()
     }
 
     func deleteStory(_ id: Story.ID) {
         guard let story = data.stories.first(where: { $0.id == id && $0.author == "me" }) else { return }
         withAnimation(.snappy) { data.stories.removeAll { $0.id == id } }
-        removedStories["me|\(id)"] = Date()
+        noteRemoved("me|\(id)")
         for c in audience(of: story) { enqueue(.storyRemoved(id: id), to: c) }
         sync(.storyRemoved(id))
         save()
@@ -1176,11 +1341,13 @@ final class AppModel {
         return (story.viewers ?? [:]).map { ($0.key, $0.value) }.sorted { $0.at > $1.at }
     }
 
-    var myStories: [Story] { data.stories.filter { $0.author == "me" && $0.isLive && $0.isReady && $0.persona == activePersona } }
+    /// Oldest first, the order they play in.
+    var myStories: [Story] { data.stories.filter { $0.author == "me" && $0.isLive && $0.isReady && $0.persona == activePersona }.sorted { $0.date < $1.date } }
 
     /// Other people's live stories, newest author first.
     var friendStories: [(author: String, stories: [Story])] {
-        let live = data.stories.filter { $0.author != "me" && $0.isLive && $0.isReady && $0.persona == activePersona }
+        // A video still arriving is listed too, shown as loading, so a stalled one doesn't just look missing.
+        let live = data.stories.filter { $0.author != "me" && $0.isLive && $0.persona == activePersona }
         let grouped = Dictionary(grouping: live, by: \.author)
         return grouped.map { ($0.key, $0.value.sorted { $0.date < $1.date }) }
             .sorted { ($0.stories.last?.date ?? .distantPast) > ($1.stories.last?.date ?? .distantPast) }
@@ -2059,6 +2226,7 @@ final class AppModel {
     func updateSecurity(_ change: (inout SecuritySettings) -> Void) {
         let before = data.security
         change(&data.security)
+        if data.security.pushWake != before.pushWake { data.security.pushWakeChosen = true }
         if data.security.onlineStatus != before.onlineStatus {
             if data.security.onlineStatus { resetPresenceSchedule() } else { sendPresence(false); online = [:] }
         }
@@ -2503,7 +2671,9 @@ final class AppModel {
     private func housekeep() async {
         refreshPush()
         retryStaleHandshakes()
+        resendUnconfirmedStories()
         data.clipParts = data.clipParts.filter { $0.value.date.addingTimeInterval(StoryLifetime.twoDays.rawValue + 3600) > Date() }
+        askForStalledClips()
         sendDueReceipts()
         await flush()
         if trafficShaping {
@@ -2587,6 +2757,18 @@ final class AppModel {
     /// or a decoy, where there's no account to say whose mailboxes they were.
     private var pushForgetPending = false
 
+    /// The mailboxes wake-ups cover: the main identity's, without those of people you've blocked or whose chat you've
+    /// muted. Anyone who knows a mailbox can write to it, so a banner for it would otherwise be theirs to ring.
+    private func pushKeys() -> Set<Data> {
+        var keys = currentLanes()[Lane(relay: nil, name: "main")] ?? []
+        for c in data.contacts where c.persona == nil {
+            guard let key = c.receiveKey else { continue }
+            let muted = data.conversations.contains { $0.kind == .direct && $0.persona == nil && $0.members == [c.fingerprint] && $0.muted }
+            if muted || data.blocked.contains(c.fingerprint) { keys.remove(key) }
+        }
+        return keys
+    }
+
     /// Whether this phone should be woken through Apple when mail lands.
     private var pushWanted: Bool { data.security.pushWake && data.security.notifications }
 
@@ -2611,7 +2793,7 @@ final class AppModel {
             if !pushWanted { pushStatus = data.security.notifications ? "Off" : "Turn notifications on first" }
             return
         }
-        let keys = currentLanes()[Lane(relay: nil, name: "main")] ?? []
+        let keys = pushKeys()
         if pushWanted {
             if Push.token == nil, !pushAsked { pushAsked = true; UIApplication.shared.registerForRemoteNotifications() }
             guard let token = Push.token else {
@@ -2622,6 +2804,8 @@ final class AppModel {
             let sound = data.security.notificationSound
             if let told = pushTold, told.token == token, told.keys == keys, told.sound == sound,
                Date().timeIntervalSince(told.at) < 15 * 60 { return }
+            // Mailboxes registered before and not now (a contact blocked or muted since) are taken off the relay.
+            let stale = Array((pushTold?.keys ?? []).subtracting(keys))
             pushBusy = true
             Task {
                 defer { pushBusy = false }
@@ -2644,6 +2828,9 @@ final class AppModel {
                     }
                 }
                 if ok {
+                    for start in stride(from: 0, to: stale.count, by: 256) {
+                        try? await client.unregisterPush(keys: Array(stale[start..<min(start + 256, stale.count)]))
+                    }
                     pushTold = (token, keys, sound, Date())
                     pushStatus = "Registered \(keys.count) mailbox\(keys.count == 1 ? "" : "es") at \(Date().formatted(date: .omitted, time: .shortened)), token ending \(token.suffix(4))"
                 }
@@ -2981,23 +3168,47 @@ final class AppModel {
                 }
                 data.stories[i].style = style
                 data.stories[i].lifetime = lifetime
-                if !data.stories[i].isLive { data.stories.remove(at: i) }
+                if !data.stories[i].isLive { data.stories.remove(at: i); break }
+                acknowledgeStory(id, author: fp, persona: persona)
+                // Sent again because pieces went missing: what's here now may complete it.
+                clipActivity[id] = Date()
+                assembleClip(id)
                 break
             }
+            if case let .video(bytes, _) = style, bytes.isEmpty { clipActivity[id] = Date() }
             var story = Story(id: id, author: fp, style: style, date: dated(date))
             story.persona = persona
             story.lifetime = lifetime
             if story.isLive { withAnimation(.snappy) { data.stories.append(story) } }
             assembleClip(id)
+            acknowledgeStory(id, author: fp, persona: persona)
         case let .storyPart(id, index, of, bytes):
             guard removedStories["\(fp)|\(id)"] == nil else { break }
+            // A piece sent again after the clip came together: nothing to do with it.
+            if data.stories.contains(where: { $0.id == id && $0.author == fp && $0.isReady }) { break }
             guard (1...StoryClipPieces.maxPieces).contains(of), (0..<of).contains(index), bytes.count <= StoryClipPieces.size,
                   data.clipParts[id] != nil || data.clipParts.count < 32 else { break }
             var pending = data.clipParts[id] ?? ClipParts(author: fp, persona: persona, of: of)
             guard pending.author == fp, pending.persona == persona, pending.of == of else { break }
             pending.parts[index] = bytes
             data.clipParts[id] = pending
+            clipActivity[id] = Date()
             assembleClip(id)
+        case let .storyReceived(id):
+            // One of my contacts has the story: it's no longer sent to them again.
+            guard let i = data.stories.firstIndex(where: { $0.id == id && $0.author == "me" && $0.persona == persona }),
+                  var delivery = data.stories[i].delivery, !delivery.confirmed.contains(fp) else { break }
+            delivery.confirmed.append(fp)
+            data.stories[i].delivery = delivery
+        case let .storyWant(id, parts):
+            // Only for a story of yours that's still up, on this persona, and that they're meant to see.
+            guard let story = data.stories.first(where: { $0.id == id && $0.author == "me" && $0.persona == persona }),
+                  story.isLive, story.shownTo.includes(fp), removedStories["me|\(id)"] == nil,
+                  !sender.isSelf, !data.blocked.contains(fp) else { break }
+            let key = "\(fp)|\(id)"
+            if let last = clipResent[key], Date().timeIntervalSince(last) < clipQuiet { break }
+            clipResent[key] = Date()
+            resendStory(story, to: sender, pieces: parts)
         case let .storyViewed(id):
             guard data.security.storyViews,
                   let i = data.stories.firstIndex(where: { $0.id == id && $0.author == "me" && $0.persona == persona }),
@@ -3005,7 +3216,7 @@ final class AppModel {
             data.stories[i].viewers = (data.stories[i].viewers ?? [:]).merging([fp: min(deposited ?? Date(), Date())]) { old, _ in old }
         case let .storyRemoved(id):
             if data.clipParts[id]?.author == fp { data.clipParts[id] = nil }
-            removedStories["\(fp)|\(id)"] = Date()
+            noteRemoved("\(fp)|\(id)")
             withAnimation { data.stories.removeAll { $0.id == id && $0.author == fp && $0.persona == persona } }
         case let .unsend(ids):
             applyUnsend(ids, from: sender)
@@ -3054,7 +3265,8 @@ final class AppModel {
         case let .removed(shared):
             guard let i = conversationIndex(shared, from: sender) else { break }
             let c = data.conversations[i]
-            guard c.isAdmin(fp) || c.canRemove("me", by: fp) else { break }
+            // Only someone allowed to take me out: the owner anyone, an admin a plain member or mod, a mod a plain member.
+            guard c.canRemove("me", by: fp) else { break }
             removeLocally(data.conversations[i].id)
         case let .moved(card):
             // They opened a mailbox just for us after we said hello through a group introduction.
@@ -3147,7 +3359,8 @@ final class AppModel {
         if let expires, expires <= Date() { return }
         let mine = me(sender.persona)?.fingerprint
         let reply = wire.reply.map {
-            ReplyRef(id: $0.id, author: $0.author == mine ? "me" : $0.author, snippet: String($0.snippet.prefix(120)))
+            ReplyRef(id: $0.id, author: $0.author == mine ? "me" : $0.author, snippet: String($0.snippet.prefix(120)),
+                     picture: $0.picture.flatMap { $0.count <= ReplyRef.maxPicture && PlatformImage(data: $0) != nil ? $0 : nil })
         }
         let preview = wire.preview.flatMap { p in
             !LinkPreviews.isWebLink(p.url) ? nil  // only plain http(s) links
@@ -3232,9 +3445,11 @@ final class AppModel {
         }
     }
 
-    /// A group or channel arrived or changed. New ones are joined; changes only count from an admin,
-    /// and only if they're newer than what we have.
-    private func joinGroup(_ info: GroupInfo, from sender: Contact) {
+    /// A group or channel arrived or changed. New ones are joined. A change to one you're in counts only from its
+    /// owner, an admin or (in a group) a mod, only if it's newer, and only for what that role may do: the owner
+    /// anything, an admin everything but who the owner, admins and mods are and the posting rule, a mod only
+    /// taking ordinary members out. Who may change it is decided before anything is touched.
+    func joinGroup(_ info: GroupInfo, from sender: Contact) {
         let persona = sender.persona
         let mine = me(persona)?.card.signing
         func fingerprint(_ key: Data) -> String { key == mine ? "me" : Identity.fingerprint(of: key) }
@@ -3245,17 +3460,27 @@ final class AppModel {
         func keep(_ intro: IntroMailbox?, at i: Int) {
             guard let intro, !data.conversations[i].introsMine.contains(intro) else { return }
             data.conversations[i].introsMine.append(intro)
+            // A few are plenty: each is polled, and registered for wake-ups.
+            if data.conversations[i].introsMine.count > 8 { data.conversations[i].introsMine.removeFirst() }
         }
 
+        // Who the group says is in it, worked out without changing anything.
+        let cards = info.roster.prefix(Conversation.maxMembers).filter { $0.signingKey != mine }
         var members: [String] = [sender.fingerprint]
-        for card in info.roster where card.signingKey != mine {
+        for card in cards {
             let fp = Identity.fingerprint(of: card.signingKey)
-            if let i = contactIndex(fp, persona) {
-                // Someone we know: pick up any of their devices we hadn't met.
-                for device in card.allDevices where !device.id.isEmpty && device.sendID.count == 32 && deviceIndex(i, device.id) == nil {
-                    upsertDevice(i, id: device.id, sendID: device.sendID)
-                }
-            } else {
+            if !members.contains(fp) { members.append(fp) }
+        }
+        let owner = info.owner.map(fingerprint) ?? sender.fingerprint
+        let admins = (info.admins ?? []).map(fingerprint).filter { $0 != owner }
+        let mods = info.mods.map { $0.map(fingerprint).filter { $0 != owner && !admins.contains($0) } }
+        let version = info.version ?? 0
+        /// Meets the people in the group we only know from it. A contact we already have keeps the devices we
+        /// know: what a group says about someone else's devices isn't theirs to say.
+        func meetMembers() {
+            for card in cards {
+                let fp = Identity.fingerprint(of: card.signingKey)
+                guard contactIndex(fp, persona) == nil else { continue }
                 var peer = Contact(fingerprint: fp, name: String(card.name.prefix(64)), avatar: card.avatar,
                                    signingKey: card.signingKey, agreementKey: card.agreementKey,
                                    sendID: card.sendID, hidden: true)
@@ -3265,32 +3490,39 @@ final class AppModel {
                 peer.relay = Invite.allowedRelay(card.relay)
                 upsert(peer)
             }
-            if !members.contains(fp) { members.append(fp) }
         }
-        let owner = info.owner.map(fingerprint) ?? sender.fingerprint
-        let admins = (info.admins ?? []).map(fingerprint).filter { $0 != owner }
-        let mods = info.mods.map { $0.map(fingerprint).filter { $0 != owner && !admins.contains($0) } }
-        let version = info.version ?? 0
 
         if let i = index(of: info.id) {
             let current = data.conversations[i]
+            let fromOwner = current.owner == sender.fingerprint
             let fromAdmin = current.isAdmin(sender.fingerprint)
-            guard current.persona == persona, fromAdmin || (current.kind == .group && current.mods.contains(sender.fingerprint)) else { return }
+            let fromMod = current.kind == .group && current.mods.contains(sender.fingerprint)
+            guard current.persona == persona, fromAdmin || fromMod else { return }
+            // The introduction mailbox that comes with an update, whether or not the update itself counts.
             keep(intro, at: i)
-            guard version > current.version else { return }
-            if !fromAdmin {
-                // A mod's update only counts if it takes ordinary members out and changes nothing else.
-                let gone = current.members.filter { !members.contains($0) }
-                guard String(info.title.prefix(80)) == current.title, info.avatar == current.avatar,
-                      info.about.map({ String($0.prefix(500)) }) == current.about, owner == current.owner,
-                      Set(admins) == Set(current.admins), Set(mods ?? current.mods) == Set(current.mods),
+            // Newer, but not so far ahead that nothing after it could count: from anyone but the owner, the next few.
+            guard version > current.version, fromOwner || version <= current.version + 8 else { return }
+            let gone = current.members.filter { !members.contains($0) }
+            if fromOwner {
+                guard owner == current.owner else { return }
+            } else {
+                // Nobody else can change who the owner, admins and mods are, or the posting rule, or take the owner
+                // or an admin out; a mod can't take another mod out.
+                guard owner == current.owner, Set(admins) == Set(current.admins),
+                      Set(mods ?? current.mods) == Set(current.mods),
                       (info.postPolicy ?? current.postPolicy) == current.postPolicy,
-                      members.allSatisfy({ current.members.contains($0) }),
                       gone.allSatisfy({ current.canRemove($0, by: sender.fingerprint) }) else { return }
+                if !fromAdmin {
+                    // A mod's update is only ever members taken out: nothing added, and none of the details.
+                    guard !gone.isEmpty, members.allSatisfy({ current.members.contains($0) }) else { return }
+                }
             }
-            data.conversations[i].title = String(info.title.prefix(80))
-            data.conversations[i].avatar = info.avatar
-            data.conversations[i].about = info.about.map { String($0.prefix(500)) }
+            meetMembers()
+            if fromAdmin {
+                data.conversations[i].title = String(info.title.prefix(80))
+                data.conversations[i].avatar = info.avatar
+                data.conversations[i].about = info.about.map { String($0.prefix(500)) }
+            }
             data.conversations[i].admins = admins
             data.conversations[i].mods = mods ?? current.mods
             data.conversations[i].postPolicy = info.postPolicy ?? current.postPolicy
@@ -3298,6 +3530,7 @@ final class AppModel {
             data.conversations[i].version = version
             return
         }
+        meetMembers()
         var convo = Conversation(id: info.id, kind: info.kind, title: String(info.title.prefix(80)), avatar: info.avatar,
                                  members: members)
         convo.persona = persona
@@ -3338,7 +3571,7 @@ final class AppModel {
     }
 
     /// The group as one recipient should see it. Channel followers only learn who can post.
-    private func info(for convo: Conversation, to recipient: String) -> GroupInfo {
+    func info(for convo: Conversation, to recipient: String) -> GroupInfo {
         let persona = convo.persona
         let people: [String]
         if convo.kind == .channel && !convo.isAdmin(recipient) {
@@ -3362,12 +3595,38 @@ final class AppModel {
 
     /// A picture shrunk for a group announcement. Every member's avatar and the group's own travel in each
     /// announcement, and full-size ones make it hundreds of kilobytes, many times any message, which is the
-    /// one a slow Tor circuit fails to carry. Small ones, and anything that can't be read as a picture, as is.
+    /// one a slow Tor circuit fails to carry. Small ones go as they are; anything that can't be read as a picture,
+    /// or claims more than 24 million pixels (a small file can declare gigabytes once opened), is left out. The
+    /// picture is shrunk as it's read, never opened at full size, and the answer is remembered so a group of many
+    /// people doesn't redo it for each.
     static func thumbnail(_ picture: Data?, side: CGFloat) -> Data? {
         guard let picture, picture.count > 12_000 else { return picture }
-        guard let image = PlatformImage(data: picture) else { return nil }
-        return cleanJPEG(image, maxSide: side) ?? nil
+        let key = "\(Int(side))|\(picture.count)|" + SHA256.hash(data: picture).prefix(12).map { String(format: "%02x", $0) }.joined()
+        if let hit = thumbnailCache[key] { return hit.isEmpty ? nil : hit }
+        var result = Data()
+        let quiet = [kCGImageSourceShouldCache: false] as CFDictionary
+        if let source = CGImageSourceCreateWithData(picture as CFData, quiet),
+           let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, quiet) as? [CFString: Any],
+           let width = properties[kCGImagePropertyPixelWidth] as? Int, let height = properties[kCGImagePropertyPixelHeight] as? Int,
+           width > 0, height > 0, width * height <= 24_000_000,
+           let small = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+               kCGImageSourceCreateThumbnailFromImageAlways: true,
+               kCGImageSourceCreateThumbnailWithTransform: true,
+               kCGImageSourceThumbnailMaxPixelSize: min(Int(side), max(width, height)),
+               kCGImageSourceShouldCache: false,
+           ] as CFDictionary) {
+            let out = NSMutableData()
+            if let dest = CGImageDestinationCreateWithData(out, UTType.jpeg.identifier as CFString, 1, nil) {
+                // Only the pixels: no metadata is copied from the source.
+                CGImageDestinationAddImage(dest, small, [kCGImageDestinationLossyCompressionQuality: 0.82] as CFDictionary)
+                if CGImageDestinationFinalize(dest) { result = out as Data }
+            }
+        }
+        if thumbnailCache.count >= 64 { thumbnailCache.removeAll() }
+        thumbnailCache[key] = result
+        return result.isEmpty ? nil : result
     }
+    private static var thumbnailCache: [String: Data] = [:]
 
     /// Where the other members first reach `member`: a mailbox made for each of their devices, kept as long as
     /// the group is. Never the mailbox they use with you, which only the two of you should know.
@@ -3617,7 +3876,8 @@ extension AppModel {
             guard let i = conversationIndex(for: ref, create: true),
                   !data.conversations[i].messages.contains(where: { $0.id == wire.id }) else { break }
             let mine = me(ref.persona)?.fingerprint
-            let reply = wire.reply.map { ReplyRef(id: $0.id, author: $0.author == mine ? "me" : $0.author, snippet: $0.snippet) }
+            let reply = wire.reply.map { ReplyRef(id: $0.id, author: $0.author == mine ? "me" : $0.author, snippet: $0.snippet,
+                                                  picture: $0.picture.flatMap { $0.count <= ReplyRef.maxPicture ? $0 : nil }) }
             let message = Message(id: wire.id, sender: "me", text: wire.text, image: wire.image, voice: wire.voice,
                                   date: dated(wire.date), status: .sent,
                                   expiresAt: wire.expiresIn.map { dated(wire.date).addingTimeInterval($0) }, reply: reply,
@@ -3682,7 +3942,7 @@ extension AppModel {
         case let .contactRemoved(fingerprint, persona):
             if let c = contact(fingerprint, in: persona), !c.isSelf { forget(c) }
         case let .storyRemoved(id):
-            removedStories["me|\(id)"] = Date()
+            noteRemoved("me|\(id)")
             data.stories.removeAll { $0.id == id && $0.author == "me" }
         case let .blocked(fp):
             if !data.blocked.contains(fp) { data.blocked.append(fp) }

@@ -12,7 +12,7 @@ struct ConversationView: View {
     @Environment(\.dismiss) private var dismiss
     let id: Conversation.ID
     @State private var draft = ""
-    @State private var attachment: Data?
+    @State private var attachments: [Data] = []
     @State private var showInfo = false
     @State private var recorder = VoiceRecorder()
     @State private var replyingTo: Message?
@@ -22,7 +22,10 @@ struct ConversationView: View {
     @State private var flash: UUID?
     /// The chat follows the bottom as it fills and settles, until you scroll away from it yourself.
     @State private var pinnedToEnd = true
-    @State private var distanceFromEnd: CGFloat = 0
+    /// Updated every scroll frame, so it lives outside view state: only crossing the threshold redraws.
+    @State private var scrollTrack = ScrollTrack()
+    @State private var showJumpDown = false
+    @State private var unreadBelow = 0
     @State private var hovered: UUID?
     @State private var swipe: (id: UUID, dx: CGFloat)?
     #if os(macOS)
@@ -214,14 +217,18 @@ struct ConversationView: View {
             // Rows are only measured as they come into view, so a chat opened at the bottom can grow under you
             // (photos, previews) and end up scrolled up. While it's following the bottom, it stays there.
             .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height - $0.contentOffset.y - $0.containerSize.height } action: { _, new in
-                distanceFromEnd = new
+                scrollTrack.distance = new
+            }
+            .onScrollGeometryChange(for: Bool.self) { $0.contentSize.height - $0.contentOffset.y - $0.containerSize.height > 320 } action: { _, far in
+                if showJumpDown != far { withAnimation(.snappy(duration: 0.2)) { showJumpDown = far } }
+                if !far { unreadBelow = 0 }
             }
             .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height } action: { old, new in
                 if pinnedToEnd, new != old { proxy.scrollTo("end", anchor: .bottom) }
             }
             .onScrollPhaseChange { old, new in
                 if new == .interacting { pinnedToEnd = false }
-                if new == .idle, old == .interacting || old == .decelerating { pinnedToEnd = distanceFromEnd < 80 }
+                if new == .idle, old == .interacting || old == .decelerating { pinnedToEnd = scrollTrack.distance < 80 }
             }
             #if os(iOS)
             .scrollDismissesKeyboard(.interactively)
@@ -232,6 +239,39 @@ struct ConversationView: View {
                 if let last = c.messages.last, pinnedToEnd || last.isMine {
                     pinnedToEnd = true
                     withAnimation(.smooth(duration: 0.3)) { proxy.scrollTo("end", anchor: .bottom) }
+                } else if let last = c.messages.last, !last.isMine, !last.isSystem {
+                    unreadBelow += 1
+                }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if showJumpDown {
+                    Button {
+                        pinnedToEnd = true
+                        unreadBelow = 0
+                        withAnimation(.smooth(duration: 0.35)) { proxy.scrollTo("end", anchor: .bottom) }
+                    } label: {
+                        ZStack(alignment: .topTrailing) {
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(Ink.text)
+                                .frame(width: 40, height: 40)
+                                .background(Ink.raised, in: .circle)
+                                .overlay(Circle().strokeBorder(Ink.line))
+                                .shadow(color: .black.opacity(0.18), radius: 4, y: 1)
+                            if unreadBelow > 0 {
+                                Text(unreadBelow > 99 ? "99+" : "\(unreadBelow)")
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundStyle(Ink.onAccent)
+                                    .padding(.horizontal, 5).frame(minWidth: 18, minHeight: 18)
+                                    .background(theme.accent, in: .capsule)
+                                    .offset(x: 6, y: -6)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, Platform.isPhone ? 14 : 22).padding(.bottom, 12)
+                    .transition(.scale(scale: 0.6).combined(with: .opacity))
+                    .accessibilityLabel(unreadBelow > 0 ? "Scroll to latest, \(unreadBelow) new" : "Scroll to latest")
                 }
             }
         }
@@ -314,17 +354,28 @@ struct ConversationView: View {
                 }
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            if let attachment, let img = PlatformImage(data: attachment) {
-                HStack {
-                    Image(platformImage: img).resizable().scaledToFill()
-                        .frame(width: 84, height: 84).clipShape(.rect(cornerRadius: 10))
-                        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Ink.line))
-                        .overlay(alignment: .topTrailing) {
-                            Button { withAnimation(.snappy) { self.attachment = nil } } label: { Image(systemName: "xmark") }
-                                .buttonStyle(IconButtonStyle(size: 22)).offset(x: 6, y: -6)
+            if !attachments.isEmpty {
+                ScrollView(.horizontal) {
+                    HStack(spacing: 12) {
+                        ForEach(Array(attachments.enumerated()), id: \.offset) { i, data in
+                            if let img = PlatformImage(data: data) {
+                                Image(platformImage: img).resizable().scaledToFill()
+                                    .frame(width: 84, height: 84).clipShape(.rect(cornerRadius: 10))
+                                    .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Ink.line))
+                                    .overlay(alignment: .topTrailing) {
+                                        Button {
+                                            withAnimation(.snappy) { _ = attachments.remove(at: i) }
+                                        } label: { Image(systemName: "xmark") }
+                                            .buttonStyle(IconButtonStyle(size: 22)).offset(x: 6, y: -6)
+                                            .accessibilityLabel("Remove photo")
+                                    }
+                            }
                         }
-                    Spacer()
+                    }
+                    .padding(.top, 8).padding(.trailing, 8)
                 }
+                .scrollIndicators(.never)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .transition(.scale(scale: 0.8, anchor: .bottomLeading).combined(with: .opacity))
             }
             if recorder.isRecording {
@@ -332,12 +383,14 @@ struct ConversationView: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             } else {
                 HStack(alignment: .bottom, spacing: 8) {
-                    ImagePickButton(maxSide: 1600, picked: { data in withAnimation(.snappy) { attachment = data } }) {
+                    ImagePickButton(maxSide: 1600, pickedMany: { photos in
+                        withAnimation(.snappy) { attachments = Array((attachments + photos).prefix(10)) }
+                    }) {
                         Image(systemName: "paperclip")
                     }
                         .buttonStyle(IconButtonStyle(size: 36))
-                        .help("Attach a photo")
-                        .accessibilityLabel("Attach photo")
+                        .help("Attach photos")
+                        .accessibilityLabel("Attach photos")
 
                     TextField("", text: $draft, prompt: Text(placeholder(c)).foregroundStyle(Ink.faint), axis: .vertical)
                         .textFieldStyle(.plain)
@@ -375,7 +428,7 @@ struct ConversationView: View {
                             }
                         }
 
-                    if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachment == nil {
+                    if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty {
                         Button { Task { _ = await recorder.start() } } label: { Image(systemName: "mic") }
                             .buttonStyle(IconButtonStyle(size: 36))
                             .help("Record a voice message")
@@ -389,7 +442,7 @@ struct ConversationView: View {
                             .transition(.opacity)
                     }
                 }
-                .animation(.snappy(duration: 0.2), value: draft.isEmpty && attachment == nil)
+                .animation(.snappy(duration: 0.2), value: draft.isEmpty && attachments.isEmpty)
             }
         }
         .padding(.horizontal, Platform.isPhone ? 10 : 18)
@@ -398,7 +451,7 @@ struct ConversationView: View {
         .background(Ink.base)
         .overlay(alignment: .top) { Rectangle().fill(Ink.line).frame(height: 1) }
         .animation(.snappy(duration: 0.25), value: recorder.isRecording)
-        .animation(.snappy(duration: 0.25), value: attachment)
+        .animation(.snappy(duration: 0.25), value: attachments.count)
         .animation(.snappy(duration: 0.25), value: replyingTo?.id)
         .animation(.snappy(duration: 0.25), value: draftPreview)
     }
@@ -429,9 +482,18 @@ struct ConversationView: View {
 
     private func send() {
         let preview = draftPreview.flatMap { draft.contains($0.url) ? $0 : nil }
-        model.send(draft, image: attachment, replyTo: replyingTo, preview: preview, in: id)
+        // Each photo goes as its own message; the text and reply ride along with the first.
+        if attachments.isEmpty {
+            model.send(draft, replyTo: replyingTo, preview: preview, in: id)
+        } else {
+            for (i, photo) in attachments.enumerated() {
+                model.send(i == 0 ? draft : "", image: photo, replyTo: i == 0 ? replyingTo : nil,
+                           preview: i == 0 ? preview : nil, in: id)
+            }
+        }
+        model.playSendSound()
         draft = ""
-        attachment = nil
+        attachments = []
         replyingTo = nil
         draftPreview = nil
         dismissedPreview = nil
@@ -441,6 +503,7 @@ struct ConversationView: View {
     private func sendVoice() {
         guard let note = recorder.finish() else { return }
         model.send("", voice: note, replyTo: replyingTo, in: id)
+        model.playSendSound()
         replyingTo = nil
     }
 
@@ -612,6 +675,12 @@ private struct Bubble: View {
                 Button { jump(quote.id) } label: {
                     HStack(spacing: 8) {
                         Rectangle().fill(mine ? Ink.onAccent.opacity(0.35) : tint).frame(width: 2).clipShape(.capsule)
+                        if let data = quote.picture, let img = PlatformImage(data: data) {
+                            Image(platformImage: img).resizable().scaledToFill()
+                                .frame(width: 36, height: 64)
+                                .clipShape(.rect(cornerRadius: 5))
+                                .accessibilityHidden(true)
+                        }
                         VStack(alignment: .leading, spacing: 1) {
                             Text(quoteAuthor ?? "")
                                 .font(.system(size: 11, weight: .semibold))
@@ -889,6 +958,11 @@ private struct RecordingBar: View {
 }
 
 /// Three bouncing dots and who's typing.
+/// A value that changes often but shouldn't redraw anything when it does.
+private final class ScrollTrack {
+    var distance: CGFloat = 0
+}
+
 private struct TypingDots: View {
     @Environment(\.theme) private var theme
     var names: [String]

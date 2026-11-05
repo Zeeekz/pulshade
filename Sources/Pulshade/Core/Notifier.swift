@@ -88,9 +88,14 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         return [.banner, .sound, .list]
     }
 
-    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse) async {
-        guard let raw = response.notification.request.content.userInfo["conversation"] as? String,
-              let id = UUID(uuidString: raw) else { return }
-        await MainActor.run { self.onOpen?(id) }
+    /// Finishes on the main thread: UIKit aborts the app if the completion of a tapped notification arrives from
+    /// a background one while the app is being brought forward.
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                            withCompletionHandler completionHandler: @escaping @Sendable () -> Void) {
+        let raw = response.notification.request.content.userInfo["conversation"] as? String
+        DispatchQueue.main.async {
+            if let raw, let id = UUID(uuidString: raw) { MainActor.assumeIsolated { Notifier.shared.onOpen?(id) } }
+            completionHandler()
+        }
     }
 }

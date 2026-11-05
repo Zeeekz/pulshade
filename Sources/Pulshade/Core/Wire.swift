@@ -102,9 +102,15 @@ enum Payload: Codable, Equatable {
     case storyRemoved(id: UUID)
     /// The sender viewed this story of yours.
     case storyViewed(id: UUID)
+    /// The sender has this story of yours, whole (a video: with its clip), so you needn't send it again. Sent only
+    /// with delivery receipts on. Apps from before this never send it, and are sent a story a few times instead.
+    case storyReceived(id: UUID)
     /// One piece of a video story's clip (the story itself, sent first, has an empty clip). Pieces are small enough
     /// for one relay message each, and the receiver puts them together once all `of` have arrived.
     case storyPart(id: UUID, index: Int, of: Int, bytes: Data)
+    /// "Your video stopped arriving": the pieces still missing (nil for all of them), asked of whoever posted it.
+    /// They send the story again with those pieces. Builds from before it can't read it and leave it.
+    case storyWant(id: UUID, parts: [Int]?)
     /// Delete for everyone: the sender takes their own messages back.
     case unsend(ids: [UUID])
     /// Nil emoji clears your reaction.

@@ -110,7 +110,9 @@ enum StoryFilter: String, CaseIterable, Identifiable, Codable {
 
     /// A photo (any image file data) with this look baked in, as a clean JPEG: no location or camera details
     /// survive. `none` still re-encodes, so what's sent never carries the original's metadata.
-    func bake(into data: Data, maxSide: CGFloat = 1600) -> Data? {
+    /// With `text`, the story's words (drawn over the whole 9:16 frame) are laid over the finished picture; a photo
+    /// of another shape is cropped to the frame first, which is what the story would show of it anyway.
+    func bake(into data: Data, maxSide: CGFloat = 1600, text: CIImage? = nil) -> Data? {
         let options: [CIImageOption: Any] = [.applyOrientationProperty: true]
         guard var image = CIImage(data: data, options: options) else { return nil }
         let longest = max(image.extent.width, image.extent.height)
@@ -118,8 +120,19 @@ enum StoryFilter: String, CaseIterable, Identifiable, Codable {
             let s = maxSide / longest
             image = image.transformed(by: CGAffineTransform(scaleX: s, y: s))
         }
+        if text != nil {
+            let e = image.extent
+            let frame = StoryVideo.size.width / StoryVideo.size.height
+            let w = min(e.width, e.height * frame), h = w / frame
+            image = image.cropped(to: CGRect(x: e.minX + (e.width - w) / 2, y: e.minY + (e.height - h) / 2, width: w, height: h))
+            image = image.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY))
+        }
         let extent = image.extent
-        let out = apply(image).cropped(to: extent)
+        var out = apply(image).cropped(to: extent)
+        if let text {
+            let s = extent.width / text.extent.width
+            out = text.transformed(by: CGAffineTransform(scaleX: s, y: s)).composited(over: out).cropped(to: extent)
+        }
         guard let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
         return Self.context.jpegRepresentation(of: out, colorSpace: space,
                                                options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.82])
@@ -154,7 +167,9 @@ enum StoryVideo {
 
     /// The look to bake into every frame, scaled to fill the story's 9:16 frame and centred.
     static func composition(for asset: AVAsset, filter: StoryFilter, size: CGSize = StoryVideo.size,
-                            zoom: ZoomTrack = .none) -> AVMutableVideoComposition {
+                            zoom: ZoomTrack = .none, text: CIImage? = nil) -> AVMutableVideoComposition {
+        // The words are drawn once at full HD and fitted to this clip's size, then laid over every frame.
+        let words = text.map { $0.transformed(by: CGAffineTransform(scaleX: size.width / $0.extent.width, y: size.width / $0.extent.width)) }
         let composition = AVMutableVideoComposition(asset: asset) { request in
             let source = request.sourceImage
             let e = source.extent
@@ -171,7 +186,9 @@ enum StoryVideo {
                 // Scale about the centre of the frame.
                 image = image.transformed(by: CGAffineTransform(a: z, b: 0, c: 0, d: z, tx: c.x * (1 - z), ty: c.y * (1 - z)))
             }
-            request.finish(with: filter.apply(image.cropped(to: frame)).cropped(to: frame), context: StoryFilter.context)
+            var finished = filter.apply(image.cropped(to: frame)).cropped(to: frame)
+            if let words { finished = words.composited(over: finished).cropped(to: frame) }
+            request.finish(with: finished, context: StoryFilter.context)
         }
         composition.renderSize = size
         composition.frameDuration = CMTime(value: 1, timescale: fps)
@@ -187,7 +204,7 @@ enum StoryVideo {
     /// Re-encodes a recording or picked clip with the look baked in: first 15 seconds, portrait 720p, bitrate
     /// chosen to fit `maxBytes`, no location or device metadata. Returns the file's bytes.
     static func export(from url: URL, filter: StoryFilter, zoom: ZoomTrack = .none, maxBytes: Int = StoryVideo.maxBytes,
-                       maxSeconds: Double = StoryVideo.maxSeconds, size: CGSize? = nil) async throws -> Data {
+                       maxSeconds: Double = StoryVideo.maxSeconds, size: CGSize? = nil, text: CIImage? = nil) async throws -> Data {
         let asset = AVURLAsset(url: url)
         guard let track = try? await asset.loadTracks(withMediaType: .video).first,
               let total = try? await asset.load(.duration), total.seconds.isFinite, total.seconds > 0 else { throw StoryVideoError.unreadable }
@@ -199,7 +216,7 @@ enum StoryVideo {
         for share in [0.85, 0.65, 0.45] {
             let out = FileManager.default.temporaryDirectory.appendingPathComponent("story-\(UUID().uuidString).mp4")
             defer { try? FileManager.default.removeItem(at: out) }
-            try await transcode(asset, to: out, seconds: seconds, filter: filter, zoom: zoom, size: size,
+            try await transcode(asset, to: out, seconds: seconds, filter: filter, zoom: zoom, size: size, text: text,
                                 bitsPerSecond: Int(Double(maxBytes) * share * 8 / seconds) - 48_000)
             let data = try Data(contentsOf: out)
             if data.count <= maxBytes { return data }
@@ -208,7 +225,7 @@ enum StoryVideo {
     }
 
     private static func transcode(_ asset: AVURLAsset, to out: URL, seconds: Double, filter: StoryFilter, zoom: ZoomTrack, size: CGSize,
-                                  bitsPerSecond: Int) async throws {
+                                  text: CIImage? = nil, bitsPerSecond: Int) async throws {
         let range = CMTimeRange(start: .zero, duration: CMTime(seconds: seconds, preferredTimescale: 600))
         let reader = try AVAssetReader(asset: asset)
         reader.timeRange = range
@@ -216,7 +233,7 @@ enum StoryVideo {
         let readerVideo = AVAssetReaderVideoCompositionOutput(videoTracks: videoTracks, videoSettings: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
         ])
-        readerVideo.videoComposition = composition(for: asset, filter: filter, size: size, zoom: zoom)
+        readerVideo.videoComposition = composition(for: asset, filter: filter, size: size, zoom: zoom, text: text)
         guard reader.canAdd(readerVideo) else { throw StoryVideoError.unreadable }
         reader.add(readerVideo)
 
