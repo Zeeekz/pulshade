@@ -236,14 +236,70 @@ struct StoryPick: Identifiable {
 }
 
 #if os(iOS)
-private struct PickedMovie: Transferable {
-    let url: URL
-    static var transferRepresentation: some TransferRepresentation {
-        FileRepresentation(contentType: .movie) { SentTransferredFile($0.url) } importing: { received in
-            let copy = FileManager.default.temporaryDirectory.appendingPathComponent("story-pick-\(UUID().uuidString).mov")
-            try FileManager.default.copyItem(at: received.file, to: copy)
-            return PickedMovie(url: copy)
+import PhotosUI
+
+/// Apple's own photo picker, shown straight from UIKit: it hands back the picture, or a copy of the video's file, to
+/// the callback. (SwiftUI's PhotosPicker, shown over the story camera, was closed before it could answer.)
+@MainActor
+final class LibraryPicker: NSObject, PHPickerViewControllerDelegate {
+    private static var current: LibraryPicker?
+    private var done: ((StoryPick.Kind?, UIImage?) -> Void)?
+
+    /// A clip comes back as `.clip` (already copied somewhere that stays), a picture as an image to be framed.
+    static func present(done: @escaping (StoryPick.Kind?, UIImage?) -> Void) {
+        var configuration = PHPickerConfiguration(photoLibrary: .shared())
+        configuration.filter = .any(of: [.images, .videos])
+        configuration.selectionLimit = 1
+        configuration.preferredAssetRepresentationMode = .current
+        let controller = PHPickerViewController(configuration: configuration)
+        let picker = LibraryPicker()
+        picker.done = done
+        controller.delegate = picker
+        current = picker
+        guard var top = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive })?.keyWindow?.rootViewController else {
+            current = nil
+            return
         }
+        while let next = top.presentedViewController { top = next }
+        top.present(controller, animated: true)
+    }
+
+    nonisolated func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        DispatchQueue.main.async { picker.dismiss(animated: true) }
+        guard let provider = results.first?.itemProvider else {
+            Task { @MainActor in self.finish(nil, nil) }
+            return
+        }
+        if provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier) {
+            provider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { url, _ in
+                // The file is only there until this returns, so it is copied now.
+                guard let url else {
+                    Task { @MainActor in self.finish(nil, nil) }
+                    return
+                }
+                let copy = FileManager.default.temporaryDirectory.appendingPathComponent("story-pick-\(UUID().uuidString).mov")
+                do {
+                    try FileManager.default.copyItem(at: url, to: copy)
+                    Task { @MainActor in self.finish(.clip(copy, .none), nil) }
+                } catch {
+                    Task { @MainActor in self.finish(nil, nil) }
+                }
+            }
+        } else if provider.canLoadObject(ofClass: UIImage.self) {
+            provider.loadObject(ofClass: UIImage.self) { object, _ in
+                let image = object as? UIImage
+                Task { @MainActor in self.finish(nil, image) }
+            }
+        } else {
+            Task { @MainActor in self.finish(nil, nil) }
+        }
+    }
+
+    private func finish(_ kind: StoryPick.Kind?, _ image: UIImage?) {
+        done?(kind, image)
+        done = nil
+        Self.current = nil
     }
 }
 #endif
@@ -254,28 +310,11 @@ struct StoryMediaPicker<Label: View>: View {
     var picked: (StoryPick.Kind) -> Void
     @ViewBuilder var label: Label
     @State private var pending: PendingCrop?
-    #if os(iOS)
-    @State private var choosing = false
-    @State private var item: PhotosPickerItem?
-    #endif
 
     var body: some View {
         Button { choose() } label: { label }
-            #if os(iOS)
-            .photosPicker(isPresented: $choosing, selection: $item, matching: .any(of: [.images, .videos]))
-            .onChange(of: item) { _, new in
-                guard let new else { return }
-                Task {
-                    if new.supportedContentTypes.contains(where: { $0.conforms(to: .movie) }) {
-                        if let movie = try? await new.loadTransferable(type: PickedMovie.self) { picked(.clip(movie.url, .none)) }
-                    } else if let raw = try? await new.loadTransferable(type: Data.self), let image = UIImage(data: raw) {
-                        pending = PendingCrop(image: image)
-                    }
-                    item = nil
-                }
-            }
-            #endif
-            .cropper($pending, frame: .story) { picked(.photo($0)) }
+            // Its own anchor: a sheet and the photo picker on one view cancel each other out.
+            .background { Color.clear.cropper($pending, frame: .story) { picked(.photo($0)) } }
     }
 
     private func choose() {
@@ -291,7 +330,9 @@ struct StoryMediaPicker<Label: View>: View {
             pending = PendingCrop(image: image)
         }
         #else
-        choosing = true
+        LibraryPicker.present { kind, image in
+            if let kind { picked(kind) } else if let image { pending = PendingCrop(image: image) }
+        }
         #endif
     }
 }

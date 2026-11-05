@@ -380,6 +380,10 @@ private struct ChatList: View {
     @State private var filter: ConversationKind?
     @State private var search = ""
     @State private var composing = false
+    /// The story camera and viewer are shown from here, not from the story strip: it sits in a lazy list whose rows
+    /// SwiftUI throws away and rebuilds, and whatever they were showing went with them.
+    @State private var composingStory = false
+    @State private var viewingStory: StoryReel?
     @State private var confirmDelete: Conversation?
     @State private var confirmClear = false
     @State private var scanningCode = false
@@ -431,7 +435,7 @@ private struct ChatList: View {
                 LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
                     VStack(spacing: 0) {
                         searchField
-                        StoryStrip()
+                        StoryStrip(composing: $composingStory, viewing: $viewingStory)
                             .padding(.vertical, 12)
                     }
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { storiesHeight = $0 }
@@ -472,6 +476,13 @@ private struct ChatList: View {
             NewConversationSheet { id in selection = id }
         }
         .sheet(isPresented: $scanningCode) { ScanSheet() }
+        // Each cover on an anchor of its own: two full-screen covers on one view cancel each other out.
+        .background { Color.clear.storyCamera(isPresented: $composingStory) }
+        .background {
+            Color.clear.viewerCover(item: $viewingStory) { reel in
+                StoryViewer(stories: reel.stories, start: reel.start, following: reel.following)
+            }
+        }
     }
 
     private var searchField: some View {
