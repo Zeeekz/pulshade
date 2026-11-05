@@ -2782,6 +2782,7 @@ final class AppModel {
     private func housekeep() async {
         refreshPush()
         watchTor()
+        watchStall()
         retryStaleHandshakes()
         resendUnconfirmedStories()
         data.clipParts = data.clipParts.filter { $0.value.date.addingTimeInterval(StoryLifetime.twoDays.rawValue + 3600) > Date() }
@@ -2904,10 +2905,34 @@ final class AppModel {
         guard !retryingRelay, let client = client(nil) else { return }
         retryingRelay = true
         defer { retryingRelay = false }
-        let reached = await client.health()
+        // Races fresh routes against the one in use, so a stuck connection doesn't have to time out first.
+        let reached = await Self.reach(client)
         if !reached { lastRelayContact = .distantPast }
         noteRelay(reached: reached)
         if reached { Task { await syncOnce() } }
+    }
+
+    /// When the last time the app checked the connection by itself.
+    @ObservationIgnored private var lastAutoRetry = Date.distantPast
+
+    /// What pressing "Check connection" does, done for you: over Tor, when something has waited to send for 15 seconds,
+    /// or the relay has been silent for 40 (a fetch waits up to 25 for mail, so a quiet but healthy connection can't
+    /// be told from a dead one sooner), look again on fresh routes and then send and fetch at once. A route that died
+    /// quietly would take a minute to time out on its own. Every 5 seconds while it lasts (a check still under way is
+    /// never doubled up), and never in the background or
+    /// right after a launch or a new network.
+    private func watchStall() {
+        #if os(iOS)
+        if backgroundedAt != nil { return }
+        #endif
+        guard phase == .unlocked, trafficShaping, overTor, !retryingRelay else { return }
+        let now = Date()
+        let since = [resumedAt, unlockedAt].compactMap { $0 }.max() ?? unlockedAt
+        let sendStalled = waitingToSend.oldest.map { now.timeIntervalSince($0) > 15 } ?? false
+        let silent = now.timeIntervalSince(lastRelayContact) > 40
+        guard sendStalled || silent, now.timeIntervalSince(lastAutoRetry) > 5, now.timeIntervalSince(since) > 15 else { return }
+        lastAutoRetry = now
+        Task { await retryRelay() }
     }
 
     /// A client for a contact's relay, or the default relay when nil. Each lane has its own connections, so
@@ -3132,9 +3157,20 @@ final class AppModel {
                 }
             }
         }
+        if aborted { return }
         if !down.isEmpty { link = .offline }
         save()
     }
+
+    /// Outbox items being sent right now by any flush, so two never send the same one, or write to one mailbox
+    /// at the same time. A message sent during a long upload starts its own flush and goes straight out.
+    @ObservationIgnored private var sendingIDs: Set<UUID> = []
+    @ObservationIgnored private var sendingMail: Set<Data> = []
+    @ObservationIgnored private var sendingBig: Set<UUID> = []
+    /// Under this an envelope is a short message or a receipt.
+    private static let smallEnvelope = 32_768
+    /// Photos and the like sent at once. They share a connection, so more only makes each of them slower.
+    private static let bigUploads = 2
 
     /// Mailboxes written to at once when sending.
     private static let sendLanes = 6
@@ -3153,21 +3189,10 @@ final class AppModel {
         let owner = identity.fingerprint
         for (n, (lane, keys)) in currentLanes().shuffled().enumerated() {
             if n > 0 && trafficShaping && !keys.isEmpty {
-        if aborted { return }
                 try? await Task.sleep(for: .milliseconds(Int.random(in: 150...900)))
                 guard self.identity?.fingerprint == owner else { return }
             }
             await poll(lane, keys: keys)
-    /// Outbox items being sent right now by any flush, so two never send the same one, or write to one mailbox
-    /// at the same time. A message sent during a long upload starts its own flush and goes straight out.
-    @ObservationIgnored private var sendingIDs: Set<UUID> = []
-    @ObservationIgnored private var sendingMail: Set<Data> = []
-    @ObservationIgnored private var sendingBig: Set<UUID> = []
-    /// Under this an envelope is a short message or a receipt.
-    private static let smallEnvelope = 32_768
-    /// Photos and the like sent at once. They share a connection, so more only makes each of them slower.
-    private static let bigUploads = 2
-
         }
         guard self.identity?.fingerprint == owner else { return }
         await flush()
