@@ -1,14 +1,21 @@
 import SwiftUI
 
 struct WelcomeView: View {
-    enum Route { case home, create, restore, link }
-    @State private var route: Route = .home
+    enum Route { case connection, home, create, restore, link }
+    /// A fresh install asks how to connect before it connects to anything.
+    @State private var route: Route = Tor.needsChoice ? .connection : .home
     @State private var appeared = false
     @State private var signingIn = false
 
     var body: some View {
         ZStack {
             switch route {
+            case .connection:
+                ConnectionChoice { tor in
+                    Tor.enabled = tor
+                    go(.home)
+                }
+                .transition(.opacity)
             case .home: home.transition(.opacity)
             case .create: CreateFlow(back: { go(.home) }).transition(.push(from: .trailing))
             case .restore: RestoreFlow(back: { go(.home) }).transition(.push(from: .trailing))
@@ -60,6 +67,50 @@ struct WelcomeView: View {
     }
 
     private func go(_ r: Route) { withAnimation(.smooth(duration: 0.45)) { route = r } }
+}
+
+/// The first thing a fresh install asks, before it connects to anything: through Tor, or straight to the server.
+struct ConnectionChoice: View {
+    var chosen: (_ tor: Bool) -> Void
+
+    var body: some View {
+        OnboardingPage(title: "How should PULSHADE connect?",
+                       subtitle: "Pick one now. You can change it later in Settings.", back: nil) {
+            VStack(spacing: 14) {
+                option(symbol: "bolt.fill", title: "Fast",
+                       detail: "Connects straight to PULSHADE's server, so messages and stories go in seconds. The server doesn't keep logs of who connects. It does see your IP address while you're connected, and so does your network, so they can tell you use PULSHADE. Neither can read what you say.",
+                       tor: false)
+                option(symbol: "lock.shield.fill", title: "Private, through Tor",
+                       detail: "Hides your IP address by sending everything through Tor. It can be slow, and on some networks messages arrive late.",
+                       tor: true)
+            }
+        } actions: {
+            EmptyView()
+        }
+    }
+
+    private func option(symbol: String, title: String, detail: String, tor: Bool) -> some View {
+        Button { chosen(tor) } label: {
+            VStack(alignment: .leading, spacing: 8) {
+                Label(title, systemImage: symbol)
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(Ink.text)
+                Text(branded: detail)
+                    .font(.system(size: 14))
+                    .foregroundStyle(Ink.dim)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Ink.raised, in: .rect(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Ink.line))
+            .contentShape(.rect(cornerRadius: 14))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .accessibilityHint(detail)
+    }
 }
 
 /// The shared frame of every sign-in screen: a back button, a title, one line of explanation,
