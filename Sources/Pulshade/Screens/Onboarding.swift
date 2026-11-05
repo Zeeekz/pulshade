@@ -2,7 +2,7 @@ import SwiftUI
 
 struct WelcomeView: View {
     enum Route { case connection, home, create, restore, link }
-    /// A fresh install asks how to connect before it connects to anything.
+    /// With no account on the device, it asks how to connect before it connects to anything.
     @State private var route: Route = Tor.needsChoice ? .connection : .home
     @State private var appeared = false
     @State private var signingIn = false

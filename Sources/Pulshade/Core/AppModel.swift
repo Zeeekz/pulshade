@@ -145,7 +145,7 @@ final class AppModel {
         #endif
         // Tor takes a moment to connect: start it now, in the background, so it's ready by the first request.
         let onionOnly = URL(string: AppData.defaultRelay).map(Tor.isOnion) == true && AppData.directRelay == nil
-        // A fresh install waits for its owner to choose between Tor and a direct connection first.
+        // With no account here, nothing connects until its owner has chosen between Tor and a direct connection.
         let awaitingChoice = !vault.exists && Tor.needsChoice
         if (Tor.enabled && !awaitingChoice) || onionOnly {
             DispatchQueue.global(qos: .utility).async { Tor.start() }
