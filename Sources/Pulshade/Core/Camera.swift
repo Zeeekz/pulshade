@@ -47,10 +47,18 @@ final class Camera: NSObject {
     /// False when there's no camera, or Pulshade isn't allowed to use it.
     func start() async -> Bool {
         guard !running, await AVCaptureDevice.requestAccess(for: .video) else { return running }
-        guard configure() else { return false }
+        // A microphone already allowed goes in with the first setup, so nothing has to be set up again.
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized { micAllowed = true }
+        // A stop still under way finishes first.
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in queue.async { done.resume() } }
+        guard !running, configure() else { return running }
         running = true
+        // Waits for the session to be running: setting it up again while it's still starting throws, and
+        // that took the whole app down.
         let session = session
-        queue.async { session.startRunning() }
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            queue.async { session.startRunning(); done.resume() }
+        }
         return true
     }
 

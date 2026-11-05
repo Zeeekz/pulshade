@@ -4,6 +4,7 @@ import AVFoundation
 import ImageIO
 import UniformTypeIdentifiers
 import SwiftUI
+import Network
 #if canImport(PulshadeShared)
 import PulshadeShared
 #endif
@@ -76,6 +77,14 @@ final class AppModel {
     private(set) var retryingRelay = false
     private var relayFailures = 0
     private var lastRelayContact = Date()
+    /// For the Network page: when the relay last answered, and when mail last arrived. Memory only.
+    private(set) var lastRelayReached: Date?
+    private(set) var lastMailReceived: Date?
+    /// When Automatic last moved Tor between direct and Snowflake, and how many times since the relay last answered.
+    private(set) var bridgeSwitchedAt: Date?
+    private var autoSwitches = 0
+    private var pathMonitor: NWPathMonitor?
+    private var lastPath: String?
     private var unlockedAt = Date()
     /// The Pulshade Admin app's key, built into the app: collectibles and the reports mailbox count only if it signed
     /// them.
@@ -2067,8 +2076,30 @@ final class AppModel {
     func blockRequest(_ id: FriendRequest.ID) {
         guard let request = data.requests.first(where: { $0.id == id }) else { return }
         data.blocked.append(request.fingerprint)
+        data.blockedNames[request.fingerprint] = request.card.name
         sync(.blocked(request.fingerprint))
         declineRequest(id)
+    }
+
+    /// Blocks someone you already chat with: their chat, stories and requests go, and anything they send later is
+    /// dropped. Nothing tells them.
+    func blockContact(_ fingerprint: String, persona: UUID?) {
+        guard let c = contact(fingerprint, in: persona), !c.isSelf else { return }
+        if !data.blocked.contains(fingerprint) { data.blocked.append(fingerprint) }
+        data.blockedNames[fingerprint] = c.displayName
+        sync(.blocked(fingerprint))
+        forget(c)
+        save()
+        refreshPush()
+    }
+
+    /// Lets someone reach you again. They come back only if one of you sends a new request.
+    func unblock(_ fingerprint: String) {
+        withAnimation(.snappy) {
+            data.blocked.removeAll { $0 == fingerprint }
+            data.blockedNames[fingerprint] = nil
+        }
+        save()
     }
 
     // MARK: Burners
@@ -2612,6 +2643,7 @@ final class AppModel {
 
     private func startSync() {
         syncTask?.cancel()
+        if trafficShaping { watchNetwork() }
         guard trafficShaping else {
             // Tests: one round at a time, at a steady pace.
             syncTask = Task { [weak self] in
@@ -2713,6 +2745,7 @@ final class AppModel {
             let waited = wait > 0 && (!envelopes.isEmpty || Date().timeIntervalSince(started) > Double(wait) / 2)
             guard identity?.fingerprint == owner, !envelopes.isEmpty else { return waited }
             for envelope in envelopes { receive(envelope) }
+            lastMailReceived = Date()
             deposited = nil
             save()
             try await client.ack(envelopes)
@@ -2727,6 +2760,7 @@ final class AppModel {
     /// pressing send doesn't wait for Tor to build one.
     private func housekeep() async {
         refreshPush()
+        watchTor()
         retryStaleHandshakes()
         resendUnconfirmedStories()
         data.clipParts = data.clipParts.filter { $0.value.date.addingTimeInterval(StoryLifetime.twoDays.rawValue + 3600) > Date() }
@@ -2746,6 +2780,61 @@ final class AppModel {
         }
     }
 
+    // MARK: Connection health
+
+    /// Messages and stories still waiting on this device to reach the relay, and how long the oldest has waited.
+    var waitingToSend: (count: Int, oldest: Date?) {
+        let items = data.outbox.filter { $0.ephemeral != true }
+        return (items.count, items.compactMap(\.queued).min())
+    }
+
+    /// Under Automatic bridges: when the relay hasn't answered for a while over Tor, try the other way in. Plain Tor
+    /// is tried for 40 seconds, then Snowflake for 75 (it connects slower), and so on, a few times. A network that
+    /// blocks Tor then gets Snowflake without anyone opening a setting, and the choice is remembered.
+    private func watchTor() {
+        #if os(iOS)
+        if backgroundedAt != nil { return }
+        #endif
+        guard phase == .unlocked, trafficShaping, Bridges.current == .auto, overTor, autoSwitches < 4 else { return }
+        let since = [lastRelayReached, bridgeSwitchedAt, resumedAt, unlockedAt].compactMap { $0 }.max() ?? unlockedAt
+        guard Date().timeIntervalSince(since) > (Bridges.autoUsesSnowflake ? 75 : 40) else { return }
+        autoSwitches += 1
+        bridgeSwitchedAt = Date()
+        let toSnowflake = !Bridges.autoUsesSnowflake
+        Task.detached(priority: .userInitiated) { [weak self] in
+            Bridges.switchAuto(toSnowflake: toSnowflake)
+            await MainActor.run { if let self, self.phase == .unlocked { Task { await self.syncOnce() } } }
+        }
+    }
+
+    /// A new network (wifi to mobile data, or a different cell) kills the connections Tor had open. Rather than
+    /// letting each lane find that out by timing out, drop them at once and look again.
+    private func watchNetwork() {
+        guard pathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        pathMonitor = monitor
+        monitor.pathUpdateHandler = { [weak self] path in
+            let kinds = [NWInterface.InterfaceType.wifi, .cellular, .wiredEthernet].filter { path.usesInterfaceType($0) }
+            let now = "\(path.status)|\(kinds.map(\.hashValue))"
+            Task { @MainActor in
+                guard let self else { return }
+                defer { self.lastPath = now }
+                guard let before = self.lastPath, before != now, path.status == .satisfied, self.phase == .unlocked,
+                      self.overTor else { return }
+                self.resumedAt = Date()
+                self.autoSwitches = 0
+                Task.detached(priority: .userInitiated) {
+                    Tor.wake()
+                    await MainActor.run {
+                        RelayClient.closeAll()
+                        if self.phase == .unlocked { Task { await self.syncOnce() } }
+                    }
+                }
+            }
+        }
+        monitor.start(queue: DispatchQueue(label: "pulshade.path", qos: .utility))
+    }
+
     /// Sends right away instead of waiting for the next poll.
     private func kick() {
         guard phase == .unlocked else { return }
@@ -2759,6 +2848,8 @@ final class AppModel {
         if reached {
             relayFailures = 0
             lastRelayContact = Date()
+            lastRelayReached = Date()
+            autoSwitches = 0
             link = .online
             if relayUnreachable { withAnimation(.smooth) { relayUnreachable = false } }
             if connecting { withAnimation(.smooth(duration: 0.5)) { connecting = false } }
@@ -4022,6 +4113,11 @@ extension AppModel {
         case let .blocked(fp):
             if !data.blocked.contains(fp) { data.blocked.append(fp) }
             data.requests.removeAll { $0.fingerprint == fp }
+            // Blocked from a chat on another device: drop them here too.
+            for c in data.contacts where c.fingerprint == fp && !c.isSelf {
+                if data.blockedNames[fp] == nil { data.blockedNames[fp] = c.displayName }
+                forget(c)
+            }
         case let .read(ref):
             if let i = conversationIndex(for: ref, create: false) { data.conversations[i].unread = 0 }
         case let .publicInvite(persona, receiveKey, relay):

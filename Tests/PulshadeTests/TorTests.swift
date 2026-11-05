@@ -208,7 +208,7 @@ struct BridgeNetworkTests {
         Bridges.forget()
         Bridges.reload()
         #expect(!FileManager.default.fileExists(atPath: Bridges.file.path))
-        #expect(Bridges.current == .off && Bridges.customLines.isEmpty)
+        #expect(Bridges.current == .auto && !Bridges.autoUsesSnowflake && Bridges.customLines.isEmpty)
     }
 
     @Test func aChoiceFromOlderBuildsMovesOutOfThePreferences() throws {
@@ -224,6 +224,26 @@ struct BridgeNetworkTests {
         #expect(UserDefaults.standard.object(forKey: "pulshade.bridges.custom") == nil)
         Bridges.reload()
         #expect(Bridges.current == .snowflake)
+    }
+
+    @Test func automaticGoesDirectUntilSnowflakeIsNeededAndRemembersIt() throws {
+        let folder = testDirectory("pulshade-bridges-auto")
+        Bridges.file = folder.appendingPathComponent("bridges.sealed")
+        defer { Bridges.forget(); try? FileManager.default.removeItem(at: folder) }
+        Bridges.forget()
+        #expect(Bridges.current == .auto && !Bridges.active && Bridges.lines.isEmpty)
+
+        Bridges.switchAuto(toSnowflake: true)
+        #expect(Bridges.active && Bridges.usable(Bridges.lines) == Bridges.builtIn[.snowflake]?.count)
+        Bridges.reload()
+        #expect(Bridges.current == .auto && Bridges.autoUsesSnowflake, "remembered for the next launch")
+
+        Bridges.switchAuto(toSnowflake: false)
+        #expect(!Bridges.active && Bridges.lines.isEmpty)
+
+        // A choice made by hand isn't touched by the automatic one.
+        Bridges.remember(.off)
+        #expect(!Bridges.switchAuto(toSnowflake: true) && !Bridges.active)
     }
 }
 

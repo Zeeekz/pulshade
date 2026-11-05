@@ -146,7 +146,8 @@ struct RelayClient {
     /// service, which through a bridge or on a slow network can take well over a minute; given less, it gives up
     /// and starts again just before it would have got there, every time.
     nonisolated(unsafe) private static var established: Set<String> = []
-    private static let firstRequestTimeout: TimeInterval = 150
+    /// Through bridges everything is slower, so the first request there is given longer.
+    private static var firstRequestTimeout: TimeInterval { Bridges.active ? 150 : 90 }
 
     /// Whether this lane already has a working route.
     var isEstablished: Bool { Self.lock.withLock { Self.established.contains(sessionName) } }

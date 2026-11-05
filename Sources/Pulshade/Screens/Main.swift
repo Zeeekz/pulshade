@@ -100,6 +100,11 @@ private struct PhoneMainView: View {
         .onChange(of: model.openedHandle, initial: true) { _, handle in
             if handle != nil { section = .contacts }
         }
+        // The open chat was deleted (by them, another of your devices, a burn or a block): go back to the list
+        // rather than leave an empty screen.
+        .onChange(of: selection.map { model.conversation($0) == nil } ?? false) { _, gone in
+            if gone { selection = nil }
+        }
     }
 
     private func open(_ id: Conversation.ID) {
@@ -378,6 +383,8 @@ private struct ChatList: View {
     @State private var confirmDelete: Conversation?
     @State private var confirmClear = false
     @State private var scanningCode = false
+    /// How tall the search bar and stories are together, so the list can snap past them.
+    @State private var storiesHeight: CGFloat = 0
 
     private var items: [Conversation] {
         model.sortedConversations.filter { c in
@@ -418,51 +425,29 @@ private struct ChatList: View {
             .padding(.top, Platform.isPhone ? 12 : 38)
             .padding(.bottom, 12)
 
-            HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass").font(.system(size: 12)).foregroundStyle(Ink.faint)
-                TextField("", text: $search, prompt: Text("Search").foregroundStyle(Ink.faint))
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 13))
-            }
-            .padding(.horizontal, 10)
-            .frame(height: 30)
-            .background(Ink.raised, in: .rect(cornerRadius: 8))
-            .padding(.horizontal, 16)
-
-            StoryStrip()
-                .padding(.vertical, 12)
-
-            FilterChips(filter: $filter)
-                .padding(.horizontal, 16)
-                .padding(.bottom, 8)
-
-            if items.isEmpty {
-                Spacer()
-                Constellation(symbol: filter?.symbol ?? "bubble.left.and.bubble.right",
-                              text: search.isEmpty ? "No conversations" : "No results")
-                Spacer()
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 1) {
-                        ForEach(items) { c in
-                            Button {
-                                selection = c.id
-                                model.markRead(c.id)
-                            } label: {
-                                ChatRow(conversation: c, selected: selection == c.id)
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel(c.title)
-                            .contextMenu { rowMenu(c) }
-                                .transition(.asymmetric(insertion: .scale(scale: 0.9).combined(with: .opacity),
-                                                        removal: .opacity))
-                        }
+            // Search and stories scroll away with the chats, as in Telegram, so the list gets the whole screen;
+            // the filters stay pinned under the heading.
+            ScrollView {
+                LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
+                    VStack(spacing: 0) {
+                        searchField
+                        StoryStrip()
+                            .padding(.vertical, 12)
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.bottom, 12)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { storiesHeight = $0 }
+                    SwiftUI.Section {
+                        rows
+                    } header: {
+                        FilterChips(filter: $filter)
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 8)
+                            .background(Ink.base)
+                    }
                 }
-                .scrollIndicators(.never)
             }
+            .scrollIndicators(.never)
+            .scrollDismissesKeyboard(.immediately)
+            .scrollTargetBehavior(StoriesSnap(height: storiesHeight))
         }
         .confirmationDialog(confirmDelete?.deleteWarning.title ?? "",
                             isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } }),
@@ -489,11 +474,68 @@ private struct ChatList: View {
         .sheet(isPresented: $scanningCode) { ScanSheet() }
     }
 
+    private var searchField: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").font(.system(size: 12)).foregroundStyle(Ink.faint)
+            TextField("", text: $search, prompt: Text("Search").foregroundStyle(Ink.faint))
+                .textFieldStyle(.plain)
+                .font(.system(size: 13))
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 30)
+        .background(Ink.raised, in: .rect(cornerRadius: 8))
+        .padding(.horizontal, 16)
+    }
+
+    @ViewBuilder private var rows: some View {
+        if items.isEmpty {
+            Constellation(symbol: filter?.symbol ?? "bubble.left.and.bubble.right",
+                          text: search.isEmpty ? "No conversations" : "No results")
+                .padding(.top, 80)
+        } else {
+            LazyVStack(spacing: 1) {
+                ForEach(items) { c in row(c) }
+            }
+            .padding(.horizontal, 8)
+            .padding(.bottom, 12)
+        }
+    }
+
+    private func row(_ c: Conversation) -> some View {
+        Button {
+            selection = c.id
+            model.markRead(c.id)
+        } label: {
+            ChatRow(conversation: c, selected: selection == c.id)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(c.title)
+        .contextMenu { rowMenu(c) }
+        .transition(.asymmetric(insertion: .scale(scale: 0.9).combined(with: .opacity), removal: .opacity))
+    }
+
     @ViewBuilder private func rowMenu(_ c: Conversation) -> some View {
         Button(c.pinned ? "Unpin" : "Pin") { model.togglePin(c.id) }
         Button(c.muted ? "Unmute" : "Mute") { model.toggleMute(c.id) }
         Divider()
         Button("Delete…", role: .destructive) { confirmDelete = c }
+    }
+}
+
+/// Like Telegram: the search bar and stories never stop half shown. A scroll that would end part way through them
+/// carries on to show them in full or hide them completely, whichever way it was going; past them, the chats
+/// scroll freely.
+private struct StoriesSnap: ScrollTargetBehavior {
+    var height: CGFloat
+
+    func updateTarget(_ target: inout ScrollTarget, context: TargetContext) {
+        let y = target.rect.minY
+        guard height > 0, y > 0, y < height else { return }
+        let hide: Bool
+        if context.velocity.dy > 0.1 { hide = true }
+        else if context.velocity.dy < -0.1 { hide = false }
+        else { hide = y > height / 2 }
+        target.rect.origin.y = hide ? height : 0
     }
 }
 

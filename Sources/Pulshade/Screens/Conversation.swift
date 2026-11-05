@@ -1096,6 +1096,7 @@ private struct ConversationInfo: View {
     @State private var pulseCheck = false
     @State private var confirmDelete = false
     @State private var confirmRemove = false
+    @State private var confirmBlock = false
     @State private var reporting: ReportSubject?
     @State private var adding = false
 
@@ -1473,6 +1474,27 @@ private struct ConversationInfo: View {
                 }
                 .buttonStyle(.plain)
                 .sheet(item: $reporting) { ReportSheet(subject: $0) }
+                if !contact.isSelf {
+                    Divider().overlay(Ink.line)
+                    Button { confirmBlock = true } label: {
+                        HStack {
+                            Text("Block").foregroundStyle(Color.red.opacity(0.9))
+                            Spacer()
+                            Image(systemName: "hand.raised").foregroundStyle(Color.red.opacity(0.9))
+                        }
+                        .font(.system(size: 13, weight: .medium))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .confirmationDialog("Block \(contact.displayName)?", isPresented: $confirmBlock, titleVisibility: .visible) {
+                        Button("Block", role: .destructive) {
+                            dismiss()
+                            model.blockContact(fp, persona: c.persona)
+                        }
+                    } message: {
+                        Text("This chat is deleted on your side and anything they send is dropped. They aren't told. You can unblock them in Privacy & Security.")
+                    }
+                }
                 if !contact.hidden && !contact.isSelf {
                     Divider().overlay(Ink.line)
                     Button { confirmRemove = true } label: {
