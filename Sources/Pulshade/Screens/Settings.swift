@@ -759,13 +759,8 @@ private struct NotificationSettings: View {
             #if os(iOS)
             if on {
                 SettingsGroup("When locked",
-                              footer: "Lets the relay wake this iPhone through Apple when mail arrives, so you hear about it while the phone is locked. The wake-up only says \"New message\". Apple learns that your iPhone was woken, and when, and the relay keeps its push token. Only your main identity is covered.") {
+                              footer: "Lets the relay wake this iPhone through Apple when mail arrives, so you hear about it while the phone is locked. The wake-up only says \"New message\". Apple learns that your iPhone was woken, and when, and the relay keeps its push token. Turned off, you only hear about messages while PULSHADE is open. Only your main identity is covered.") {
                     SecurityToggle(title: "Wake when locked", key: \.pushWake)
-                    if !model.pushStatus.isEmpty {
-                        RowDivider()
-                        Text(model.pushStatus).font(.system(size: 12)).foregroundStyle(Ink.dim)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
                 }
             }
             #endif
@@ -796,8 +791,9 @@ private struct AppearanceSettings: View {
 
     var body: some View {
         SettingsScreen(title: "Appearance") {
-            SettingsGroup("Theme", footer: "Light and Dark are clean and quiet. Pulse is deep violet glass with a slow glow behind it.") {
-                HStack(spacing: 12) {
+            SettingsGroup("Theme", footer: "Light, Sand, Dark and Midnight are clean and quiet. Pulse is deep violet glass with a slow glow behind it.") {
+                let columns = [GridItem(.adaptive(minimum: 96), spacing: 12)]
+                LazyVGrid(columns: columns, spacing: 12) {
                     ForEach(Theme.all) { t in
                         ThemeCard(theme: t, selected: t.id == model.theme.id) { model.setTheme(t) }
                     }

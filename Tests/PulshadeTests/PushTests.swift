@@ -41,13 +41,26 @@ struct PushTests {
         #expect(item.lane == nil)
     }
 
-    @Test func pushIsOffUntilTheUserTurnsItOn() {
-        #expect(SecuritySettings().pushWake == false)
+    @Test func pushIsOnWithNotificationsUnlessTurnedOff() {
+        #expect(SecuritySettings().pushWake == true)
     }
 
     @Test func settingsFromBeforePushExistedStillOpen() throws {
         let json = try JSONSerialization.data(withJSONObject: ["autoLockMinutes": 5, "notifications": true])
         let settings = try JSONDecoder.pulshade.decode(SecuritySettings.self, from: json)
-        #expect(settings.pushWake == false)
+        #expect(settings.pushWake == true)
+    }
+
+    /// Off was everyone's default once, so an "off" saved then is not a choice; one made by hand is kept.
+    @MainActor @Test func onlyAnOffChosenByHandStaysOff() async throws {
+        let unchosen = try JSONSerialization.data(withJSONObject: ["pushWake": false])
+        #expect(try JSONDecoder.pulshade.decode(SecuritySettings.self, from: unchosen).pushWake == true)
+
+        let model = testModel("pulshade-push")
+        defer { model.lock() }
+        try await model.create(identity: .generate(), profile: Profile(name: "P"), passcode: "test-passcode")
+        model.updateSecurity { $0.pushWake = false }
+        let saved = try JSONEncoder.pulshade.encode(model.data.security)
+        #expect(try JSONDecoder.pulshade.decode(SecuritySettings.self, from: saved).pushWake == false)
     }
 }

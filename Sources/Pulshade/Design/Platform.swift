@@ -59,8 +59,12 @@ enum Platform {
         board.setData(jpeg, forType: NSPasteboard.PasteboardType(UTType.jpeg.identifier))
         board.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
         board.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.TransientType"))
+        // A picture isn't left on the clipboard for good, any more than text is.
+        let count = board.changeCount
+        DispatchQueue.main.asyncAfter(deadline: .now() + 120) { if board.changeCount == count { board.clearContents() } }
         #else
-        UIPasteboard.general.setItems([[UTType.jpeg.identifier: jpeg]], options: [.localOnly: true])
+        UIPasteboard.general.setItems([[UTType.jpeg.identifier: jpeg]],
+                                      options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(120)])
         #endif
     }
 
@@ -165,13 +169,17 @@ struct ImagePickButton<Label: View>: View {
     var hasImage = false
     var removeTitle = "Remove picture"
     var onRemove: (() -> Void)? = nil
-    var picked: (Data) -> Void
+    var picked: (Data) -> Void = { _ in }
+    /// When set, the picker allows several photos at once (never with a crop) and hands them all over here.
+    var pickedMany: (([Data]) -> Void)? = nil
     @ViewBuilder var label: Label
     @State private var pending: PendingCrop?
     @State private var asking = false
     #if os(iOS)
     @State private var choosing = false
+    @State private var choosingMany = false
     @State private var item: PhotosPickerItem?
+    @State private var items: [PhotosPickerItem] = []
     #endif
 
     var body: some View {
@@ -185,6 +193,20 @@ struct ImagePickButton<Label: View>: View {
             }
             #if os(iOS)
             .photosPicker(isPresented: $choosing, selection: $item, matching: .images)
+            .photosPicker(isPresented: $choosingMany, selection: $items, maxSelectionCount: 10, matching: .images)
+            .onChange(of: items) { _, new in
+                guard !new.isEmpty else { return }
+                let chosen = new
+                items = []
+                Task {
+                    var all: [Data] = []
+                    for entry in chosen {
+                        if let raw = try? await entry.loadTransferable(type: Data.self), let image = UIImage(data: raw),
+                           let data = cleanJPEG(image, maxSide: maxSide) { all.append(data) }
+                    }
+                    if !all.isEmpty { pickedMany?(all) }
+                }
+            }
             .onChange(of: item) { _, new in
                 guard let new else { return }
                 Task {
@@ -210,11 +232,17 @@ struct ImagePickButton<Label: View>: View {
         #if os(macOS)
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.image]
-        panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url, let image = NSImage(contentsOf: url) else { return }
+        panel.allowsMultipleSelection = pickedMany != nil
+        guard panel.runModal() == .OK else { return }
+        if let pickedMany {
+            let all = panel.urls.prefix(10).compactMap { NSImage(contentsOf: $0) }.compactMap { cleanJPEG($0, maxSide: maxSide) }
+            if !all.isEmpty { pickedMany(all) }
+            return
+        }
+        guard let url = panel.url, let image = NSImage(contentsOf: url) else { return }
         use(image)
         #else
-        choosing = true
+        if pickedMany != nil { choosingMany = true } else { choosing = true }
         #endif
     }
 }

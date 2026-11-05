@@ -23,6 +23,9 @@ struct ImageViewer: View {
     /// How far it's been dragged down on its way to closing (only while not zoomed in).
     @State private var dragY: CGFloat = 0
     @State private var notice: String?
+    /// The picture redrawn into a fresh JPEG, which is what's saved, shared and copied: what a stranger sent is never
+    /// passed on as it arrived, so it can't bring location or other hidden data into your library.
+    @State private var cleaned: Data?
 
     private var image: PlatformImage? { PlatformImage(data: data) }
 
@@ -47,8 +50,10 @@ struct ImageViewer: View {
                 Spacer()
                 HStack(spacing: 14) {
                     control("square.and.arrow.down", label: "Save") { save() }
-                    ShareLink(item: PhotoFile(data: data), preview: SharePreview("Photo")) { face("square.and.arrow.up") }
-                        .accessibilityLabel("Share")
+                    if let cleaned {
+                        ShareLink(item: PhotoFile(data: cleaned), preview: SharePreview("Photo")) { face("square.and.arrow.up") }
+                            .accessibilityLabel("Share")
+                    }
                     control("doc.on.doc", label: "Copy") { copy() }
                 }
             }
@@ -62,6 +67,7 @@ struct ImageViewer: View {
                     .transition(.opacity)
             }
         }
+        .task { cleaned = image.flatMap { cleanJPEG($0, maxSide: 4096) } }
         #if os(macOS)
         .frame(minWidth: 520, minHeight: 440)
         .onKeyPress(.escape) { dismiss(); return .handled }
@@ -130,8 +136,8 @@ struct ImageViewer: View {
 
     /// Photos on iPhone (only ever added to, never read), a file of your choosing on the Mac.
     private func save() {
+        guard let photo = cleaned else { say("Couldn't read the picture"); return }
         #if os(iOS)
-        let photo = data
         Task {
             let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
             guard status == .authorized || status == .limited else {
@@ -151,12 +157,13 @@ struct ImageViewer: View {
         panel.allowedContentTypes = [.jpeg]
         panel.nameFieldStringValue = "Photo.jpg"
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do { try data.write(to: url, options: .atomic); say("Saved") } catch { say("Couldn't save") }
+        do { try photo.write(to: url, options: .atomic); say("Saved") } catch { say("Couldn't save") }
         #endif
     }
 
     private func copy() {
-        Platform.copyImage(data)
+        guard let cleaned else { say("Couldn't read the picture"); return }
+        Platform.copyImage(cleaned)
         say("Copied")
     }
 }

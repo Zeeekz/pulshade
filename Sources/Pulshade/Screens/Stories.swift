@@ -20,7 +20,10 @@ struct StoryStrip: View {
     var body: some View {
         ScrollView(.horizontal) {
             HStack(alignment: .top, spacing: 14) {
-                Button { model.myStories.isEmpty ? (composing = true) : (viewing = StoryReel(stories: model.myStories)) } label: {
+                Button {
+                    model.myStories.isEmpty ? (composing = true)
+                        : (viewing = StoryReel(stories: model.myStories, following: unseenReels(after: nil)))
+                } label: {
                     StoryBubble(image: model.activeProfile.avatar, seed: model.fingerprint, name: "Your story",
                                 active: !model.myStories.isEmpty, adding: model.myStories.isEmpty,
                                 uploading: model.storyUpload, glow: model.hasUnviewedStory)
@@ -38,7 +41,8 @@ struct StoryStrip: View {
                 ForEach(model.friendStories, id: \.author) { entry in
                     let contact = model.contact(entry.author)
                     Button {
-                        viewing = StoryReel(stories: entry.stories, start: entry.stories.firstIndex { !$0.seen } ?? 0)
+                        viewing = StoryReel(stories: entry.stories, start: entry.stories.firstIndex { !$0.seen } ?? 0,
+                                            following: unseenReels(after: entry.author))
                     } label: {
                         StoryBubble(image: contact?.avatar, seed: entry.author, name: model.displayName(entry.author),
                                     active: entry.stories.contains { !$0.seen }, adding: false)
@@ -53,7 +57,14 @@ struct StoryStrip: View {
         }
         .scrollIndicators(.never)
         .storyCamera(isPresented: $composing)
-        .sheet(item: $viewing) { reel in StoryViewer(stories: reel.stories, start: reel.start) }
+        .sheet(item: $viewing) { reel in StoryViewer(stories: reel.stories, start: reel.start, following: reel.following) }
+    }
+
+    /// The row's stories that haven't all been seen, after `author`'s (or all of them, from your own).
+    private func unseenReels(after author: String?) -> [[Story]] {
+        let all = model.friendStories
+        let rest = author.flatMap { a in all.firstIndex { $0.author == a }.map { Array(all[($0 + 1)...]) } } ?? all
+        return rest.filter { $0.stories.contains { !$0.seen } }.map(\.stories)
     }
 }
 
@@ -61,6 +72,8 @@ struct StoryReel: Identifiable {
     let id = UUID()
     var stories: [Story]
     var start = 0
+    /// Whose stories play next when these run out: the people after them in the row who have something unseen.
+    var following: [[Story]] = []
 }
 
 private struct StoryBubble: View {
@@ -119,7 +132,19 @@ struct StoryFace: View {
                 if !caption.isEmpty { StoryCaption(text: caption, compact: compact) }
             case let .video(data, caption):
                 Color.black
-                if let clip { LayerView(layer: clip.layer).frame(maxWidth: .infinity, maxHeight: .infinity) } else { StoryPoster(data: data) }
+                if data.isEmpty {
+                    // Still arriving: it plays as soon as the last piece is in.
+                    VStack(spacing: 10) {
+                        ProgressView().tint(.white)
+                        if !compact { Text("Loading video").font(.system(size: 13, weight: .semibold)).foregroundStyle(.white.opacity(0.8)) }
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Loading video")
+                } else if let clip {
+                    LayerView(layer: clip.layer).frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    StoryPoster(data: data)
+                }
                 if !caption.isEmpty { StoryCaption(text: caption, compact: compact) }
             }
         }
@@ -168,6 +193,13 @@ struct StoryComposer: View {
     @State private var audience: StoryAudience = .everyone
     @State private var lifetime = StoryLifetime.day.rawValue
     @State private var choosingAudience = false
+    /// Text placed on the picture, clip or colours, and the piece being worked on.
+    @State private var overlays: [StoryTextOverlay] = []
+    /// The piece being typed, and the one pinch and twist act on (the last touched).
+    @State private var typing: UUID?
+    @State private var active: UUID?
+    @State private var choosingSettings = false
+    @State private var seed = UUID().uuidString
     /// The story being edited, if this isn't a new one.
     private var editing: Story?
     /// After posting, so the camera behind closes too.
@@ -209,6 +241,31 @@ struct StoryComposer: View {
     }
 
     var body: some View {
+        Group {
+            if editing == nil { creator } else { legacyBody }
+        }
+        .onAppear {
+            guard editing == nil else { return }
+            audience = model.storyChoice.audience
+            lifetime = model.storyChoice.lifetime
+            startTyping()
+        }
+        .onChange(of: image == nil && clip == nil) { _, plain in if plain { startTyping() } }
+        .task(id: clip) { openClip() }
+        .task(id: [filter.rawValue, String(image?.count ?? 0)]) { await look() }
+        .onChange(of: filter) { _, new in clipPreview?.set(new) }
+        .onDisappear {
+            clipPreview?.close()
+            if let clip { try? FileManager.default.removeItem(at: clip) }
+        }
+    }
+
+    private var legacyBody: some View {
+        legacyContent
+            .sheet(isPresented: $choosingAudience) { StoryAudiencePicker(audience: $audience) }
+    }
+
+    private var legacyContent: some View {
         SheetBody(width: 440) {
             VStack(spacing: 18) {
                 SheetHeader(symbol: "circle.dashed.inset.filled", title: editing == nil ? "Story" : "Edit story")
@@ -218,7 +275,6 @@ struct StoryComposer: View {
                     .shadow(color: theme.accent.opacity(0.35), radius: 30)
                     .animation(.smooth, value: palette)
                     .animation(.smooth, value: image)
-                    .modifier(OptionalFilterSwipe(filter: $filter, enabled: canFilter))
                 if canFilter { FilterDots(filter: $filter) }
 
                 if image == nil && clip == nil && !isVideoEdit {
@@ -290,24 +346,207 @@ struct StoryComposer: View {
                         }
                     }
                     .buttonStyle(GlowButtonStyle(size: 46))
-                    .disabled(exporting || (image == nil && clip == nil && !isVideoEdit && text.trimmingCharacters(in: .whitespaces).isEmpty))
+                    .disabled(exporting || !canPost)
                     .accessibilityLabel(exporting ? "Preparing video" : editing == nil ? "Post" : "Save")
                 }
             }
         }
-        .onAppear {
-            guard editing == nil else { return }
-            audience = model.storyChoice.audience
-            lifetime = model.storyChoice.lifetime
+    }
+
+
+    // MARK: New story
+
+    /// The biggest 9:16 frame that fits.
+    private func fit(_ size: CGSize) -> CGSize {
+        let width = max(min(size.width, size.height * 9 / 16), 1)
+        return CGSize(width: width, height: width * 16 / 9)
+    }
+
+    private func addText() {
+        // New text starts like the last piece, so a few lines match without fiddling.
+        var item = StoryTextOverlay()
+        if let last = overlays.last(where: { !$0.isEmpty }) {
+            item.color = last.color; item.face = last.face; item.backed = last.backed; item.size = last.size
         }
-        .task(id: clip) { openClip() }
-        .task(id: [filter.rawValue, String(image?.count ?? 0)]) { await look() }
-        .onChange(of: filter) { _, new in clipPreview?.set(new) }
-        .onDisappear {
-            clipPreview?.close()
-            if let clip { try? FileManager.default.removeItem(at: clip) }
+        withAnimation(.snappy(duration: 0.2)) { overlays.append(item) }
+        active = item.id
+        typing = item.id
+    }
+
+    /// The editor: the story full screen with text on it, controls floating over the edges.
+    private var creator: some View {
+        GeometryReader { geo in
+            let canvas = fit(geo.size)
+            ZStack {
+                Color.black.ignoresSafeArea()
+                ZStack {
+                    baseFace
+                        .frame(width: canvas.width, height: canvas.height)
+                        .modifier(OptionalFilterSwipe(filter: $filter, enabled: canFilter && typing == nil))
+                    StoryOverlayCanvas(items: $overlays, active: $active, typing: $typing, canvas: canvas, add: addText)
+                }
+                .frame(width: canvas.width, height: canvas.height)
+                .clipShape(.rect(cornerRadius: Platform.isPhone ? 0 : 16))
+
+                if typing == nil {
+                    VStack {
+                        HStack {
+                            floating("xmark", label: "Close") { dismiss() }
+                            Spacer()
+                            floating("textformat", label: "Add text") { addText() }
+                        }
+                        .padding(.horizontal, 14).padding(.top, 6)
+                        Spacer()
+                        bottomControls
+                    }
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .transition(.opacity)
+                }
+                if typing != nil {
+                    StoryTypingOverlay(items: $overlays, typing: $typing, canvasWidth: canvas.width)
+                }
+            }
+            .frame(width: geo.size.width, height: geo.size.height)
         }
+        .background(Color.black.ignoresSafeArea())
+        .preferredColorScheme(.dark)
+        .animation(.snappy(duration: 0.2), value: typing)
+        .sheet(isPresented: $choosingSettings) { settingsSheet }
+    }
+
+    private func floating(_ symbol: String, label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 16, weight: .semibold)).foregroundStyle(.white)
+                .frame(width: 40, height: 40)
+                .background(.black.opacity(0.4), in: .circle)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+    }
+
+    private var bottomControls: some View {
+        VStack(spacing: 12) {
+            if let failure {
+                Text(failure).font(.system(size: 13)).foregroundStyle(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 6).background(.black.opacity(0.5), in: .capsule)
+            }
+            if canFilter { FilterDots(filter: $filter) }
+            if image == nil && clip == nil {
+                HStack(spacing: 12) {
+                    ForEach(0..<StoryPalette.all.count, id: \.self) { i in
+                        Circle().fill(StoryPalette.gradient(i))
+                            .frame(width: 26, height: 26)
+                            .overlay(Circle().strokeBorder(.white, lineWidth: palette == i ? 2.5 : 0))
+                            .scaleEffect(palette == i ? 1.15 : 1)
+                            .onTapGesture { withAnimation(.snappy) { palette = i } }
+                    }
+                }
+            }
+            HStack(spacing: 10) {
+                if image != nil || clip != nil {
+                    floating("textformat.abc", label: "Write a text story instead") {
+                        withAnimation { image = nil; clip = nil; looked = nil; filter = .none }
+                    }
+                    .disabled(exporting)
+                } else {
+                    StoryMediaPicker(picked: { kind in
+                        withAnimation {
+                            switch kind {
+                            case let .photo(data): image = data
+                            case let .clip(url, zoom): clip = url; clipZoom = zoom
+                            }
+                        }
+                    }) {
+                        Image(systemName: "photo.fill")
+                            .font(.system(size: 16, weight: .semibold)).foregroundStyle(.white)
+                            .frame(width: 40, height: 40).background(.black.opacity(0.4), in: .circle)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Choose a photo or video")
+                }
+                Spacer()
+                Button { choosingSettings = true } label: {
+                    Label(model.summary(of: audience), systemImage: "person.2.fill")
+                        .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white).lineLimit(1)
+                        .padding(.horizontal, 14).frame(height: 40)
+                        .background(.black.opacity(0.4), in: .capsule)
+                }
+                .buttonStyle(.plain)
+                Button { post() } label: {
+                    if exporting { ProgressView().controlSize(.small).tint(.white) } else { Image(systemName: "arrow.up") }
+                }
+                .buttonStyle(GlowButtonStyle(size: 44))
+                .disabled(exporting || !canPost)
+                .accessibilityLabel(exporting ? "Preparing video" : "Post")
+            }
+            .padding(.horizontal, 14)
+        }
+        .padding(.bottom, 8)
+    }
+
+    /// Who can see it and how long it lasts, one tap from the editor.
+    private var settingsSheet: some View {
+        SheetBody(width: 420) {
+            VStack(spacing: 18) {
+                SheetHeader(symbol: "person.2.fill", title: "Share story")
+                SettingsGroup {
+                    Button { choosingAudience = true } label: {
+                        SettingRow("Who can see it", symbol: "person.2") {
+                            Text(model.summary(of: audience)).font(.system(size: 14)).foregroundStyle(Ink.faint).lineLimit(1)
+                            Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Ink.faint)
+                        }
+                        .contentShape(.rect)
+                    }
+                    .buttonStyle(.plain)
+                    RowDivider(inset: 52)
+                    SettingRow("Lasts", symbol: "clock") {
+                        Picker("", selection: $lifetime) {
+                            ForEach(StoryLifetime.allCases) { Text($0.label).tag($0.rawValue) }
+                        }
+                        .pickerStyle(.menu).labelsHidden().fixedSize()
+                    }
+                }
+            }
+        }
+        .presentationDetents([.medium])
         .sheet(isPresented: $choosingAudience) { StoryAudiencePicker(audience: $audience) }
+    }
+
+    /// Whether there's something to post: text on a colour, a picture or a clip, or an edit.
+    private var canPost: Bool {
+        if editing != nil { return image != nil || isVideoEdit || !text.trimmingCharacters(in: .whitespaces).isEmpty }
+        return image != nil || clip != nil || overlays.contains { !$0.isEmpty }
+    }
+
+    /// A story of only colours and words opens with a line of text ready to type, in the middle.
+    private func startTyping() {
+        guard editing == nil, image == nil, clip == nil, overlays.allSatisfy(\.isEmpty) else { return }
+        var first = StoryTextOverlay()
+        first.size = 0.1
+        overlays = [first]
+        active = first.id
+        typing = first.id
+    }
+
+    @ViewBuilder private var baseFace: some View {
+        if clip != nil, let clipPreview {
+            ZStack {
+                Color.black
+                LayerView(layer: clipPreview.layer)
+            }
+            .accessibilityLabel("Video preview")
+        } else if clip != nil {
+            Color.black.overlay { ProgressView().tint(.white) }
+        } else if let shown = looked ?? image, let img = PlatformImage(data: shown) {
+            ZStack {
+                Color.black
+                Image(platformImage: img).resizable().scaledToFill()
+            }
+            .clipped()
+        } else {
+            StoryTextBackdrop(palette: palette, seed: seed)
+        }
     }
 
     private var isVideoEdit: Bool {
@@ -354,11 +593,12 @@ struct StoryComposer: View {
         } else if let clip {
             exporting = true
             failure = nil
-            let look = filter, caption = text, track = clipZoom
+            let look = filter, track = clipZoom
+            let words = StoryOverlayRender.text(overlays)
             Task {
                 do {
-                    let data = try await StoryVideo.export(from: clip, filter: look, zoom: track)
-                    model.postStory(.video(data, caption: caption), audience: audience, lifetime: lifetime)
+                    let data = try await StoryVideo.export(from: clip, filter: look, zoom: track, text: words)
+                    model.postStory(.video(data, caption: ""), audience: audience, lifetime: lifetime)
                     exporting = false
                     finish()
                 } catch {
@@ -368,18 +608,42 @@ struct StoryComposer: View {
             }
         } else if let image {
             // The look is baked into the pixels that are sent, not just the preview.
-            let sent = filter == .none ? image : (filter.bake(into: image) ?? image)
-            model.postStory(.image(sent, caption: text), audience: audience, lifetime: lifetime)
+            let words = StoryOverlayRender.text(overlays)
+            let sent = (filter == .none && words == nil) ? image : (filter.bake(into: image, text: words) ?? image)
+            model.postStory(.image(sent, caption: ""), audience: audience, lifetime: lifetime)
+            finish()
+        } else if let made = StoryOverlayRender.textStory(overlays, palette: palette, seed: seed) {
+            // A story of colours and words goes out as a picture, so it looks the same for everyone, however
+            // the text was placed.
+            model.postStory(.image(made, caption: ""), audience: audience, lifetime: lifetime)
             finish()
         } else {
-            model.postStory(preview.style, audience: audience, lifetime: lifetime)
-            finish()
+            failure = "The story couldn't be prepared."
         }
     }
 
     private func finish() {
         dismiss()
         posted()
+    }
+}
+
+extension View {
+    /// The story editor: full screen on the phone, a sheet the size of a story on the Mac.
+    func composerCover<Item: Identifiable, Content: View>(item: Binding<Item?>, @ViewBuilder content: @escaping (Item) -> Content) -> some View {
+        #if os(iOS)
+        fullScreenCover(item: item) { content($0) }
+        #else
+        sheet(item: item) { content($0).frame(width: 420, height: 740) }
+        #endif
+    }
+
+    func composerCover<Content: View>(isPresented: Binding<Bool>, @ViewBuilder content: @escaping () -> Content) -> some View {
+        #if os(iOS)
+        fullScreenCover(isPresented: isPresented, content: content)
+        #else
+        sheet(isPresented: isPresented) { content().frame(width: 420, height: 740) }
+        #endif
     }
 }
 
@@ -495,6 +759,35 @@ struct StoryAudiencePicker: View {
         case .only: "Only the people you pick see it."
         case .except: "Everyone in your contacts sees it, except the people you pick."
         }
+    }
+}
+
+/// The progress of the story on screen.
+@Observable
+final class StoryClock {
+    var progress: Double = 0
+}
+
+/// One bar per story, filling as each plays. It is the only thing that redraws as time passes.
+private struct StoryBars: View {
+    var count: Int
+    var index: Int
+    var clock: StoryClock
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(0..<count, id: \.self) { i in
+                GeometryReader { geo in
+                    Capsule().fill(.white.opacity(0.25))
+                        .overlay(alignment: .leading) {
+                            Capsule().fill(.white)
+                                .frame(width: geo.size.width * (i < index ? 1 : i == index ? clock.progress : 0))
+                        }
+                }
+                .frame(height: 3)
+            }
+        }
+        .accessibilityHidden(true)
     }
 }
 
@@ -700,13 +993,13 @@ struct StoryCamera: View {
             withAnimation(.easeOut(duration: 0.3)) { zoomShown = false }
         }
         .cropper($pending, frame: .story) { data in framed = StoryPick(kind: .photo(data), filter: filter) }
-        .sheet(item: $framed) { pick in
+        .composerCover(item: $framed) { pick in
             switch pick.kind {
             case let .photo(data): StoryComposer(image: data, filter: pick.filter, posted: { dismiss() })
             case let .clip(url, zoom): StoryComposer(clip: url, zoom: zoom, filter: pick.filter, posted: { dismiss() })
             }
         }
-        .sheet(isPresented: $writing) { StoryComposer(posted: { dismiss() }) }
+        .composerCover(isPresented: $writing) { StoryComposer(posted: { dismiss() }) }
     }
 
     // MARK: Shutter
@@ -808,10 +1101,14 @@ struct StoryViewer: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    var stories: [Story]
     var start = 0
+    /// The stories on screen now, and the people queued after them.
+    @State private var reel: [Story]
+    @State private var upcoming: [[Story]]
     @State private var index = 0
-    @State private var progress: Double = 0
+    /// How far through the story on screen. Kept out of the view's own state so the 30 ticks a second redraw only
+    /// the bars, not the picture, the header and the buttons.
+    @State private var clock = StoryClock()
     @State private var editing: Story?
     @State private var showingViewers: Story?
     @State private var confirmDelete = false
@@ -825,16 +1122,32 @@ struct StoryViewer: View {
     @State private var holding = false
     @State private var touching = false
     @State private var holdTask: Task<Void, Never>?
+    /// A reply being written to a friend's story. Typing holds the story still.
+    @State private var replyText = ""
+    @FocusState private var replying: Bool
+    /// Shown for a moment after a like or reply goes.
+    @State private var sentNote: String?
     private let duration: Double = 5
+
+    init(stories: [Story], start: Int = 0, following: [[Story]] = []) {
+        self.start = start
+        _reel = State(initialValue: stories)
+        _upcoming = State(initialValue: following)
+    }
     private let tick = Timer.publish(every: 1 / 30, on: .main, in: .common).autoconnect()
 
     /// The stories still up, as they are now (one may have been edited since the viewer opened).
     private var current: [Story] {
         // Only what's still up: one deleted or expired elsewhere while this is open goes from it too.
-        stories.filter { !gone.contains($0.id) }.compactMap { s in model.data.stories.first { $0.id == s.id } }
+        reel.filter { !gone.contains($0.id) }.compactMap { s in model.data.stories.first { $0.id == s.id } }
     }
 
-    private var paused: Bool { editing != nil || showingViewers != nil || confirmDelete || holding }
+    private var paused: Bool {
+        editing != nil || showingViewers != nil || confirmDelete || holding || replying || !replyText.isEmpty || loading
+    }
+
+    /// The story on screen is a video still arriving: it waits, unwatched, until it can play.
+    private var loading: Bool { current.indices.contains(index) && !current[index].isReady }
 
     private var currentID: Story.ID? { current.indices.contains(index) ? current[index].id : nil }
 
@@ -847,20 +1160,9 @@ struct StoryViewer: View {
                     .transition(reduceMotion ? .opacity
                                 : .asymmetric(insertion: .move(edge: .trailing), removal: .move(edge: .leading)))
             }
-            HStack(spacing: 4) {
-                ForEach(stories.indices, id: \.self) { i in
-                    GeometryReader { geo in
-                        Capsule().fill(.white.opacity(0.25))
-                            .overlay(alignment: .leading) {
-                                Capsule().fill(.white)
-                                    .frame(width: geo.size.width * (i < index ? 1 : i == index ? progress : 0))
-                            }
-                    }
-                    .frame(height: 3)
-                }
-            }
-            .padding(14)
-            .opacity(holding ? 0 : 1)
+            StoryBars(count: stories.count, index: index, clock: clock)
+                .padding(14)
+                .opacity(holding ? 0 : 1)
             GeometryReader { geo in
                 Color.clear.contentShape(Rectangle())
                     .gesture(DragGesture(minimumDistance: 0)
@@ -870,6 +1172,9 @@ struct StoryViewer: View {
                     .accessibilityLabel("Story")
                     .accessibilityAction(named: "Next story") { step(1) }
                     .accessibilityAction(named: "Previous story") { step(-1) }
+            }
+            if stories.indices.contains(index), !holding {
+                storyHeader(stories[index])
             }
             if clip != nil, !holding {
                 HStack {
@@ -891,6 +1196,20 @@ struct StoryViewer: View {
                     ownerBar(stories[index])
                 }
             }
+            if stories.indices.contains(index), stories[index].author != "me", !holding {
+                VStack {
+                    Spacer()
+                    if let sentNote {
+                        Text(sentNote)
+                            .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
+                            .padding(.horizontal, 14).padding(.vertical, 8)
+                            .background(.black.opacity(0.55), in: .capsule)
+                            .transition(.opacity.combined(with: .move(edge: .bottom)))
+                            .padding(.bottom, 8)
+                    }
+                    friendBar(stories[index])
+                }
+            }
         }
         .scaleEffect(1 - min(dragY, 400) / 2000, anchor: .top)
         .offset(y: dragY)
@@ -899,8 +1218,15 @@ struct StoryViewer: View {
                minHeight: Platform.isPhone ? nil : 680, maxHeight: Platform.isPhone ? .infinity : 680)
         .background(.black.opacity(1 - Double(min(dragY, 300)) / 600))
         .onAppear { index = min(start, max(stories.count - 1, 0)) }
-        .onChange(of: index, initial: true) { if current.indices.contains(index) { model.markSeen(current[index].id) } }
+        .onChange(of: index, initial: true) { markSeenIfReady() }
+        .onChange(of: loading) { _, now in
+            // The last piece just came in: play it from the start.
+            guard !now else { return }
+            openClip()
+            markSeenIfReady()
+        }
         .onChange(of: currentID, initial: true) { openClip() }
+        .onChange(of: currentID) { replyText = ""; replying = false }
         .onChange(of: paused) { _, now in
             if now { clip?.pause() } else { clip?.play() }
         }
@@ -908,12 +1234,12 @@ struct StoryViewer: View {
         .onReceive(tick) { _ in
             guard !paused else { return }
             if let clip {
-                progress = clip.progress
+                clock.progress = clip.progress
                 if clip.finished { step(1) }
                 return
             }
-            progress += 1 / (duration * 30)
-            if progress >= 1 { step(1) }
+            clock.progress += 1 / (duration * 30)
+            if clock.progress >= 1 { step(1) }
         }
         .onKeyPress(.leftArrow) { step(-1); return .handled }
         .onKeyPress(.rightArrow) { step(1); return .handled }
@@ -930,12 +1256,16 @@ struct StoryViewer: View {
         }
     }
 
+    private func markSeenIfReady() {
+        if current.indices.contains(index), current[index].isReady { model.markSeen(current[index].id) }
+    }
+
     /// Plays the video of the story now on screen, and lets go of the last one.
     private func openClip() {
         clip?.close()
         clip = nil
-        progress = 0
-        guard current.indices.contains(index), case let .video(data, _) = current[index].style else { return }
+        clock.progress = 0
+        guard current.indices.contains(index), case let .video(data, _) = current[index].style, !data.isEmpty else { return }
         clip = StoryClip(data: data)
         if !paused { clip?.play() }
     }
@@ -967,11 +1297,100 @@ struct StoryViewer: View {
             return
         }
         withAnimation(.smooth(duration: 0.25)) { dragY = 0 }
+        // Swiping up on your own story shows who has seen it.
+        if drag.translation.height < -70, abs(drag.translation.height) > abs(drag.translation.width) * 1.5,
+           current.indices.contains(index), current[index].author == "me" {
+            showingViewers = current[index]
+            return
+        }
         guard !wasHolding, abs(drag.translation.width) < 24, abs(drag.translation.height) < 24 else { return }
         step(drag.startLocation.x < width / 2 ? -1 : 1)
     }
 
-    /// Under your own story: who viewed it, and editing or deleting it.
+    /// Under a friend's story: write them a reply, or like it. Either arrives in your chat with them.
+    private func friendBar(_ story: Story) -> some View {
+        let liked = story.liked == true
+        let canSend = !replyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return HStack(spacing: 10) {
+            TextField("", text: $replyText, prompt: Text("Reply to \(model.displayName(story.author))")
+                .foregroundStyle(.white.opacity(0.7)))
+                .textFieldStyle(.plain)
+                .font(.system(size: 14))
+                .foregroundStyle(.white)
+                .focused($replying)
+                .submitLabel(.send)
+                .onSubmit { sendReply(to: story) }
+                .padding(.horizontal, 16).frame(height: 40)
+                .background(.black.opacity(0.35), in: .capsule)
+                .overlay(Capsule().strokeBorder(.white.opacity(0.45), lineWidth: 1))
+            if canSend {
+                barButton("arrow.up", label: "Send reply") { sendReply(to: story) }
+            } else {
+                Button { like(story) } label: {
+                    Image(systemName: liked ? "heart.fill" : "heart")
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundStyle(liked ? Color.red : .white)
+                        .frame(width: 40, height: 40)
+                        .contentTransition(.symbolEffect(.replace))
+                }
+                .buttonStyle(.plain)
+                .disabled(liked)
+                .accessibilityLabel(liked ? "Liked" : "Like story")
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 18)
+    }
+
+    private func like(_ story: Story) {
+        guard story.liked != true else { return }
+        flash("Liked")
+        model.playSendSound()
+        Task { await model.answerStory(story, like: true) }
+    }
+
+    private func sendReply(to story: Story) {
+        let words = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !words.isEmpty else { return }
+        Task { await model.answerStory(story, text: words) }
+        model.playSendSound()
+        replyText = ""
+        replying = false
+        flash("Reply sent")
+    }
+
+    private func flash(_ note: String) {
+        withAnimation(.snappy) { sentNote = note }
+        Task {
+            try? await Task.sleep(for: .seconds(1.5))
+            if sentNote == note { withAnimation(.snappy) { sentNote = nil } }
+        }
+    }
+
+    /// Who posted the story on screen and how long ago, under the progress bars.
+    private func storyHeader(_ story: Story) -> some View {
+        let mine = story.author == "me"
+        let name = mine ? "Your story" : model.displayName(story.author)
+        let avatar = mine ? model.activeProfile.avatar : model.contact(story.author)?.avatar
+        return HStack(spacing: 8) {
+            Avatar(image: avatar, seed: mine ? model.fingerprint : story.author, size: 30)
+            Text(name).font(.system(size: 14, weight: .semibold)).lineLimit(1)
+            Text(Self.age(of: story.date)).font(.system(size: 13)).opacity(0.75)
+            Spacer()
+        }
+        .foregroundStyle(.white)
+        .shadow(color: .black.opacity(0.5), radius: 4)
+        .padding(.top, 26).padding(.leading, 14).padding(.trailing, clip != nil ? 54 : 14)
+        .allowsHitTesting(false)
+        .accessibilityElement(children: .combine)
+    }
+
+    /// "Just now", "12 min ago", "3 hr ago".
+    private static func age(of date: Date) -> String {
+        if Date().timeIntervalSince(date) < 60 { return "Just now" }
+        return date.formatted(.relative(presentation: .numeric, unitsStyle: .abbreviated))
+    }
+
     private func ownerBar(_ story: Story) -> some View {
         let views = model.viewers(of: story.id).count
         return HStack(spacing: 10) {
@@ -1009,20 +1428,34 @@ struct StoryViewer: View {
         let id = current[index].id
         model.deleteStory(id)
         gone.insert(id)
-        progress = 0
+        clock.progress = 0
         if current.isEmpty { dismiss() } else { index = min(index, current.count - 1) }
+    }
+
+    /// Past the last story of this person: on to the next person with something new, or close.
+    private func nextReel() {
+        guard !upcoming.isEmpty else { dismiss(); return }
+        clip?.close()
+        clip = nil
+        let next = upcoming.removeFirst()
+        withAnimation(reduceMotion ? .easeInOut(duration: 0.2) : .smooth(duration: 0.35)) {
+            reel = next
+            gone = []
+            index = next.firstIndex { !$0.seen } ?? 0
+        }
+        clock.progress = 0
     }
 
     private func step(_ d: Int) {
         let next = index + d
         guard current.indices.contains(next) else {
-            if d > 0 { dismiss() } else { progress = 0; clip?.restart() }
+            if d > 0 { nextReel() } else { clock.progress = 0; clip?.restart() }
             return
         }
         // Let go of this clip now, so a late tick can't step twice.
         clip?.close()
         clip = nil
         withAnimation(reduceMotion ? .easeInOut(duration: 0.2) : .smooth(duration: 0.35)) { index = next }
-        progress = 0
+        clock.progress = 0
     }
 }

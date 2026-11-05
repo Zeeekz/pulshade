@@ -173,6 +173,10 @@ struct RootView: View {
     @State private var active = true
     /// iPhone: the screen is being recorded, mirrored or shared.
     @State private var captured = false
+    #if os(iOS)
+    /// Bumped each time the app comes to the front, so the screenshot shield is put back together.
+    @State private var shieldEpoch = 0
+    #endif
 
     var body: some View {
         shielded
@@ -201,6 +205,12 @@ struct RootView: View {
             .onChange(of: scenePhase, initial: true) { _, phase in
                 active = phase == .active
                 captured = Self.screenCaptured
+                if phase == .active {
+                    // Opening from a notification on a locked phone could leave the shielded layer black until the
+                    // app switcher redrew it. Rebuild it now and again once the unlock animation is over.
+                    shieldEpoch += 1
+                    Task { try? await Task.sleep(for: .milliseconds(450)); shieldEpoch += 1 }
+                }
             }
             // iOS can't keep a recording or a mirrored screen from showing the app, so it's covered instead.
             .onReceive(NotificationCenter.default.publisher(for: UIScreen.capturedDidChangeNotification)) { _ in
@@ -216,7 +226,7 @@ struct RootView: View {
     /// iPhone: screenshots can't be stopped, so the app is drawn where they come out blank.
     @ViewBuilder private var shielded: some View {
         #if os(iOS)
-        CaptureShield(on: model.blockCapture, content: AnyView(
+        CaptureShield(on: model.blockCapture, epoch: shieldEpoch, content: AnyView(
             content.environment(model).environment(\.theme, model.theme).tint(model.theme.accent)
         ))
         .ignoresSafeArea()
@@ -257,12 +267,17 @@ struct RootView: View {
 /// field), so they come out blank. iOS doesn't promise that layer; where it isn't found, content draws as usual.
 private struct CaptureShield: UIViewControllerRepresentable {
     var on: Bool
+    var epoch = 0
     var content: AnyView
 
     func makeUIViewController(context: Context) -> Controller { Controller(content) }
 
     func updateUIViewController(_ controller: Controller, context: Context) {
         controller.hosting.rootView = content
+        if controller.epoch != epoch {
+            controller.epoch = epoch
+            controller.reseat()
+        }
         controller.shield(on)
     }
 
@@ -277,6 +292,7 @@ private struct CaptureShield: UIViewControllerRepresentable {
             return found
         }()
         private var shielding: Bool?
+        var epoch = 0
 
         init(_ content: AnyView) {
             hosting = UIHostingController(rootView: content)
@@ -292,6 +308,14 @@ private struct CaptureShield: UIViewControllerRepresentable {
             addChild(hosting)
             shield(shielding ?? true)
             hosting.didMove(toParent: self)
+        }
+
+        /// Takes the content out of the shielded layer so the next `shield` puts it back and redraws it.
+        func reseat() {
+            guard isViewLoaded else { return }
+            hosting.view.removeFromSuperview()
+            canvas?.removeFromSuperview()
+            shielding = nil
         }
 
         func shield(_ on: Bool) {
@@ -312,6 +336,8 @@ private struct CaptureShield: UIViewControllerRepresentable {
             hosting.view.frame = host.bounds
             hosting.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
             host.addSubview(hosting.view)
+            host.setNeedsLayout()
+            host.layoutIfNeeded()
         }
     }
 }

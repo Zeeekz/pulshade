@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// One of three complete looks: every surface, text colour and accent comes from here.
+/// One of the complete looks: every surface, text colour and accent comes from here.
 struct Theme: Identifiable, Equatable {
     let id: String
     let name: String
@@ -47,7 +47,22 @@ struct Theme: Identifiable, Equatable {
                                           faint: .hex(0xC9BCF5).opacity(0.38), onAccent: .white),
                              glow: 1)
 
-    static let all: [Theme] = [light, dark, pulse]
+    /// A warm, paper-like light theme: cream surfaces with a terracotta accent.
+    static let sand = Theme(id: "sand", name: "Sand", scheme: .light,
+                            colors: [.hex(0xC4552F), .hex(0xE08A3C), .hex(0x8A5A44)],
+                            ink: Palette(void: .hex(0xEAE3D6), base: .hex(0xF6F1E7), surface: .hex(0xFCF9F3),
+                                         raised: .hex(0xEFE8DA), hover: .hex(0xE4DCCB), line: .hex(0x4A3A22).opacity(0.12),
+                                         text: .hex(0x2A2118).opacity(0.92), dim: .hex(0x2A2118).opacity(0.6),
+                                         faint: .hex(0x2A2118).opacity(0.4), onAccent: .white))
+    /// A flat deep-navy dark theme with a clear blue accent.
+    static let midnight = Theme(id: "midnight", name: "Midnight", scheme: .dark,
+                                colors: [.hex(0x6FA8FF), .hex(0x4E6BFF), .hex(0x4FC3F7)],
+                                ink: Palette(void: .hex(0x050A14), base: .hex(0x0A101C), surface: .hex(0x111A2B),
+                                             raised: .hex(0x182339), hover: .hex(0x1F2C47), line: .hex(0x9DB8FF).opacity(0.09),
+                                             text: .hex(0xF0F4FF).opacity(0.93), dim: .hex(0xDCE5FF).opacity(0.58),
+                                             faint: .hex(0xC6D3F5).opacity(0.36), onAccent: .hex(0x06101F)))
+
+    static let all: [Theme] = [light, sand, dark, midnight, pulse]
 
     /// Ids from before there were three themes were all dark, so they open as Dark.
     static func named(_ id: String) -> Theme { all.first { $0.id == id } ?? dark }

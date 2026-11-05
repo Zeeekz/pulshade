@@ -13,7 +13,7 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     CODE_SIGN_STYLE: Automatic
-    MARKETING_VERSION: "0.1.0"
+    MARKETING_VERSION: "1.0"
     CURRENT_PROJECT_VERSION: "1"
     # Crash messages and debug info carry source paths; these keep the home folder's name out of the app.
     OTHER_SWIFT_FLAGS: "$(inherited) -enable-upcoming-feature ConciseMagicFile -file-prefix-map $(SRCROOT)=."

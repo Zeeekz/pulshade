@@ -377,6 +377,12 @@ struct ReplyRef: Codable, Equatable {
     /// Who wrote the quoted message: a fingerprint, or "me".
     var author: String
     var snippet: String
+    /// A small picture of what's quoted, for a story liked or replied to (it's gone by the time anyone scrolls
+    /// back). Builds from before it show the words alone.
+    var picture: Data? = nil
+
+    /// Pictures bigger than this, or that aren't pictures, are left off what arrives.
+    static let maxPicture = 48_000
 }
 
 /// A link preview, built on the sender's Mac and sent inside the encrypted message,
@@ -692,6 +698,14 @@ struct StoryChoice: Codable, Equatable {
     var lifetime: TimeInterval = StoryLifetime.day.rawValue
 }
 
+/// Where sending one of your stories stands, kept on the device that posted it: who has said they have it, and how
+/// many times it's been sent again since. A build that doesn't know this field simply doesn't keep it.
+struct StoryDelivery: Codable, Equatable {
+    var confirmed: [String] = []
+    var resends = 0
+    var last: Date?
+}
+
 struct Story: Codable, Identifiable, Equatable {
     var id = UUID()
     /// Fingerprint of the author, or "me".
@@ -707,10 +721,15 @@ struct Story: Codable, Identifiable, Equatable {
     var audience: StoryAudience?
     /// Your own stories only: who viewed it, and when.
     var viewers: [String: Date]?
+    /// Someone else's story only: you've liked it.
+    var liked: Bool?
 
     var expires: Date { date.addingTimeInterval(lifetime ?? StoryLifetime.day.rawValue) }
     var isLive: Bool { expires > Date() }
     var shownTo: StoryAudience { audience ?? .everyone }
+    /// Your own stories only, on the device that posted it: whether contacts have it yet.
+    var delivery: StoryDelivery?
+
     /// Whether it can ride along in a device sync, which fits a story only as small as a photo.
     var isSyncable: Bool {
         if case .video = style { return false }
@@ -786,9 +805,13 @@ struct SecuritySettings: Codable, Equatable {
     var notifications = true
     var notificationContent: NotificationContent = .hidden
     var notificationSound = true
-    /// Let the relay wake this iPhone through Apple when mail arrives, so a locked phone hears about it. Off by
-    /// default: Apple learns that the device was woken and when, and the relay holds its push token.
-    var pushWake = false
+    /// Let the relay wake this iPhone through Apple when mail arrives, so a locked phone hears about it. On with
+    /// notifications, as in any messenger: without it a locked iPhone hears about nothing. Apple learns that the
+    /// device was woken and when, and the relay holds its push token; anyone who'd rather not turns it off.
+    var pushWake = true
+    /// Whether `pushWake` was set by hand. It used to be off by default, so everyone from then saved "off"
+    /// without choosing it: only a choice made by hand is kept.
+    var pushWakeChosen = false
     /// Build a preview when you send a link. Off by default: building one visits the website from your own
     /// connection. Received previews never contact the website.
     var linkPreviews = false
@@ -833,7 +856,8 @@ struct SecuritySettings: Codable, Equatable {
         notifications = try c.decodeIfPresent(Bool.self, forKey: .notifications) ?? d.notifications
         notificationContent = (try? c.decodeIfPresent(NotificationContent.self, forKey: .notificationContent)) ?? d.notificationContent
         notificationSound = try c.decodeIfPresent(Bool.self, forKey: .notificationSound) ?? d.notificationSound
-        pushWake = try c.decodeIfPresent(Bool.self, forKey: .pushWake) ?? d.pushWake
+        pushWakeChosen = try c.decodeIfPresent(Bool.self, forKey: .pushWakeChosen) ?? false
+        pushWake = pushWakeChosen ? (try c.decodeIfPresent(Bool.self, forKey: .pushWake) ?? d.pushWake) : d.pushWake
         linkPreviews = try c.decodeIfPresent(Bool.self, forKey: .linkPreviews) ?? d.linkPreviews
         menuBarIcon = try c.decodeIfPresent(Bool.self, forKey: .menuBarIcon) ?? d.menuBarIcon
         deliveryReceipts = try c.decodeIfPresent(Bool.self, forKey: .deliveryReceipts) ?? d.deliveryReceipts

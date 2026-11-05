@@ -16,7 +16,8 @@ relay="http://$(cat relay/pulshade-onion/hostname 2>/dev/null)"
 out=build/testflight
 rm -rf "$out"; mkdir -p "$out"
 
-./scripts/build-tor.sh
+# PULSHADE_SKIP_TOR_BUILD=1 uses Tor as last built, when tor/ hasn't changed since.
+[[ -n ${PULSHADE_SKIP_TOR_BUILD:-} ]] || ./scripts/build-tor.sh
 xcodegen generate >/dev/null
 
 xcodebuild -project Pulshade.xcodeproj -scheme PulshadeiOS -configuration Release \
@@ -30,11 +31,25 @@ xcodebuild -project Pulshade.xcodeproj -scheme PulshadeiOS -configuration Releas
 # Nothing that names you may leave this Mac: check the app before it goes up. It looks for your home folder, your
 # account name, and any words you list one per line in ios/name-check.txt (kept out of git).
 app="$out/Pulshade.xcarchive/Products/Applications/Pulshade.app"
-names="/Users/|(^|[^a-z])${USER}([^a-z]|$)"
+names="/Users/"
+[[ -n "${USER:-}" ]] && names="$names|(^|[^a-z])${USER}([^a-z]|$)"
 [[ -f ios/name-check.txt ]] && names="$names|$(grep -v '^$' ios/name-check.txt | paste -sd '|' -)"
-if { strings -a "$app/Pulshade" | grep -i -E "$names"; } >/dev/null; then
-  echo "Found your name or home folder inside the app. Not uploading:"
-  strings -a "$app/Pulshade" | grep -i -E "$names" | head
+# The whole app, not just its program: its property lists, assets and anything else in the bundle. Not its signing,
+# though: the certificate and provisioning profile carry the developer account's name, which an individual account
+# can't avoid and TestFlight shows anyway, and Apple re-signs the app and drops the profile before testers get it.
+# So the check runs on a copy with those taken out.
+check="$out/name-check/Pulshade.app"
+rm -rf "$out/name-check"; mkdir -p "$out/name-check"; ditto "$app" "$check"
+rm -f "$check/embedded.mobileprovision"
+find "$check" -name _CodeSignature -type d -prune -exec rm -rf {} +
+find "$check" -type f -print0 | while IFS= read -r -d '' f; do
+  file -b "$f" | grep -q '^Mach-O' && codesign --remove-signature "$f" 2>/dev/null || true
+done
+found=$(grep -rlaiE "$names" "$check" 2>/dev/null | sed "s#$check/##" || true)
+rm -rf "$out/name-check"
+if [[ -n "$found" ]]; then
+  echo "Found your name or home folder inside the app, in these files. Not uploading:"
+  print -r -- "$found"
   exit 1
 fi
 
