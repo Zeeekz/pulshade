@@ -197,13 +197,13 @@ final class AppModel {
     /// One health check that doesn't wait on a bad circuit. A new circuit into an onion service usually answers in
     /// a few seconds, but often enough it's one that carries nothing and only times out. So past a few seconds,
     /// a second check races it on a fresh circuit of the same lane, and the first answer counts.
-    nonisolated static func reach(_ client: RelayClient) async -> Bool {
+    nonisolated static func reach(_ client: RelayClient, patience: Double = 5) async -> Bool {
         guard Tor.uses(client.base) else { return await client.health() }
         // A route into an onion service usually connects in seconds, but now and then one gets stuck for good, and
         // through a bridge or on a slow network that's common. So the first attempt keeps going (it may yet get
         // there) while fresh routes join it: one after 5 seconds on a lane that has worked before; on one that
         // hasn't, where everything is slower, two, further apart. Whichever answers first wins.
-        let joins: [Double] = client.isEstablished ? [5] : [20, 50]
+        let joins: [Double] = client.isEstablished ? [patience] : [20, 50]
         return await withTaskGroup(of: Bool.self) { group in
             group.addTask { await client.health() }
             for delay in joins {
@@ -1284,13 +1284,15 @@ final class AppModel {
             let story = data.stories[i]
             guard story.author == "me", story.isLive, var delivery = story.delivery, delivery.resends < Self.storyRetry.count,
                   now.timeIntervalSince(delivery.last ?? story.date) >= Self.storyRetry[delivery.resends] else { continue }
+            // Still going out for the first time (or again): sending it again would only double the load.
+            guard outboxCopies(of: story.id) == 0, storyBacklog[story.id] == nil else { continue }
             let waiting = audience(of: story).filter { !delivery.confirmed.contains($0.fingerprint) }
             delivery.last = now
             // Everyone has it: nothing left to do for this one.
             delivery.resends = waiting.isEmpty ? Self.storyRetry.count : delivery.resends + 1
             data.stories[i].delivery = delivery
             // A video's clip is heavy: it goes again only the first couple of times.
-            for c in waiting { sendStory(story, to: c, withClip: delivery.resends <= 2) }
+            fanOut(story, to: waiting.map { ($0, delivery.resends <= 2) })
         }
     }
 
@@ -1302,7 +1304,7 @@ final class AppModel {
         story.delivery = StoryDelivery()
         data.storyChoices[choiceKey(activePersona)] = StoryChoice(audience: audience, lifetime: lifetime)
         withAnimation(.snappy) { data.stories.insert(story, at: 0) }
-        for c in self.audience(of: story) { sendStory(story, to: c, withClip: true) }
+        fanOut(story, to: self.audience(of: story).map { ($0, true) })
         trackUpload(of: story.id)
         if story.isSyncable { var shared = story; shared.delivery = nil; sync(.story(shared)) }
         save()
@@ -1345,7 +1347,8 @@ final class AppModel {
         let story = data.stories[i]
         let after = self.audience(of: story)
         for c in before where !after.contains(where: { $0.fingerprint == c.fingerprint }) { enqueue(.storyRemoved(id: id), to: c) }
-        for c in after { sendStory(story, to: c, withClip: !before.contains { $0.fingerprint == c.fingerprint }) }
+        storyBacklog[id] = nil
+        fanOut(story, to: after.map { c in (c, !before.contains { $0.fingerprint == c.fingerprint }) })
         trackUpload(of: id)
         if story.isSyncable { var shared = story; shared.delivery = nil; sync(.story(shared)) }
         save()
@@ -1354,6 +1357,7 @@ final class AppModel {
     func deleteStory(_ id: Story.ID) {
         guard let story = data.stories.first(where: { $0.id == id && $0.author == "me" }) else { return }
         withAnimation(.snappy) { data.stories.removeAll { $0.id == id } }
+        storyBacklog[id] = nil
         noteRemoved("me|\(id)")
         for c in audience(of: story) { enqueue(.storyRemoved(id: id), to: c) }
         sync(.storyRemoved(id))
@@ -1376,6 +1380,51 @@ final class AppModel {
     /// How many copies of a story were waiting to go out when it was posted or last changed.
     private var storyUploadTotal: [Story.ID: Int] = [:]
 
+    /// Someone a story is still to be queued for.
+    private struct StoryTarget { var fingerprint: String; var persona: UUID?; var withClip: Bool }
+    /// The people a story hasn't been queued for yet, and about how many copies each takes.
+    private struct StoryBacklog { var targets: [StoryTarget]; var perContact = 1 }
+    /// Sealing a story for everyone at once piles hundreds of megabytes into the outbox, and every save then wrote all
+    /// of it out again, which starved the rest of the app. So it is queued for a few people at a time, as the earlier
+    /// copies go. Memory only: if the app is closed, the quiet re-send later covers whoever was left.
+    @ObservationIgnored private var storyBacklog: [Story.ID: StoryBacklog] = [:]
+    /// Copies of one story to hold in the outbox before queueing it for more people.
+    private static let storyOutboxLimit = 12
+
+    private func fanOut(_ story: Story, to targets: [(Contact, Bool)]) {
+        storyBacklog[story.id] = StoryBacklog(targets: targets.map {
+            StoryTarget(fingerprint: $0.0.fingerprint, persona: $0.0.persona, withClip: $0.1)
+        })
+        let queued = drainStoryBacklog(story.id)
+        if queued > 0 { storyBacklog[story.id]?.perContact = max(1, unsentCopies(of: story.id) / queued) }
+    }
+
+    /// Queues stories for more people while there's room. Returns how many people it queued for.
+    @discardableResult
+    private func drainStoryBacklog(_ only: Story.ID? = nil) -> Int {
+        var queued = 0
+        for id in Array(storyBacklog.keys) where only == nil || only == id {
+            guard var entry = storyBacklog[id], let story = data.stories.first(where: { $0.id == id }) else {
+                storyBacklog[id] = nil
+                continue
+            }
+            while let target = entry.targets.first, outboxCopies(of: id) < Self.storyOutboxLimit {
+                entry.targets.removeFirst()
+                guard let i = contactIndex(target.fingerprint, target.persona) else { continue }
+                sendStory(story, to: data.contacts[i], withClip: target.withClip)
+                queued += 1
+            }
+            storyBacklog[id] = entry.targets.isEmpty ? nil : entry
+        }
+        return queued
+    }
+
+    /// Copies still to be queued, counted in copies.
+    private func backlogCopies(of id: Story.ID) -> Int {
+        guard let entry = storyBacklog[id] else { return 0 }
+        return entry.targets.count * entry.perContact
+    }
+
     /// Copies of a story not yet handed to the relay: still waiting for a session, or sealed and queued.
     private func unsentCopies(of id: Story.ID) -> Int {
         let waiting = data.contacts.reduce(0) { n, c in
@@ -1385,7 +1434,7 @@ final class AppModel {
     }
 
     private func trackUpload(of id: Story.ID) {
-        let n = unsentCopies(of: id)
+        let n = unsentCopies(of: id) + backlogCopies(of: id)
         if n > 0 { storyUploadTotal[id] = n } else { storyUploadTotal[id] = nil }
         markUploadedIfDone(id)
     }
@@ -1397,7 +1446,7 @@ final class AppModel {
     /// Once nothing of a story is left in the outbox, its upload is over for good. The sends that come later, to
     /// people who never confirmed, happen quietly.
     private func markUploadedIfDone(_ id: Story.ID) {
-        guard outboxCopies(of: id) == 0, let i = data.stories.firstIndex(where: { $0.id == id }),
+        guard outboxCopies(of: id) == 0, storyBacklog[id] == nil, let i = data.stories.firstIndex(where: { $0.id == id }),
               data.stories[i].delivery != nil, data.stories[i].delivery?.uploaded != true else { return }
         data.stories[i].delivery?.uploaded = true
         storyUploadTotal[id] = nil
@@ -1407,13 +1456,13 @@ final class AppModel {
     func isUploading(_ id: Story.ID) -> Bool {
         guard let story = data.stories.first(where: { $0.id == id }), story.author == "me",
               story.delivery != nil, story.delivery?.uploaded != true else { return false }
-        return outboxCopies(of: id) > 0
+        return outboxCopies(of: id) > 0 || storyBacklog[id] != nil
     }
 
     /// How far a story you posted has got to its audience, 0...1, or nil once it's all gone (or never needed to).
     func uploadProgress(of id: Story.ID) -> Double? {
         guard let total = storyUploadTotal[id], data.stories.first(where: { $0.id == id })?.delivery?.uploaded != true else { return nil }
-        let left = unsentCopies(of: id)
+        let left = unsentCopies(of: id) + backlogCopies(of: id)
         guard left > 0 else { return nil }
         return 1 - Double(left) / Double(max(total, left))
     }
@@ -2825,7 +2874,10 @@ final class AppModel {
         data.clipParts = data.clipParts.filter { $0.value.date.addingTimeInterval(StoryLifetime.twoDays.rawValue + 3600) > Date() }
         askForStalledClips()
         sendDueReceipts()
-        await flush()
+        drainStoryBacklog()
+        // A long upload mustn't hold up everything else housekeeping does, so sending runs on its own; the tests
+        // send and then look, so there it is waited for.
+        if trafficShaping { Task { await flush() } } else { await flush() }
         if trafficShaping {
             // Each sending lane that's been used lately is kept warm on its own, so no two personas share a connection.
             // The main persona's lane is always kept warm; another's only while it's being used.
@@ -2855,7 +2907,8 @@ final class AppModel {
         if backgroundedAt != nil { return }
         #endif
         guard phase == .unlocked, trafficShaping, Bridges.current == .auto, overTor, autoSwitches < 4 else { return }
-        let since = [lastRelayReached, bridgeSwitchedAt, resumedAt, unlockedAt].compactMap { $0 }.max() ?? unlockedAt
+        // A send that went through means the way in works, even if a big upload has the fetches waiting behind it.
+        let since = [lastRelayReached, lastDepositOK, bridgeSwitchedAt, resumedAt, unlockedAt].compactMap { $0 }.max() ?? unlockedAt
         guard Date().timeIntervalSince(since) > (Bridges.autoUsesSnowflake ? 75 : 40) else { return }
         autoSwitches += 1
         bridgeSwitchedAt = Date()
@@ -2883,6 +2936,10 @@ final class AppModel {
                 self.resumedAt = Date()
                 self.autoSwitches = 0
                 Task.detached(priority: .userInitiated) {
+                    // A new network gets a fresh try at plain Tor. Snowflake, which an earlier network may have forced,
+                    // is a good deal slower, and left alone it would carry on being used here for as long as it answers.
+                    // If plain Tor doesn't get through within 40 seconds, Automatic moves to Snowflake again by itself.
+                    if Bridges.current == .auto, Bridges.autoUsesSnowflake { _ = Bridges.switchAuto(toSnowflake: false) }
                     Tor.wake()
                     await MainActor.run {
                         RelayClient.closeAll()
@@ -2949,6 +3006,21 @@ final class AppModel {
         if reached { Task { await syncOnce() } }
     }
 
+    /// The check the app makes by itself. Gentler: a connection busy with a big upload answers slowly, which isn't
+    /// the same as being dead, so a fresh route is only tried if the check still hasn't answered after 15 seconds.
+    /// Throwing the route away every few seconds, as the first version did, left Tor no time to connect at all.
+    private func autoCheck() async {
+        guard !autoChecking, let client = client(nil) else { return }
+        autoChecking = true
+        defer { autoChecking = false }
+        let reached = await Self.reach(client, patience: 15)
+        if !reached { lastRelayContact = .distantPast }
+        noteRelay(reached: reached)
+        if reached { kick() }
+    }
+
+    @ObservationIgnored private var autoChecking = false
+
     /// When the last time the app checked the connection by itself.
     @ObservationIgnored private var lastAutoRetry = Date.distantPast
 
@@ -2962,14 +3034,15 @@ final class AppModel {
         #if os(iOS)
         if backgroundedAt != nil { return }
         #endif
-        guard phase == .unlocked, trafficShaping, overTor, !retryingRelay else { return }
+        guard phase == .unlocked, trafficShaping, overTor, !retryingRelay, !autoChecking else { return }
         let now = Date()
         let since = [resumedAt, unlockedAt].compactMap { $0 }.max() ?? unlockedAt
-        let sendStalled = waitingToSend.oldest.map { now.timeIntervalSince($0) > 15 } ?? false
-        let silent = now.timeIntervalSince(lastRelayContact) > 40
-        guard sendStalled || silent, now.timeIntervalSince(lastAutoRetry) > 5, now.timeIntervalSince(since) > 15 else { return }
+        // Silence counts, not how long something has waited: a big upload legitimately takes a while.
+        let limit: TimeInterval = waitingToSend.count > 0 ? 15 : 40
+        guard now.timeIntervalSince(lastRelayContact) > limit, now.timeIntervalSince(lastAutoRetry) > 5,
+              now.timeIntervalSince(since) > 15 else { return }
         lastAutoRetry = now
-        Task { await retryRelay() }
+        Task { await autoCheck() }
     }
 
     /// A client for a contact's relay, or the default relay when nil. Each lane has its own connections, so
@@ -3122,24 +3195,39 @@ final class AppModel {
     private func flush() async {
         let owner = identity?.fingerprint
         var down: Set<String> = []
-        // Mailboxes that failed or are full this time: what's written to them waits, nothing else does.
+        // Mailboxes that are full this time: what's written to them waits, nothing else does. And those a big upload
+        // to just failed: that was a slow upload, not the mailbox, so short messages to it still go.
         var held: Set<Data> = []
+        var heldBig: Set<Data> = []
         var tried: Set<UUID> = []
         var aborted = false
 
-        // The smallest waiting item of a mailbox whose turn it is (its own order holds), if there's room for it.
-        // Big ones share one connection, so more than a couple at once only makes each slower, and slow enough
-        // to time out; short ones are tiny and always get through.
+        // The smallest waiting item that may go, if there's room for it. Short messages keep their order among
+        // themselves, and so do photos and story pieces, but a short message doesn't wait behind a story's pieces
+        // for the same person (the ratchet reads them in either order). Big ones share one connection, so more than
+        // a couple at once only makes each slower, and slow enough to time out; short ones are tiny and always
+        // get through.
         func pick() -> (item: Outgoing, client: RelayClient, lane: String)? {
             guard !aborted else { return nil }
             var best: (item: Outgoing, client: RelayClient, lane: String)?
-            var seen: Set<Data> = []
+            var seenSmall: Set<Data> = [], seenBig: Set<Data> = []
             for item in data.outbox where !tried.contains(item.id) && !sendingIDs.contains(item.id) {
                 let relay = item.relay ?? data.relay
-                let lane = item.lane ?? Outgoing.lane(for: nil)
-                guard !down.contains(relay), !held.contains(item.sendID), !seen.contains(item.sendID),
-                      !sendingMail.contains(item.sendID), let client = client(item.relay, lane: lane) else { continue }
-                seen.insert(item.sendID)
+                // Photos and story pieces go on a connection of their own, so a big upload neither crowds out the short
+                // messages nor takes their connection down with it when it fails.
+                let lane = (item.lane ?? Outgoing.lane(for: nil)) + (item.blob.count > Self.smallEnvelope ? Self.bulkSuffix : "")
+                guard !down.contains(relay), !held.contains(item.sendID) else { continue }
+                if item.blob.count > Self.smallEnvelope {
+                    guard !heldBig.contains(item.sendID), !seenBig.contains(item.sendID),
+                          !sendingBigMail.contains(item.sendID) else { continue }
+                    seenBig.insert(item.sendID)
+                } else {
+                    guard !seenSmall.contains(item.sendID), !sendingSmallMail.contains(item.sendID) else { continue }
+                    seenSmall.insert(item.sendID)
+                }
+                guard let client = client(item.relay, lane: lane) else { continue }
+                // A lane without a working route finds one first, once: not for every item that's waiting.
+                if Tor.uses(client.base), !client.isEstablished, routeFinding.contains(lane) { continue }
                 if best == nil || item.blob.count < best!.item.blob.count { best = (item, client, lane) }
             }
             guard let best else { return nil }
@@ -3154,14 +3242,20 @@ final class AppModel {
             while true {
                 while let next = pick() {
                     let item = next.item, client = next.client, lane = next.lane
+                    let findsRoute = Tor.uses(client.base) && !client.isEstablished
+                    if findsRoute { routeFinding.insert(lane) }
                     tried.insert(item.id)
                     sendingIDs.insert(item.id)
-                    sendingMail.insert(item.sendID)
-                    if item.blob.count > Self.smallEnvelope { sendingBig.insert(item.id) }
+                    if item.blob.count > Self.smallEnvelope {
+                        sendingBig.insert(item.id)
+                        sendingBigMail.insert(item.sendID)
+                    } else {
+                        sendingSmallMail.insert(item.sendID)
+                    }
                     running += 1
                     group.addTask {
                         // As with fetching: a lane without a working route finds one before it sends.
-                        if Tor.uses(client.base), !client.isEstablished { _ = await Self.reach(client) }
+                        if findsRoute { _ = await Self.reach(client) }
                         do {
                             try await client.deposit(item.blob, to: item.sendID, wake: item.message != nil || item.rings == true, ring: item.rings == true)
                             return (item, lane, nil)
@@ -3170,9 +3264,9 @@ final class AppModel {
                 }
                 guard running > 0, let (item, lane, error) = await group.next() else { break }
                 running -= 1
+                routeFinding.remove(lane)
                 sendingIDs.remove(item.id)
-                sendingMail.remove(item.sendID)
-                sendingBig.remove(item.id)
+                if sendingBig.remove(item.id) != nil { sendingBigMail.remove(item.sendID) } else { sendingSmallMail.remove(item.sendID) }
                 guard identity?.fingerprint == owner else { aborted = true; group.cancelAll(); continue }
                 if let error {
                     if error is RelayTooLarge {
@@ -3180,17 +3274,21 @@ final class AppModel {
                         data.outbox.removeAll { $0.id == item.id }
                         continue
                     }
-                    if error is RelayMailboxFull || item.blob.count > Self.largeEnvelope {
+                    if error is RelayMailboxFull {
                         held.insert(item.sendID)
+                    } else if item.blob.count > Self.largeEnvelope {
+                        heldBig.insert(item.sendID)
                     } else {
                         down.insert(item.relay ?? data.relay)
                     }
                     // A signal that couldn't be sent is not worth sending later.
                     if item.ephemeral == true { data.outbox.removeAll { $0.id == item.id } }
                 } else {
-                    lastSent[lane] = Date()
+                    if !lane.hasSuffix(Self.bulkSuffix) { lastSent[lane] = Date() }
+                    lastDepositOK = Date()
                     data.outbox.removeAll { $0.id == item.id }
                     if let message = item.message { setStatus(.sent, for: [message]) }
+                    if item.story != nil { drainStoryBacklog() }
                     if let story = item.story { markUploadedIfDone(story) }
                 }
             }
@@ -3203,10 +3301,17 @@ final class AppModel {
     /// Outbox items being sent right now by any flush, so two never send the same one, or write to one mailbox
     /// at the same time. A message sent during a long upload starts its own flush and goes straight out.
     @ObservationIgnored private var sendingIDs: Set<UUID> = []
-    @ObservationIgnored private var sendingMail: Set<Data> = []
+    @ObservationIgnored private var sendingSmallMail: Set<Data> = []
+    /// The last time the relay took something we sent.
+    @ObservationIgnored private var lastDepositOK: Date?
+    /// Lanes where a send is finding a route right now.
+    @ObservationIgnored private var routeFinding: Set<String> = []
+    @ObservationIgnored private var sendingBigMail: Set<Data> = []
     @ObservationIgnored private var sendingBig: Set<UUID> = []
     /// Under this an envelope is a short message or a receipt.
     private static let smallEnvelope = 32_768
+    /// Added to a sending lane's name for the connection that carries the big uploads.
+    private static let bulkSuffix = "|bulk"
     /// Photos and the like sent at once. They share a connection, so more only makes each of them slower.
     private static let bigUploads = 2
 
@@ -4455,6 +4560,7 @@ extension AppModel {
         fresh.invites = bundle.publicInvites ?? []
         fresh.requests = bundle.requests ?? []
         data = fresh
+        adoptConnectionChoice()
 
         // Your other devices.
         var me = Contact(fingerprint: identity.fingerprint, name: "My devices", signingKey: identity.card.signing,
@@ -4560,7 +4666,6 @@ extension AppModel {
         for story in data.stories where story.author == "me" && story.persona == id { deleteStory(story.id) }
         try await sendEverything()
         // Collects whatever is still waiting in its mailboxes, so the relay doesn't hold it for days.
-        adoptConnectionChoice()
         let shaping = trafficShaping
         trafficShaping = false
         await syncOnce()
