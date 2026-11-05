@@ -78,6 +78,7 @@
 	<array>
 		<string>audio</string>
 		<string>fetch</string>
+		<string>voip</string>
 	</array>
 	<key>UILaunchScreen</key>
 	<dict>
