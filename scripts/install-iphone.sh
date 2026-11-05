@@ -12,6 +12,7 @@ relay="http://$ip:7878"
 [[ -f relay/pulshade-onion/hostname ]] && relay="http://$(cat relay/pulshade-onion/hostname)"
 
 [[ -f ios/Local.xcconfig ]] || { echo "Put your signing team in ios/Local.xcconfig: DEVELOPMENT_TEAM = <team id>"; exit 1; }
+[[ -n ${PULSHADE_SKIP_TOR_BUILD:-} ]] || # PULSHADE_SKIP_TOR_BUILD=1 uses Tor as last built, when tor/ hasn't changed since.
 [[ -n ${PULSHADE_SKIP_TOR_BUILD:-} ]] || ./scripts/build-tor.sh
 xcodegen generate >/dev/null
 xcodebuild -project Pulshade.xcodeproj -scheme PulshadeiOS -destination "id=$device" -derivedDataPath ios/build \

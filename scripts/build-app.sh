@@ -5,6 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 config=${1:-release}
+[[ -n ${PULSHADE_SKIP_TOR_BUILD:-} ]] || # PULSHADE_SKIP_TOR_BUILD=1 uses Tor as last built, when tor/ hasn't changed since.
 [[ -n ${PULSHADE_SKIP_TOR_BUILD:-} ]] || ./scripts/build-tor.sh
 swift build -c "$config"
 bin="$(swift build -c "$config" --show-bin-path)/Pulshade"
