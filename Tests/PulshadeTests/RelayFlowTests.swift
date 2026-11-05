@@ -781,6 +781,60 @@ struct RelayFlowTests {
         await mac.unpublishProfile()
     }
 
+    /// A request that waits a while for an answer, while the one who sent it changes their profile, still ends in a
+    /// chat that works both ways. The profile update waited on the request's handshake, which was started again after
+    /// a minute, so the acceptance that came later answered a handshake the phone no longer had: the phone kept
+    /// showing the request as waiting and wrote to the public request mailbox.
+    @Test func aRequestAnsweredLateStillOpensAChat() async throws {
+        let mac = try await makeUser("Mac")
+        let phone = try await makeUser("Phone")
+        defer { for m in [mac, phone] { m.lock() } }
+        let handle = "late_\(Int.random(in: 10000...99999))"
+        try await mac.publishProfile(handle: handle)
+        let found = try #require(try await phone.findProfile(handle))
+        _ = try #require(phone.sendRequest(to: found, note: "hi from my phone"))
+        await settle(mac, phone)
+        let request = try #require(mac.requests.first)
+
+        // While it waits, the phone changes its profile, and more than a minute goes by.
+        phone.updateProfile { $0.bio = "on the go" }
+        try await Task.sleep(for: .seconds(2))
+        let macFP = mac.fingerprint
+        let i = try #require(phone.data.contacts.firstIndex { $0.fingerprint == macFP })
+        let asked = try #require(phone.data.contacts[i].devices[0].handshake?.ephemeral)
+        phone.data.contacts[i].devices[0].handshake?.startedAt = Date().addingTimeInterval(-120)
+        await settle(mac, phone)
+        #expect(phone.data.contacts[i].devices[0].handshake?.ephemeral == asked, "The request's handshake is kept for the answer")
+
+        _ = try #require(mac.acceptRequest(request.id))
+        await settle(mac, phone, rounds: 8)
+        let phonesMac = try #require(phone.data.contacts.first { $0.fingerprint == macFP })
+        #expect(!phonesMac.awaitingAcceptance, "The phone sees the request accepted")
+        #expect(phonesMac.sendID != found.sendID, "and writes to the mailbox the Mac opened for it")
+        #expect(phonesMac.bio == nil)
+        #expect(mac.data.contacts.first { $0.fingerprint == phone.fingerprint }?.bio == "on the go", "The waiting profile arrives")
+        let phoneChat = try #require(phone.data.conversations.first { $0.kind == .direct })
+        phone.send("can you see this?", in: phoneChat.id)
+        await settle(mac, phone)
+        let macChat = try #require(mac.data.conversations.first { $0.kind == .direct })
+        #expect(mac.conversation(macChat.id)?.messages.contains { $0.text == "can you see this?" } == true)
+        mac.send("yes", in: macChat.id)
+        await settle(mac, phone)
+        #expect(phone.conversation(phoneChat.id)?.messages.contains { $0.text == "yes" } == true)
+
+        // A phone already caught this way (it has a session, but never heard it was accepted) is told again as soon
+        // as it writes to the public mailbox, and moves to its own.
+        let j = try #require(phone.data.contacts.firstIndex { $0.fingerprint == macFP })
+        phone.data.contacts[j].awaitingAcceptance = true
+        phone.data.contacts[j].sendID = found.sendID
+        phone.send("still there?", in: phoneChat.id)
+        await settle(mac, phone)
+        #expect(mac.conversation(macChat.id)?.messages.contains { $0.text == "still there?" } == true)
+        let healed = try #require(phone.data.contacts.first { $0.fingerprint == macFP })
+        #expect(!healed.awaitingAcceptance && healed.sendID != found.sendID)
+        await mac.unpublishProfile()
+    }
+
     /// After the passcode, Pulshade waits on a connecting screen until the relay answers.
     @Test func unlockingWaitsForTheRelay() async throws {
         let model = try await makeUser("Waiting")

@@ -1573,6 +1573,9 @@ final class AppModel {
             throw DirectoryError.full
         } catch RelayClient.DirectoryError.unreachable {
             throw DirectoryError.unreachable
+        } catch RelayClient.DirectoryError.invalid {
+            // Anything else the relay said no with, a rate limit among them.
+            throw DirectoryError.invalid
         }
         var profile = profile(for: persona)
         if let old = profile.handle, old != handle { await release(old, persona: persona) }
@@ -2510,10 +2513,12 @@ final class AppModel {
         seal(payload, contact: i, device: 0, message: message)
     }
 
-    /// Handshakes that got no answer (the other side didn't know us yet, say) are tried again.
+    /// Handshakes that got no answer (the other side didn't know us yet, say) are tried again. Not a request's: it
+    /// went with the request and is answered when they accept, which can be days later. Starting it again would
+    /// leave their answer to the first one with nothing to open it.
     private func retryStaleHandshakes() {
         let cutoff = Date().addingTimeInterval(-60)
-        for i in data.contacts.indices {
+        for i in data.contacts.indices where !data.contacts[i].awaitingAcceptance {
             for d in data.contacts[i].devices.indices {
                 let link = data.contacts[i].devices[d]
                 if link.session == nil && link.awaitingHello != true && !link.pending.isEmpty
@@ -3037,6 +3042,17 @@ final class AppModel {
     /// Who's been given a private mailbox since launch, so it's said once.
     @ObservationIgnored private var movedOffIntro: Set<String> = []
 
+    /// A friend still writing to your public request mailbox never heard that you accepted (the answer was lost, or
+    /// reached a handshake their side had since started again). Tell them again, so they move to their own mailbox and
+    /// stop showing the request as waiting. Once they've heard, nothing more of theirs comes this way.
+    private func remindAccepted(_ fp: String, _ persona: UUID?) {
+        guard let i = contactIndex(fp, persona) else { return }
+        let c = data.contacts[i]
+        guard !c.isSelf, !c.hidden, !c.awaitingAcceptance, let receiveKey = c.receiveKey,
+              c.devices.contains(where: { $0.session != nil }) else { return }
+        enqueue(.accepted(sendID: Mailbox.sendID(for: receiveKey)), to: c)
+    }
+
     private func receive(_ envelope: RelayEnvelope) {
         deposited = envelope.deposited
         if let offer = data.linkOffers.firstIndex(where: { $0.receiveKey == envelope.receiveKey }) {
@@ -3095,6 +3111,8 @@ final class AppModel {
         guard let i = contactIndex(fp, persona) else { return }
         let viaIntro = data.conversations.contains { $0.introsMine.contains { $0.receiveKey == envelope.receiveKey } }
         defer { if viaIntro { moveOffIntro(fp, persona) } }
+        let viaRequestMailbox = data.invites.contains { $0.isPublic && $0.receiveKey == envelope.receiveKey }
+        defer { if viaRequestMailbox { remindAccepted(fp, persona) } }
 
         switch payload {
         case let .deviceHello(card, request):
