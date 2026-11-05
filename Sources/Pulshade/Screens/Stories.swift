@@ -1111,6 +1111,31 @@ struct StoryCamera: View {
 
 // MARK: - Viewer
 
+/// Over a story of yours that hasn't finished going out, as on Instagram.
+struct UploadingCover: View {
+    var progress: Double?
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.5)
+            VStack(spacing: 14) {
+                ProgressView().controlSize(.large).tint(.white)
+                Text("Uploading")
+                    .font(.system(size: 16, weight: .semibold)).foregroundStyle(.white)
+                if let progress {
+                    Text("\(Int((progress * 100).rounded()))%")
+                        .font(.system(size: 13, weight: .medium).monospacedDigit()).foregroundStyle(.white.opacity(0.7))
+                }
+            }
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+        .animation(.smooth(duration: 0.3), value: progress)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Uploading")
+    }
+}
+
 struct StoryViewer: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
@@ -1173,6 +1198,11 @@ struct StoryViewer: View {
                     .id(stories[index].id)
                     .transition(reduceMotion ? .opacity
                                 : .asymmetric(insertion: .move(edge: .trailing), removal: .move(edge: .leading)))
+                if stories[index].author == "me", model.isUploading(stories[index].id) {
+                    UploadingCover(progress: model.uploadProgress(of: stories[index].id))
+                        .id("uploading-\(stories[index].id)")
+                        .transition(.opacity)
+                }
             }
             StoryBars(count: stories.count, index: index, clock: clock)
                 .padding(14)
