@@ -727,7 +727,7 @@ private struct Bubble: View {
                     if message.expiresAt != nil { Image(systemName: "timer") }
                     Text(message.date.formatted(date: .omitted, time: .shortened))
                     if mine {
-                        Image(systemName: message.status.symbol).contentTransition(.symbolEffect(.replace))
+                        StatusTicks(status: message.status).animation(.snappy(duration: 0.2), value: message.status)
                     }
                 }
                 .font(.system(size: 10, weight: .medium))
