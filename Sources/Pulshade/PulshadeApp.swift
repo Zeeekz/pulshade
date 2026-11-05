@@ -43,7 +43,7 @@ struct PulshadeApp: App {
                 .onAppear { NSApplication.shared.activate(ignoringOtherApps: true) }
                 .onOpenURL { model.open($0) }
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
-                    model.save()
+                    model.save(); model.settleSaves()
                 }
         }
         .windowStyle(.hiddenTitleBar)

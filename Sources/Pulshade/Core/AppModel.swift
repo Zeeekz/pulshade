@@ -377,7 +377,9 @@ final class AppModel {
         data.invites.removeAll { $0.channel == nil && !$0.isPublic && $0.createdAt < Date().addingTimeInterval(-7 * 24 * 3600) }
         data.invites.removeAll { ($0.retiresAt ?? .distantFuture) < Date() }
         UserDefaults.standard.set(data.theme, forKey: "pulshade.theme")
+        // Written straight away: a new account must have its file before anything else happens.
         save()
+        settleSaves()
         mirrorSecurity()
         lastActivity = Date()
         Notifier.shared.onOpen = { [weak self] id in self?.open(id) }
@@ -489,6 +491,7 @@ final class AppModel {
         if hadPush { withdrawPush() }
         syncTask?.cancel()
         tickTask?.cancel()
+        discardSaves()
         vault.destroy(leavingNoTrace: leavingNoTrace)
         AnnouncementWatch.forget()
         // The few display settings kept outside the vault, so the lock screen can look right.
@@ -515,13 +518,54 @@ final class AppModel {
         RelayClient.closeAll(finishing: !cutOffOnLock)
     }
 
+    /// The newest state waiting to be written, with the account it belongs to.
+    @ObservationIgnored private var unsaved: (data: AppData, identity: Identity)?
+    @ObservationIgnored private var saveTimer: Task<Void, Never>?
+    /// Writes happen here, one at a time and in order, so the main thread never waits on encrypting the whole vault.
+    private static let saveQueue = DispatchQueue(label: "pulshade.save", qos: .userInitiated)
+
+    /// Saves are gathered for a moment and written off the main thread: sending a few messages in a row would
+    /// otherwise encrypt and rewrite the whole vault several times each, and freeze the chat while it did.
     func save() {
         guard let identity else { return }
-        try? vault.save(data, with: identity)
+        if let pending = unsaved, pending.identity.storageKey.bytes != identity.storageKey.bytes { flushSave() }
+        unsaved = (data, identity)
+        if saveTimer == nil {
+            saveTimer = Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(400))
+                guard !Task.isCancelled else { return }
+                self?.flushSave()
+            }
+        }
         updateBadge()
         AnnouncementWatch.mirror(.init(notifications: data.security.notifications, content: data.security.notificationContent,
                                        sound: data.security.notificationSound,
                                        muted: conversation(Conversation.announcementsID)?.muted ?? false))
+    }
+
+    /// Starts writing whatever is waiting, in the background.
+    private func flushSave() {
+        saveTimer?.cancel()
+        saveTimer = nil
+        guard let (data, identity) = unsaved else { return }
+        unsaved = nil
+        let vault = vault
+        Self.saveQueue.async { try? vault.save(data, with: identity) }
+    }
+
+    /// Writes whatever is waiting and returns once it's on disk: before locking, quitting, going to the background,
+    /// and before anything else touches the vault's files.
+    func settleSaves() {
+        flushSave()
+        Self.saveQueue.sync {}
+    }
+
+    /// Drops a waiting write and lets any under way finish, so nothing lands after the vault's files are wiped.
+    private func discardSaves() {
+        saveTimer?.cancel()
+        saveTimer = nil
+        unsaved = nil
+        Self.saveQueue.sync {}
     }
 
     private func updateBadge() {
@@ -2305,6 +2349,7 @@ final class AppModel {
     /// looks the same whichever opened last), and rewrites them and the filler files together, so every data
     /// file changes at the same moment and none stands out.
     private func refreshDisguises() {
+        settleSaves()
         guard isPrimary, let identity, phase == .unlocked else { return }
         var real = [identity]
         for seed in [data.decoySeed, data.panicSeed].compactMap({ $0 }) {
@@ -2321,6 +2366,7 @@ final class AppModel {
     }
 
     private func rebalanceFiles() {
+        settleSaves()
         guard let identity else { return }
         let extras = [data.decoySeed, data.panicSeed].compactMap { $0 }.compactMap { try? Identity(seed: $0) }
         vault.rebalance(real: [identity] + extras)

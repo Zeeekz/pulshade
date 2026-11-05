@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 config=${1:-release}
-./scripts/build-tor.sh
+[[ -n ${PULSHADE_SKIP_TOR_BUILD:-} ]] || ./scripts/build-tor.sh
 swift build -c "$config"
 bin="$(swift build -c "$config" --show-bin-path)/Pulshade"
 
