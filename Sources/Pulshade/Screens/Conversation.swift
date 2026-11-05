@@ -13,6 +13,7 @@ struct ConversationView: View {
     let id: Conversation.ID
     @State private var draft = ""
     @State private var attachments: [Data] = []
+    @State private var takingPhoto = false
     @State private var showInfo = false
     @State private var recorder = VoiceRecorder()
     @State private var replyingTo: Message?
@@ -383,14 +384,10 @@ struct ConversationView: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             } else {
                 HStack(alignment: .bottom, spacing: 8) {
-                    ImagePickButton(maxSide: 1600, pickedMany: { photos in
-                        withAnimation(.snappy) { attachments = Array((attachments + photos).prefix(10)) }
-                    }) {
-                        Image(systemName: "paperclip")
-                    }
+                    Button { takingPhoto = true } label: { Image(systemName: "camera") }
                         .buttonStyle(IconButtonStyle(size: 36))
-                        .help("Attach photos")
-                        .accessibilityLabel("Attach photos")
+                        .help("Take or choose a photo")
+                        .accessibilityLabel("Take or choose a photo")
 
                     TextField("", text: $draft, prompt: Text(placeholder(c)).foregroundStyle(Ink.faint), axis: .vertical)
                         .textFieldStyle(.plain)
@@ -450,6 +447,9 @@ struct ConversationView: View {
         .padding(.bottom, Platform.isPhone ? 8 : 14)
         .background(Ink.base)
         .overlay(alignment: .top) { Rectangle().fill(Ink.line).frame(height: 1) }
+        .chatCamera(isPresented: $takingPhoto) { photos in
+            withAnimation(.snappy) { attachments = Array((attachments + photos).prefix(10)) }
+        }
         .animation(.snappy(duration: 0.25), value: recorder.isRecording)
         .animation(.snappy(duration: 0.25), value: attachments.count)
         .animation(.snappy(duration: 0.25), value: replyingTo?.id)
