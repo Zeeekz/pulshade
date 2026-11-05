@@ -50,6 +50,8 @@ const MAX_MAILBOXES: usize = 200_000;
 const MAX_PUSH_KEYS: usize = 256;
 const MAX_KEYS_PER_FETCH: usize = 512;
 const MAX_ITEMS_PER_KEY: usize = 64;
+/// The most envelope bytes one fetch answers with (apart from a single envelope larger than this, which goes alone).
+const MAX_FETCH_BYTES: usize = 1024 * 1024;
 const TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 /// The longest a fetch may wait for mail.
 const MAX_WAIT: u64 = 25;
@@ -213,9 +215,14 @@ async fn fetch(State(store): State<Shared>, Json(req): Json<FetchRequest>) -> Re
 fn collect(store: &Shared, mailboxes: &[Option<Id>]) -> Vec<Envelope> {
     let store = store.lock().unwrap();
     let mut items = Vec::new();
-    for (k, mailbox) in mailboxes.iter().enumerate() {
+    let mut bytes = 0;
+    'boxes: for (k, mailbox) in mailboxes.iter().enumerate() {
         let Some(queue) = mailbox.and_then(|id| store.queues.get(&id)) else { continue };
         for item in queue.iter().take(MAX_ITEMS_PER_KEY) {
+            // One answer stays small enough to arrive over a slow circuit before the app gives up; the rest
+            // comes on the next fetch, once this has been acknowledged. The first envelope always goes, however big.
+            if !items.is_empty() && bytes + item.blob.len() > MAX_FETCH_BYTES { break 'boxes; }
+            bytes += item.blob.len();
             items.push(Envelope { k, id: item.id, blob: B64.encode(&item.blob), age: item.at.elapsed().as_secs() });
         }
     }
@@ -1178,6 +1185,37 @@ mod tests {
         let ids: Vec<u64> = res.items.iter().map(|i| i.id).collect();
         ack(State(store.clone()), Json(AckRequest { acks: vec![Ack { key: hex::encode(receive), ids }] })).await;
         assert_eq!(store.lock().unwrap().bytes, 0);
+    }
+
+    /// A big story must not hold up what's behind it: one fetch stays under the size cap (but always carries at
+    /// least one envelope), and acknowledging what came lets the next fetch bring the rest, in order.
+    #[tokio::test]
+    async fn a_fetch_stays_small_and_the_rest_follows_after_acknowledging() {
+        let store: Shared = Arc::default();
+        let receive = key(33);
+        let send = hex::encode(send_id_for(&receive));
+        let big = Bytes::from(vec![7u8; 400 * 1024]);
+        for _ in 0..5 { assert_eq!(deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), big.clone()).await, StatusCode::ACCEPTED); }
+        assert_eq!(deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), Bytes::from_static(b"hi")).await, StatusCode::ACCEPTED);
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            let Json(res) = fetch(State(store.clone()), Json(FetchRequest { keys: vec![hex::encode(receive)], wait: 0 })).await.unwrap();
+            if res.items.is_empty() { break; }
+            let size: usize = res.items.iter().map(|i| B64.decode(&i.blob).unwrap().len()).sum();
+            assert!(size <= MAX_FETCH_BYTES, "answered with {size} bytes");
+            let ids: Vec<u64> = res.items.iter().map(|i| i.id).collect();
+            seen.extend(res.items.iter().map(|i| B64.decode(&i.blob).unwrap().len()));
+            ack(State(store.clone()), Json(AckRequest { acks: vec![Ack { key: hex::encode(receive), ids }] })).await;
+        }
+        // Ids are unpredictable, so order is judged by what each envelope held.
+        assert_eq!(seen, vec![400 * 1024, 400 * 1024, 400 * 1024, 400 * 1024, 400 * 1024, 2], "everything arrives, in the order sent");
+        assert_eq!(store.lock().unwrap().bytes, 0);
+
+        // A single envelope past the cap still goes, alone.
+        let huge = Bytes::from(vec![1u8; MAX_FETCH_BYTES + 10]);
+        deposit(State(store.clone()), Path(send), HeaderMap::new(), huge).await;
+        let Json(res) = fetch(State(store), Json(FetchRequest { keys: vec![hex::encode(receive)], wait: 0 })).await.unwrap();
+        assert_eq!(res.items.len(), 1);
     }
 
     #[tokio::test]
