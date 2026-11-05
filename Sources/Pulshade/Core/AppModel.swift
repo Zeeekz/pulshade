@@ -145,7 +145,9 @@ final class AppModel {
         #endif
         // Tor takes a moment to connect: start it now, in the background, so it's ready by the first request.
         let onionOnly = URL(string: AppData.defaultRelay).map(Tor.isOnion) == true && AppData.directRelay == nil
-        if Tor.enabled || onionOnly {
+        // A fresh install waits for its owner to choose between Tor and a direct connection first.
+        let awaitingChoice = !vault.exists && Tor.needsChoice
+        if (Tor.enabled && !awaitingChoice) || onionOnly {
             DispatchQueue.global(qos: .utility).async { Tor.start() }
         }
         #if os(macOS)
@@ -282,6 +284,21 @@ final class AppModel {
 
     // MARK: Identity lifecycle
 
+    /// What was chosen before sign-up (Tor or a direct connection) is what this device's account uses, whatever
+    /// another device or a backup said.
+    private func adoptConnectionChoice(fresh: Bool = false) {
+        let on = Tor.enabled
+        if fresh {
+            data.security.tor = on
+            data.security.torSince = on ? Date() : nil
+            data.security.torFromStart = on
+        } else if data.security.tor != on {
+            data.security.tor = on
+            data.security.torSince = on ? Date() : nil
+            data.security.torFromStart = false
+        }
+    }
+
     func create(identity: Identity, profile: Profile, passcode: String) async throws {
         let vault = vault
         try await Task.detached { try vault.create(identity, passcode: passcode) }.value
@@ -289,6 +306,7 @@ final class AppModel {
         slot = 0
         data = AppData()
         data.profile = profile
+        adoptConnectionChoice(fresh: true)
         didUnlock()
     }
 
@@ -311,6 +329,7 @@ final class AppModel {
         } else {
             data = stored
         }
+        adoptConnectionChoice()
         didUnlock()
         // It's on this device now. An old copy left behind could only fall out of step.
         if backup != nil { Task { try? await deleteBackup(of: identity) } }
@@ -4541,6 +4560,7 @@ extension AppModel {
         for story in data.stories where story.author == "me" && story.persona == id { deleteStory(story.id) }
         try await sendEverything()
         // Collects whatever is still waiting in its mailboxes, so the relay doesn't hold it for days.
+        adoptConnectionChoice()
         let shaping = trafficShaping
         trafficShaping = false
         await syncOnce()
