@@ -14,8 +14,8 @@ enum StoryPalette {
 /// Horizontal row at the top of the chat list: you first, then friends with live stories.
 struct StoryStrip: View {
     @Environment(AppModel.self) private var model
-    @State private var viewing: StoryReel?
-    @State private var composing = false
+    @Binding var composing: Bool
+    @Binding var viewing: StoryReel?
 
     var body: some View {
         ScrollView(.horizontal) {
@@ -70,8 +70,7 @@ struct StoryStrip: View {
             .padding(.vertical, 4)
         }
         .scrollIndicators(.never)
-        .storyCamera(isPresented: $composing)
-        .sheet(item: $viewing) { reel in StoryViewer(stories: reel.stories, start: reel.start, following: reel.following) }
+
     }
 
     /// The row's stories that haven't all been seen, after `author`'s (or all of them, from your own).
@@ -120,6 +119,31 @@ private struct StoryBubble: View {
 }
 
 /// The visible face of a story, shared by the card, the composer preview and the viewer.
+/// Story pictures, decoded once. Decoding a photo takes long enough to be felt when it happens as the next story
+/// slides in, so the ones either side of the story on screen are decoded ahead, off the main thread.
+enum StoryImages {
+    private static let cache = NSCache<NSString, PlatformImage>()
+
+    static func image(id: UUID, data: Data) -> PlatformImage? {
+        let key = "\(id.uuidString)-\(data.count)" as NSString
+        if let hit = cache.object(forKey: key) { return hit }
+        #if os(iOS)
+        guard let raw = UIImage(data: data) else { return nil }
+        let image = raw.preparingForDisplay() ?? raw
+        #else
+        guard let image = NSImage(data: data) else { return nil }
+        #endif
+        cache.setObject(image, forKey: key)
+        return image
+    }
+
+    static func prefetch(_ story: Story) {
+        guard case let .image(data, _) = story.style else { return }
+        let id = story.id
+        Task.detached(priority: .userInitiated) { _ = image(id: id, data: data) }
+    }
+}
+
 struct StoryFace: View {
     var story: Story
     var compact = false
@@ -140,7 +164,7 @@ struct StoryFace: View {
                     .padding(compact ? 16 : 40)
             case let .image(data, caption):
                 Color.black
-                if let img = PlatformImage(data: data) {
+                if let img = StoryImages.image(id: story.id, data: data) {
                     Image(platformImage: img).resizable().scaledToFill()
                 }
                 if !caption.isEmpty { StoryCaption(text: caption, compact: compact) }
@@ -611,6 +635,7 @@ struct StoryComposer: View {
             let words = StoryOverlayRender.text(overlays)
             Task {
                 do {
+                    let began = Date()
                     let data = try await StoryVideo.export(from: clip, filter: look, zoom: track, text: words)
                     model.postStory(.video(data, caption: ""), audience: audience, lifetime: lifetime)
                     exporting = false
@@ -643,6 +668,16 @@ struct StoryComposer: View {
 }
 
 extension View {
+    /// The story viewer: full screen on the phone, so the picture reaches the top and bottom of the screen, and a
+    /// sheet on the Mac.
+    func viewerCover<Item: Identifiable, Content: View>(item: Binding<Item?>, @ViewBuilder content: @escaping (Item) -> Content) -> some View {
+        #if os(iOS)
+        fullScreenCover(item: item) { content($0) }
+        #else
+        sheet(item: item) { content($0) }
+        #endif
+    }
+
     /// The story editor: full screen on the phone, a sheet the size of a story on the Mac.
     func composerCover<Item: Identifiable, Content: View>(item: Binding<Item?>, @ViewBuilder content: @escaping (Item) -> Content) -> some View {
         #if os(iOS)
@@ -877,8 +912,18 @@ struct StoryCamera: View {
     @State private var camera = Camera()
     @State private var ready: Bool?
     @State private var pending: PendingCrop?
-    @State private var framed: StoryPick?
-    @State private var writing = false
+    /// What the camera has opened over itself: the editor for a picked item, or the text-story editor. One cover, not
+    /// two: SwiftUI can't keep two full-screen covers on one view straight, and it dismissed the photo picker.
+    private enum Cover: Identifiable {
+        case framed(StoryPick), writing
+        var id: String {
+            switch self {
+            case let .framed(pick): "framed-\(pick.id)"
+            case .writing: "writing"
+            }
+        }
+    }
+    @State private var cover: Cover?
     @State private var filter = StoryFilter.none
     // The shutter: a press that lasts becomes a clip.
     @State private var pressStart: Date?
@@ -953,7 +998,7 @@ struct StoryCamera: View {
                 FilterDots(filter: $filter).padding(.bottom, 6)
                     .opacity(camera.recording ? 0 : 1)
                 HStack(alignment: .center) {
-                    StoryMediaPicker(picked: { kind in framed = StoryPick(kind: kind, filter: filter) }) {
+                    StoryMediaPicker(picked: { kind in cover = .framed(StoryPick(kind: kind, filter: filter)) }) {
                         controlFace("photo.on.rectangle")
                     }
                     .accessibilityLabel("Choose a photo or video")
@@ -973,7 +1018,7 @@ struct StoryCamera: View {
                 HStack(spacing: 12) {
                     Text("Tap for photo · Hold for video")
                         .font(.system(size: 12, weight: .medium)).foregroundStyle(.white.opacity(0.7))
-                    Button { writing = true } label: {
+                    Button { cover = .writing } label: {
                         Text("Aa  Text")
                             .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
                             .padding(.horizontal, 14).padding(.vertical, 8)
@@ -1006,14 +1051,17 @@ struct StoryCamera: View {
             guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.3)) { zoomShown = false }
         }
-        .cropper($pending, frame: .story) { data in framed = StoryPick(kind: .photo(data), filter: filter) }
-        .composerCover(item: $framed) { pick in
-            switch pick.kind {
-            case let .photo(data): StoryComposer(image: data, filter: pick.filter, posted: { dismiss() })
-            case let .clip(url, zoom): StoryComposer(clip: url, zoom: zoom, filter: pick.filter, posted: { dismiss() })
+        .cropper($pending, frame: .story) { data in cover = .framed(StoryPick(kind: .photo(data), filter: filter)) }
+        .composerCover(item: $cover) { cover in
+            switch cover {
+            case let .framed(pick):
+                switch pick.kind {
+                case let .photo(data): StoryComposer(image: data, filter: pick.filter, posted: { dismiss() })
+                case let .clip(url, zoom): StoryComposer(clip: url, zoom: zoom, filter: pick.filter, posted: { dismiss() })
+                }
+            case .writing: StoryComposer(posted: { dismiss() })
             }
         }
-        .composerCover(isPresented: $writing) { StoryComposer(posted: { dismiss() }) }
     }
 
     // MARK: Shutter
@@ -1055,7 +1103,7 @@ struct StoryCamera: View {
         holdRecording = true
         Haptics.tick()
         camera.record { url, track in
-            if let url { framed = StoryPick(kind: .clip(url, track), filter: filter) }
+            if let url { cover = .framed(StoryPick(kind: .clip(url, track), filter: filter)) }
         }
     }
 
@@ -1110,6 +1158,19 @@ struct StoryCamera: View {
 }
 
 // MARK: - Viewer
+
+/// Shows the cover while a story of yours is going out. Apart from the viewer, so the viewer isn't drawn again every
+/// time one more copy leaves.
+private struct UploadingGate: View {
+    @Environment(AppModel.self) private var model
+    var story: Story.ID
+
+    var body: some View {
+        if model.isUploading(story) {
+            UploadingCover(progress: model.uploadProgress(of: story)).transition(.opacity)
+        }
+    }
+}
 
 /// Over a story of yours that hasn't finished going out, as on Instagram.
 struct UploadingCover: View {
@@ -1194,21 +1255,19 @@ struct StoryViewer: View {
         let stories = current
         ZStack(alignment: .top) {
             if stories.indices.contains(index) {
+                // The picture goes under the status bar and home bar; everything written over it stays inside them.
                 StoryFace(story: stories[index], clip: clip)
+                    .ignoresSafeArea()
                     .id(stories[index].id)
-                    .transition(reduceMotion ? .opacity
-                                : .asymmetric(insertion: .move(edge: .trailing), removal: .move(edge: .leading)))
-                if stories[index].author == "me", model.isUploading(stories[index].id) {
-                    UploadingCover(progress: model.uploadProgress(of: stories[index].id))
-                        .id("uploading-\(stories[index].id)")
-                        .transition(.opacity)
-                }
+                    .transition(.opacity)
+                if stories[index].author == "me" { UploadingGate(story: stories[index].id) }
             }
             StoryBars(count: stories.count, index: index, clock: clock)
                 .padding(14)
                 .opacity(holding ? 0 : 1)
             GeometryReader { geo in
                 Color.clear.contentShape(Rectangle())
+                    .ignoresSafeArea()
                     .gesture(DragGesture(minimumDistance: 0)
                         .onChanged { drag in touchBegan(); dragMoved(drag) }
                         .onEnded { drag in touchEnded(drag, width: geo.size.width) })
@@ -1262,7 +1321,7 @@ struct StoryViewer: View {
                minHeight: Platform.isPhone ? nil : 680, maxHeight: Platform.isPhone ? .infinity : 680)
         .background(.black.opacity(1 - Double(min(dragY, 300)) / 600))
         .onAppear { index = min(start, max(stories.count - 1, 0)) }
-        .onChange(of: index, initial: true) { markSeenIfReady() }
+        .onChange(of: index, initial: true) { markSeenIfReady(); prefetchAround(index) }
         .onChange(of: loading) { _, now in
             // The last piece just came in: play it from the start.
             guard !now else { return }
@@ -1298,6 +1357,12 @@ struct StoryViewer: View {
         } message: {
             Text("It disappears for everyone who can see it.")
         }
+    }
+
+    /// Decodes the pictures either side of the one now showing, so the next tap finds them ready.
+    private func prefetchAround(_ i: Int) {
+        let stories = current
+        for n in [i + 1, i - 1] where stories.indices.contains(n) { StoryImages.prefetch(stories[n]) }
     }
 
     private func markSeenIfReady() {
@@ -1499,7 +1564,8 @@ struct StoryViewer: View {
         // Let go of this clip now, so a late tick can't step twice.
         clip?.close()
         clip = nil
-        withAnimation(reduceMotion ? .easeInOut(duration: 0.2) : .smooth(duration: 0.35)) { index = next }
+        withAnimation(.easeOut(duration: 0.18)) { index = next }
         clock.progress = 0
+        prefetchAround(next)
     }
 }
