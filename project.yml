@@ -58,7 +58,7 @@ targets:
         # App Store Connect's export compliance questions (2026-11-04: not distributed in France) said no documents are
         # needed, so this is false and each upload isn't asked again. Revisit if the app is ever released in France.
         ITSAppUsesNonExemptEncryption: false
-        NSCameraUsageDescription: Scan codes to link your devices, add friends and verify them, and take photos and videos for stories. Frames are never saved.
+        NSCameraUsageDescription: Scan codes to link your devices, add friends and verify them, and take photos for chats and photos and videos for stories. Frames are never saved.
         CFBundleURLTypes:
           - CFBundleURLName: app.pulshade.link
             CFBundleURLSchemes: [pulshade]

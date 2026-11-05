@@ -53,7 +53,7 @@
 		</dict>
 	</dict>
 	<key>NSCameraUsageDescription</key>
-	<string>Scan codes to link your devices, add friends and verify them, and take photos and videos for stories. Frames are never saved.</string>
+	<string>Scan codes to link your devices, add friends and verify them, and take photos for chats and photos and videos for stories. Frames are never saved.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Unlock PULSHADE with Face ID.</string>
 	<key>NSHumanReadableCopyright</key>
