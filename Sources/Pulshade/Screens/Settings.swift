@@ -1280,6 +1280,7 @@ private struct DisguiseSetup: View {
     @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
     let kind: DisguiseKind
+    @State private var style = LockStyle.passcode
     @State private var passcode = ""
     @State private var confirm = ""
     @State private var working = false
@@ -1302,9 +1303,15 @@ private struct DisguiseSetup: View {
                     .foregroundStyle(Ink.dim)
                     .multilineTextAlignment(.center)
                     .frame(width: 320)
-                PasscodeField(placeholder: "Passcode", text: $passcode, onSubmit: save)
-                PasscodeField(placeholder: "Again", text: $confirm, onSubmit: save)
-                    .modifier(Shake(trigger: shake))
+                LockStylePicker(style: $style, options: LockStyle.forDisguise)
+                    .onChange(of: style) { _, _ in passcode = ""; confirm = "" }
+                if let length = style.length {
+                    PinSetup(length: length, passcode: $passcode, confirm: $confirm, onDone: save)
+                } else {
+                    PasscodeField(placeholder: "Passcode", text: $passcode, onSubmit: save)
+                    PasscodeField(placeholder: "Again", text: $confirm, onSubmit: save)
+                        .modifier(Shake(trigger: shake))
+                }
                 if let problem {
                     Text(branded: problem).font(.system(size: 11, weight: .semibold)).foregroundStyle(.orange)
                 }
@@ -1318,8 +1325,8 @@ private struct DisguiseSetup: View {
     }
 
     private func save() {
-        guard passcode.count >= 6, passcode == confirm else {
-            problem = passcode.count < 6 ? "At least 6 characters" : "Passcodes don't match"
+        guard style.accepts(passcode), passcode == confirm else {
+            problem = style.accepts(passcode) ? "Entries don't match" : style.problem(for: passcode)
             withAnimation(.default) { shake += 1 }
             return
         }

@@ -143,6 +143,7 @@ struct CreateFlow: View {
     @State private var step: Step = .profile
     @State private var identity = Identity.generate()
     @State private var profile = Profile()
+    @State private var style = LockStyle.remembered
     @State private var passcode = ""
     @State private var confirm = ""
     @State private var problem: String?
@@ -174,20 +175,30 @@ struct CreateFlow: View {
     }
 
     private var passcodeStep: some View {
-        OnboardingPage(title: "Choose a passcode", subtitle: "It locks and encrypts PULSHADE on this device. Use at least 6 characters.",
+        OnboardingPage(title: "Choose a \(style.noun)",
+                       subtitle: style.isPIN
+                           ? "It locks and encrypts PULSHADE on this device. A passcode is stronger than a PIN."
+                           : "It locks and encrypts PULSHADE on this device. Use at least 6 characters.",
                        step: (1, 3), back: stepBack) {
             VStack(spacing: 12) {
-                PasscodeField(placeholder: "Passcode", text: $passcode, onSubmit: next)
-                PasscodeField(placeholder: "Confirm passcode", text: $confirm, onSubmit: next)
-                    .modifier(Shake(trigger: shake))
-                StrengthBar(passcode: passcode).padding(.top, 4)
+                LockStylePicker(style: $style).padding(.bottom, 4)
+                if let length = style.length {
+                    PinSetup(length: length, passcode: $passcode, confirm: $confirm, onDone: next).padding(.top, 8)
+                } else {
+                    PasscodeField(placeholder: "Passcode", text: $passcode, onSubmit: next)
+                    PasscodeField(placeholder: "Confirm passcode", text: $confirm, onSubmit: next)
+                        .modifier(Shake(trigger: shake))
+                    StrengthBar(passcode: passcode).padding(.top, 4)
+                }
                 if let problem {
                     Text(branded: problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange)
                 }
             }
         } actions: {
-            Button("Continue", action: next).buttonStyle(PrimaryButtonStyle())
+            // A PIN moves on by itself once it has been entered twice.
+            if !style.isPIN { Button("Continue", action: next).buttonStyle(PrimaryButtonStyle()) }
         }
+        .onChange(of: style) { _, _ in passcode = ""; confirm = ""; problem = nil }
     }
 
     private var recoveryStep: some View {
@@ -211,8 +222,8 @@ struct CreateFlow: View {
         switch step {
         case .profile: advance(to: .passcode)
         case .passcode:
-            guard passcode.count >= 6, passcode == confirm else {
-                problem = passcode.count < 6 ? "Use at least 6 characters" : "The passcodes don't match"
+            guard style.accepts(passcode), passcode == confirm else {
+                problem = style.accepts(passcode) ? "The \(style.noun)s don't match" : style.problem(for: passcode)
                 withAnimation(.default) { shake += 1 }
                 return
             }
@@ -225,6 +236,7 @@ struct CreateFlow: View {
     private func finish() {
         working = true
         Task {
+            LockStyle.remembered = style
             try? await model.create(identity: identity, profile: profile, passcode: passcode)
             working = false
         }
@@ -249,7 +261,9 @@ struct RestoreFlow: View {
     var back: () -> Void
 
     @State private var code = ""
+    @State private var style = LockStyle.remembered
     @State private var passcode = ""
+    @State private var pinConfirm = ""
     @State private var shake = 0
     @State private var working = false
     /// More than one public profile was found: which to keep.
@@ -279,7 +293,7 @@ struct RestoreFlow: View {
 
     private var entry: some View {
         OnboardingPage(title: "Restore your account",
-                       subtitle: "Enter your recovery code, then choose a new passcode for this device.", back: back) {
+                       subtitle: "Enter your recovery code, then choose a new PIN or passcode for this device.", back: back) {
             VStack(spacing: 12) {
                 ZStack(alignment: .topTrailing) {
                     TextField("", text: $code, prompt: Text("Recovery code").foregroundStyle(Ink.faint), axis: .vertical)
@@ -301,7 +315,13 @@ struct RestoreFlow: View {
                         .padding(14)
                 }
                 .modifier(Shake(trigger: shake))
-                PasscodeField(placeholder: "New passcode", text: $passcode, onSubmit: lookUp)
+                LockStylePicker(style: $style)
+                    .onChange(of: style) { _, _ in passcode = ""; pinConfirm = "" }
+                if let length = style.length {
+                    PinSetup(length: length, passcode: $passcode, confirm: $pinConfirm, onDone: lookUp)
+                } else {
+                    PasscodeField(placeholder: "New passcode", text: $passcode, onSubmit: lookUp)
+                }
                 if working && choices.isEmpty {
                     LookUpProgress(relay: model.data.relay, since: startedAt)
                 }
@@ -323,7 +343,7 @@ struct RestoreFlow: View {
             } else {
                 Button(action: lookUp) { WorkingLabel(title: "Restore", working: working) }
                     .buttonStyle(PrimaryButtonStyle())
-                    .disabled(working || seed == nil || passcode.count < 6)
+                    .disabled(working || seed == nil || !style.accepts(passcode))
             }
         }
     }
@@ -367,7 +387,7 @@ struct RestoreFlow: View {
 
     /// Looks for what a log out left behind first. Without it, the account's public profiles are the next best thing.
     private func lookUp() {
-        guard let seed, passcode.count >= 6, let identity = try? Identity(seed: seed) else {
+        guard let seed, style.accepts(passcode), let identity = try? Identity(seed: seed) else {
             withAnimation(.default) { shake += 1 }
             return
         }
@@ -430,6 +450,7 @@ struct RestoreFlow: View {
         let others = choices
         Task {
             do {
+                LockStyle.remembered = style
                 try await model.restore(seed: seed, passcode: passcode, from: backup)
             } catch {
                 working = false
@@ -473,6 +494,9 @@ struct UnlockView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     @State private var passcode = ""
+    /// A PIN pad first when that's what was chosen; "Use passcode instead" opens the full keyboard, which a
+    /// decoy or panic passcode may need.
+    @State private var style = LockStyle.remembered
     @State private var shake = 0
     @State private var working = false
     @State private var leaving = false
@@ -485,15 +509,21 @@ struct UnlockView: View {
                 .font(.system(size: 26, weight: .bold))
                 .foregroundStyle(Ink.text)
                 .padding(.top, 22)
-            Text("Enter your passcode to unlock.")
+            Text("Enter your \(style.noun) to unlock.")
                 .font(.system(size: 15))
                 .foregroundStyle(Ink.dim)
                 .padding(.top, 6)
-            PasscodeField(placeholder: "Passcode", text: $passcode, onSubmit: unlock)
-                .modifier(Shake(trigger: shake))
-                .disabled(working)
-                .padding(.top, 28)
-                .task { model.warmUp() }
+            Group {
+                if let length = style.length {
+                    PinPad(length: length, text: $passcode, disabled: working, onFull: unlock)
+                } else {
+                    PasscodeField(placeholder: "Passcode", text: $passcode, onSubmit: unlock)
+                }
+            }
+            .modifier(Shake(trigger: shake))
+            .disabled(working)
+            .padding(.top, 28)
+            .task { model.warmUp() }
             if model.dataUnreadable {
                 Text(branded: "That passcode is right, but this account's data couldn't be read, so PULSHADE didn't open it. Nothing on this device was changed. An update to PULSHADE may fix it.")
                     .font(.system(size: 13, weight: .medium))
@@ -504,10 +534,13 @@ struct UnlockView: View {
             }
             Spacer()
             VStack(spacing: 12) {
-                Button(action: unlock) { WorkingLabel(title: "Unlock", working: working) }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .disabled(working || passcode.isEmpty)
-                    .keyboardShortcut(.defaultAction)
+                // A PIN unlocks by itself on its last digit.
+                if !style.isPIN {
+                    Button(action: unlock) { WorkingLabel(title: "Unlock", working: working) }
+                        .buttonStyle(PrimaryButtonStyle())
+                        .disabled(working || passcode.isEmpty)
+                        .keyboardShortcut(.defaultAction)
+                }
                 if model.biometricsOn {
                     Button(action: unlockWithTouchID) {
                         Label("Unlock with \(Vault.biometryName)", systemImage: Vault.biometrySymbol)
@@ -515,6 +548,17 @@ struct UnlockView: View {
                     .buttonStyle(SecondaryButtonStyle())
                     .disabled(working)
                 }
+            }
+            if LockStyle.remembered.isPIN {
+                Button(style.isPIN ? "Use passcode instead" : "Use PIN instead") {
+                    passcode = ""
+                    style = style.isPIN ? .passcode : LockStyle.remembered
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(Ink.dim)
+                .padding(.top, 16)
+                .disabled(working)
             }
             Button { leaving = true } label: { Image(systemName: "flame.fill") }
                 .buttonStyle(.plain)
@@ -557,12 +601,164 @@ struct UnlockView: View {
 struct PasscodeField: View {
     var placeholder: String
     @Binding var text: String
+    var style: LockStyle = .passcode
+    /// For a PIN: submit as soon as the last digit goes in (a number pad has no return key).
+    var submitsWhenFull = false
     var onSubmit: () -> Void
 
     var body: some View {
         SecureField("", text: $text, prompt: Text(placeholder).foregroundStyle(Ink.faint))
             .textFieldStyle(LargeFieldStyle())
+            #if os(iOS)
+            .keyboardType(style.isPIN ? .numberPad : .default)
+            #endif
             .onSubmit(onSubmit)
+            .onChange(of: text) { _, typed in
+                let kept = style.filtered(typed)
+                if kept != typed { text = kept }
+                if submitsWhenFull, let length = style.length, kept.count == length { onSubmit() }
+            }
+            .onChange(of: style) { _, _ in text = style.filtered(text) }
+    }
+}
+
+/// A number pad with a dot for each digit. Taps and (on a Mac, or with a keyboard attached) typed digits both work.
+/// Calls `onFull` as the last digit goes in.
+struct PinPad: View {
+    @Environment(\.theme) private var theme
+    var length: Int
+    @Binding var text: String
+    var disabled = false
+    var onFull: () -> Void
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(spacing: Platform.isPhone ? 30 : 24) {
+            HStack(spacing: 16) {
+                ForEach(0..<length, id: \.self) { i in
+                    Circle()
+                        .fill(i < text.count ? AnyShapeStyle(theme.accent) : AnyShapeStyle(Ink.hover))
+                        .frame(width: 14, height: 14)
+                        .scaleEffect(i < text.count ? 1.15 : 1)
+                }
+            }
+            .animation(.snappy(duration: 0.15), value: text.count)
+            Grid(horizontalSpacing: 20, verticalSpacing: 14) {
+                ForEach(0..<3, id: \.self) { row in
+                    GridRow { ForEach(1...3, id: \.self) { col in digit(String(row * 3 + col)) } }
+                }
+                GridRow {
+                    Color.clear.frame(width: 74, height: 74)
+                    digit("0")
+                    Button { remove() } label: {
+                        Image(systemName: "delete.left").font(.system(size: 22, weight: .medium))
+                            .foregroundStyle(Ink.dim).frame(width: 74, height: 74).contentShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Delete")
+                    .opacity(text.isEmpty ? 0.35 : 1)
+                }
+            }
+        }
+        .disabled(disabled)
+        .focusable()
+        .focusEffectDisabled()
+        .focused($focused)
+        .onAppear { focused = true }
+        .onKeyPress(characters: .decimalDigits) { press in
+            for c in press.characters where c.isASCII { add(String(c)) }
+            return .handled
+        }
+        .onKeyPress(.delete) { remove(); return .handled }
+        .sensoryFeedback(.impact(weight: .light), trigger: text.count)
+    }
+
+    private func digit(_ d: String) -> some View {
+        Button { add(d) } label: {
+            Text(d).font(.system(size: 30, weight: .regular, design: .rounded))
+                .foregroundStyle(Ink.text)
+                .frame(width: 74, height: 74)
+                .background(Ink.raised, in: .circle)
+                .overlay(Circle().strokeBorder(Ink.line))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(d)
+    }
+
+    private func add(_ d: String) {
+        guard !disabled, text.count < length else { return }
+        text += d
+        if text.count == length { onFull() }
+    }
+
+    private func remove() {
+        guard !disabled, !text.isEmpty else { return }
+        text.removeLast()
+    }
+}
+
+/// Choosing a new PIN: once, then again to be sure. Sets both bindings and calls `onDone` when they match.
+struct PinSetup: View {
+    var length: Int
+    @Binding var passcode: String
+    @Binding var confirm: String
+    var onDone: () -> Void
+    @State private var entry = ""
+    @State private var first: String?
+    @State private var note: String?
+    @State private var busy = false
+    @State private var shake = 0
+
+    var body: some View {
+        VStack(spacing: 22) {
+            Text(first == nil ? "Enter a PIN" : "Enter it again")
+                .font(.system(size: 15, weight: .medium)).foregroundStyle(Ink.dim)
+            PinPad(length: length, text: $entry, disabled: busy, onFull: full)
+                .modifier(Shake(trigger: shake))
+            Text(branded: note ?? " ")
+                .font(.system(size: 12, weight: .medium)).foregroundStyle(.orange)
+        }
+        .id(length)
+    }
+
+    private func full() {
+        busy = true
+        Task {
+            // Long enough to see the last dot fill.
+            try? await Task.sleep(for: .milliseconds(180))
+            if let first {
+                if entry == first {
+                    passcode = first
+                    confirm = entry
+                    busy = false
+                    onDone()
+                    return
+                }
+                note = "Those didn't match. Start again."
+                self.first = nil
+                withAnimation(.default) { shake += 1 }
+            } else {
+                first = entry
+                note = nil
+            }
+            entry = ""
+            busy = false
+        }
+    }
+}
+
+/// Picks between PIN and passcode when a new secret is being chosen.
+struct LockStylePicker: View {
+    @Binding var style: LockStyle
+    var options: [LockStyle] = LockStyle.allCases
+
+    var body: some View {
+        Picker("Lock with", selection: $style) {
+            ForEach(options) { Text($0.short).tag($0) }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
     }
 }
 

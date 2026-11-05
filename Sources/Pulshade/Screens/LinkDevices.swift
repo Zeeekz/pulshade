@@ -11,6 +11,7 @@ struct LinkLoginFlow: View {
     @State private var scanner = QRScanner()
     @State private var scanning = false
     @State private var pasted = ""
+    @State private var style = LockStyle.remembered
     @State private var passcode = ""
     @State private var confirm = ""
     @State private var finishing = false
@@ -118,28 +119,37 @@ struct LinkLoginFlow: View {
     }
 
     private var passcodeStep: some View {
-        OnboardingPage(title: "Choose a passcode",
-                       subtitle: "You're logged in as \(linker.bundle?.profile.displayName ?? "you"). This passcode locks PULSHADE on this device.",
+        OnboardingPage(title: "Choose a \(style.noun)",
+                       subtitle: "You're logged in as \(linker.bundle?.profile.displayName ?? "you"). This \(style.noun) locks PULSHADE on this device.",
                        back: leave) {
             VStack(spacing: 12) {
                 Avatar(image: linker.bundle?.profile.avatar, seed: "", size: 72).padding(.bottom, 8)
-                PasscodeField(placeholder: "Passcode", text: $passcode, onSubmit: finish)
-                PasscodeField(placeholder: "Confirm passcode", text: $confirm, onSubmit: finish)
-                    .modifier(Shake(trigger: shake))
+                LockStylePicker(style: $style)
+                if let length = style.length {
+                    PinSetup(length: length, passcode: $passcode, confirm: $confirm, onDone: finish)
+                } else {
+                    PasscodeField(placeholder: "Passcode", text: $passcode, onSubmit: finish)
+                    PasscodeField(placeholder: "Confirm passcode", text: $confirm, onSubmit: finish)
+                        .modifier(Shake(trigger: shake))
+                }
             }
         } actions: {
-            Button(action: finish) { WorkingLabel(title: "Finish", working: finishing) }
-                .buttonStyle(PrimaryButtonStyle())
-                .disabled(finishing)
+            if !style.isPIN {
+                Button(action: finish) { WorkingLabel(title: "Finish", working: finishing) }
+                    .buttonStyle(PrimaryButtonStyle())
+                    .disabled(finishing)
+            }
         }
+        .onChange(of: style) { _, _ in passcode = ""; confirm = "" }
     }
 
     private func finish() {
-        guard passcode.count >= 6, passcode == confirm, let bundle = linker.bundle else {
+        guard style.accepts(passcode), passcode == confirm, let bundle = linker.bundle else {
             withAnimation(.default) { shake += 1 }
             return
         }
         finishing = true
+        LockStyle.remembered = style
         Task {
             try? await model.finishLink(bundle, deviceID: linker.deviceID, selfMailbox: linker.selfMailbox,
                                         relay: linker.relay, passcode: passcode)
