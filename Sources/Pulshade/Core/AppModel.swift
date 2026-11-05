@@ -3049,52 +3049,70 @@ final class AppModel {
         Invite.allowedRelay(relay ?? data.relay).map { Invite.route($0, overTor: Tor.enabled) }
     }
 
-    private var flushing = false
     /// One fetch at a time: two overlapping ones could both collect, and handle, the same envelope.
     private var syncing = false
 
-    /// Sends queued envelopes, oldest first, a few mailboxes at a time. Each round sends the oldest waiting one for
-    /// up to `Self.sendLanes` different mailboxes at once, so a burst (one story to thirty people) doesn't go out
-    /// one slow round trip after another, and what's written to one mailbox still goes out in order.
+    /// Sends queued envelopes: the oldest waiting one of each mailbox (so what's written to one mailbox goes out in
+    /// order), the smallest first, and a new one is started the moment another finishes. A story to thirty people
+    /// doesn't go out one slow round trip after another, and a short message never waits behind its photos.
     /// One that fails holds up only its own mailbox, and a relay that's down only its own envelopes. A large one
     /// that fails (a slow upload, not a relay that's gone) doesn't stop the small ones behind it.
     private func flush() async {
-        guard !flushing else { return }
-        flushing = true
-        defer { flushing = false }
         let owner = identity?.fingerprint
         var down: Set<String> = []
         // Mailboxes that failed or are full this time: what's written to them waits, nothing else does.
         var held: Set<Data> = []
         var tried: Set<UUID> = []
-        while true {
-            var wave: [(item: Outgoing, client: RelayClient, lane: String)] = []
-            var inWave: Set<Data> = []
-            for item in data.outbox where !tried.contains(item.id) {
+        var aborted = false
+
+        // The smallest waiting item of a mailbox whose turn it is (its own order holds), if there's room for it.
+        // Big ones share one connection, so more than a couple at once only makes each slower, and slow enough
+        // to time out; short ones are tiny and always get through.
+        func pick() -> (item: Outgoing, client: RelayClient, lane: String)? {
+            guard !aborted else { return nil }
+            var best: (item: Outgoing, client: RelayClient, lane: String)?
+            var seen: Set<Data> = []
+            for item in data.outbox where !tried.contains(item.id) && !sendingIDs.contains(item.id) {
                 let relay = item.relay ?? data.relay
                 let lane = item.lane ?? Outgoing.lane(for: nil)
-                guard !down.contains(relay), !held.contains(item.sendID), !inWave.contains(item.sendID),
-                      let client = client(item.relay, lane: lane) else { continue }
-                wave.append((item, client, lane))
-                inWave.insert(item.sendID)
-                tried.insert(item.id)
-                if wave.count == Self.sendLanes { break }
+                guard !down.contains(relay), !held.contains(item.sendID), !seen.contains(item.sendID),
+                      !sendingMail.contains(item.sendID), let client = client(item.relay, lane: lane) else { continue }
+                seen.insert(item.sendID)
+                if best == nil || item.blob.count < best!.item.blob.count { best = (item, client, lane) }
             }
-            if wave.isEmpty { break }
-            var failures: [UUID: Error] = [:]
-            await withTaskGroup(of: (UUID, Error?).self) { group in
-                for (item, client, _) in wave {
+            guard let best else { return nil }
+            let big = best.item.blob.count > Self.smallEnvelope
+            let bigInFlight = sendingBig.count
+            if big ? bigInFlight >= Self.bigUploads : sendingIDs.count >= Self.sendLanes + Self.bigUploads { return nil }
+            return best
+        }
+
+        await withTaskGroup(of: (Outgoing, String, Error?).self) { group in
+            var running = 0
+            while true {
+                while let next = pick() {
+                    let item = next.item, client = next.client, lane = next.lane
+                    tried.insert(item.id)
+                    sendingIDs.insert(item.id)
+                    sendingMail.insert(item.sendID)
+                    if item.blob.count > Self.smallEnvelope { sendingBig.insert(item.id) }
+                    running += 1
                     group.addTask {
                         // As with fetching: a lane without a working route finds one before it sends.
                         if Tor.uses(client.base), !client.isEstablished { _ = await Self.reach(client) }
-                        do { try await client.deposit(item.blob, to: item.sendID, wake: item.message != nil || item.rings == true, ring: item.rings == true); return (item.id, nil) } catch { return (item.id, error) }
+                        do {
+                            try await client.deposit(item.blob, to: item.sendID, wake: item.message != nil || item.rings == true, ring: item.rings == true)
+                            return (item, lane, nil)
+                        } catch { return (item, lane, error) }
                     }
                 }
-                for await (id, error) in group { if let error { failures[id] = error } }
-            }
-            guard identity?.fingerprint == owner else { return }
-            for (item, _, lane) in wave {
-                if let error = failures[item.id] {
+                guard running > 0, let (item, lane, error) = await group.next() else { break }
+                running -= 1
+                sendingIDs.remove(item.id)
+                sendingMail.remove(item.sendID)
+                sendingBig.remove(item.id)
+                guard identity?.fingerprint == owner else { aborted = true; group.cancelAll(); continue }
+                if let error {
                     if error is RelayTooLarge {
                         // Too big for the relay, now and always: waiting would hold up everything behind it.
                         data.outbox.removeAll { $0.id == item.id }
@@ -3135,10 +3153,21 @@ final class AppModel {
         let owner = identity.fingerprint
         for (n, (lane, keys)) in currentLanes().shuffled().enumerated() {
             if n > 0 && trafficShaping && !keys.isEmpty {
+        if aborted { return }
                 try? await Task.sleep(for: .milliseconds(Int.random(in: 150...900)))
                 guard self.identity?.fingerprint == owner else { return }
             }
             await poll(lane, keys: keys)
+    /// Outbox items being sent right now by any flush, so two never send the same one, or write to one mailbox
+    /// at the same time. A message sent during a long upload starts its own flush and goes straight out.
+    @ObservationIgnored private var sendingIDs: Set<UUID> = []
+    @ObservationIgnored private var sendingMail: Set<Data> = []
+    @ObservationIgnored private var sendingBig: Set<UUID> = []
+    /// Under this an envelope is a short message or a receipt.
+    private static let smallEnvelope = 32_768
+    /// Photos and the like sent at once. They share a connection, so more only makes each of them slower.
+    private static let bigUploads = 2
+
         }
         guard self.identity?.fingerprint == owner else { return }
         await flush()
