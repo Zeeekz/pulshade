@@ -6,6 +6,19 @@ import Foundation
 /// it says it can't send pushes, and refuses to take a registration instead of pretending.
 @Suite(.enabled(if: ProcessInfo.processInfo.environment["PULSHADE_RELAY_TEST"] == "1"), .serialized)
 struct PushTests {
+    /// A relay's health check carries a mark that changes each time it starts. A changed mark is noticed once, so the
+    /// phone registers for wake-ups again straight away; the same mark, or a relay that sends none, never counts.
+    @Test func aRelayRestartIsNoticedOnce() throws {
+        let base = try #require(URL(string: "http://restart-\(Int.random(in: 1000...9999)).example"))
+        RelayClient.note(boot: "first", of: base)
+        #expect(!RelayClient.restartedSinceLastAsked(base), "the first mark is only learnt")
+        RelayClient.note(boot: "first", of: base)
+        #expect(!RelayClient.restartedSinceLastAsked(base))
+        RelayClient.note(boot: "second", of: base)
+        #expect(RelayClient.restartedSinceLastAsked(base), "a new mark means it restarted")
+        #expect(!RelayClient.restartedSinceLastAsked(base), "and it's said once")
+    }
+
     private var client: RelayClient { RelayClient(base: URL(string: AppData.defaultRelay)!, lane: "push-test") }
 
     @Test func aRelayWithoutAnAppleKeySaysSoAndTakesNoRegistrations() async throws {

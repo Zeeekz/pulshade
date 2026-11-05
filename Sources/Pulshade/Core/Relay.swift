@@ -229,7 +229,27 @@ struct RelayClient {
         var request = URLRequest(url: base.appending(path: "v1/health"))
         request.timeoutInterval = Tor.uses(base) ? 45 : 15
         guard let (_, response) = try? await load(request) else { return false }
+        if let boot = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "X-Pulshade-Boot") { Self.note(boot: boot, of: base) }
         return (response as? HTTPURLResponse)?.statusCode == 200
+    }
+
+    /// Each relay's boot mark, from its health check: different every time it starts. Relays from before it say nothing.
+    nonisolated(unsafe) private static var boots: [String: String] = [:]
+    nonisolated(unsafe) private static var restarted: Set<String> = []
+
+    static func note(boot: String, of base: URL) {
+        let host = base.host() ?? ""
+        lock.withLock {
+            if let known = boots[host], known != boot { restarted.insert(host) }
+            boots[host] = boot
+        }
+    }
+
+    /// Whether this relay has restarted since this was last asked. A restart forgets wake-up registrations on relays
+    /// that don't keep them, so the phone registers again straight away rather than at its next quarter-hour renewal.
+    static func restartedSinceLastAsked(_ base: URL) -> Bool {
+        let host = base.host() ?? ""
+        return lock.withLock { restarted.remove(host) != nil }
     }
 
     /// The address the relay sees this lane's requests come from. Nil if it can't be reached or doesn't say.
