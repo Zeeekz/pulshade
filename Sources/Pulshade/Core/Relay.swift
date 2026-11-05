@@ -183,7 +183,10 @@ struct RelayClient {
         } catch {
             // A request cancelled because another one already got through says nothing about the circuit.
             // Requests still under way on it are left to finish or time out: they may be other routes racing this one.
-            if Tor.uses(base), !Task.isCancelled {
+            // A big upload that ran out of time was slow, not proof the route is dead: throwing the route away
+            // would make the next request build a new one, which can take a minute.
+            let slowUpload = (error as? URLError)?.code == .timedOut && (body?.count ?? 0) > 65_536
+            if Tor.uses(base), !Task.isCancelled, !slowUpload {
                 Tor.renew(lane: name)
                 let current = Self.lock.withLock {
                     Self.established.remove(name)
@@ -265,8 +268,9 @@ struct RelayClient {
     func deposit(_ blob: Data, to sendID: Data, wake: Bool = false, ring: Bool = false) async throws {
         var request = URLRequest(url: base.appending(path: "v1/q/\(sendID.hex)"))
         request.httpMethod = "PUT"
-        // A send stuck on a slow circuit gives up sooner and is tried again on the next beat.
-        request.timeoutInterval = 20
+        // A send stuck on a slow circuit gives up sooner and is tried again on the next beat. A big one is
+        // given time to go: a photo is a couple of megabytes, which a slow route needs well over 20 seconds for.
+        request.timeoutInterval = max(20, 20 + Double(blob.count) / 25_000)
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         // 2 starts a call, which rings a phone that gave the relay a call token; older relays take it as a message.
         request.setValue(ring ? "2" : wake ? "1" : "0", forHTTPHeaderField: "X-Pulshade-Wake")
