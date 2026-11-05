@@ -1370,6 +1370,9 @@ final class AppModel {
         if n > 0 { storyUploadTotal[id] = n } else { storyUploadTotal[id] = nil }
     }
 
+    /// Whether copies of a story are still waiting to go out. Unlike the progress, this holds after a restart.
+    func isUploading(_ id: Story.ID) -> Bool { unsentCopies(of: id) > 0 }
+
     /// How far a story you posted has got to its audience, 0...1, or nil once it's all gone (or never needed to).
     func uploadProgress(of id: Story.ID) -> Double? {
         guard let total = storyUploadTotal[id] else { return nil }
