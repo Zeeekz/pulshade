@@ -29,6 +29,20 @@ struct StoryStrip: View {
                                 uploading: model.storyUpload, glow: model.hasUnviewedStory)
                 }
                 .buttonStyle(.plain)
+                .overlay(alignment: .topLeading) {
+                    // Once you have a story the bubble opens it, so adding another gets its own button on the corner.
+                    if !model.myStories.isEmpty {
+                        Button { composing = true } label: {
+                            SymbolBadge(symbol: "plus", size: 22)
+                                .frame(width: 40, height: 40)
+                                .contentShape(.rect)
+                        }
+                        .buttonStyle(.plain)
+                        .offset(x: 32, y: 30)
+                        .accessibilityLabel("New story")
+                        .transition(.scale.combined(with: .opacity))
+                    }
+                }
                 .contextMenu {
                     Button("New story", systemImage: "plus") { composing = true }
                     ForEach(model.myStories) { story in

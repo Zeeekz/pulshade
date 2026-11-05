@@ -12,7 +12,7 @@ relay="http://$ip:7878"
 [[ -f relay/pulshade-onion/hostname ]] && relay="http://$(cat relay/pulshade-onion/hostname)"
 
 [[ -f ios/Local.xcconfig ]] || { echo "Put your signing team in ios/Local.xcconfig: DEVELOPMENT_TEAM = <team id>"; exit 1; }
-./scripts/build-tor.sh
+[[ -n ${PULSHADE_SKIP_TOR_BUILD:-} ]] || ./scripts/build-tor.sh
 xcodegen generate >/dev/null
 xcodebuild -project Pulshade.xcodeproj -scheme PulshadeiOS -destination "id=$device" -derivedDataPath ios/build \
   -allowProvisioningUpdates PULSHADE_RELAY="$relay" PULSHADE_RELAY_DIRECT="${PULSHADE_RELAY_DIRECT:-$(cat relay/direct-address 2>/dev/null)}" PULSHADE_RELAY_PIN="${PULSHADE_RELAY_PIN:-$(cat relay/relay-pin 2>/dev/null)}" PULSHADE_ADMIN_KEY="$(cat relay/admin-key.pub 2>/dev/null)" PULSHADE_PET_KEY="$(cat relay/pet-key.pub 2>/dev/null)" build | grep -E "error:|BUILD (SUCCEEDED|FAILED)"
