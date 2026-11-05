@@ -758,6 +758,14 @@ private struct NotificationSettings: View {
                     SecurityToggle(title: "Sound", key: \.notificationSound)
                 }
             }
+            if on && model.data.security.notificationSound {
+                SettingsGroup("Message tone", footer: "The sound a new message makes, on a locked iPhone too.") {
+                    ChoiceRows(values: MessageTone.allCases, selected: model.data.security.messageTone, label: \.label) { tone in
+                        model.updateSecurity { $0.messageTone = tone }
+                        tone.play()
+                    }
+                }
+            }
             if on {
                 SettingsGroup("Show in notifications",
                               footer: model.data.security.notificationContent == .hidden

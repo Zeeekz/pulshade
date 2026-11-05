@@ -243,7 +243,8 @@ final class CallAudio: @unchecked Sendable {
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetoothHFP])
-        try? session.setActive(true)
+        // A call answered on the system's call screen has its session switched on by the system.
+        if !CallRinger.answeredOnScreen { try? session.setActive(true) }
         #endif
         // The speaker side has to be wired up before echo cancelling goes on, or the Mac's output comes up
         // with no channels and the engine won't start.
@@ -265,9 +266,17 @@ final class CallAudio: @unchecked Sendable {
         resume()
     }
 
+    private var startTries = 0
+
     private func resume() {
         lock.withLock { queued = 0 }
-        guard (try? engine.start()) != nil else { return }
+        guard (try? engine.start()) != nil else {
+            // The system's call screen switches the session on a moment after the call is answered; try again.
+            guard startTries < 20 else { return }
+            startTries += 1
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) { [weak self] in self?.resume() }
+            return
+        }
         player.play()
     }
 
@@ -278,7 +287,7 @@ final class CallAudio: @unchecked Sendable {
         player.stop()
         engine.stop()
         #if os(iOS)
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        if !CallRinger.answeredOnScreen { try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation) }
         #endif
     }
 
