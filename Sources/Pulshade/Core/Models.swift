@@ -752,6 +752,9 @@ struct StoryDelivery: Codable, Equatable {
     var confirmed: [String] = []
     var resends = 0
     var last: Date?
+    /// Every copy sealed for the story has been handed to the relay once. Sending it again later, to someone who
+    /// hasn't confirmed, isn't the story uploading.
+    var uploaded: Bool?
 }
 
 struct Story: Codable, Identifiable, Equatable {

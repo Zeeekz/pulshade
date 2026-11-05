@@ -1368,14 +1368,32 @@ final class AppModel {
     private func trackUpload(of id: Story.ID) {
         let n = unsentCopies(of: id)
         if n > 0 { storyUploadTotal[id] = n } else { storyUploadTotal[id] = nil }
+        markUploadedIfDone(id)
+    }
+
+    /// Copies of a story sealed and waiting in the outbox. Not those still waiting for a session with someone: they
+    /// can't go until that person is reachable, which isn't up to the upload.
+    private func outboxCopies(of id: Story.ID) -> Int { data.outbox.filter { $0.story == id }.count }
+
+    /// Once nothing of a story is left in the outbox, its upload is over for good. The sends that come later, to
+    /// people who never confirmed, happen quietly.
+    private func markUploadedIfDone(_ id: Story.ID) {
+        guard outboxCopies(of: id) == 0, let i = data.stories.firstIndex(where: { $0.id == id }),
+              data.stories[i].delivery != nil, data.stories[i].delivery?.uploaded != true else { return }
+        data.stories[i].delivery?.uploaded = true
+        storyUploadTotal[id] = nil
     }
 
     /// Whether copies of a story are still waiting to go out. Unlike the progress, this holds after a restart.
-    func isUploading(_ id: Story.ID) -> Bool { unsentCopies(of: id) > 0 }
+    func isUploading(_ id: Story.ID) -> Bool {
+        guard let story = data.stories.first(where: { $0.id == id }), story.author == "me",
+              story.delivery != nil, story.delivery?.uploaded != true else { return false }
+        return outboxCopies(of: id) > 0
+    }
 
     /// How far a story you posted has got to its audience, 0...1, or nil once it's all gone (or never needed to).
     func uploadProgress(of id: Story.ID) -> Double? {
-        guard let total = storyUploadTotal[id] else { return nil }
+        guard let total = storyUploadTotal[id], data.stories.first(where: { $0.id == id })?.delivery?.uploaded != true else { return nil }
         let left = unsentCopies(of: id)
         guard left > 0 else { return nil }
         return 1 - Double(left) / Double(max(total, left))
@@ -3154,6 +3172,7 @@ final class AppModel {
                     lastSent[lane] = Date()
                     data.outbox.removeAll { $0.id == item.id }
                     if let message = item.message { setStatus(.sent, for: [message]) }
+                    if let story = item.story { markUploadedIfDone(story) }
                 }
             }
         }
