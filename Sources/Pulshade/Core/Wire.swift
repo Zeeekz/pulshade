@@ -161,6 +161,11 @@ enum Payload: Codable, Equatable {
         }
     }
 
+    /// Whether this starts a call, which rings the other phone like a phone call.
+    var rings: Bool {
+        if case .callOffer = self { true } else { false }
+    }
+
     /// The story this carries, so its upload can be followed.
     var storyID: UUID? {
         switch self {

@@ -24,17 +24,25 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
 
     func start() {
         center?.delegate = self
+        MessageTone.install()
         center?.requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
     }
 
-    func post(_ content: (title: String, body: String), conversation: UUID, sound: Bool) {
+    func post(_ content: (title: String, body: String), conversation: UUID, sound: Bool, tone: MessageTone = .standard) {
         guard let center else { return }
         let note = UNMutableNotificationContent()
         note.title = content.title
         note.body = content.body
         note.threadIdentifier = conversation.uuidString
         note.userInfo = ["conversation": conversation.uuidString]
-        if sound { note.sound = .default }
+        if sound {
+            if let name = tone.fileName {
+                MessageTone.install()
+                note.sound = UNNotificationSound(named: UNNotificationSoundName(name))
+            } else {
+                note.sound = .default
+            }
+        }
         // Same identifier per chat: a new message replaces the old banner instead of piling up.
         center.add(UNNotificationRequest(identifier: conversation.uuidString, content: note, trigger: nil))
     }

@@ -25,6 +25,13 @@ enum Push {
 }
 
 final class PushDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        // A call push that wakes a closed app finds this ready, and the tones are where the system looks for them.
+        MainActor.assumeIsolated { CallRinger.shared.start() }
+        MessageTone.install()
+        return true
+    }
+
     func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
         Push.token = deviceToken.map { String(format: "%02x", $0) }.joined()
         Push.failure = nil

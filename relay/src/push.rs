@@ -29,6 +29,8 @@ type Id = [u8; 32];
 /// each message gets its own banner; it only stops a burst (a story's pieces, say) becoming a stream of them. The
 /// relay can't tell a message from a receipt, so some banners are for mail that isn't one.
 const COOLDOWN: Duration = Duration::from_secs(3);
+/// A phone is not rung again within this, so one call that reaches it twice (two personas, say) rings once.
+const CALL_COOLDOWN: Duration = Duration::from_secs(10);
 /// A registration is forgotten after this long without being renewed (phones renew at every launch, and every few
 /// hours while Pulshade is open). Short, so a wiped account's pushes stop on their own.
 const TTL: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -80,7 +82,28 @@ struct Target {
     token: String,
     sandbox: bool,
     sound: bool,
+    /// The tone picked in the app, from `TONES`; None is the system's default sound.
+    tone: Option<String>,
+    /// The phone's separate token for call pushes (PushKit), if its app sent one.
+    voip: Option<String>,
     at: Instant,
+}
+
+/// Tones an app may ask for. The relay only ever puts one of these names in a push, never text an app sent.
+pub const TONES: &[&str] = &["pulse", "chime", "bubble", "drop", "knock", "tick"];
+
+/// What else a phone tells the relay when it registers.
+#[derive(Default, Clone)]
+pub struct Extras {
+    pub tone: Option<String>,
+    pub voip: Option<String>,
+}
+
+/// Why mail landed: an ordinary message, or the start of a call, which rings the phone.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Wake {
+    Message,
+    Call,
 }
 
 /// A registration as the relay keeps it on disk between runs (sealed, with the waiting mail), so a restart doesn't
@@ -91,6 +114,10 @@ pub struct Saved {
     pub token: String,
     pub sandbox: bool,
     pub sound: bool,
+    #[serde(default)]
+    pub tone: Option<String>,
+    #[serde(default)]
+    pub voip: Option<String>,
     pub registered: u64,
 }
 
@@ -104,6 +131,8 @@ pub struct Push {
     targets: Mutex<HashMap<Id, Target>>,
     /// When each device was last woken.
     last: Mutex<HashMap<String, Instant>>,
+    /// When each device was last rung (by its call token), so a call's copies don't ring it twice.
+    last_call: Mutex<HashMap<String, Instant>>,
     /// The second being counted, and how many pushes went out in it.
     rate: Mutex<(Instant, u32)>,
     jwt: Mutex<Option<Signed>>,
@@ -125,6 +154,7 @@ impl Push {
             config,
             targets: Mutex::default(),
             last: Mutex::default(),
+            last_call: Mutex::default(),
             rate: Mutex::new((Instant::now(), 0)),
             jwt: Mutex::default(),
             changed: AtomicBool::new(false),
@@ -147,6 +177,8 @@ impl Push {
             token: t.token.clone(),
             sandbox: t.sandbox,
             sound: t.sound,
+            tone: t.tone.clone(),
+            voip: t.voip.clone(),
             registered: now.saturating_sub(t.at.elapsed().as_secs()),
         }).collect();
         (saved, changed)
@@ -163,7 +195,9 @@ impl Push {
                 continue;
             }
             let at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
-            targets.insert(mailbox, Target { token: s.token, sandbox: s.sandbox, sound: s.sound, at });
+            let voip = s.voip.filter(|v| valid_token(v));
+            let tone = s.tone.filter(|t| TONES.contains(&t.as_str()));
+            targets.insert(mailbox, Target { token: s.token, sandbox: s.sandbox, sound: s.sound, tone, voip, at });
         }
         targets.len()
     }
@@ -171,6 +205,12 @@ impl Push {
     /// Remembers `token` for these mailboxes (by send id), replacing any earlier one. False if the token already holds
     /// as many mailboxes as a device can. When the table is full, the oldest registrations make way.
     pub fn register(&self, mailboxes: &[Id], token: &str, sandbox: bool, sound: bool) -> bool {
+        self.register_with(mailboxes, token, sandbox, sound, Extras::default())
+    }
+
+    pub fn register_with(&self, mailboxes: &[Id], token: &str, sandbox: bool, sound: bool, extras: Extras) -> bool {
+        let tone = extras.tone.filter(|t| TONES.contains(&t.as_str()));
+        let voip = extras.voip.map(|v| v.to_lowercase()).filter(|v| valid_token(v));
         self.changed.store(true, Ordering::SeqCst);
         let mut targets = self.targets.lock().unwrap();
         let held = targets.values().filter(|t| t.token == token).count();
@@ -190,7 +230,7 @@ impl Push {
             }
         }
         for id in mailboxes {
-            targets.insert(*id, Target { token: token.to_string(), sandbox, sound, at: Instant::now() });
+            targets.insert(*id, Target { token: token.to_string(), sandbox, sound, tone: tone.clone(), voip: voip.clone(), at: Instant::now() });
         }
         true
     }
@@ -207,6 +247,13 @@ impl Push {
         self.last.lock().unwrap().remove(token);
     }
 
+    fn drop_voip(&self, voip: &str) {
+        self.changed.store(true, Ordering::SeqCst);
+        for t in self.targets.lock().unwrap().values_mut() {
+            if t.voip.as_deref() == Some(voip) { t.voip = None; }
+        }
+    }
+
     /// Drops registrations that were never renewed, and cooldown records that no longer matter.
     pub fn sweep(&self) {
         let now = Instant::now();
@@ -216,6 +263,7 @@ impl Push {
         if targets.len() != before { self.changed.store(true, Ordering::SeqCst); }
         drop(targets);
         self.last.lock().unwrap().retain(|_, at| now.duration_since(*at) < COOLDOWN);
+        self.last_call.lock().unwrap().retain(|_, at| now.duration_since(*at) < CALL_COOLDOWN);
     }
 
     pub fn registered(&self) -> usize {
@@ -224,14 +272,40 @@ impl Push {
 
     /// Mail landed in this mailbox: wake its phone, if it has one registered and wasn't woken a moment ago.
     pub fn notify(self: &Arc<Self>, mailbox: Id) {
+        self.notify_as(mailbox, Wake::Message);
+    }
+
+    /// As `notify`, but for a call, a phone that gave a call token is rung (a call screen, however it was asleep).
+    /// One without falls back to an ordinary wake-up.
+    pub fn notify_as(self: &Arc<Self>, mailbox: Id, wake: Wake) {
         if self.config.is_none() {
             return;
         }
-        let (token, sandbox, sound) = {
+        let (token, sandbox, sound, tone, voip) = {
             let targets = self.targets.lock().unwrap();
             let Some(target) = targets.get(&mailbox) else { return };
-            (target.token.clone(), target.sandbox, target.sound)
+            (target.token.clone(), target.sandbox, target.sound, target.tone.clone(), target.voip.clone())
         };
+        if let (Wake::Call, Some(voip)) = (wake, voip) {
+            {
+                let mut last = self.last_call.lock().unwrap();
+                if last.get(&voip).is_some_and(|at| at.elapsed() < CALL_COOLDOWN) {
+                    return;
+                }
+                let mut rate = self.rate.lock().unwrap();
+                if rate.0.elapsed() >= Duration::from_secs(1) {
+                    *rate = (Instant::now(), 0);
+                }
+                if rate.1 >= MAX_SENDS_PER_SECOND {
+                    return;
+                }
+                rate.1 += 1;
+                last.insert(voip.clone(), Instant::now());
+            }
+            let this = self.clone();
+            tokio::spawn(async move { this.send_call(&voip, sandbox).await });
+            return;
+        }
         {
             let mut last = self.last.lock().unwrap();
             if last.get(&token).is_some_and(|at| at.elapsed() < COOLDOWN) {
@@ -249,7 +323,7 @@ impl Push {
             last.insert(token.clone(), Instant::now());
         }
         let this = self.clone();
-        tokio::spawn(async move { this.send(&token, sandbox, sound).await });
+        tokio::spawn(async move { this.send(&token, sandbox, sound, tone.as_deref()).await });
     }
 
     fn authorization(&self) -> Option<String> {
@@ -268,15 +342,46 @@ impl Push {
         Some(jwt)
     }
 
-    async fn send(&self, token: &str, sandbox: bool, sound: bool) {
+    /// Rings a phone through its call token: Apple wakes the app at once, which puts up the call screen. It carries
+    /// nothing but that a call is coming, and isn't kept if the phone can't be reached now.
+    async fn send_call(&self, voip: &str, sandbox: bool) {
+        let Some((config, _)) = self.config.as_ref() else { return };
+        let Some(jwt) = self.authorization() else { return };
+        let base = if sandbox { &config.sandbox_url } else { &config.production_url };
+        let response = self
+            .http
+            .post(format!("{base}/3/device/{voip}"))
+            .header("authorization", format!("bearer {jwt}"))
+            .header("apns-topic", format!("{}.voip", config.topic))
+            .header("apns-push-type", "voip")
+            .header("apns-priority", "10")
+            .header("apns-expiration", "0")
+            .body(r#"{"call":1}"#)
+            .send()
+            .await;
+        match response {
+            Ok(r) if r.status().as_u16() == 410 || r.status().as_u16() == 400 => {
+                let text = r.text().await.unwrap_or_default();
+                if text.contains("Unregistered") || text.contains("BadDeviceToken") || text.contains("DeviceTokenNotForTopic") {
+                    self.drop_voip(voip);
+                }
+            }
+            Ok(r) if r.status().as_u16() == 403 => *self.jwt.lock().unwrap() = None,
+            _ => {}
+        }
+    }
+
+    async fn send(&self, token: &str, sandbox: bool, sound: bool, tone: Option<&str>) {
         let Some((config, _)) = self.config.as_ref() else { return };
         let Some(jwt) = self.authorization() else { return };
         let base = if sandbox { &config.sandbox_url } else { &config.production_url };
         // The same text for everyone. No collapse id: each push is a banner of its own, as in any messenger.
         let body = if sound {
-            r#"{"aps":{"alert":{"title":"PULSHADE","body":"New message"},"sound":"default","thread-id":"pulshade"}}"#
+            // A tone the phone picked is a file it keeps in its own Library/Sounds, named for the tone.
+            let name = tone.filter(|t| TONES.contains(t)).map(|t| format!("tone-{t}.wav")).unwrap_or_else(|| "default".into());
+            format!(r#"{{"aps":{{"alert":{{"title":"PULSHADE","body":"New message"}},"sound":"{name}","thread-id":"pulshade"}}}}"#)
         } else {
-            r#"{"aps":{"alert":{"title":"PULSHADE","body":"New message"},"thread-id":"pulshade"}}"#
+            r#"{"aps":{"alert":{"title":"PULSHADE","body":"New message"},"thread-id":"pulshade"}}"#.to_string()
         };
         let response = self
             .http
@@ -490,5 +595,77 @@ nOl4KCikUySqK0sLiU3iyHn+a7zanVQQhi8scw4f4gBEnLmamXFj8G0c\n\
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(seen.0.lock().unwrap().len() as u32, MAX_SENDS_PER_SECOND);
+    }
+
+    const VOIP: &str = "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff";
+
+    #[tokio::test]
+    async fn a_call_rings_a_phone_that_gave_a_call_token_and_says_nothing_else() {
+        let (push, seen) = start().await;
+        push.register_with(&[[20; 32]], TOKEN, false, true, Extras { tone: None, voip: Some(VOIP.into()) });
+        push.notify_as([20; 32], Wake::Call);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let got = seen.0.lock().unwrap();
+        assert_eq!(got.len(), 1, "one push, the call one");
+        let (token, headers, body) = &got[0];
+        assert_eq!(token, VOIP);
+        assert_eq!(headers["apns-topic"], "app.pulshade.ios.voip");
+        assert_eq!(headers["apns-push-type"], "voip");
+        assert_eq!(headers["apns-expiration"], "0", "not kept for a phone that can't be reached now");
+        assert!(!body.contains("New message") && !body.contains("from"));
+    }
+
+    #[tokio::test]
+    async fn a_call_for_a_phone_without_a_call_token_is_an_ordinary_wake_up() {
+        let (push, seen) = start().await;
+        push.register(&[[21; 32]], TOKEN, false, true);
+        push.notify_as([21; 32], Wake::Call);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let got = seen.0.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, TOKEN);
+        assert_eq!(got[0].1["apns-push-type"], "alert");
+    }
+
+    #[tokio::test]
+    async fn messages_never_use_the_call_token_and_a_call_copied_to_two_mailboxes_rings_once() {
+        let (push, seen) = start().await;
+        push.register_with(&[[22; 32], [23; 32]], TOKEN, false, true, Extras { tone: None, voip: Some(VOIP.into()) });
+        push.notify_as([22; 32], Wake::Message);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(seen.0.lock().unwrap()[0].0, TOKEN);
+        push.notify_as([22; 32], Wake::Call);
+        push.notify_as([23; 32], Wake::Call);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let rings = seen.0.lock().unwrap().iter().filter(|g| g.0 == VOIP).count();
+        assert_eq!(rings, 1);
+    }
+
+    #[tokio::test]
+    async fn a_call_token_apple_calls_dead_is_dropped_but_the_phone_keeps_its_wake_ups() {
+        let (push, seen) = start().await;
+        *seen.1.lock().unwrap() = 410;
+        push.register_with(&[[24; 32]], TOKEN, false, true, Extras { tone: None, voip: Some(VOIP.into()) });
+        push.notify_as([24; 32], Wake::Call);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(push.registered(), 1);
+        assert!(push.targets.lock().unwrap()[&[24; 32]].voip.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_picked_tone_names_the_sound_and_anything_not_on_the_list_is_ignored() {
+        let (push, seen) = start().await;
+        push.register_with(&[[25; 32]], TOKEN, false, true, Extras { tone: Some("chime".into()), voip: None });
+        push.notify([25; 32]);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(seen.0.lock().unwrap()[0].2.contains(r#""sound":"tone-chime.wav""#), "{}", seen.0.lock().unwrap()[0].2);
+        let other = "cd".repeat(32);
+        push.register_with(&[[26; 32]], &other, false, true, Extras { tone: Some("../../evil\"".into()), voip: Some("not hex".into()) });
+        push.notify([26; 32]);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let got = seen.0.lock().unwrap();
+        assert!(got[1].2.contains(r#""sound":"default""#), "{}", got[1].2);
+        let t = push.targets.lock().unwrap();
+        assert!(t[&[26; 32]].tone.is_none() && t[&[26; 32]].voip.is_none());
     }
 }

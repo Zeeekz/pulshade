@@ -140,6 +140,9 @@ final class AppModel {
         phase = vault.exists ? .locked : .welcome
         Ink.source = { [weak self] in self?.theme ?? .dark }
         guard watchSystem else { return }
+        #if os(iOS)
+        CallRinger.shared.model = self
+        #endif
         // Tor takes a moment to connect: start it now, in the background, so it's ready by the first request.
         let onionOnly = URL(string: AppData.defaultRelay).map(Tor.isOnion) == true && AppData.directRelay == nil
         if Tor.enabled || onionOnly {
@@ -230,6 +233,14 @@ final class AppModel {
         RelayClient.closeAll()
         #endif
     }
+
+    #if os(iOS)
+    /// A call push woke Pulshade. If it is unlocked, it reconnects and fetches at once, so the caller's name reaches the
+    /// call screen while it is still ringing.
+    func callPushArrived() {
+        if phase == .unlocked { reconnect() }
+    }
+    #endif
 
     func willEnterForeground() {
         defer { backgroundedAt = nil }
@@ -623,7 +634,7 @@ final class AppModel {
         #endif
         let content = Notifier.content(for: message, in: convo, sender: displayName(message.sender),
                                        style: data.security.notificationContent)
-        Notifier.shared.post(content, conversation: convo.id, sound: data.security.notificationSound)
+        Notifier.shared.post(content, conversation: convo.id, sound: data.security.notificationSound, tone: data.security.messageTone)
     }
 
     // MARK: Contacts & invites
@@ -2314,6 +2325,8 @@ final class AppModel {
         }
         if data.security.notifications && !before.notifications { Notifier.shared.start() }
         if pushWanted != (before.pushWake && before.notifications) { refreshPush(turningOff: !pushWanted) }
+        // A new tone or sound setting goes to the relay, which names the sound in a locked phone's wake-up.
+        else if pushWanted && (data.security.messageTone != before.messageTone || data.security.notificationSound != before.notificationSound) { refreshPush() }
         if data.security.notificationContent != before.notificationContent || !data.security.notifications {
             Notifier.shared.clearAll()
         }
@@ -2489,7 +2502,7 @@ final class AppModel {
                 guard let plain = try? JSONEncoder.pulshade.encode(item.payload),
                       let message = try? session.encrypt(plain) else { continue }
                 seal(.ratchet(message), contact: i, device: d, message: item.message, ephemeral: item.payload.isEphemeral,
-                     story: item.payload.storyID)
+                     story: item.payload.storyID, rings: item.payload.rings)
             }
             data.contacts[i].devices[d].session = session
             data.contacts[i].devices[d].pending = []
@@ -2526,7 +2539,7 @@ final class AppModel {
 
     /// Seals a payload to one of a contact's devices, as the persona that knows them, and queues it.
     private func seal(_ payload: Payload, contact i: Int, device d: Int, message: UUID? = nil, ephemeral: Bool = false,
-                      story: UUID? = nil) {
+                      story: UUID? = nil, rings: Bool = false) {
         let c = data.contacts[i]
         guard c.devices.indices.contains(d), let me = me(c.persona),
               let blob = try? Envelope.seal(payload, from: me, device: deviceID(for: c.persona), to: c.agreementKey) else { return }
@@ -2534,7 +2547,7 @@ final class AppModel {
         // Only the newest of these waits for a mailbox.
         if ephemeral { data.outbox.removeAll { $0.ephemeral == true && $0.sendID == sendID } }
         data.outbox.append(Outgoing(sendID: sendID, blob: blob, relay: c.relay, message: message, ephemeral: ephemeral ? true : nil,
-                                  story: story, lane: c.persona == nil ? nil : Outgoing.lane(for: c.persona)))
+                                  story: story, lane: c.persona == nil ? nil : Outgoing.lane(for: c.persona), rings: rings ? true : nil))
         kick()
     }
 
@@ -2895,7 +2908,7 @@ final class AppModel {
 
     /// What the relay was last told about this phone's push, so it's only told again when something changed. Dropped
     /// at lock: it holds this account's mailbox keys, which a decoy or another account must never see or act on.
-    private var pushTold: (token: String, keys: Set<Data>, sound: Bool, at: Date)?
+    private var pushTold: (token: String, keys: Set<Data>, sound: Bool, tone: MessageTone, voip: String?, at: Date)?
     private var pushBusy = false
     /// Where push stands, in words, for Settings: off, waiting for Apple, refused by the relay, or registered.
     private(set) var pushStatus = ""
@@ -2953,7 +2966,9 @@ final class AppModel {
             }
             guard !keys.isEmpty else { pushStatus = "No mailboxes to register yet"; return }
             let sound = data.security.notificationSound
-            if let told = pushTold, told.token == token, told.keys == keys, told.sound == sound,
+            let tone = data.security.messageTone
+            let voip = CallRinger.voipToken
+            if let told = pushTold, told.token == token, told.keys == keys, told.sound == sound, told.tone == tone, told.voip == voip,
                Date().timeIntervalSince(told.at) < 15 * 60 { return }
             // Mailboxes registered before and not now (a contact blocked or muted since) are taken off the relay.
             let stale = Array((pushTold?.keys ?? []).subtracting(keys))
@@ -2971,7 +2986,7 @@ final class AppModel {
                 for start in stride(from: 0, to: all.count, by: 256) {
                     let chunk = Array(all[start..<min(start + 256, all.count)])
                     do {
-                        try await client.registerPush(keys: chunk, token: token, sandbox: Push.sandbox, sound: sound)
+                        try await client.registerPush(keys: chunk, token: token, sandbox: Push.sandbox, sound: sound, tone: tone, voip: voip)
                     } catch {
                         ok = false
                         pushStatus = (error as? PushRefused).map { "The server refused the registration (\($0.status))" } ?? "Couldn't reach the server to register"
@@ -2982,7 +2997,7 @@ final class AppModel {
                     for start in stride(from: 0, to: stale.count, by: 256) {
                         try? await client.unregisterPush(keys: Array(stale[start..<min(start + 256, stale.count)]))
                     }
-                    pushTold = (token, keys, sound, Date())
+                    pushTold = (token, keys, sound, tone, voip, Date())
                     pushStatus = "Registered \(keys.count) mailbox\(keys.count == 1 ? "" : "es") at \(Date().formatted(date: .omitted, time: .shortened)), token ending \(token.suffix(4))"
                 }
             }
@@ -3064,7 +3079,7 @@ final class AppModel {
                     group.addTask {
                         // As with fetching: a lane without a working route finds one before it sends.
                         if Tor.uses(client.base), !client.isEstablished { _ = await Self.reach(client) }
-                        do { try await client.deposit(item.blob, to: item.sendID, wake: item.message != nil); return (item.id, nil) } catch { return (item.id, error) }
+                        do { try await client.deposit(item.blob, to: item.sendID, wake: item.message != nil || item.rings == true, ring: item.rings == true); return (item.id, nil) } catch { return (item.id, error) }
                     }
                 }
                 for await (id, error) in group { if let error { failures[id] = error } }
@@ -4646,6 +4661,9 @@ extension AppModel {
         current.phase = .connecting
         call = current
         callTimeout?.cancel()
+        #if os(iOS)
+        CallRinger.shared.answeredInApp()
+        #endif
         enqueue(.callAnswer(id: current.invite.id, accepted: true), to: contact)
         sync(.callHandled(current.invite.id))
         save()
@@ -4702,6 +4720,14 @@ extension AppModel {
 
     fileprivate func receiveCall(_ invite: CallInvite, from sender: Contact) {
         guard invite.room.count == 32, invite.key.count == 32 else { return }
+        #if os(iOS)
+        if CallRinger.shared.consumeEarlyDecline() {
+            // Already declined on the call screen, before this arrived.
+            enqueue(.callAnswer(id: invite.id, accepted: false), to: sender)
+            kick()
+            return
+        }
+        #endif
         guard call == nil else {
             // Already on a call: busy.
             enqueue(.callAnswer(id: invite.id, accepted: false), to: sender)
@@ -4709,8 +4735,13 @@ extension AppModel {
         }
         call = ActiveCall(invite: invite, peer: sender.fingerprint, persona: sender.persona, outgoing: false, phase: .ringing,
                           speaker: Platform.isPhone)
-        if data.security.notifications {
-            let name = data.security.notificationContent == .hidden ? "PULSHADE" : sender.displayName
+        let name = data.security.notificationContent == .hidden ? "PULSHADE" : sender.displayName
+        var onCallScreen = false
+        #if os(iOS)
+        // The system's call screen, when the call push put it up, learns who's calling.
+        onCallScreen = CallRinger.shared.inviteArrived(id: invite.id, name: name)
+        #endif
+        if data.security.notifications && !onCallScreen {
             Notifier.shared.post((name, "Incoming call"), conversation: UUID(), sound: data.security.notificationSound)
         }
         ringFor(seconds: 45, else: "Missed call")
@@ -4793,6 +4824,9 @@ extension AppModel {
         callTimeout?.cancel()
         callMedia?.stop()
         callMedia = nil
+        #if os(iOS)
+        CallRinger.shared.callEnded(missed: call?.phase == .ringing)
+        #endif
         call = nil
     }
 

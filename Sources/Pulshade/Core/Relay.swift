@@ -262,13 +262,14 @@ struct RelayClient {
 
     /// `wake` says whether this is a real message, which may wake a locked iPhone; typing signals, receipts and
     /// the rest say no, so they don't make a banner. A relay from before this ignores it.
-    func deposit(_ blob: Data, to sendID: Data, wake: Bool = false) async throws {
+    func deposit(_ blob: Data, to sendID: Data, wake: Bool = false, ring: Bool = false) async throws {
         var request = URLRequest(url: base.appending(path: "v1/q/\(sendID.hex)"))
         request.httpMethod = "PUT"
         // A send stuck on a slow circuit gives up sooner and is tried again on the next beat.
         request.timeoutInterval = 20
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-        request.setValue(wake ? "1" : "0", forHTTPHeaderField: "X-Pulshade-Wake")
+        // 2 starts a call, which rings a phone that gave the relay a call token; older relays take it as a message.
+        request.setValue(ring ? "2" : wake ? "1" : "0", forHTTPHeaderField: "X-Pulshade-Wake")
         let (_, response) = try await load(request, body: blob)
         let status = (response as? HTTPURLResponse)?.statusCode
         if status == 507 { throw RelayMailboxFull() }
@@ -320,13 +321,13 @@ struct RelayClient {
 
     /// Asks the relay to wake this phone, through Apple, when mail lands in these mailboxes (256 at most per call).
     /// Holding the receive keys is what proves they're ours.
-    func registerPush(keys: [Data], token: String, sandbox: Bool, sound: Bool) async throws {
-        struct Body: Encodable { var keys: [String]; var token: String; var sandbox: Bool; var sound: Bool }
+    func registerPush(keys: [Data], token: String, sandbox: Bool, sound: Bool, tone: MessageTone = .standard, voip: String? = nil) async throws {
+        struct Body: Encodable { var keys: [String]; var token: String; var sandbox: Bool; var sound: Bool; var tone: String?; var voip: String? }
         var request = URLRequest(url: base.appending(path: "v1/push"))
         request.httpMethod = "PUT"
         await prove(&request, "push")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body = try JSONEncoder().encode(Body(keys: keys.map(\.hex), token: token, sandbox: sandbox, sound: sound))
+        let body = try JSONEncoder().encode(Body(keys: keys.map(\.hex), token: token, sandbox: sandbox, sound: sound, tone: tone.relayName, voip: voip))
         let (_, response) = try await load(request, body: body)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 204 else { throw PushRefused(status: status) }

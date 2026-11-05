@@ -141,6 +141,11 @@ fn wakes(headers: &HeaderMap) -> bool {
     headers.get("x-pulshade-wake").and_then(|v| v.to_str().ok()) != Some("0")
 }
 
+/// Whether the deposit starts a call (`x-pulshade-wake: 2`), which rings a phone instead of showing a banner.
+fn rings(headers: &HeaderMap) -> bool {
+    headers.get("x-pulshade-wake").and_then(|v| v.to_str().ok()) == Some("2")
+}
+
 async fn deposit(State(store): State<Shared>, Path(send_id): Path<String>, headers: HeaderMap, body: Bytes) -> StatusCode {
     let Some(id) = parse_id(&send_id) else { return StatusCode::BAD_REQUEST };
     if body.is_empty() || body.len() > MAX_ENVELOPE {
@@ -163,7 +168,7 @@ async fn deposit(State(store): State<Shared>, Path(send_id): Path<String>, heade
     ARRIVALS.notify_waiters();
     // A phone that asked for it is woken, with nothing about the mail in the push.
     if wakes(&headers) {
-        push::global().notify(id);
+        push::global().notify_as(id, if rings(&headers) { push::Wake::Call } else { push::Wake::Message });
     }
     StatusCode::ACCEPTED
 }
@@ -275,6 +280,12 @@ struct PushRegister {
     /// Whether the push makes a sound: the phone's own Sound setting.
     #[serde(default = "yes")]
     sound: bool,
+    /// The message tone it picked, one of `push::TONES`; anything else is the default sound.
+    #[serde(default)]
+    tone: Option<String>,
+    /// The phone's token for call pushes, which ring it like a phone call.
+    #[serde(default)]
+    voip: Option<String>,
 }
 
 fn yes() -> bool {
@@ -314,10 +325,11 @@ async fn push_register(
     if !push.enabled() {
         return StatusCode::NOT_IMPLEMENTED;
     }
-    if req.keys.len() > MAX_PUSH_KEYS || !push::valid_token(&req.token) {
+    if req.keys.len() > MAX_PUSH_KEYS || !push::valid_token(&req.token) || req.voip.as_deref().is_some_and(|v| !push::valid_token(v)) {
         return StatusCode::BAD_REQUEST;
     }
-    if push.register(&mailboxes_of(&req.keys), &req.token.to_lowercase(), req.sandbox, req.sound) {
+    let extras = push::Extras { tone: req.tone, voip: req.voip };
+    if push.register_with(&mailboxes_of(&req.keys), &req.token.to_lowercase(), req.sandbox, req.sound, extras) {
         StatusCode::NO_CONTENT
     } else {
         StatusCode::INSUFFICIENT_STORAGE
@@ -1067,6 +1079,16 @@ mod tests {
 
     fn key(n: u8) -> Id {
         [n; 32]
+    }
+
+    #[test]
+    fn a_deposit_marked_two_is_a_call() {
+        let mut headers = HeaderMap::new();
+        assert!(!rings(&headers));
+        headers.insert("x-pulshade-wake", "2".parse().unwrap());
+        assert!(rings(&headers) && wakes(&headers));
+        headers.insert("x-pulshade-wake", "1".parse().unwrap());
+        assert!(!rings(&headers));
     }
 
     #[test]

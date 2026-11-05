@@ -774,6 +774,8 @@ struct Outgoing: Codable, Identifiable {
     /// The connection it's sent on. Each persona sends on its own, as it reads on its own, so the relay can't tell
     /// from one connection that two personas are the same person. Nil is the main persona's.
     var lane: String?
+    /// This starts a call, so the relay rings the other phone instead of showing a banner. Nil for anything else.
+    var rings: Bool?
     /// When it was queued, for the Network page. Nil for those queued by builds from before.
     var queued: Date? = Date()
 
@@ -807,6 +809,8 @@ struct SecuritySettings: Codable, Equatable {
     var notifications = true
     var notificationContent: NotificationContent = .hidden
     var notificationSound = true
+    /// The sound of a new message, when sound is on.
+    var messageTone: MessageTone = .standard
     /// Let the relay wake this iPhone through Apple when mail arrives, so a locked phone hears about it. On with
     /// notifications, as in any messenger: without it a locked iPhone hears about nothing. Apple learns that the
     /// device was woken and when, and the relay holds its push token; anyone who'd rather not turns it off.
@@ -858,6 +862,7 @@ struct SecuritySettings: Codable, Equatable {
         notifications = try c.decodeIfPresent(Bool.self, forKey: .notifications) ?? d.notifications
         notificationContent = (try? c.decodeIfPresent(NotificationContent.self, forKey: .notificationContent)) ?? d.notificationContent
         notificationSound = try c.decodeIfPresent(Bool.self, forKey: .notificationSound) ?? d.notificationSound
+        messageTone = (try? c.decodeIfPresent(MessageTone.self, forKey: .messageTone)) ?? d.messageTone
         pushWakeChosen = try c.decodeIfPresent(Bool.self, forKey: .pushWakeChosen) ?? false
         pushWake = pushWakeChosen ? (try c.decodeIfPresent(Bool.self, forKey: .pushWake) ?? d.pushWake) : d.pushWake
         linkPreviews = try c.decodeIfPresent(Bool.self, forKey: .linkPreviews) ?? d.linkPreviews
