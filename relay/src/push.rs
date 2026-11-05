@@ -15,10 +15,11 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use p256::pkcs8::DecodePrivateKey;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::{Arc, LazyLock, Mutex},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -82,6 +83,17 @@ struct Target {
     at: Instant,
 }
 
+/// A registration as the relay keeps it on disk between runs (sealed, with the waiting mail), so a restart doesn't
+/// silence every phone until its owner next opens the app. `registered` is when, by the wall clock.
+#[derive(Serialize, Deserialize)]
+pub struct Saved {
+    pub mailbox: String,
+    pub token: String,
+    pub sandbox: bool,
+    pub sound: bool,
+    pub registered: u64,
+}
+
 struct Signed {
     jwt: String,
     made: Instant,
@@ -96,6 +108,8 @@ pub struct Push {
     rate: Mutex<(Instant, u32)>,
     jwt: Mutex<Option<Signed>>,
     http: reqwest::Client,
+    /// Registrations changed since they were last written out.
+    changed: AtomicBool,
 }
 
 /// The one the relay runs with, set up from `apns.json` when there is one.
@@ -113,6 +127,7 @@ impl Push {
             last: Mutex::default(),
             rate: Mutex::new((Instant::now(), 0)),
             jwt: Mutex::default(),
+            changed: AtomicBool::new(false),
             http: reqwest::Client::builder().timeout(Duration::from_secs(15)).build().expect("http client"),
         }
     }
@@ -122,9 +137,41 @@ impl Push {
         self.config.is_some()
     }
 
+    /// Every live registration, to write to disk, and whether any changed since the last time this was asked.
+    pub fn saved(&self) -> (Vec<Saved>, bool) {
+        let changed = self.changed.swap(false, Ordering::SeqCst);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let targets = self.targets.lock().unwrap();
+        let saved = targets.iter().map(|(id, t)| Saved {
+            mailbox: hex::encode(id),
+            token: t.token.clone(),
+            sandbox: t.sandbox,
+            sound: t.sound,
+            registered: now.saturating_sub(t.at.elapsed().as_secs()),
+        }).collect();
+        (saved, changed)
+    }
+
+    /// Registrations written out by the last run. Ones past their week are left behind.
+    pub fn restore(&self, saved: Vec<Saved>) -> usize {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let mut targets = self.targets.lock().unwrap();
+        for s in saved {
+            let age = Duration::from_secs(now.saturating_sub(s.registered));
+            let Some(mailbox) = hex::decode(&s.mailbox).ok().and_then(|raw| Id::try_from(raw).ok()) else { continue };
+            if age >= TTL || !valid_token(&s.token) || targets.len() >= MAX_TARGETS {
+                continue;
+            }
+            let at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+            targets.insert(mailbox, Target { token: s.token, sandbox: s.sandbox, sound: s.sound, at });
+        }
+        targets.len()
+    }
+
     /// Remembers `token` for these mailboxes (by send id), replacing any earlier one. False if the token already holds
     /// as many mailboxes as a device can. When the table is full, the oldest registrations make way.
     pub fn register(&self, mailboxes: &[Id], token: &str, sandbox: bool, sound: bool) -> bool {
+        self.changed.store(true, Ordering::SeqCst);
         let mut targets = self.targets.lock().unwrap();
         let held = targets.values().filter(|t| t.token == token).count();
         let new = mailboxes.iter().filter(|id| targets.get(*id).is_none_or(|t| t.token != token)).count();
@@ -149,11 +196,13 @@ impl Push {
     }
 
     pub fn remove(&self, mailboxes: &[Id]) {
+        self.changed.store(true, Ordering::SeqCst);
         self.targets.lock().unwrap().retain(|id, _| !mailboxes.contains(id));
     }
 
     /// Everything registered for a device token, for a phone that has no keys to name its mailboxes with.
     pub fn forget(&self, token: &str) {
+        self.changed.store(true, Ordering::SeqCst);
         self.targets.lock().unwrap().retain(|_, t| t.token != token);
         self.last.lock().unwrap().remove(token);
     }
@@ -161,7 +210,11 @@ impl Push {
     /// Drops registrations that were never renewed, and cooldown records that no longer matter.
     pub fn sweep(&self) {
         let now = Instant::now();
-        self.targets.lock().unwrap().retain(|_, t| now.duration_since(t.at) < TTL);
+        let mut targets = self.targets.lock().unwrap();
+        let before = targets.len();
+        targets.retain(|_, t| now.duration_since(t.at) < TTL);
+        if targets.len() != before { self.changed.store(true, Ordering::SeqCst); }
+        drop(targets);
         self.last.lock().unwrap().retain(|_, at| now.duration_since(*at) < COOLDOWN);
     }
 

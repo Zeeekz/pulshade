@@ -2698,6 +2698,12 @@ final class AppModel {
         guard !mine.isEmpty else { return false }
         fetching.formUnion(mine)
         defer { fetching.subtract(mine) }
+        // A lane with no working route yet (after a launch, or coming back from the background) finds one first,
+        // racing fresh circuits, rather than letting the fetch sit for minutes on one that carries nothing.
+        if Tor.uses(client.base), !client.isEstablished, !(await Self.reach(client)) {
+            if lane.relay == nil { noteRelay(reached: false) }
+            return false
+        }
         let wait = fetchWait
         let started = Date()
         do {
@@ -2827,6 +2833,9 @@ final class AppModel {
     /// default identity's mailboxes: one token on two identities' mailboxes would let the relay link them.
     func refreshPush(turningOff: Bool = false) {
         #if os(iOS)
+        if let address = reachable(nil), let base = URL(string: address), RelayClient.restartedSinceLastAsked(base) {
+            pushTold = nil
+        }
         if pushForgetPending {
             if let token = Push.token {
                 pushForgetPending = false
@@ -2962,6 +2971,8 @@ final class AppModel {
             await withTaskGroup(of: (UUID, Error?).self) { group in
                 for (item, client, _) in wave {
                     group.addTask {
+                        // As with fetching: a lane without a working route finds one before it sends.
+                        if Tor.uses(client.base), !client.isEstablished { _ = await Self.reach(client) }
                         do { try await client.deposit(item.blob, to: item.sendID, wake: item.message != nil); return (item.id, nil) } catch { return (item.id, error) }
                     }
                 }

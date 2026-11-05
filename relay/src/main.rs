@@ -34,8 +34,8 @@ use std::{
     collections::{HashMap, VecDeque},
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, LazyLock, Mutex},
-    time::{Duration, Instant},
+    sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, Ordering}},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Notify;
 
@@ -56,6 +56,17 @@ const MAX_WAIT: u64 = 25;
 
 /// Wakes waiting fetches whenever anything is deposited, so mail goes out the moment it lands.
 static ARRIVALS: LazyLock<Notify> = LazyLock::new(Notify::new);
+/// Set whenever waiting mail changes, so the spool is only written when there's something new.
+static MAIL_CHANGED: AtomicBool = AtomicBool::new(false);
+/// Different every time the relay starts. The health check carries it, so an app can tell the relay restarted and
+/// register for wake-ups again straight away.
+static BOOT: LazyLock<String> = LazyLock::new(|| {
+    let mut raw = [0u8; 8];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut raw)).expect("no randomness");
+    hex::encode(raw)
+});
+/// How often waiting mail and wake-up registrations are written out, at most.
+const SPOOL_EVERY: Duration = Duration::from_secs(30);
 
 type Id = [u8; 32];
 
@@ -145,6 +156,7 @@ async fn deposit(State(store): State<Shared>, Path(send_id): Path<String>, heade
     }
     queue.push_back(item);
     store.bytes += size;
+    MAIL_CHANGED.store(true, Ordering::SeqCst);
     drop(store);
     ARRIVALS.notify_waiters();
     // A phone that asked for it is woken, with nothing about the mail in the push.
@@ -238,6 +250,7 @@ async fn ack(State(store): State<Shared>, Json(req): Json<AckRequest>) -> Status
             }
         }
         store.bytes = store.bytes.saturating_sub(freed);
+        if freed > 0 { MAIL_CHANGED.store(true, Ordering::SeqCst); }
     }
     StatusCode::NO_CONTENT
 }
@@ -694,12 +707,138 @@ fn purge(store: &Shared) {
         !queue.is_empty()
     });
     // Recounted, so the running total can't drift.
+    let before = store.bytes;
     store.bytes = store.queues.values().flat_map(|q| q.iter()).map(|item| item.blob.len()).sum();
+    if store.bytes != before { MAIL_CHANGED.store(true, Ordering::SeqCst); }
+}
+
+// MARK: Spool
+
+/// Waiting mail and wake-up registrations, as written to disk between runs: sealed with the relay's storage key, so
+/// the file shows nothing. Envelopes are end-to-end encrypted already; what the seal hides is which mailboxes hold
+/// mail and which phone each wake-up goes to. Without it, a restart lost everything waiting and left every locked
+/// phone unwoken until its owner opened the app.
+#[derive(Serialize, Deserialize)]
+struct Spool {
+    id_seed: String,
+    counter: u64,
+    queues: Vec<SpooledQueue>,
+    #[serde(default)]
+    push: Vec<push::Saved>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SpooledQueue {
+    mailbox: String,
+    items: Vec<SpooledItem>,
+}
+
+/// `deposited` is when it arrived, by the wall clock, so its age and expiry carry across a restart.
+#[derive(Serialize, Deserialize)]
+struct SpooledItem {
+    id: u64,
+    deposited: u64,
+    blob: String,
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn spool_path(directory_path: &str) -> PathBuf {
+    PathBuf::from(directory_path).with_file_name("pulshade-spool.sealed")
+}
+
+/// Writes the spool if anything changed since the last time (or always, with `force`), sealed in memory and swapped in
+/// whole, so nothing readable ever reaches the disk.
+fn save_spool(store: &Shared, path: &std::path::Path, sealer: &sealed::Sealer, force: bool) {
+    let mail_changed = MAIL_CHANGED.swap(false, Ordering::SeqCst);
+    let (push, push_changed) = push::global().saved();
+    if !force && !mail_changed && !push_changed {
+        return;
+    }
+    let now = unix_now();
+    let spool = {
+        let store = store.lock().unwrap();
+        Spool {
+            id_seed: hex::encode(store.id_seed),
+            counter: store.counter,
+            queues: store.queues.iter().map(|(id, queue)| SpooledQueue {
+                mailbox: hex::encode(id),
+                items: queue.iter().map(|item| SpooledItem {
+                    id: item.id,
+                    deposited: now.saturating_sub(item.at.elapsed().as_secs()),
+                    blob: B64.encode(&item.blob),
+                }).collect(),
+            }).collect(),
+            push,
+        }
+    };
+    let Ok(raw) = serde_json::to_vec(&spool) else { return };
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, sealer.seal(&raw)).is_ok() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        if std::fs::rename(&tmp, path).is_ok() {
+            return;
+        }
+    }
+    // Not written: try again next time.
+    MAIL_CHANGED.store(true, Ordering::SeqCst);
+}
+
+/// Brings back what the last run left waiting. Mail past its week, and anything unreadable, stays behind.
+fn load_spool(store: &Shared, path: &std::path::Path, sealer: &sealed::Sealer) -> (usize, usize) {
+    let Ok(raw) = std::fs::read(path) else { return (0, 0) };
+    if !sealed::Sealer::is_sealed(&raw) {
+        return (0, 0);
+    }
+    let Some(spool) = sealer.open(&raw).and_then(|plain| serde_json::from_slice::<Spool>(&plain).ok()) else {
+        eprintln!("the spool at {} couldn't be opened; starting without it", path.display());
+        return (0, 0);
+    };
+    let now = unix_now();
+    let mut count = 0;
+    {
+        let mut store = store.lock().unwrap();
+        if let Some(seed) = hex::decode(&spool.id_seed).ok().and_then(|raw| <[u8; 32]>::try_from(raw).ok()) {
+            store.id_seed = seed;
+            store.counter = spool.counter;
+        }
+        for queue in spool.queues {
+            let Some(id) = parse_id(&queue.mailbox) else { continue };
+            let items: VecDeque<Item> = queue.items.into_iter().filter_map(|item| {
+                let age = Duration::from_secs(now.saturating_sub(item.deposited));
+                if age >= TTL {
+                    return None;
+                }
+                let blob = Bytes::from(B64.decode(item.blob).ok()?);
+                Some(Item { id: item.id, at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now), blob })
+            }).take(MAX_QUEUE).collect();
+            if items.is_empty() || store.queues.len() >= MAX_MAILBOXES {
+                continue;
+            }
+            count += items.len();
+            store.queues.insert(id, items);
+        }
+        store.bytes = store.queues.values().flat_map(|q| q.iter()).map(|item| item.blob.len()).sum();
+    }
+    let woken = push::global().restore(spool.push);
+    (count, woken)
+}
+
+/// Waits for Ctrl-C or the service manager's stop (SIGTERM), either of which ends the relay cleanly.
+async fn stop_signal() {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("no signal handling");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
 }
 
 fn app(state: AppState) -> Router {
     Router::new()
-        .route("/v1/health", get(|| async { "ok" }))
+        .route("/v1/health", get(|| async { ([("x-pulshade-boot", BOOT.as_str())], "ok") }))
         // The address this request came from, for the app's anonymity report. Answered, never kept.
         .route("/v1/seen", get(|caller::Caller(ip): caller::Caller| async move { ip.to_string() }))
         .route("/v1/q/{send_id}", put(deposit))
@@ -792,6 +931,13 @@ async fn main() {
     }
     let bind = std::env::var("PULSHADE_BIND").unwrap_or_else(|_| "127.0.0.1:7878".into());
     let store: Shared = Arc::default();
+    // What the last run left waiting, before anyone can ask for it.
+    let spool = spool_path(&directory_path);
+    let spool_sealer = Arc::new(sealed::Sealer::standard(&PathBuf::from(&directory_path)));
+    let (waiting, woken) = load_spool(&store, &spool, &spool_sealer);
+    if waiting > 0 || woken > 0 {
+        eprintln!("brought back {waiting} waiting envelope(s) and {woken} wake-up registration(s)");
+    }
     let state = AppState {
         store: store.clone(),
         calls: Arc::default(),
@@ -813,6 +959,15 @@ async fn main() {
             purge(&sweeper);
             push::global().sweep();
             backups.sweep(backup::BACKUP_TTL);
+        }
+    });
+    let (spooler, spool_file, sealer) = (store.clone(), spool.clone(), spool_sealer.clone());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(SPOOL_EVERY);
+        loop {
+            tick.tick().await;
+            let (store, file, sealer) = (spooler.clone(), spool_file.clone(), sealer.clone());
+            let _ = tokio::task::spawn_blocking(move || save_spool(&store, &file, &sealer, false)).await;
         }
     });
     // Addresses are only kept while they count towards a limit, checked every minute.
@@ -840,9 +995,11 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&bind).await.expect("could not bind");
     eprintln!("pulshade relay listening on {bind}");
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(async { tokio::signal::ctrl_c().await.ok(); })
+        .with_graceful_shutdown(stop_signal())
         .await
         .unwrap();
+    // Everything still waiting goes to disk before the process ends, so nothing is lost to a restart.
+    save_spool(&store, &spool, &spool_sealer, true);
 }
 
 #[cfg(test)]
@@ -954,6 +1111,52 @@ mod tests {
         let Json(res) = fetch(State(store), Json(FetchRequest { keys: vec![hex::encode(other)], wait: 1 })).await.unwrap();
         assert!(res.items.is_empty());
         assert!(started.elapsed() >= Duration::from_secs(1), "nothing for it: waited out the second");
+    }
+
+    /// What's waiting and who to wake survive a restart: written out sealed, read back by the next run with the same
+    /// ids and ages, and nothing past its week comes back.
+    #[tokio::test]
+    async fn waiting_mail_and_wake_ups_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("pulshade-spool-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pulshade-spool.sealed");
+        let sealer = sealed::Sealer::with_key([7; 32]);
+        let store: Shared = Arc::default();
+        let receive = key(31);
+        let send = hex::encode(send_id_for(&receive));
+        assert_eq!(deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), Bytes::from_static(b"first")).await, StatusCode::ACCEPTED);
+        assert_eq!(deposit(State(store.clone()), Path(send), HeaderMap::new(), Bytes::from_static(b"second")).await, StatusCode::ACCEPTED);
+        // One that's been waiting longer than a relay keeps anything.
+        let stale = key(32);
+        store.lock().unwrap().queues.insert(send_id_for(&stale), VecDeque::from([Item {
+            id: 99, at: Instant::now().checked_sub(TTL + Duration::from_secs(60)).unwrap(), blob: Bytes::from_static(b"old"),
+        }]));
+        let token = "ab".repeat(32);
+        assert!(push::global().register(&[send_id_for(&receive)], &token, false, true));
+        let Json(before) = fetch(State(store.clone()), Json(FetchRequest { keys: vec![hex::encode(receive)], wait: 0 })).await.unwrap();
+
+        save_spool(&store, &path, &sealer, true);
+        let raw = std::fs::read(&path).unwrap();
+        assert!(sealed::Sealer::is_sealed(&raw), "sealed on disk");
+        assert!(!raw.windows(5).any(|w| w == b"first") && !raw.windows(token.len()).any(|w| w == token.as_bytes()), "nothing readable");
+
+        // The next run starts empty, and the spool brings it back.
+        push::global().forget(&token);
+        let next: Shared = Arc::default();
+        let (waiting, woken) = load_spool(&next, &path, &sealer);
+        assert_eq!(waiting, 2, "the stale one stays behind");
+        assert!(woken >= 1);
+        let Json(after) = fetch(State(next.clone()), Json(FetchRequest { keys: vec![hex::encode(receive)], wait: 0 })).await.unwrap();
+        assert_eq!(after.items.iter().map(|i| (i.id, i.blob.clone())).collect::<Vec<_>>(),
+                   before.items.iter().map(|i| (i.id, i.blob.clone())).collect::<Vec<_>>(), "same envelopes, same ids");
+        assert_eq!(next.lock().unwrap().bytes, 5 + 6);
+        assert!(next.lock().unwrap().queues.get(&send_id_for(&stale)).is_none());
+        // New ids carry on from where the last run stopped, so none is ever handed out twice.
+        assert_eq!(next.lock().unwrap().counter, store.lock().unwrap().counter);
+        let (saved, _) = push::global().saved();
+        assert!(saved.iter().any(|s| s.token == token && s.mailbox == hex::encode(send_id_for(&receive))));
+        push::global().forget(&token);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// What's waiting is counted, so a flood is refused (507) before it can take the relay down, and acknowledging
