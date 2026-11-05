@@ -75,13 +75,13 @@ struct ConnectionChoice: View {
 
     var body: some View {
         OnboardingPage(title: "How should PULSHADE connect?",
-                       subtitle: "Pick one now. You can change it later in Settings.", back: nil) {
+                       subtitle: "Fast is much quicker. Tor hides your IP address. You can change it later in Settings.", back: nil) {
             VStack(spacing: 14) {
                 option(symbol: "bolt.fill", title: "Fast",
-                       detail: "Connects straight to PULSHADE's server, so messages and stories go in seconds. The server doesn't keep logs of who connects. It does see your IP address while you're connected, and so does your network, so they can tell you use PULSHADE. Neither can read what you say.",
+                       detail: "Connects straight to PULSHADE's server, so messages and stories arrive in seconds. The server sees your IP address while you're connected, and so does your network, but PULSHADE keeps no logs of who connects and no record of who talks to whom. Neither can read what you say.",
                        tor: false)
                 option(symbol: "lock.shield.fill", title: "Private, through Tor",
-                       detail: "Hides your IP address by sending everything through Tor. It can be slow, and on some networks messages arrive late.",
+                       detail: "Hides your IP address by sending everything through Tor. It's the slow route: messages and stories can arrive late, or not for a while, on some networks.",
                        tor: true)
             }
         } actions: {
