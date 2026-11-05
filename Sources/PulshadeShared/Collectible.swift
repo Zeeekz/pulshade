@@ -70,6 +70,7 @@ public struct Collectible: Codable, Equatable, Hashable, Identifiable {
         case pulsePop = "pulsepop"
         case bonfire = "bonfire"
         case christmasTree = "christmastree"
+        case bitcoin = "bitcoin"
         /// Its id is still `greendragon`, from before it was renamed, so any already given out keep counting.
         case pulze = "greendragon"
         case guardian = "guardian"
@@ -85,6 +86,7 @@ public struct Collectible: Codable, Equatable, Hashable, Identifiable {
             case .pulsePop: "Pulse Pop"
             case .bonfire: "Bonfire Night"
             case .christmasTree: "Christmas Tree"
+            case .bitcoin: "Bitcoin"
             case .pulze: "Pulze The Dragon"
             case .guardian: "Guardian"
             case .goldPulze: "Golden Pulze The Dragon"
@@ -111,6 +113,7 @@ public struct Collectible: Codable, Equatable, Hashable, Identifiable {
             case .pulsePop: "A can of Pulse Pop that won't stay shut."
             case .bonfire: "A roaring bonfire with fireworks bursting overhead. Remember, remember."
             case .christmasTree: "A Christmas tree with twinkling lights and snow drifting down. Hush now."
+            case .bitcoin: "A glossy Bitcoin coin that spins to show its pulse. Number one, or number one hundred."
             case .pulze: "A dark blue dragon, crackling with electricity."
             case .guardian: "Awarded to the people who keep Pulshade safe. Earned, never passed on."
             case .goldPulze: "A rare golden dragon, crackling with sparks. Hatched from a dragon egg, and not often."

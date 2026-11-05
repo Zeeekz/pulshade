@@ -33,6 +33,7 @@ struct CollectibleArtTests {
         ("tophat", TopHatShape.loop, { AnyView(TopHatShape(time: $0)) }),
         ("bonfire", BonfireFrame.loop, { AnyView(BonfireFrame(time: $0)) }),
         ("christmastree", ChristmasTreeFrame.loop, { AnyView(ChristmasTreeFrame(time: $0)) }),
+        ("bitcoin", BitcoinFrame.loop, { AnyView(BitcoinFrame(time: $0)) }),
     ]
 
     private func frame(_ index: Int, _ time: Double, _ size: CGFloat) throws -> Data {
@@ -93,6 +94,19 @@ struct CollectibleArtTests {
         }
         #expect(average(gold).r > average(gold).b, "gold is redder than blue")
         #expect(average(blue).b > average(blue).r)
+    }
+
+    @Test func theBitcoinCoinRendersInThreeDimensions() throws {
+        let front = try #require(BitcoinStage.still(pixels: 500, yaw: -0.5))
+        let side = try #require(BitcoinStage.still(pixels: 500, yaw: 1.2))
+        let back = try #require(BitcoinStage.still(pixels: 500, yaw: .pi + 0.4))
+        #expect(front.width == 500 && side.width == 500 && back.width == 500)
+        guard let dir = ProcessInfo.processInfo.environment["PULSHADE_ART_DIR"] else { return }
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        for (name, image) in [("bitcoin3d-front", front), ("bitcoin3d-side", side), ("bitcoin3d-back", back)] {
+            let rep = NSBitmapImageRep(cgImage: image)
+            try #require(rep.representation(using: .png, properties: [:])).write(to: URL(fileURLWithPath: "\(dir)/\(name).png"))
+        }
     }
 
     @Test func theDragonRendersFromItsScene() throws {

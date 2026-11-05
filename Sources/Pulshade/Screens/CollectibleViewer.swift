@@ -52,6 +52,8 @@ struct CollectibleViewerSheet: View {
             Group {
                 if item.kind == .pulze || item.kind == .goldPulze {
                     DragonViewer(golden: item.kind == .goldPulze)
+                } else if item.kind == .bitcoin {
+                    BitcoinViewer()
                 } else if let kind = item.kind {
                     ObjectViewer3D(kind: kind)
                 }
