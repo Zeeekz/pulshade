@@ -35,9 +35,9 @@ enum Tor {
     /// Whether the person has chosen between Tor and a direct connection on this device.
     static var chosen: Bool { UserDefaults.standard.object(forKey: "pulshade.tor") != nil }
 
-    /// A fresh install asks before it connects to anything. Not where the relay can only be reached over Tor: there
-    /// is nothing to choose.
-    static var needsChoice: Bool { !chosen && AppData.directRelay != nil }
+    /// Whenever there's no account on this device (a fresh install, after Detach or Burn), the first thing asked is how
+    /// to connect, before anything connects. Not where the relay can only be reached over Tor: there is nothing to choose.
+    static var needsChoice: Bool { AppData.directRelay != nil }
 
     /// An onion relay can only be reached over Tor, whatever the setting.
     static func uses(_ url: URL) -> Bool {
