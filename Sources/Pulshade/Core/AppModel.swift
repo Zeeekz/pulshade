@@ -238,7 +238,7 @@ final class AppModel {
     /// A call push woke Pulshade. If it is unlocked, it reconnects and fetches at once, so the caller's name reaches the
     /// call screen while it is still ringing.
     func callPushArrived() {
-        if phase == .unlocked { reconnect() }
+        if phase == .unlocked { reconnect() } else if phase == .locked { warmUp() }
     }
     #endif
 
@@ -2750,19 +2750,24 @@ final class AppModel {
             return false
         }
         let wait = fetchWait
-        let started = Date()
         do {
-            let envelopes = try await client.fetch(Array(mine), wait: wait)
-            if lane.relay == nil { noteRelay(reached: true) }
-            // Mail, or an empty answer after a real wait. An instant empty one means the relay doesn't wait.
-            let waited = wait > 0 && (!envelopes.isEmpty || Date().timeIntervalSince(started) > Double(wait) / 2)
-            guard identity?.fingerprint == owner, !envelopes.isEmpty else { return waited }
-            for envelope in envelopes { receive(envelope) }
-            lastMailReceived = Date()
-            deposited = nil
-            save()
-            try await client.ack(envelopes)
-            return waited
+            // The relay answers with a limited amount at a time, so a plain check (no waiting) asks again until it
+            // has nothing more. A waiting one is back at the relay within a moment anyway, see `pollLane`.
+            for _ in 0..<(wait == 0 ? 10 : 1) {
+                let started = Date()
+                let envelopes = try await client.fetch(Array(mine), wait: wait)
+                if lane.relay == nil { noteRelay(reached: true) }
+                // Mail, or an empty answer after a real wait. An instant empty one means the relay doesn't wait.
+                let waited = wait > 0 && (!envelopes.isEmpty || Date().timeIntervalSince(started) > Double(wait) / 2)
+                guard identity?.fingerprint == owner, !envelopes.isEmpty else { return waited }
+                for envelope in envelopes { receive(envelope) }
+                lastMailReceived = Date()
+                deposited = nil
+                save()
+                try await client.ack(envelopes)
+                if wait > 0 { return waited }
+            }
+            return false
         } catch {
             if lane.relay == nil { noteRelay(reached: false) }
             return false
@@ -4652,7 +4657,8 @@ extension AppModel {
         kick()
         // Wait in the room so the audio can start the moment they answer.
         connectCall()
-        ringFor(seconds: 45, else: "No answer")
+        // Long enough for a locked phone to be answered, unlocked and to fetch the call over Tor.
+        ringFor(seconds: 90, else: "No answer")
     }
 
     func answerCall() {
@@ -4744,7 +4750,8 @@ extension AppModel {
         if data.security.notifications && !onCallScreen {
             Notifier.shared.post((name, "Incoming call"), conversation: UUID(), sound: data.security.notificationSound)
         }
-        ringFor(seconds: 45, else: "Missed call")
+        // The caller's own timer decides first; this only covers a caller who never says they've gone.
+        ringFor(seconds: 120, else: "Missed call")
     }
 
     fileprivate func callAnswered(_ id: UUID, accepted: Bool, by sender: Contact) {
