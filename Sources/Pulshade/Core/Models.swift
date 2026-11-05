@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 import CryptoKit
 #if canImport(PulshadeShared)
 import PulshadeShared
@@ -359,6 +360,53 @@ enum MessageStatus: String, Codable {
         case .sent: 1
         case .delivered: 2
         case .read: 3
+        }
+    }
+}
+
+/// Where a message you sent has got to, as ticks: a clock while it waits, one tick once the relay has it, two once
+/// it reached them, and two in colour once they've read it. Takes its colour from where it sits, except when read.
+struct StatusTicks: View {
+    var status: MessageStatus
+    /// The size of a tick.
+    var size: CGFloat = 10
+
+    /// Bright enough to stand out on a coloured bubble and on a dark chat list alike.
+    static let readColour = Color(red: 0.36, green: 0.92, blue: 0.62)
+
+    var body: some View {
+        ticks
+            .font(.system(size: size, weight: status == .read ? .heavy : .semibold))
+            .modifier(ReadColour(read: status == .read))
+            .accessibilityLabel(label)
+    }
+
+    @ViewBuilder private var ticks: some View {
+        switch status {
+        case .queued: Image(systemName: "clock")
+        case .sent: Image(systemName: "checkmark")
+        case .delivered, .read:
+            ZStack(alignment: .leading) {
+                Image(systemName: "checkmark")
+                Image(systemName: "checkmark").offset(x: size * 0.45)
+            }
+            .frame(width: size * 1.6, alignment: .leading)
+        }
+    }
+
+    private var label: String {
+        switch status {
+        case .queued: "Waiting to send"
+        case .sent: "Sent"
+        case .delivered: "Delivered"
+        case .read: "Read"
+        }
+    }
+
+    private struct ReadColour: ViewModifier {
+        var read: Bool
+        func body(content: Content) -> some View {
+            if read { content.foregroundStyle(StatusTicks.readColour) } else { content }
         }
     }
 }

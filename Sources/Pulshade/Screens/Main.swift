@@ -617,7 +617,7 @@ private struct ChatRow: View {
                 HStack(spacing: 6) {
                     if let last = c.messages.last {
                         if last.isMine {
-                            Image(systemName: last.status.symbol).font(.system(size: 10)).foregroundStyle(Ink.faint)
+                            StatusTicks(status: last.status).foregroundStyle(Ink.faint)
                         }
                         if last.image != nil { Image(systemName: "photo").font(.system(size: 11)).foregroundStyle(Ink.dim) }
                         if last.voice != nil { Image(systemName: "waveform").font(.system(size: 11)).foregroundStyle(Ink.dim) }
