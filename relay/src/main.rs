@@ -217,18 +217,27 @@ async fn fetch(State(store): State<Shared>, Json(req): Json<FetchRequest>) -> Re
     }
 }
 
+/// Mail up to this size is a message or a receipt; above it, a photo or a piece of a story.
+const SHORT_MAIL: usize = 64 * 1024;
+
+/// What a fetch hands over: short mail first, from every mailbox, then the big. A message sent after a story's
+/// pieces used to wait behind them, fetched a piece at a time over a slow circuit, and a big piece at the front of
+/// one mailbox held up the others in the same answer. Mail is read in either order, and each is acknowledged by its
+/// id, so taking the short ones first changes nothing for the apps.
 fn collect(store: &Shared, mailboxes: &[Option<Id>]) -> Vec<Envelope> {
     let store = store.lock().unwrap();
     let mut items = Vec::new();
     let mut bytes = 0;
-    'boxes: for (k, mailbox) in mailboxes.iter().enumerate() {
-        let Some(queue) = mailbox.and_then(|id| store.queues.get(&id)) else { continue };
-        for item in queue.iter().take(MAX_ITEMS_PER_KEY) {
-            // One answer stays small enough to arrive over a slow circuit before the app gives up; the rest
-            // comes on the next fetch, once this has been acknowledged. The first envelope always goes, however big.
-            if !items.is_empty() && bytes + item.blob.len() > MAX_FETCH_BYTES { break 'boxes; }
-            bytes += item.blob.len();
-            items.push(Envelope { k, id: item.id, blob: B64.encode(&item.blob), age: item.at.elapsed().as_secs() });
+    'passes: for big in [false, true] {
+        for (k, mailbox) in mailboxes.iter().enumerate() {
+            let Some(queue) = mailbox.and_then(|id| store.queues.get(&id)) else { continue };
+            for item in queue.iter().filter(|item| (item.blob.len() > SHORT_MAIL) == big).take(MAX_ITEMS_PER_KEY) {
+                // One answer stays small enough to arrive over a slow circuit before the app gives up; the rest
+                // comes on the next fetch, once this has been acknowledged. The first envelope always goes, however big.
+                if !items.is_empty() && bytes + item.blob.len() > MAX_FETCH_BYTES { break 'passes; }
+                bytes += item.blob.len();
+                items.push(Envelope { k, id: item.id, blob: B64.encode(&item.blob), age: item.at.elapsed().as_secs() });
+            }
         }
     }
     items
@@ -1407,6 +1416,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A message sent after a story's pieces is handed over first, and a big piece at the front of one mailbox
+    /// doesn't hold up the short mail in the others.
+    #[tokio::test]
+    async fn short_mail_is_fetched_before_big_pieces_ahead_of_it() {
+        let store: Shared = Arc::default();
+        let (a, b) = (key(61), key(62));
+        let big = |id: u64| Item { id, at: Instant::now(), blob: Bytes::from(vec![1u8; 2_000_000]) };
+        let short = |id: u64, body: &'static [u8]| Item { id, at: Instant::now(), blob: Bytes::from_static(body) };
+        store.lock().unwrap().queues.insert(send_id_for(&a), VecDeque::from([big(1), big(2), short(3, b"hello")]));
+        store.lock().unwrap().queues.insert(send_id_for(&b), VecDeque::from([big(4), short(5, b"hi"), short(6, b"there")]));
+
+        let Json(first) = fetch(State(store.clone()), Json(FetchRequest { keys: vec![hex::encode(a), hex::encode(b)], wait: 0 })).await.unwrap();
+        let ids: Vec<u64> = first.items.iter().map(|i| i.id).collect();
+        assert_eq!(ids, vec![3, 5, 6], "only the short mail, though big pieces came first in both mailboxes");
+
+        // Acknowledged, the big ones come, one at a time as before.
+        let ack_body = AckRequest { acks: vec![
+            Ack { key: hex::encode(a), ids: vec![3] },
+            Ack { key: hex::encode(b), ids: vec![5, 6] },
+        ] };
+        assert!(ack(State(store.clone()), Json(ack_body)).await.is_success());
+        let Json(next) = fetch(State(store.clone()), Json(FetchRequest { keys: vec![hex::encode(a), hex::encode(b)], wait: 0 })).await.unwrap();
+        assert_eq!(next.items.iter().map(|i| i.id).collect::<Vec<_>>(), vec![1], "then the oldest big piece, alone");
+    }
+
     /// What's waiting is counted, so a flood is refused (507) before it can take the relay down, and acknowledging
     /// or expiring mail gives the room back.
     #[tokio::test]
@@ -1429,7 +1463,8 @@ mod tests {
     }
 
     /// A big story must not hold up what's behind it: one fetch stays under the size cap (but always carries at
-    /// least one envelope), and acknowledging what came lets the next fetch bring the rest, in order.
+    /// least one envelope), and acknowledging what came lets the next fetch bring the rest: the short mail first,
+    /// then the big, each in the order sent.
     #[tokio::test]
     async fn a_fetch_stays_small_and_the_rest_follows_after_acknowledging() {
         let store: Shared = Arc::default();
@@ -1449,7 +1484,7 @@ mod tests {
             ack(State(store.clone()), Json(AckRequest { acks: vec![Ack { key: hex::encode(receive), ids }] })).await;
         }
         // Ids are unpredictable, so order is judged by what each envelope held.
-        assert_eq!(seen, vec![400 * 1024, 400 * 1024, 400 * 1024, 400 * 1024, 400 * 1024, 2], "everything arrives, in the order sent");
+        assert_eq!(seen, vec![2, 400 * 1024, 400 * 1024, 400 * 1024, 400 * 1024, 400 * 1024], "everything arrives, the short one first");
         assert_eq!(store.lock().unwrap().bytes, 0);
 
         // A single envelope past the cap still goes, alone.
