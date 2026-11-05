@@ -147,8 +147,14 @@ final class CallRinger: NSObject {
     private func watchForInvite(_ id: UUID) {
         waiting?.cancel()
         waiting = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(40))
+            // Rings as long as the caller does. A call that was answered gets longer still: Pulshade may have to be
+            // unlocked and reach the relay before the call's envelope can be fetched.
+            try? await Task.sleep(for: .seconds(90))
             guard !Task.isCancelled, let self, self.uuid == id, self.invite == nil else { return }
+            if self.answeredEarly {
+                try? await Task.sleep(for: .seconds(90))
+                guard !Task.isCancelled, self.uuid == id, self.invite == nil else { return }
+            }
             self.provider.reportCall(with: id, endedAt: Date(), reason: .unanswered)
             self.clear()
         }
