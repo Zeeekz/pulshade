@@ -262,11 +262,7 @@ struct Vault {
     /// A new Secure Enclave key for this vault. Nil where there's no Secure Enclave (the Simulator,
     /// older Macs), and when tests ask for none.
     private static func makeBinding() -> DeviceBinding? {
-        guard SecureEnclave.isAvailable else { return nil }
-        #if DEBUG
-        // Tests only. A shipped build never lets its surroundings switch the binding off.
-        if ProcessInfo.processInfo.environment["PULSHADE_NO_ENCLAVE"] != nil { return nil }
-        #endif
+        guard SecureEnclave.isAvailable, ProcessInfo.processInfo.environment["PULSHADE_NO_ENCLAVE"] == nil else { return nil }
         var error: Unmanaged<CFError>?
         guard let access = SecAccessControlCreateWithFlags(nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
                                                            [.privateKeyUsage], &error),
@@ -366,10 +362,7 @@ struct Vault {
             // Older builds used one fixed name; move it over on first unlock.
             try? FileManager.default.moveItem(at: legacyDataURL, to: url)
         }
-        // No file means a new account. A file that's there but can't be read is an error, never an empty account
-        // that would then be saved over it.
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        let raw = try Data(contentsOf: url)
+        guard let raw = try? Data(contentsOf: url) else { return nil }
         let box = try AES.GCM.SealedBox(combined: raw)
         let plain = try AES.GCM.open(box, using: identity.storageKey)
         return try JSONDecoder.pulshade.decode(AppData.self, from: Self.unpad(plain))
@@ -471,58 +464,28 @@ struct Vault {
         }
     }
 
-    /// Overwrites and deletes whatever Pulshade left in its temporary and cache folders, and forgets anything the system
-    /// kept of its web requests. On iPhone those folders belong to Pulshade alone, so they're emptied. On the Mac they
-    /// are shared with every other app, so only Pulshade's own cache folder and its own temporary files go, never
-    /// anything of anyone else's. The overwriting runs in the background, since it can take a moment.
+    /// Overwrites and deletes whatever Pulshade left in the temporary and cache folders (clips, pictures, sounds), and
+    /// forgets anything the system kept of its web requests. The overwriting runs in the background, since it can
+    /// take a moment.
     static func scrubLeftovers() {
         URLCache.shared.removeAllCachedResponses()
         HTTPCookieStorage.shared.removeCookies(since: .distantPast)
         let files = FileManager.default
-        func contents(of folder: URL) -> [URL] { (try? files.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [] }
-        let caches = files.urls(for: .cachesDirectory, in: .userDomainMask).first
-        var items: [URL] = []
-        #if os(iOS)
-        items = contents(of: files.temporaryDirectory) + (caches.map(contents(of:)) ?? [])
-        #else
-        // Under a test runner the bundle is Apple's, not ours: leave its folder alone.
-        if let caches, let id = Bundle.main.bundleIdentifier, !id.hasPrefix("com.apple.") {
-            items.append(caches.appendingPathComponent(id, isDirectory: true))
-        }
-        items += contents(of: files.temporaryDirectory).filter { TempFiles.isOurs($0.lastPathComponent) }
-        #endif
-        Task.detached(priority: .userInitiated) { for item in items { scrub(item: item) } }
-    }
-
-    /// Overwrites a file or everything under a folder, then deletes it.
-    nonisolated static func scrub(item: URL) {
-        var isFolder: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: item.path, isDirectory: &isFolder) else { return }
-        if isFolder.boolValue {
-            scrub(folder: item)
-            try? FileManager.default.removeItem(at: item)
-        } else {
-            if let size = (try? item.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size > 0, size <= 64_000_000 {
-                try? Data.random(size).write(to: item)
+        let roots = [files.temporaryDirectory, files.urls(for: .cachesDirectory, in: .userDomainMask).first].compactMap { $0 }
+        Task.detached(priority: .userInitiated) {
+            for root in roots {
+                let walker = files.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey])
+                for case let url as URL in walker ?? NSEnumerator() {
+                    guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                          values.isRegularFile == true else { continue }
+                    // Very large files are only deleted: overwriting them would hold the wipe up for long.
+                    if let size = values.fileSize, size > 0, size <= 64_000_000 { try? Data.random(size).write(to: url) }
+                    try? files.removeItem(at: url)
+                }
+                for url in (try? files.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [] {
+                    try? files.removeItem(at: url)
+                }
             }
-            try? FileManager.default.removeItem(at: item)
-        }
-    }
-
-    /// Overwrites every file under `root` (up to 64 MB each; larger ones are only deleted, so the wipe isn't held
-    /// up) and deletes everything in it.
-    private nonisolated static func scrub(folder root: URL) {
-        let files = FileManager.default
-        if let walker = files.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey]) {
-            for case let url as URL in walker {
-                guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
-                      values.isRegularFile == true else { continue }
-                if let size = values.fileSize, size > 0, size <= 64_000_000 { try? Data.random(size).write(to: url) }
-                try? files.removeItem(at: url)
-            }
-        }
-        for url in (try? files.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [] {
-            try? files.removeItem(at: url)
         }
     }
 

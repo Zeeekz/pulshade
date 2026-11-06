@@ -15,7 +15,7 @@ struct LeaveView: View {
                     LeaveOption(symbol: "lock.fill", color: Ink.dim, title: "Lock",
                                 detail: "Close PULSHADE now. Your passcode opens it again.") { model.lock() }
                     LeaveOption(symbol: "person.crop.circle.badge.minus", color: .orange, title: "Detach",
-                                detail: "Wipes this device at once, with no questions: everything on it is overwritten and PULSHADE starts fresh. Nothing is sent, so your other devices keep the account. \(model.data.security.keepBackup ? "Your recovery code brings back your profile, contacts and groups from the sealed backup (\(model.backupStatus.lowercased())), never your chats." : "Backups are off, so nothing comes back from the relay.")") { model.wipeNow() }
+                                detail: "Wipes this device at once, with no questions: everything on it is overwritten and PULSHADE starts fresh. Nothing is sent, so your other devices keep the account.") { model.wipeNow() }
                     if model.activePersona != nil {
                         LeaveOption(symbol: "flame", color: .red, title: "Burn persona",
                                     detail: "Delete \(model.activeProfile.displayName) for good. Your main identity and other personas aren't touched.") { burningPersona = true }
@@ -76,8 +76,6 @@ struct BurnSheet: View {
     @State private var confirm = ""
     @State private var working = false
     @State private var problem: String?
-    /// The relay couldn't be reached: offers to burn this device alone.
-    @State private var offline = false
 
     var body: some View {
         SheetBody(width: 460) {
@@ -94,31 +92,20 @@ struct BurnSheet: View {
                 }
                 BurnConfirmField(confirm: $confirm)
                 if let problem {
-                    ProblemText(problem)
+                    Text(branded: problem).font(.system(size: 13, weight: .medium)).foregroundStyle(.orange)
                 }
-                BurnButton(working: working, enabled: confirm == "BURN", action: { burn() })
-                if offline {
-                    Text("Or wipe only this device now. The relay's copy of your backup then stays there, opens only with your recovery code, and is erased within 180 days. Your @handles aren't retired and your contacts aren't told.")
-                        .font(.system(size: 13)).foregroundStyle(Ink.dim)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Button("Burn this device only") { burn(deviceOnly: true) }
-                        .disabled(working || confirm != "BURN")
-                }
+                BurnButton(working: working, enabled: confirm == "BURN", action: burn)
             }
         }
     }
 
-    private func burn(deviceOnly: Bool = false) {
+    private func burn() {
         working = true
         problem = nil
         Task {
             do {
-                try await model.burn(thisDeviceOnly: deviceOnly)
-            } catch AppModel.LeaveError.backupNotRemoved {
-                offline = false
-                problem = "Your saved backup couldn't be removed from the relay, so nothing was burned. Try again."
+                try await model.burn()
             } catch {
-                offline = true
                 problem = "Can't reach the relay, so nothing was burned yet. Check your connection and try again."
             }
             working = false
@@ -156,7 +143,7 @@ struct PersonaBurnSheet: View {
                 }
                 BurnConfirmField(confirm: $confirm)
                 if let problem {
-                    ProblemText(problem)
+                    Text(branded: problem).font(.system(size: 13, weight: .medium)).foregroundStyle(.orange)
                 }
                 BurnButton(working: working, enabled: confirm == "BURN", action: burn)
             }
@@ -206,7 +193,7 @@ struct LockedLeaveSheet: View {
                     BurnConfirmField(confirm: $confirm)
                 }
                 if let problem {
-                    ProblemText(problem)
+                    Text(branded: problem).font(.system(size: 13, weight: .medium)).foregroundStyle(.orange)
                 }
                 if burning {
                     BurnButton(working: working, enabled: confirm == "BURN" && !code.isEmpty, action: leave)
@@ -227,8 +214,6 @@ struct LockedLeaveSheet: View {
                 try await model.leaveFromLock(burning: burning, recoveryCode: code)
             } catch AppModel.LeaveError.wrongRecoveryCode {
                 problem = "That isn't the recovery code of the account on this device"
-            } catch AppModel.LeaveError.backupNotRemoved {
-                problem = "Your saved backup couldn't be removed from the relay, so nothing was burned. Try again."
             } catch {
                 problem = "Can't reach the relay. Check your connection and try again."
             }

@@ -53,8 +53,7 @@ struct CallCrypto {
         let bytes = Data(packet)
         guard bytes.count >= 9 + 16, let kind = Kind(rawValue: bytes[0]) else { return nil }
         let n = bytes[1..<9].reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
-        // Compared without adding to the packet's own number, which could be made large enough to overflow.
-        guard n >= newest || newest - n < 100, !seen.contains(n),
+        guard n + 100 > newest, !seen.contains(n),
               let box = try? ChaChaPoly.SealedBox(nonce: Self.nonce(n), ciphertext: bytes[9..<(bytes.count - 16)],
                                                    tag: bytes[(bytes.count - 16)...]),
               let padded = try? ChaChaPoly.open(box, using: receiveKey, authenticating: bytes[0..<9]), padded.count >= 2
@@ -64,7 +63,7 @@ struct CallCrypto {
         let body = Data(padded.dropFirst(2).prefix(length))
         seen.insert(n)
         newest = max(newest, n)
-        if seen.count > 400 { seen = seen.filter { $0 >= newest || newest - $0 < 200 } }
+        if seen.count > 400 { seen = seen.filter { $0 + 200 > newest } }
         return (kind, body)
     }
 }
@@ -225,10 +224,6 @@ final class CallAudio: @unchecked Sendable {
     /// Buffers handed to the player and not yet played, so the delay never builds up.
     private var queued = 0
     private var restarter: NSObjectProtocol?
-    private var routeWatcher: NSObjectProtocol?
-    /// Loudspeaker (iPhone) rather than the earpiece. The system forgets the override whenever the audio route
-    /// changes or echo cancelling comes on, so it's kept here and applied again each time.
-    private var speaker = false
     var muted = false
 
     init?(onPacket: @escaping (Data) -> Void) {
@@ -268,14 +263,6 @@ final class CallAudio: @unchecked Sendable {
         // The system can stop the engine mid-call (a route change, say). Start it again.
         restarter = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine,
                                                            queue: nil) { [weak self] _ in self?.resume() }
-        #if os(iOS)
-        // A route change (Bluetooth, headphones, echo cancelling settling) can put the sound back on the earpiece.
-        routeWatcher = NotificationCenter.default.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil,
-                                                              queue: nil) { [weak self] note in
-            let reason = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt).flatMap(AVAudioSession.RouteChangeReason.init)
-            if reason != .override { self?.applyRoute() }
-        }
-        #endif
         resume()
     }
 
@@ -291,14 +278,11 @@ final class CallAudio: @unchecked Sendable {
             return
         }
         player.play()
-        applyRoute()
     }
 
     func stop() {
         if let restarter { NotificationCenter.default.removeObserver(restarter) }
         restarter = nil
-        if let routeWatcher { NotificationCenter.default.removeObserver(routeWatcher) }
-        routeWatcher = nil
         engine.inputNode.removeTap(onBus: 0)
         player.stop()
         engine.stop()
@@ -308,19 +292,8 @@ final class CallAudio: @unchecked Sendable {
     }
 
     func setSpeaker(_ on: Bool) {
-        lock.withLock { speaker = on }
-        applyRoute()
-    }
-
-    private func applyRoute() {
         #if os(iOS)
-        let on = lock.withLock { speaker }
-        let session = AVAudioSession.sharedInstance()
-        // Only touch the route when it isn't already what was asked for, so this can't loop on its own change.
-        let onSpeaker = session.currentRoute.outputs.contains { $0.portType == .builtInSpeaker }
-        let toBuiltIn = session.currentRoute.outputs.allSatisfy { [.builtInSpeaker, .builtInReceiver].contains($0.portType) }
-        guard toBuiltIn, onSpeaker != on else { return }
-        try? session.overrideOutputAudioPort(on ? .speaker : .none)
+        try? AVAudioSession.sharedInstance().overrideOutputAudioPort(on ? .speaker : .none)
         #endif
     }
 
@@ -360,8 +333,6 @@ final class CallAudio: @unchecked Sendable {
     }
 
     private func decode(_ packet: Data) -> AVAudioPCMBuffer? {
-        // An empty packet has no bytes to point at.
-        guard !packet.isEmpty else { return nil }
         let compressed = AVAudioCompressedBuffer(format: opus, packetCapacity: 1, maximumPacketSize: packet.count)
         packet.withUnsafeBytes { compressed.data.copyMemory(from: $0.baseAddress!, byteCount: packet.count) }
         compressed.byteLength = UInt32(packet.count)

@@ -88,78 +88,6 @@ struct Aurora: View {
     }
 }
 
-/// The lock screen's wallpaper: slow clouds of the theme's colours drifting over a faint dot grid, the beating
-/// Pulshade mark in the middle and a hint to slide right. Everything on it moves by itself.
-struct LockWallpaper: View {
-    @Environment(\.theme) private var theme
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    /// Taps on the hint, for a Mac or VoiceOver where sliding is awkward.
-    var onOpen: () -> Void = {}
-
-    var body: some View {
-        TimelineView(.animation(minimumInterval: reduceMotion ? 1 : 1 / 30)) { context in
-            let t = reduceMotion ? 0 : context.date.timeIntervalSinceReferenceDate
-            GeometryReader { geo in
-                let w = geo.size.width, h = geo.size.height, reach = max(w, h)
-                ZStack {
-                    Ink.void
-                    ForEach(0..<4, id: \.self) { i in
-                        let k = Double(i)
-                        Circle()
-                            .fill(RadialGradient(colors: [theme.colors[i % theme.colors.count].opacity(0.34 + 0.06 * sin(t * 0.3 + k)), .clear],
-                                                 center: .center, startRadius: 0, endRadius: reach * 0.5))
-                            .frame(width: reach, height: reach)
-                            .position(x: w * (0.5 + 0.40 * sin(t * 0.11 + k * 1.7)), y: h * (0.5 + 0.36 * cos(t * 0.09 + k * 2.3)))
-                    }
-                    DotGrid(spacing: 22)
-                        .mask(RadialGradient(colors: [.white, .white.opacity(0.3), .clear], center: .center,
-                                             startRadius: 0, endRadius: reach * 0.6))
-                        .opacity(0.8)
-                    VStack(spacing: 18) {
-                        PulseMark(size: 110, animated: !reduceMotion)
-                        Text("Pulshade")
-                            .font(.system(size: 30, weight: .bold))
-                            .tracking(1.5)
-                            .foregroundStyle(Ink.text)
-                    }
-                    .position(x: w / 2, y: h * 0.42)
-                    hint(t: t).position(x: w / 2, y: h - 72)
-                }
-            }
-        }
-        .ignoresSafeArea()
-        .overlay(Grain().opacity(0.02).allowsHitTesting(false))
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Pulshade is locked")
-        .accessibilityHint("Slide left to enter your passcode")
-        .accessibilityAddTraits(.isButton)
-        .accessibilityAction { onOpen() }
-    }
-
-    /// "Slide to unlock" with a ripple of light running along its arrows.
-    private func hint(t: Double) -> some View {
-        Button(action: onOpen) {
-            HStack(spacing: 8) {
-                Text("Slide to unlock")
-                    .font(.system(size: 15, weight: .medium))
-                HStack(spacing: -2) {
-                    ForEach(0..<3, id: \.self) { i in
-                        let glow = 0.35 + 0.65 * max(0, sin(t * 3 - Double(2 - i) * 0.7))
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 13, weight: .bold))
-                            .opacity(glow)
-                    }
-                }
-            }
-            .foregroundStyle(Ink.dim)
-            .padding(.horizontal, 20).padding(.vertical, 12)
-            .background(Ink.raised.opacity(0.6), in: .capsule)
-            .overlay(Capsule().strokeBorder(Ink.line))
-        }
-        .buttonStyle(.plain)
-    }
-}
-
 /// A grid of very faint dots, like graph paper in the dark.
 struct DotGrid: View {
     var spacing: CGFloat
@@ -240,7 +168,7 @@ struct Avatar: View {
 
     var body: some View {
         ZStack {
-            if let image, let ns = DecodedImages.image(image) {
+            if let image, let ns = PlatformImage(data: image) {
                 Image(platformImage: ns).resizable().scaledToFill()
             } else {
                 PulseArt(tint: Signature.tint(for: seed, model: model), size: size, symbol: symbol)

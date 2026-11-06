@@ -5,7 +5,7 @@ import PulshadeShared
 
 /// The pages Settings opens, each from a row on the main list.
 enum SettingsPage: String, Hashable {
-    case profile, handles, collectibles, privacy, blocked, notifications, appearance, devices, network, anonymity, account, updates
+    case profile, handles, collectibles, privacy, notifications, appearance, devices, network, anonymity, account, updates
 }
 
 /// Settings, laid out like a phone's own: your profile on top, then a short list of rows,
@@ -30,7 +30,7 @@ struct SettingsView: View {
                                 value: model.activeProfile.handle.map { "@\($0)" } ?? "Private")
                         if Platform.isPhone {
                             RowDivider(inset: 54)
-                            MenuRow(page: .collectibles, symbol: "crown.fill", color: .hex(0xE5383B), title: "Collectibles & Pets",
+                            MenuRow(page: .collectibles, symbol: "crown.fill", color: .hex(0xE5383B), title: "Collectibles",
                                     value: model.activeProfile.badge?.kind?.name)
                         }
                     }
@@ -60,7 +60,7 @@ struct SettingsView: View {
                         }
                     }
                     #endif
-                    SettingsGroup(footer: "Lock closes PULSHADE until your passcode. Detach wipes this device at once, without asking. Burn deletes the account everywhere.") {
+                    SettingsGroup {
                         ActionRow(title: "Lock") { model.lock() }
                         RowDivider()
                         ActionRow(title: "Detach") { model.wipeNow() }
@@ -91,7 +91,6 @@ struct SettingsView: View {
                     case .handles: HandleSettings()
                     case .collectibles: CollectiblesView(inSettings: true)
                     case .privacy: PrivacySettings()
-                    case .blocked: BlockedSettings()
                     case .notifications: NotificationSettings()
                     case .appearance: AppearanceSettings()
                     case .devices: DevicesSettings()
@@ -130,7 +129,7 @@ struct SettingsView: View {
 
     private var anonymityValue: String {
         guard let relay = URL(string: model.data.relay) else { return "Direct" }
-        if Tor.isOnion(relay) && AppData.directRelay == nil { return "Tor" }
+        if Tor.isOnion(relay) { return "Tor" }
         let local = relay.host().map { Invite.isLocal($0.lowercased()) } ?? false
         return model.data.security.tor ? (local ? "Offline" : "Tor") : "Direct"
     }
@@ -267,7 +266,7 @@ private struct SecurityToggle: View {
 
     var body: some View {
         SettingRow(title) {
-            Toggle(title, isOn: Binding(get: { model.data.security[keyPath: key] },
+            Toggle("", isOn: Binding(get: { model.data.security[keyPath: key] },
                                      set: { v in withAnimation(.snappy) { model.updateSecurity { $0[keyPath: key] = v } } }))
                 .toggleStyle(GlowToggleStyle())
         }
@@ -277,7 +276,6 @@ private struct SecurityToggle: View {
 /// A whole-row button, red when it destroys something.
 struct ActionRow: View {
     @Environment(\.theme) private var theme
-    @Environment(\.isEnabled) private var enabled
     var title: String
     var destructive = false
     var action: () -> Void
@@ -287,7 +285,6 @@ struct ActionRow: View {
             Text(title)
                 .font(.system(size: 15))
                 .foregroundStyle(destructive ? Color.red : theme.accent)
-                .opacity(enabled ? 1 : 0.4)
                 .frame(maxWidth: .infinity, minHeight: 50, alignment: .leading)
                 .padding(.horizontal, 16)
                 .contentShape(.rect)
@@ -317,66 +314,6 @@ private struct ChoiceRows<Value: Hashable>: View {
             }
             .buttonStyle(.plain)
         }
-    }
-}
-
-/// A row that opens a small menu of choices, so a short list takes one line instead of one row per choice.
-private struct MenuChoiceRow<Value: Hashable>: View {
-    var title: String
-    var values: [Value]
-    var selected: Value
-    var label: (Value) -> String
-    var choose: (Value) -> Void
-
-    var body: some View {
-        SettingRow(title) {
-            Menu {
-                ForEach(values, id: \.self) { v in
-                    Button { withAnimation(.snappy) { choose(v) } } label: {
-                        if v == selected { Label(label(v), systemImage: "checkmark") } else { Text(label(v)) }
-                    }
-                }
-            } label: {
-                HStack(spacing: 5) {
-                    Text(label(selected)).font(.system(size: 14)).foregroundStyle(Ink.dim)
-                    Image(systemName: "chevron.up.chevron.down").font(.system(size: 10, weight: .semibold)).foregroundStyle(Ink.faint)
-                }
-                .contentShape(.rect)
-            }
-            .menuStyle(.button)
-            .buttonStyle(.plain)
-        }
-    }
-}
-
-/// Long explanations stay out of the way: a small line that opens the full text when tapped.
-private struct LearnMore: View {
-    var title = "How this works"
-    var text: String
-    @State private var open = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Button { withAnimation(.snappy) { open.toggle() } } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "info.circle").font(.system(size: 12))
-                    Text(title).font(.system(size: 12, weight: .medium))
-                    Image(systemName: "chevron.right").font(.system(size: 9, weight: .bold)).rotationEffect(.degrees(open ? 90 : 0))
-                }
-                .foregroundStyle(Ink.dim)
-                .contentShape(.rect)
-            }
-            .buttonStyle(.plain)
-            if open {
-                Text(branded: text)
-                    .font(.system(size: 12)).foregroundStyle(Ink.faint)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .transition(.opacity)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 14)
-        .padding(.top, -14)
     }
 }
 
@@ -439,170 +376,114 @@ private struct ProfileSettings: View {
     @State private var burningPersona = false
 
     private var listed: Bool { model.activeProfile.handle != nil }
-    private static let bioLimit = 120
 
-    private func hint(_ text: String, color: Color) -> some View {
-        Text(text)
-            .font(.system(size: 12, weight: .medium))
-            .foregroundStyle(color)
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 16)
-            .padding(.bottom, 10)
-    }
-
-    /// A labelled row: the label on the left, the field filling the rest.
-    private func fieldRow<Field: View>(_ label: String, top: Bool = false, @ViewBuilder field: () -> Field) -> some View {
-        HStack(alignment: top ? .top : .center, spacing: 12) {
-            Text(label)
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(Ink.faint)
-                .frame(width: 70, alignment: .leading)
-                .padding(.top, top ? 3 : 0)
-            field()
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, top ? 14 : 0)
-        .frame(minHeight: 50)
-    }
-
-    /// Your profile as people you chat with see it, changing as you edit, with the colour picker built in.
-    private var hero: some View {
-        let tint = model.signature("me")
-        return VStack(spacing: 12) {
-            VStack(spacing: -48) {
+    var body: some View {
+        SettingsScreen(title: "Profile") {
+            VStack(spacing: -50) {
                 BannerPicker(image: Binding(get: { model.activeProfile.banner },
                                             set: { v in model.updateProfile { $0.banner = v } }),
                              seed: model.fingerprint)
                 AvatarPicker(image: Binding(get: { model.activeProfile.avatar },
                                             set: { v in model.updateProfile { $0.avatar = v } }),
-                             seed: model.fingerprint, size: 96)
-                    .background(Circle().fill(Ink.base).padding(-5))
-                    .overlay(Circle().strokeBorder(tint, lineWidth: 3).padding(-5))
-                    .shadow(color: tint.opacity(0.5), radius: 22)
+                             seed: model.fingerprint, size: 100)
+                    .background(Circle().fill(Ink.base).padding(-4))
             }
-            VStack(spacing: 4) {
-                Text(name.isEmpty ? "Your name" : name)
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(name.isEmpty ? Ink.faint : Ink.text)
-                if let h = model.activeProfile.handle {
-                    Text("@\(h)").font(.system(size: 13, weight: .bold)).foregroundStyle(tint)
-                }
-                if !bio.isEmpty {
-                    Text(bio)
-                        .font(.system(size: 13)).foregroundStyle(Ink.dim)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: 300)
-                        .padding(.top, 2)
-                }
+            SettingsGroup("Name", footer: "Only people you chat with see your name, picture and banner.") {
+                TextField("", text: $name, prompt: Text("Your name").foregroundStyle(Ink.faint))
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 15))
+                    .foregroundStyle(Ink.text)
+                    .padding(.horizontal, 16)
+                    .frame(minHeight: 50)
+                    .onChange(of: name) { model.updateProfile { $0.name = name.trimmingCharacters(in: .whitespaces) } }
             }
-            .padding(.horizontal, 12)
-            VStack(spacing: 6) {
+            SettingsGroup("Public profile",
+                          footer: listed ? "Anyone can find you by your @handle and send a chat request."
+                                         : "Turn this on to claim a @handle. Otherwise only people you give an invite code can reach you.") {
+                SettingRow("Discoverable") {
+                    Toggle("", isOn: Binding(get: { listed }, set: { on in
+                        if on { claim() } else { Task { await model.unpublishProfile() } }
+                    }))
+                    .toggleStyle(GlowToggleStyle())
+                    .disabled(claiming)
+                }
+                RowDivider()
+                HStack(spacing: 4) {
+                    Text("@").font(.system(size: 15)).foregroundStyle(Ink.faint)
+                    TextField("", text: $handle, prompt: Text("handle").foregroundStyle(Ink.faint))
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 15))
+                        .foregroundStyle(Ink.text)
+                        #if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        #endif
+                        .onSubmit(claim)
+                    if claiming { ProgressView().controlSize(.small) }
+                    if listed && handle == model.activeProfile.handle {
+                        Image(systemName: "checkmark.seal.fill").foregroundStyle(theme.accent)
+                    } else {
+                        Button("Claim", action: claim)
+                            .font(.system(size: 14, weight: .semibold))
+                            .buttonStyle(.plain)
+                            .foregroundStyle(handle.isEmpty ? Ink.faint : theme.accent)
+                            .disabled(handle.isEmpty || claiming)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .frame(minHeight: 50)
+                if let handleProblem {
+                    Text(handleProblem)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 10)
+                }
+                if listed, let mine = model.activeProfile.handle, let me = model.me(model.activePersona) {
+                    RowDivider()
+                    // Carries a check of your key, so it can never open someone else's profile.
+                    ActionRow(title: "Copy profile link") {
+                        copyToClipboard(DirectoryProfile.link(mine, key: me.card.signing))
+                    }
+                }
+                RowDivider()
+                NavigationLink(value: SettingsPage.handles) {
+                    SettingRow("Your handles") {
+                        Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Ink.faint)
+                    }
+                    .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                RowDivider()
+                TextField("", text: $bio, prompt: Text("Bio").foregroundStyle(Ink.faint), axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 15))
+                    .foregroundStyle(Ink.text)
+                    .lineLimit(1...4)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 15)
+                    .onChange(of: bio) { model.updateProfile { $0.bio = String(bio.prefix(160)) } }
+            }
+            ProfileLinksEditor()
+            ProfileNotesEditor()
+            SettingsGroup("Signature colour", footer: "How your messages glow on other people's screens.") {
                 HStack(spacing: 0) {
                     ForEach(Signature.colors.indices, id: \.self) { i in
-                        let on = tint == Signature.colors[i]
+                        let on = model.signature("me") == Signature.colors[i]
                         Button { withAnimation(.snappy) { model.updateProfile { $0.color = i } } } label: {
                             Circle().fill(Signature.colors[i])
                                 .frame(width: 22, height: 22)
                                 .overlay(Circle().strokeBorder(Ink.text, lineWidth: on ? 2 : 0).padding(-4))
-                                .frame(maxWidth: .infinity, minHeight: 40)
+                                .frame(maxWidth: .infinity, minHeight: 50)
                                 .contentShape(.rect)
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel("Signature colour \(i + 1)")
                     }
                 }
-                Text("Your colour: it rings your picture and makes your messages glow on other people's screens.")
-                    .font(.system(size: 11)).foregroundStyle(Ink.faint)
-                    .multilineTextAlignment(.center)
+                .padding(.horizontal, 8)
             }
-            .padding(.top, 4)
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity)
-        .glass(14)
-    }
-
-    var body: some View {
-        SettingsScreen(title: "Profile") {
-            hero
-            SettingsGroup("About you", footer: "Only people you chat with see your name, picture and banner.") {
-                fieldRow("Name") {
-                    TextField("", text: $name, prompt: Text("Your name").foregroundStyle(Ink.faint))
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 15))
-                        .foregroundStyle(Ink.text)
-                        .onChange(of: name) { model.updateProfile { $0.name = name.trimmingCharacters(in: .whitespaces) } }
-                }
-                RowDivider()
-                fieldRow("Username") {
-                    HStack(spacing: 4) {
-                        Text("@").font(.system(size: 15)).foregroundStyle(Ink.faint)
-                        TextField("", text: $handle, prompt: Text("username").foregroundStyle(Ink.faint))
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 15))
-                            .foregroundStyle(Ink.text)
-                            #if os(iOS)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            #endif
-                            .onSubmit(claim)
-                        if claiming { ProgressView().controlSize(.small) }
-                        if listed && handle == model.activeProfile.handle {
-                            Image(systemName: "checkmark.seal.fill").foregroundStyle(theme.accent)
-                        } else {
-                            Button("Claim", action: claim)
-                                .font(.system(size: 14, weight: .semibold))
-                                .buttonStyle(.plain)
-                                .foregroundStyle(handle.isEmpty ? Ink.faint : theme.accent)
-                                .disabled(handle.isEmpty || claiming)
-                        }
-                    }
-                }
-                if let handleProblem {
-                    hint(handleProblem, color: .orange)
-                } else if !handle.isEmpty && handle != model.activeProfile.handle {
-                    hint("If you set a username you become discoverable: people can find you by it and send a chat request.", color: Ink.faint)
-                } else if listed {
-                    hint("Anyone can find you by @\(model.activeProfile.handle ?? "") and send a chat request.", color: Ink.faint)
-                }
-                RowDivider()
-                fieldRow("Bio", top: true) {
-                    VStack(alignment: .trailing, spacing: 2) {
-                        TextField("", text: $bio, prompt: Text("A line about you").foregroundStyle(Ink.faint), axis: .vertical)
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 15))
-                            .foregroundStyle(Ink.text)
-                            .lineLimit(1...3)
-                            .onChange(of: bio) {
-                                if bio.count > Self.bioLimit { bio = String(bio.prefix(Self.bioLimit)) }
-                                model.updateProfile { $0.bio = bio }
-                            }
-                        Text("\(bio.count) / \(Self.bioLimit)")
-                            .font(.system(size: 11)).monospacedDigit()
-                            .foregroundStyle(bio.count >= Self.bioLimit ? Color.orange : Ink.faint)
-                    }
-                }
-            }
-            SettingsGroup("Discoverability") {
-                if listed, let mine = model.activeProfile.handle, let me = model.me(model.activePersona) {
-                    // Carries a check of your key, so it can never open someone else's profile.
-                    ActionRow(title: "Copy profile link") {
-                        copyToClipboard(DirectoryProfile.link(mine, key: me.card.signing))
-                    }
-                    RowDivider()
-                    ActionRow(title: "Stop being discoverable") { Task { await model.unpublishProfile() } }
-                    RowDivider()
-                }
-                NavigationLink(value: SettingsPage.handles) {
-                    SettingRow("Your handles", symbol: "at") {
-                        Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Ink.faint)
-                    }
-                    .contentShape(.rect)
-                }
-                .buttonStyle(.plain)
-            }
-            PinnedEditor()
             if let id = model.activePersona {
                 SettingsGroup(footer: "Burning this persona deletes it for good. Your main identity and other personas aren't touched.") {
                     ActionRow(title: "Burn persona", destructive: true) { burningPersona = true }
@@ -613,7 +494,7 @@ private struct ProfileSettings: View {
         .onChange(of: model.activePersona, initial: true) {
             name = model.activeProfile.name
             handle = model.activeProfile.handle ?? ""
-            bio = String((model.activeProfile.bio ?? "").prefix(Self.bioLimit))
+            bio = model.activeProfile.bio ?? ""
         }
     }
 
@@ -686,7 +567,7 @@ private struct HandleSettings: View {
             HStack {
                 Text("\(used) of \(AppModel.maxHandles) used").font(.system(size: 13)).foregroundStyle(Ink.faint)
                 Spacer()
-                if let problem { ProblemText(problem) }
+                if let problem { Text(problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange) }
             }
             .padding(.horizontal, 14)
         }
@@ -769,7 +650,6 @@ private struct HandleSettings: View {
 
 private struct PrivacySettings: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.theme) private var theme
     @State private var biometrics = false
     @State private var settingUp: DisguiseKind?
     @State private var confirmRemove: DisguiseKind?
@@ -777,11 +657,11 @@ private struct PrivacySettings: View {
     var body: some View {
         SettingsScreen(title: "Privacy & Security") {
             SettingsGroup("Lock", footer: model.biometricsBlocked
-                          ? "\(Vault.biometryName) is off while a decoy or panic passcode is set."
+                          ? "\(Vault.biometryName) is off while a decoy or panic passcode is set: it would open your account without asking which."
                           : nil) {
                 if Vault.biometricsAvailable {
                     SettingRow("Unlock with \(Vault.biometryName)") {
-                        Toggle("Unlock with \(Vault.biometryName)", isOn: Binding(get: { biometrics }, set: { on in
+                        Toggle("", isOn: Binding(get: { biometrics }, set: { on in
                             model.setBiometrics(on)
                             withAnimation(.snappy) { biometrics = model.biometricsOn }
                         }))
@@ -790,16 +670,18 @@ private struct PrivacySettings: View {
                     }
                     RowDivider()
                 }
-                MenuChoiceRow(title: "Auto-lock", values: [1, 5, 15, 0], selected: model.data.security.autoLockMinutes,
-                              label: { $0 == 0 ? "Never" : $0 == 1 ? "1 minute" : "\($0) minutes" }) { m in
-                    model.updateSecurity { $0.autoLockMinutes = m }
-                }
-                RowDivider()
                 SecurityToggle(title: Platform.isPhone ? "Hide in app switcher" : "Blur when in background", key: \.blurWhenInactive)
                 RowDivider()
                 SecurityToggle(title: "Block screenshots & recording", key: \.blockCapture)
             }
-            SettingsGroup("Messages") {
+            SettingsGroup("Auto-lock", footer: "Locks PULSHADE after this long without use.") {
+                ChoiceRows(values: [1, 5, 15, 0], selected: model.data.security.autoLockMinutes,
+                           label: { $0 == 0 ? "Never" : $0 == 1 ? "After 1 minute" : "After \($0) minutes" }) { m in
+                    model.updateSecurity { $0.autoLockMinutes = m }
+                }
+            }
+            SettingsGroup("Messages",
+                          footer: "To make a link preview, your device visits the website over Tor, on a circuit of its own, so the website never sees your IP address (with Tor off, it does). People receiving it never contact the website. Receipts are sent a little later, together, so their timing gives nothing away. With read receipts or story views off you won't see other people's either, and one-time chats never send them. Online status shows a green dot while you have PULSHADE open. It goes only to contacts you've accepted who have it on too, never from a burner, and you see theirs only if you show yours. The relay can't read it, but it can see when it goes out and to whom, and switching persona shows it that two personas share a device, so it's off until you turn it on.") {
                 SecurityToggle(title: "Link previews", key: \.linkPreviews)
                 RowDivider()
                 SecurityToggle(title: "Delivery receipts", key: \.deliveryReceipts)
@@ -812,40 +694,27 @@ private struct PrivacySettings: View {
                 RowDivider()
                 SecurityToggle(title: "Story views", key: \.storyViews)
             }
-            LearnMore(title: "What these do",
-                      text: "Link previews are made on your device over Tor, on a circuit of their own, so the website never sees your IP address (with Tor off, it does). People receiving the message never contact the website. Receipts are sent a little later, together, so their timing gives nothing away. With read receipts or story views off you won't see other people's either, and one-time chats never send them. Online status shows a green dot while you have PULSHADE open. It goes only to accepted contacts who have it on too, never from a burner, and you see theirs only if you show yours. The relay can't read it, but it can see when it goes out and to whom, and switching persona shows it that two personas share a device, so it's off until you turn it on.")
-            SettingsGroup("People & disguise", footer: "A decoy passcode opens an empty PULSHADE. A panic passcode erases everything, then does the same.") {
-                NavigationLink(value: SettingsPage.blocked) {
-                    SettingRow("Blocked") {
-                        Text(model.data.blocked.isEmpty ? "Nobody" : "\(model.data.blocked.count)")
-                            .font(.system(size: 14)).foregroundStyle(Ink.faint)
-                        Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Ink.faint)
+            SettingsGroup("Blocked",
+                          footer: "Anything blocked people send is dropped without telling them. Unblocking lets them send you a new request; your old chat doesn't come back.") {
+                if model.data.blocked.isEmpty {
+                    SettingRow("Nobody") { EmptyView() }
+                } else {
+                    ForEach(Array(model.data.blocked.enumerated()), id: \.element) { i, fp in
+                        if i > 0 { RowDivider() }
+                        SettingRow(model.data.blockedNames[fp] ?? "Unknown · \(fp.prefix(8))") {
+                            Button("Unblock") { model.unblock(fp) }
+                                .buttonStyle(.plain)
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(model.theme.accent)
+                        }
                     }
-                    .contentShape(.rect)
                 }
-                .buttonStyle(.plain)
-                RowDivider()
+            }
+            SettingsGroup("Disguise",
+                          footer: "A decoy passcode opens an empty PULSHADE. A panic passcode silently erases everything, then does the same.") {
                 disguiseRow(.decoy, title: "Decoy passcode", isSet: model.hasDecoy)
                 RowDivider()
                 disguiseRow(.panic, title: "Panic passcode", isSet: model.hasPanic)
-            }
-            SettingsGroup("Backup", footer: "A sealed copy of your profile, contacts, groups, @handles and settings (never chats) is kept on the relay and saved again a few minutes after something changes. Only your recovery code can open it, so the relay can't. Detach wipes this device at once, and your recovery code brings the copy back. Off erases it from the relay.") {
-                SettingRow("Keep a sealed backup") {
-                    Toggle("Keep a sealed backup", isOn: Binding(get: { model.data.security.keepBackup },
-                                             set: { v in withAnimation(.snappy) { model.setKeepBackup(v) } }))
-                        .toggleStyle(GlowToggleStyle())
-                }
-                if model.data.security.keepBackup {
-                    RowDivider()
-                    SettingRow("Last saved") {
-                        Text(model.backupStatus).font(.system(size: 14)).foregroundStyle(Ink.faint)
-                    }
-                }
-            }
-            SettingsGroup {
-                MenuRow(page: .anonymity, symbol: "eye.slash.fill", color: .hex(0x64D2FF), title: "Anonymity Report")
-                RowDivider(inset: 54)
-                MenuRow(page: .network, symbol: "antenna.radiowaves.left.and.right", color: .hex(0x30D158), title: "Network & Tor")
             }
         }
         .onAppear { biometrics = model.biometricsOn }
@@ -866,33 +735,7 @@ private struct PrivacySettings: View {
             }
             .font(.system(size: 14, weight: .semibold))
             .buttonStyle(.plain)
-            .foregroundStyle(isSet ? Ink.dim : theme.accent)
-        }
-    }
-}
-
-// MARK: - Blocked
-
-private struct BlockedSettings: View {
-    @Environment(AppModel.self) private var model
-
-    var body: some View {
-        SettingsScreen(title: "Blocked", back: "Privacy") {
-            SettingsGroup(footer: "Anything blocked people send is dropped without telling them. Unblocking lets them send you a new request; your old chat doesn't come back.") {
-                if model.data.blocked.isEmpty {
-                    SettingRow("Nobody") { EmptyView() }
-                } else {
-                    ForEach(Array(model.data.blocked.enumerated()), id: \.element) { i, fp in
-                        if i > 0 { RowDivider() }
-                        SettingRow(model.data.blockedNames[fp] ?? "Unknown · \(fp.prefix(8))") {
-                            Button("Unblock") { model.unblock(fp) }
-                                .buttonStyle(.plain)
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(model.theme.accent)
-                        }
-                    }
-                }
-            }
+            .foregroundStyle(isSet ? Ink.dim : Color.accentColor)
         }
     }
 }
@@ -905,45 +748,47 @@ private struct NotificationSettings: View {
 
     var body: some View {
         let on = model.data.security.notifications
-        let security = model.data.security
         SettingsScreen(title: "Notifications") {
-            SettingsGroup(footer: on && security.notificationContent != .hidden
-                          ? "The system keeps notification text outside PULSHADE's encryption." : nil) {
+            SettingsGroup {
                 SecurityToggle(title: "Notifications", key: \.notifications)
                 if on {
                     RowDivider()
-                    MenuChoiceRow(title: "Show in notifications", values: Array(NotificationContent.allCases),
-                                  selected: security.notificationContent, label: \.label) { option in
+                    SecurityToggle(title: "Sound", key: \.notificationSound)
+                }
+            }
+            if on && model.data.security.notificationSound {
+                SettingsGroup("Message tone", footer: "The sound a new message makes, on a locked iPhone too.") {
+                    ChoiceRows(values: MessageTone.allCases, selected: model.data.security.messageTone, label: \.label) { tone in
+                        model.updateSecurity { $0.messageTone = tone }
+                        tone.play()
+                    }
+                }
+            }
+            if on {
+                SettingsGroup("Show in notifications",
+                              footer: model.data.security.notificationContent == .hidden
+                                  ? "Notifications only say \"New message\"."
+                                  : "The system saves notification text in its own database, outside PULSHADE's encryption, and may keep it after PULSHADE clears the notification.") {
+                    ChoiceRows(values: NotificationContent.allCases, selected: model.data.security.notificationContent,
+                               label: \.label) { option in
                         model.updateSecurity { $0.notificationContent = option }
                     }
-                    RowDivider()
-                    SecurityToggle(title: "Sound", key: \.notificationSound)
-                    if security.notificationSound {
-                        RowDivider()
-                        MenuChoiceRow(title: "Message tone", values: Array(MessageTone.allCases),
-                                      selected: security.messageTone, label: \.label) { tone in
-                            model.updateSecurity { $0.messageTone = tone }
-                            tone.play()
-                        }
-                    }
-                    #if os(iOS)
-                    RowDivider()
-                    SecurityToggle(title: "Wake when locked", key: \.pushWake)
-                    #endif
                 }
             }
             #if os(iOS)
             if on {
-                LearnMore(title: "About waking a locked iPhone",
-                          text: "Lets the relay wake this iPhone through Apple when mail arrives, so you hear about it while the phone is locked. The wake-up only says \"New message\". Apple learns that your iPhone was woken, and when, and the relay keeps its push token. Turned off, you only hear about messages while PULSHADE is open. Only your main identity is covered.")
+                SettingsGroup("When locked",
+                              footer: "Lets the relay wake this iPhone through Apple when mail arrives, so you hear about it while the phone is locked. The wake-up only says \"New message\". Apple learns that your iPhone was woken, and when, and the relay keeps its push token. Turned off, you only hear about messages while PULSHADE is open. Only your main identity is covered.") {
+                    SecurityToggle(title: "Wake when locked", key: \.pushWake)
+                }
             }
             #endif
             #if os(macOS)
-            SettingsGroup("Mac") {
+            SettingsGroup("Mac", footer: "Keeps PULSHADE, and its menu bar icon, running from when you log in.") {
                 SecurityToggle(title: "Menu bar icon", key: \.menuBarIcon)
                 RowDivider()
                 SettingRow("Open at login") {
-                    Toggle("Open at login", isOn: Binding(get: { loginItem }, set: { on in
+                    Toggle("", isOn: Binding(get: { loginItem }, set: { on in
                         LoginItem.set(on)
                         loginItem = LoginItem.enabled
                     }))
@@ -1056,7 +901,7 @@ private struct NetworkSettings: View {
             }
             SettingsGroup("Tor", footer: torFooter) {
                 SettingRow("Connect over Tor") {
-                    Toggle("Connect over Tor", isOn: Binding(get: { torLocked || model.data.security.tor },
+                    Toggle("", isOn: Binding(get: { torLocked || model.data.security.tor },
                                              set: { v in
                                                  // Switching it off asks first: it's a step down that can't be undone for what the relay sees.
                                                  if !v && model.data.security.tor { confirmTorOff = true; return }
@@ -1293,14 +1138,14 @@ private struct UpdateSettings: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(16)
                     RowDivider()
-                    ActionRow(title: "Install and restart") {
+                    ActionRow(title: "Install and Restart") {
                         guard let client = model.client(nil, lane: "update") else { return }
                         Task { await updater.install(client) }
                     }
                 }
             }
             SettingsGroup {
-                ActionRow(title: "Check for updates") {
+                ActionRow(title: "Check for Updates") {
                     guard let client = model.client(nil, lane: "update") else { return }
                     Task { await updater.check(client) }
                 }
@@ -1400,8 +1245,7 @@ private struct ThemeCard: View {
     }
 }
 
-/// A glowing pill switch that matches the theme. It draws only the switch: the row beside it shows the title,
-/// and the toggle's own label names it for VoiceOver.
+/// A glowing pill switch that matches the theme.
 struct GlowToggleStyle: ToggleStyle {
     @Environment(\.theme) private var theme
 
@@ -1419,9 +1263,7 @@ struct GlowToggleStyle: ToggleStyle {
                 .animation(.snappy(duration: 0.3), value: configuration.isOn)
         }
         .buttonStyle(.plain)
-        .accessibilityLabel { _ in configuration.label }
         .accessibilityValue(configuration.isOn ? "On" : "Off")
-        .accessibilityAddTraits(.isToggle)
     }
 }
 
@@ -1451,7 +1293,7 @@ private struct DisguiseSetup: View {
                 Image(systemName: kind == .decoy ? "theatermasks" : "flame")
                     .font(.system(size: 52, weight: .light))
                     .foregroundStyle(kind == .decoy ? AnyShapeStyle(theme.gradient) : AnyShapeStyle(Color.orange))
-                    .symbolEffect(.pulse, isActive: !Platform.reduceMotion)
+                    .symbolEffect(.pulse)
                 Text(branded: kind == .decoy
                      ? "Opens an empty PULSHADE with your name and theme. Your real chats stay hidden."
                      : "Silently erases your real identity and chats, then opens an empty PULSHADE. This can't be undone.")
@@ -1469,7 +1311,7 @@ private struct DisguiseSetup: View {
                         .modifier(Shake(trigger: shake))
                 }
                 if let problem {
-                    ProblemText(problem)
+                    Text(branded: problem).font(.system(size: 11, weight: .semibold)).foregroundStyle(.orange)
                 }
                 Button(action: save) {
                     if working { ProgressView().controlSize(.small).tint(Ink.onAccent) } else { Image(systemName: "checkmark") }

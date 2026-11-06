@@ -20,8 +20,6 @@ public struct CollectibleIcon: View {
         case .bonfire: BonfireArt().frame(width: size, height: size)
         case .christmasTree: ChristmasTreeArt().frame(width: size, height: size)
         case .bitcoin: BitcoinArt().frame(width: size, height: size)
-        case .winnie: WinnieArt().frame(width: size, height: size)
-        case .honeyJar: HoneyJarArt().frame(width: size, height: size)
         case .pulze: DragonStill(size: size)
         case .goldPulze: DragonStill(size: size, golden: true)
         case .guardian: GuardianArt().frame(width: size, height: size)

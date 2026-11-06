@@ -21,8 +21,6 @@ struct PulshadeApp: App {
         #if os(macOS)
         NSApplication.shared.setActivationPolicy(.regular)
         #endif
-        // Whatever a crash or a quit left of a clip is overwritten and deleted before anything else.
-        TempFiles.sweep()
         // Set early so taps on notifications are handled even right after launch.
         Notifier.shared.attach()
         #if os(iOS)

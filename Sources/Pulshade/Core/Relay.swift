@@ -566,32 +566,17 @@ struct RelayClient {
 
     enum BackupError: Error { case unreachable, refused }
 
-    func putBackup(_ blob: Data, key: Data, sig: Data, ts: UInt64, forgetHash: Data? = nil) async throws {
+    func putBackup(_ blob: Data, key: Data, sig: Data, ts: UInt64) async throws {
         var request = URLRequest(url: base.appending(path: "v1/backup/\(key.hex)"))
         request.httpMethod = "PUT"
         request.timeoutInterval = 120
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         request.setValue(sig.base64EncodedString(), forHTTPHeaderField: "X-Pulshade-Sig")
         request.setValue(String(ts), forHTTPHeaderField: "X-Pulshade-Ts")
-        // A hash of the delete-only token the panic passcode holds; the relay keeps it beside the backup.
-        if let forgetHash { request.setValue(forgetHash.hex, forHTTPHeaderField: "X-Pulshade-Forget") }
         await prove(&request, "backup|\(key.hex)")
         guard let (_, response) = try? await load(request, body: blob),
               let status = (response as? HTTPURLResponse)?.statusCode else { throw BackupError.unreachable }
         guard (200..<300).contains(status) else { throw BackupError.refused }
-    }
-
-    /// Erases a backup with its delete-only token. The answer's status: 204 done, 410 nothing there, 401 not this
-    /// token; anything else (or an error) means try again later.
-    func forgetBackup(key: Data, token: Data) async throws -> Int {
-        struct Body: Encodable { var token: String }
-        var request = URLRequest(url: base.appending(path: "v1/backup/\(key.hex)/forget"))
-        request.httpMethod = "POST"
-        request.timeoutInterval = 60
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        guard let (_, response) = try? await load(request, body: try JSONEncoder().encode(Body(token: token.hex))),
-              let status = (response as? HTTPURLResponse)?.statusCode else { throw BackupError.unreachable }
-        return status
     }
 
     /// Nil when there's no backup under this key.

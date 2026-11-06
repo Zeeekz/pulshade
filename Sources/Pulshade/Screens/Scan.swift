@@ -46,7 +46,7 @@ struct ScanSheet: View {
                     .frame(width: 260, height: 260)
                     .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(theme.accent.opacity(scanning ? 0.6 : 0.2), lineWidth: 1.5))
                     if let problem {
-                        ProblemText(problem)
+                        Text(branded: problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange)
                             .multilineTextAlignment(.center)
                     }
                     Text("Point it at the code on a new device you're logging in to, or at a friend's invite.")

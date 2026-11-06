@@ -154,7 +154,7 @@ struct ConversationView: View {
         case .direct: "End-to-end encrypted"
         case .group: "\(c.members.count + 1) members"
         case .channel where c.isAnnouncements: "@\(Announcement.handle) · Official"
-        case .channel: c.amAdmin ? counted(model.followers(of: c).count, "follower") : "Channel"
+        case .channel: c.amAdmin ? "\(model.followers(of: c).count) followers" : "Channel"
         case .broadcast: "Broadcast to \(c.members.count)"
         }
     }
@@ -938,7 +938,7 @@ private struct RecordingBar: View {
                 .buttonStyle(IconButtonStyle(size: 42))
                 .accessibilityLabel("Cancel recording")
             Circle().fill(.red).frame(width: 10, height: 10)
-                .phaseAnimator(Platform.reduceMotion ? [1.0] : [1.0, 0.3]) { v, o in v.opacity(o) } animation: { _ in .easeInOut(duration: 0.6) }
+                .phaseAnimator([1.0, 0.3]) { v, o in v.opacity(o) } animation: { _ in .easeInOut(duration: 0.6) }
             Waveform(levels: Array(recorder.levels.suffix(60)), progress: 1, color: theme.accent)
                 .frame(height: 30)
                 .animation(.linear(duration: 0.1), value: recorder.levels.count)
@@ -974,7 +974,7 @@ private struct TypingDots: View {
                 HStack(spacing: 4) {
                     ForEach(0..<3) { i in
                         Circle().fill(theme.gradient).frame(width: 7, height: 7)
-                            .phaseAnimator(Platform.reduceMotion ? [0.0] : [0.0, -5.0, 0.0]) { v, y in v.offset(y: y) } animation: { _ in
+                            .phaseAnimator([0.0, -5.0, 0.0]) { v, y in v.offset(y: y) } animation: { _ in
                                 .easeInOut(duration: 0.35).delay(Double(i) * 0.12)
                             }
                     }
@@ -1064,7 +1064,7 @@ struct LinkBadge: View {
         let online = model.link == .online
         HStack(spacing: 7) {
             ZStack {
-                if online, !Platform.reduceMotion {
+                if online {
                     Circle().fill(theme.accent).frame(width: 8, height: 8)
                         .phaseAnimator([1.0, 2.6]) { v, s in v.scaleEffect(s).opacity(2.8 - s) } animation: { _ in .easeOut(duration: 1.4) }
                 }
@@ -1078,9 +1078,7 @@ struct LinkBadge: View {
         .padding(.horizontal, 11).frame(height: 30)
         .glass(15)
         .animation(.smooth, value: online)
-        .help(online ? "Connected to the relay" : "Relay unreachable. Messages wait, sealed, on this \(Platform.isPhone ? "iPhone" : "Mac").")
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(online ? "Connected to the relay" : "Relay unreachable")
+        .help(online ? "Connected to the relay" : "Relay unreachable. Messages wait, sealed, on this Mac.")
     }
 }
 
@@ -1102,11 +1100,8 @@ private struct ConversationInfo: View {
     @State private var confirmDelete = false
     @State private var confirmRemove = false
     @State private var confirmBlock = false
-    @State private var pending: Pending?
     @State private var reporting: ReportSubject?
     @State private var adding = false
-    /// Flips on as the sheet opens, so the profile eases in instead of just appearing.
-    @State private var arrived = false
 
     var body: some View {
         if let c = model.conversation(id) {
@@ -1137,10 +1132,6 @@ private struct ConversationInfo: View {
                         actions(c)
                     }
                     .padding(20)
-                    .confirms($pending)
-                    .opacity(arrived ? 1 : 0)
-                    .offset(y: arrived ? 0 : 18)
-                    .scaleEffect(arrived ? 1 : 0.96, anchor: .top)
                 }
                 .scrollIndicators(.never)
             }
@@ -1148,7 +1139,6 @@ private struct ConversationInfo: View {
             .background(Ink.base)
             .preferredColorScheme(Ink.scheme)
             .onAppear {
-                withAnimation(.smooth(duration: 0.55).delay(0.08)) { arrived = true }
                 nickname = model.contact(c.members.first ?? "")?.nickname ?? ""
                 title = c.title
                 about = c.about ?? ""
@@ -1262,8 +1252,8 @@ private struct ConversationInfo: View {
         case .direct: "End-to-end encrypted"
         case .group: "Group · \(c.members.count + 1) members"
         case .channel where c.isAnnouncements: "@\(Announcement.handle) · Official"
-        case .channel: c.amAdmin ? "Channel · \(counted(model.followers(of: c).count, "follower"))" : "Channel"
-        case .broadcast: "Broadcast list · \(c.members.count == 1 ? "1 person" : "\(c.members.count) people")"
+        case .channel: c.amAdmin ? "Channel · \(model.followers(of: c).count) followers" : "Channel"
+        case .broadcast: "Broadcast list · \(c.members.count) people"
         }
     }
 
@@ -1273,12 +1263,8 @@ private struct ConversationInfo: View {
 
     private func burnButton(_ persona: UUID) -> some View {
         Button {
-            pending = Pending(title: "Burn this persona now?",
-                              message: "It's deleted for good, with its chats and contacts. Your main identity and other personas aren't touched.",
-                              confirm: "Burn") {
-                dismiss()
-                model.burn(persona)
-            }
+            dismiss()
+            model.burn(persona)
         } label: {
             Label("Burn now", systemImage: "flame.fill")
                 .font(.system(size: 13, weight: .semibold))
@@ -1300,11 +1286,6 @@ private struct ConversationInfo: View {
                         .textFieldStyle(.plain)
                         .multilineTextAlignment(.trailing)
                         .onSubmit { model.rename(fp, to: nickname.trimmingCharacters(in: .whitespaces)) }
-                        // On iPhone the sheet is usually closed without pressing Return.
-                        .onDisappear {
-                            let wanted = nickname.trimmingCharacters(in: .whitespaces)
-                            if wanted != contact.name { model.rename(fp, to: wanted) }
-                        }
                 }
                 Divider().overlay(Ink.line)
                 Button { pulseCheck = true } label: {
@@ -1456,16 +1437,12 @@ private struct ConversationInfo: View {
                     }
                     if c.canRemove(fp, by: "me") {
                         Button("Remove from \(c.kind == .channel ? "channel" : "group")", role: .destructive) {
-                            pending = Pending(title: "Remove \(name) from the \(c.kind == .channel ? "channel" : "group")?", confirm: "Remove") {
-                                model.removeMember(c.id, fp)
-                            }
+                            model.removeMember(c.id, fp)
                         }
                     }
                 } label: {
-                    Image(systemName: "ellipsis").font(.system(size: 12)).foregroundStyle(Ink.faint).frame(width: 30, height: 30)
-                        .contentShape(.rect)
+                    Image(systemName: "ellipsis").font(.system(size: 12)).foregroundStyle(Ink.faint).frame(width: 22, height: 22)
                 }
-                .accessibilityLabel("More for \(name)")
                 .menuStyle(.button)
                 .buttonStyle(.plain)
                 .menuIndicator(.hidden)
@@ -1616,7 +1593,6 @@ struct Field<Trailing: View>: View {
 /// Pick contacts to add to a group or channel.
 private struct AddPeopleSheet: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
     let id: Conversation.ID
     @State private var picked: Set<String> = []
@@ -1645,7 +1621,7 @@ private struct AddPeopleSheet: View {
                                             Text(person.displayName).font(.system(size: 13)).foregroundStyle(Ink.text)
                                             Spacer()
                                             Image(systemName: on ? "checkmark.circle.fill" : "circle")
-                                                .foregroundStyle(on ? AnyShapeStyle(theme.accent) : AnyShapeStyle(Ink.faint))
+                                                .foregroundStyle(on ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Ink.faint))
                                         }
                                         .padding(.horizontal, 10).padding(.vertical, 6)
                                         .background(on ? Ink.raised : .clear, in: .rect(cornerRadius: 8))

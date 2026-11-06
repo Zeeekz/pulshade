@@ -242,7 +242,7 @@ struct CreateFlow: View {
                     StrengthBar(passcode: passcode).padding(.top, 4)
                 }
                 if let problem {
-                    ProblemText(problem)
+                    Text(branded: problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange)
                 }
             }
         } actions: {
@@ -261,7 +261,6 @@ struct CreateFlow: View {
                 // No copy button: clipboards sync between devices and clipboard apps keep history.
                 Text("Write it on paper. It isn't offered for copying, because clipboards sync to other devices and keep history.")
                     .font(.system(size: 12)).foregroundStyle(Ink.faint).multilineTextAlignment(.center)
-                if let problem { ProblemText(problem).multilineTextAlignment(.center) }
             }
         } actions: {
             Button(action: finish) { WorkingLabel(title: "I've saved it", working: working) }
@@ -289,11 +288,7 @@ struct CreateFlow: View {
         working = true
         Task {
             LockStyle.remembered = style
-            do {
-                try await model.create(identity: identity, profile: profile, passcode: passcode)
-            } catch {
-                withAnimation(.snappy) { problem = "Couldn't set up the account on this device. Check there's free space and try again." }
-            }
+            try? await model.create(identity: identity, profile: profile, passcode: passcode)
             working = false
         }
     }
@@ -382,10 +377,10 @@ struct RestoreFlow: View {
                     LookUpProgress(relay: model.data.relay, since: startedAt)
                 }
                 if let problem {
-                    ProblemText(problem)
+                    Text(branded: problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange)
                         .multilineTextAlignment(.center)
                 }
-                Text("If you detached, your profile, @handles, contacts and groups come back. Chats don't: they only ever lived on your devices.")
+                Text("If you logged out, everything comes back: your profile, contacts and chats.")
                     .font(.system(size: 12))
                     .foregroundStyle(Ink.faint)
                     .multilineTextAlignment(.center)
@@ -476,12 +471,6 @@ struct RestoreFlow: View {
                 working = false
                 withAnimation(.snappy) { problem = "Can't reach the relay. Check your connection and try again." }
                 return
-            case .unreadable:
-                // Carrying on would start the account over, and the next backup would replace this one.
-                lookup = nil
-                working = false
-                withAnimation(.snappy) { problem = "A backup is saved for this code, but this version of Pulshade can't open it. Update Pulshade and try again." }
-                return
             case .none:
                 break
             }
@@ -562,70 +551,8 @@ struct UnlockView: View {
     @State private var shake = 0
     @State private var working = false
     @State private var leaving = false
-    /// The wallpaper covers the keypad until it's slid away. `drag` is how far a finger has pulled it: left to open, right to close.
-    @State private var opened = false
-    @State private var drag: CGFloat = 0
 
     var body: some View {
-        GeometryReader { geo in
-            let width = max(geo.size.width, 1)
-            // 0 is the wallpaper, 1 the keypad. A finger moves it either way, so the page follows it both ways.
-            let progress = opened ? 1 - min(max(drag / width, 0), 1) : min(max(-drag / width, 0), 1)
-            ZStack {
-                if progress > 0 {
-                    pad
-                        .opacity(0.25 + 0.75 * progress)
-                        .scaleEffect(0.96 + 0.04 * progress)
-                }
-                LockWallpaper(onOpen: { open() })
-                    .offset(x: -width * progress)
-                    .allowsHitTesting(!opened)
-            }
-            .contentShape(.rect)
-            // Slide left to open the keypad, right to put the wallpaper back. Only sideways drags count, so the
-            // keypad's own buttons and the passcode field keep working.
-            .simultaneousGesture(DragGesture(minimumDistance: 12)
-                .onChanged { v in
-                    guard abs(v.translation.width) > abs(v.translation.height) else { return }
-                    drag = opened ? max(v.translation.width, 0) : min(v.translation.width, 0)
-                }
-                .onEnded { v in
-                    let sideways = abs(v.translation.width) > abs(v.translation.height)
-                    let thrown = v.predictedEndTranslation.width * 0.5
-                    if opened {
-                        let pulled = max(v.translation.width, thrown)
-                        if sideways, pulled > width * 0.25 { close() } else { withAnimation(.snappy) { drag = 0 } }
-                    } else {
-                        let pushed = max(-v.translation.width, -thrown)
-                        if sideways, pushed > width * 0.3 { open() } else { withAnimation(.snappy) { drag = 0 } }
-                    }
-                })
-        }
-        .ignoresSafeArea()
-        .task { model.warmUp() }
-        .onAppear { if model.biometricsOn { unlockWithTouchID() } }
-        .sheet(isPresented: $leaving) { LockedLeaveSheet() }
-        #if os(macOS)
-        .focusable()
-        .focusEffectDisabled()
-        .onKeyPress { _ in
-            guard !opened else { return .ignored }
-            open()
-            return .handled
-        }
-        #endif
-    }
-
-    private func open() {
-        withAnimation(.smooth(duration: 0.4)) { opened = true; drag = 0 }
-    }
-
-    private func close() {
-        passcode = ""
-        withAnimation(.smooth(duration: 0.4)) { opened = false; drag = 0 }
-    }
-
-    private var pad: some View {
         VStack(spacing: 0) {
             Spacer()
             PulseMark(size: 72, animated: true)
@@ -647,6 +574,7 @@ struct UnlockView: View {
             .modifier(Shake(trigger: shake))
             .disabled(working)
             .padding(.top, 28)
+            .task { model.warmUp() }
             if model.dataUnreadable {
                 Text(branded: "That passcode is right, but this account's data couldn't be read, so PULSHADE didn't open it. Nothing on this device was changed. An update to PULSHADE may fix it.")
                     .font(.system(size: 13, weight: .medium))
@@ -692,6 +620,8 @@ struct UnlockView: View {
                 .accessibilityLabel("Burn or detach")
         }
         .onboardingColumn()
+        .onAppear { if model.biometricsOn { unlockWithTouchID() } }
+        .sheet(isPresented: $leaving) { LockedLeaveSheet() }
     }
 
     private func unlockWithTouchID() {
@@ -941,13 +871,12 @@ struct RecoveryCodeGrid: View {
     var code: String
     var body: some View {
         let groups = code.split(separator: " ").map(String.init)
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: 60, maximum: 78), spacing: 10), count: Platform.isPhone ? 4 : 5), spacing: 10) {
+        LazyVGrid(columns: Array(repeating: GridItem(.fixed(Platform.isPhone ? 72 : 78), spacing: 10), count: Platform.isPhone ? 4 : 5), spacing: 10) {
             ForEach(Array(groups.enumerated()), id: \.offset) { i, g in
                 Text(g)
                     .font(.system(size: 15, weight: .semibold, design: .monospaced))
                     .foregroundStyle(Ink.text)
-                    .lineLimit(1).minimumScaleFactor(0.8)
-                    .frame(maxWidth: .infinity, minHeight: 36)
+                    .frame(width: 78, height: 36)
                     .glass(10)
                     .transition(.scale.combined(with: .opacity))
                     .animation(.snappy.delay(Double(i) * 0.03), value: code)

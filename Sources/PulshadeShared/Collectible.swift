@@ -71,8 +71,6 @@ public struct Collectible: Codable, Equatable, Hashable, Identifiable {
         case bonfire = "bonfire"
         case christmasTree = "christmastree"
         case bitcoin = "bitcoin"
-        case winnie = "winnie"
-        case honeyJar = "honeyjar"
         /// Its id is still `greendragon`, from before it was renamed, so any already given out keep counting.
         case pulze = "greendragon"
         case guardian = "guardian"
@@ -89,8 +87,6 @@ public struct Collectible: Codable, Equatable, Hashable, Identifiable {
             case .bonfire: "Bonfire Night"
             case .christmasTree: "Christmas Tree"
             case .bitcoin: "Bitcoin"
-            case .winnie: "Winnie The Pooh"
-            case .honeyJar: "Honey Jar"
             case .pulze: "Pulze The Dragon"
             case .guardian: "Guardian"
             case .goldPulze: "Golden Pulze The Dragon"
@@ -118,8 +114,6 @@ public struct Collectible: Codable, Equatable, Hashable, Identifiable {
             case .bonfire: "A roaring bonfire with fireworks bursting overhead. Remember, remember."
             case .christmasTree: "A Christmas tree with twinkling lights and snow drifting down. Hush now."
             case .bitcoin: "A glossy Bitcoin coin that spins to show its pulse. Number one, or number one hundred."
-            case .winnie: "A silly old bear in a little red jumper, waving hello. Oh, bother."
-            case .honeyJar: "A jar of honey brimming over, with a bee that won't leave it alone. Just a smackerel."
             case .pulze: "A dark blue dragon, crackling with electricity."
             case .guardian: "Awarded to the people who keep Pulshade safe. Earned, never passed on."
             case .goldPulze: "A rare golden dragon, crackling with sparks. Hatched from a dragon egg, and not often."
@@ -143,8 +137,7 @@ public struct Collectible: Codable, Equatable, Hashable, Identifiable {
     public func isGenuine(for owner: Data, adminKey: Data?, petKey: Data? = nil) -> Bool {
         guard kind != nil, self.owner == owner else { return false }
         let message = Self.signedPart(item: item, serial: serial, owner: owner)
-        // The relay's key only counts for what can be hatched or passed on. A Guardian is the admin key's alone.
-        return [adminKey, kind?.transferable == true ? petKey : nil].contains { raw in
+        return [adminKey, petKey].contains { raw in
             guard let raw, let key = try? Curve25519.Signing.PublicKey(rawRepresentation: raw) else { return false }
             return key.isValidSignature(sig, for: message)
         }
