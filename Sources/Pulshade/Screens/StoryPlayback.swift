@@ -144,6 +144,9 @@ private struct FilterSwipe: ViewModifier {
     @Binding var filter: StoryFilter
     /// Off while a pinch or a hold on the shutter has the touch.
     var enabled = true
+    /// Whether a swipe changes the look. The camera turns it off: there a swipe left closes it, and the looks
+    /// come from `FilterStrip`. The keys, VoiceOver and the name flash still work.
+    var swipes = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var shown: StoryFilter?
     @State private var token = UUID()
@@ -153,7 +156,7 @@ private struct FilterSwipe: ViewModifier {
             .contentShape(Rectangle())
             .gesture(DragGesture(minimumDistance: 24).onEnded { drag in
                 let dx = drag.translation.width, dy = drag.translation.height
-                guard enabled, abs(dx) > 48, abs(dx) > abs(dy) * 1.5 else { return }
+                guard enabled, swipes, abs(dx) > 48, abs(dx) > abs(dy) * 1.5 else { return }
                 step(dx < 0 ? 1 : -1)
             })
             .onKeyPress(.leftArrow) { step(-1); return .handled }
@@ -191,7 +194,49 @@ private struct FilterSwipe: ViewModifier {
 }
 
 extension View {
-    func filterSwipe(_ filter: Binding<StoryFilter>, enabled: Bool = true) -> some View { modifier(FilterSwipe(filter: filter, enabled: enabled)) }
+    func filterSwipe(_ filter: Binding<StoryFilter>, enabled: Bool = true, swipes: Bool = true) -> some View {
+        modifier(FilterSwipe(filter: filter, enabled: enabled, swipes: swipes))
+    }
+}
+
+/// The looks by name in a row that scrolls, for the camera: tapping one picks it, and the row keeps the chosen
+/// one in view. It is the only place on the camera that moves sideways, so it never fights the swipe that closes it.
+struct FilterStrip: View {
+    @Binding var filter: StoryFilter
+    @Environment(\.theme) private var theme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal) {
+                HStack(spacing: 8) {
+                    ForEach(StoryFilter.allCases) { look in
+                        Button {
+                            Haptics.tick()
+                            withAnimation(reduceMotion ? nil : .snappy) { filter = look }
+                        } label: {
+                            Text(look.label)
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(look == filter ? theme.accent : .white.opacity(0.85))
+                                .padding(.horizontal, 12).frame(height: 30)
+                                .background(look == filter ? theme.accent.opacity(0.22) : .black.opacity(0.35), in: .capsule)
+                                .overlay(Capsule().strokeBorder(look == filter ? theme.accent : .white.opacity(0.18), lineWidth: 1))
+                        }
+                        .buttonStyle(.plain)
+                        .id(look)
+                        .accessibilityLabel(look.label)
+                        .accessibilityAddTraits(look == filter ? .isSelected : [])
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
+            .scrollIndicators(.never)
+            .onChange(of: filter) { _, new in
+                withAnimation(reduceMotion ? nil : .snappy) { proxy.scrollTo(new, anchor: .center) }
+            }
+        }
+        .frame(height: 30)
+    }
 }
 
 /// A row of dots under the preview: the current look's is long. Tapping one picks that look.

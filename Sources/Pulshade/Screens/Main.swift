@@ -66,6 +66,7 @@ private struct PhoneMainView: View {
     @State private var section: Section = .chats
     @State private var selection: Conversation.ID?
     @State private var switchingPersona = false
+    @State private var screenHeight: CGFloat = 800
 
     var body: some View {
         TabView(selection: $section) {
@@ -104,12 +105,34 @@ private struct PhoneMainView: View {
             if let progress = slide.progress {
                 StoryCamera(close: { slide.settle(open: false) })
                     .offset(x: -(1 - progress) * slide.width)
+                    // Swipe left on the picture to put the camera away, following the finger like opening it.
+                    // The bottom controls (looks, shutter) keep their own touches.
+                    .simultaneousGesture(DragGesture(minimumDistance: 20, coordinateSpace: .global)
+                        .onChanged { drag in
+                            let dx = drag.translation.width, dy = drag.translation.height
+                            if !slide.dragging {
+                                guard dx < -24, abs(dx) > abs(dy) * 2, drag.startLocation.y < screenHeight - 230 else { return }
+                                slide.dragging = true
+                            }
+                            slide.progress = min(max(1 + dx / slide.width, 0), 1)
+                        }
+                        .onEnded { drag in
+                            guard slide.dragging else { return }
+                            let shut = drag.translation.width < -slide.width * 0.33 || drag.predictedEndTranslation.width < -slide.width * 0.6
+                            if shut { Haptics.tick() }
+                            slide.settle(open: !shut)
+                        })
                     .accessibilityHidden(progress < 1)
             }
         }
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { slide.width = max($0, 1) }
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { screenHeight = $0 }
         .environment(slide)
         .inAppBanners()
+        .onChange(of: section, initial: true) {
+            model.onChatsTab = section == .chats
+            if section == .chats { model.dismissBanner() }
+        }
         .background(TabHold(tab: 4) { switchingPersona = true })
         .sheet(isPresented: $switchingPersona) {
             PersonaSwitcher(done: { switchingPersona = false })

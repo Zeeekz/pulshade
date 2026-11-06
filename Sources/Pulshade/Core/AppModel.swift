@@ -729,7 +729,13 @@ final class AppModel {
         // On the phone, a message that lands while Pulshade is open gets Pulshade's own banner at the top of the
         // screen, not a system one (which would be a second banner after the wake-up one from the lock screen).
         if appActive {
-            let named = data.security.notificationContent != .hidden
+            // On the chats tab the list already shows the new message, so no banner.
+            if onChatsTab { return }
+            // The banner only shows while Pulshade is open, so once it's unlocked it says who wrote and what,
+            // whatever the lock-screen setting is. Locked, it follows that setting.
+            let style: NotificationContent = phase == .unlocked ? .full : data.security.notificationContent
+            let content = Notifier.content(for: message, in: convo, sender: displayName(message.sender), style: style)
+            let named = style != .hidden
             showBanner(InAppBanner(conversation: convo.id, title: content.title, body: content.body,
                                    avatar: named ? (convo.kind == .direct ? contact(message.sender, in: convo.persona)?.avatar : convo.avatar) : nil,
                                    seed: convo.kind == .direct ? message.sender : convo.id.uuidString, showsAvatar: named))
@@ -741,6 +747,8 @@ final class AppModel {
 
     /// The banner showing at the top of the screen, if any. See `InAppBanner`.
     var inAppBanner: InAppBanner?
+    /// Whether the phone's tab bar is on Chats, where a banner isn't needed.
+    @ObservationIgnored var onChatsTab = true
     @ObservationIgnored private var bannerTask: Task<Void, Never>?
 
     /// Shows a banner for a few seconds; a newer one takes its place.

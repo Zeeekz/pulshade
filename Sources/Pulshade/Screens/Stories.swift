@@ -984,7 +984,7 @@ struct StoryCamera: View {
                         })
                 }
                 .ignoresSafeArea()
-                    .filterSwipe($filter, enabled: !pinching && pressStart == nil)
+                    .filterSwipe($filter, enabled: !pinching && pressStart == nil, swipes: false)
                     .simultaneousGesture(MagnifyGesture()
                         .onChanged { value in
                             pinching = true
@@ -1039,8 +1039,9 @@ struct StoryCamera: View {
                 }
                 Spacer()
                 if camera.lensStops.count > 1 && ready == true { lensPills.padding(.bottom, 10) }
-                FilterDots(filter: $filter).padding(.bottom, 6)
+                FilterStrip(filter: $filter).padding(.bottom, 10)
                     .opacity(camera.recording ? 0 : 1)
+                    .allowsHitTesting(!camera.recording)
                 HStack(alignment: .center) {
                     StoryMediaPicker(picked: { kind in cover = .framed(StoryPick(kind: kind, filter: filter)) }) {
                         controlFace("photo.on.rectangle")

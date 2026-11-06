@@ -49,25 +49,33 @@ private struct InAppBannerView: View {
             model.dismissBanner()
             model.open(banner.conversation)
         } label: {
-            HStack(spacing: 12) {
+            HStack(spacing: 11) {
                 if banner.showsAvatar {
-                    Avatar(image: banner.avatar, seed: banner.seed, size: 38)
+                    Avatar(image: banner.avatar, seed: banner.seed, size: 36)
                 } else {
-                    PulseMark(size: 22).frame(width: 38, height: 38)
+                    PulseMark(size: 20).frame(width: 36, height: 36)
                 }
-                VStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 1) {
                     Text(banner.title).font(.system(size: 14, weight: .semibold)).foregroundStyle(Ink.text).lineLimit(1)
                     Text(banner.body).font(.system(size: 13)).foregroundStyle(Ink.dim).lineLimit(2)
                         .multilineTextAlignment(.leading)
                 }
                 Spacer(minLength: 0)
             }
-            .padding(.horizontal, 12).padding(.vertical, 10)
+            .padding(.horizontal, 12).padding(.vertical, 9)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Ink.raised, in: .rect(cornerRadius: 18))
-            .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(Ink.line, lineWidth: 1))
-            .shadow(color: .black.opacity(0.28), radius: 18, y: 8)
-            .contentShape(.rect(cornerRadius: 18))
+            // The themes' own panel colours, on a solid base: some of them are see-through, and a banner
+            // floating over chat text would show it. Same radius and hairline as the app's other cards.
+            .background {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 14).fill(Ink.void)
+                    RoundedRectangle(cornerRadius: 14).fill(Ink.surface)
+                    RoundedRectangle(cornerRadius: 14).fill(theme.wash)
+                }
+            }
+            .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Ink.line, lineWidth: 1))
+            .shadow(color: .black.opacity(Ink.scheme == .dark ? 0.35 : 0.14), radius: 12, y: 5)
+            .contentShape(.rect(cornerRadius: 14))
         }
         .buttonStyle(.plain)
         .offset(y: min(lift, 0))
