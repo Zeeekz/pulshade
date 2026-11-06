@@ -454,7 +454,7 @@ final class AppModel {
             for persona in [nil] + data.personas.map(\.id)
             where !(profile(for: persona).bio ?? "").isEmpty || profile(for: persona).handle != nil
                 || !ProfileLink.cleaned(profile(for: persona).links).isEmpty {
-                for c in contacts(of: persona) { enqueue(profilePayload(persona), to: c) }
+                for c in contacts(of: persona) { enqueue(profilePayload(persona, for: c.fingerprint), to: c) }
             }
         }
     }
@@ -770,10 +770,10 @@ final class AppModel {
                         signingKey: keys.signing, agreementKey: keys.agreement, sendID: sendID, device: deviceID(for: persona))
     }
 
-    /// The notes of a profile that are worth sending: checked again, none if there are none.
-    static func sharedNotes(_ profile: Profile) -> [ProfileNote]? {
-        let notes = ProfileNote.cleaned(profile.notes)
-        return notes.isEmpty ? nil : notes
+    /// The notes of a profile that one contact is sent: the ones for everyone and the ones chosen for them, checked
+    /// again, none if there are none. With no contact (the public listing), only the notes for everyone.
+    static func sharedNotes(_ profile: Profile, for fingerprint: String? = nil) -> [ProfileNote]? {
+        ProfileNote.notes(profile.notes, sentTo: fingerprint)
     }
 
     /// The links and wallets of a profile that are worth sending: checked again, none if there are none.
@@ -789,12 +789,12 @@ final class AppModel {
         return mine.isEmpty ? nil : Array(mine)
     }
 
-    private func profilePayload(_ persona: UUID?) -> Payload {
+    private func profilePayload(_ persona: UUID?, for contact: String) -> Payload {
         let profile = profile(for: persona)
         return .profile(name: profile.name, avatar: profile.avatar, color: profile.color, banner: profile.banner,
                         bio: profile.bio.flatMap { $0.isEmpty ? nil : $0 }, handle: profile.handle, badge: profile.badge,
                         links: Self.sharedLinks(profile), collectibles: Self.sharedCollectibles(profile),
-                        notes: Self.sharedNotes(profile))
+                        notes: Self.sharedNotes(profile, for: contact))
     }
 
     /// Someone's signature colour: what they chose, or one picked from their fingerprint.
@@ -2367,7 +2367,7 @@ final class AppModel {
         profileTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(1.5))
             guard !Task.isCancelled, let self else { return }
-            for c in self.contacts(of: persona) { self.enqueue(self.profilePayload(persona), to: c) }
+            for c in self.contacts(of: persona) { self.enqueue(self.profilePayload(persona, for: c.fingerprint), to: c) }
             self.sync(.profile(persona: persona, self.profile(for: persona)))
             self.save()
             await self.republish(persona)
@@ -2629,7 +2629,7 @@ final class AppModel {
         data.contacts[i].devices[d].awaitingHello = nil
         data.contacts[i].devices[d].acceptedHello = request.ephemeral
         seal(.sessionAccept(answer), contact: i, device: d)
-        let first: Payload = data.contacts[i].isSelf ? .sync(.hello) : profilePayload(data.contacts[i].persona)
+        let first: Payload = data.contacts[i].isSelf ? .sync(.hello) : profilePayload(data.contacts[i].persona, for: data.contacts[i].fingerprint)
         data.contacts[i].devices[d].pending.insert(PendingPayload(payload: first, message: nil), at: 0)
         sendPending(contact: i)
     }
@@ -4312,7 +4312,7 @@ extension AppModel {
             }
             var incoming = incoming
             incoming.links = Optional(ProfileLink.cleaned(incoming.links)).flatMap { $0.isEmpty ? nil : $0 }
-            incoming.notes = Optional(ProfileNote.cleaned(incoming.notes)).flatMap { $0.isEmpty ? nil : $0 }
+            incoming.notes = Optional(ProfileNote.cleaned(incoming.notes, keepAudience: true)).flatMap { $0.isEmpty ? nil : $0 }
             setProfile(incoming, for: persona)
         case let .persona(persona):
             if let i = data.personas.firstIndex(where: { $0.id == persona.id }) {

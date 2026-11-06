@@ -30,7 +30,7 @@ struct PinnedEditor: View {
     var body: some View {
         let empty = links.isEmpty && notes.isEmpty
         SettingsGroup("Pinned to your profile",
-                      footer: "Links and wallets are public. Notes can be locked with a password, and are encrypted on this device.") {
+                      footer: "Links and wallets are public. A note can be public, locked with a password, or sent only to contacts you choose.") {
             if empty {
                 SettingRow("Nothing pinned yet") { EmptyView() }
                     .foregroundStyle(Ink.faint)
@@ -98,7 +98,7 @@ struct PinnedEditor: View {
         pinRow(title: note.title, subtitle: note.subtitle, mono: false,
                edit: { noteDraft = NoteDraft(existing: note) },
                remove: { storeNotes { list in list.removeAll { $0.id == note.id } } }) {
-            Image(systemName: note.isLocked ? "lock.fill" : "doc.text.fill")
+            Image(systemName: note.isLocked ? "lock.fill" : note.isRestricted ? "person.2.fill" : "doc.text.fill")
                 .font(.system(size: 14, weight: .semibold)).foregroundStyle(theme.accent)
                 .frame(width: 36, height: 36)
                 .background(Ink.base, in: .rect(cornerRadius: 10, style: .continuous))
@@ -143,7 +143,7 @@ struct PinnedEditor: View {
 
     private func storeNotes(_ change: (inout [ProfileNote]) -> Void) {
         model.updateProfile { profile in
-            var list = ProfileNote.cleaned(profile.notes)
+            var list = ProfileNote.cleaned(profile.notes, keepAudience: true)
             change(&list)
             profile.notes = list.isEmpty ? nil : list
         }
