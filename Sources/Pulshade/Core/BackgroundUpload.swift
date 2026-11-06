@@ -60,7 +60,9 @@ enum BackgroundUpload {
         new.expirationHandler = {
             Task { @MainActor in
                 guard task === new else { return }
-                new.setTaskCompleted(success: false)
+                // Nothing is lost when iOS ends this early: what is left goes out the next time Pulshade is open. So it
+                // isn't reported as a failure, which would leave a "Task failed" mark on the phone with nothing wrong.
+                new.setTaskCompleted(success: true)
                 task = nil
                 isWanted = false
                 onEnded?()

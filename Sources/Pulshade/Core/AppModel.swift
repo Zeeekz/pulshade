@@ -290,6 +290,28 @@ final class AppModel {
         }
     }
 
+    /// Pull down on the chats: what coming back from the background does (Tor woken, stale connections dropped, every
+    /// lane checked at once), and the call waits for it, up to a few seconds, so the spinner has something to show.
+    func refresh() async {
+        guard phase == .unlocked else { return }
+        relayFailures = 0
+        lastRelayContact = Date()
+        resumedAt = Date()
+        nextAnnouncementCheck = Date()
+        // The work carries on by itself if it's slow (Tor can take a while); the spinner never waits past six seconds
+        // for it. (A task group would: it waits for every child, whichever finished first.)
+        var finished = false
+        Task {
+            await Task.detached(priority: .userInitiated) { Tor.wake() }.value
+            RelayClient.closeAll()
+            await syncOnce()
+            finished = true
+        }
+        let deadline = Date().addingTimeInterval(6)
+        while !finished, Date() < deadline { try? await Task.sleep(for: .milliseconds(150)) }
+        Haptics.tick()
+    }
+
     /// Any touch counts as activity on iPhone.
     func noteActivity() { lastActivity = Date() }
 
