@@ -152,6 +152,81 @@ enum StoryVideoError: Error, LocalizedError {
     }
 }
 
+// MARK: - Clips in memory
+
+/// A video clip that only ever exists in memory: recorded, picked, edited, received or played, it is never written
+/// to a file of ours. AVFoundation is given the bytes through a custom address, so it can play, read and export
+/// them as if they were a file. Gone when the last reference goes, and nothing to wipe.
+final class MemoryClip: Identifiable, @unchecked Sendable {
+    let id = UUID()
+    let bytes: Data
+
+    init(_ bytes: Data) { self.bytes = bytes }
+
+    /// A fresh asset over the bytes. It keeps its loader alive for as long as it lives.
+    func makeAsset() -> AVURLAsset {
+        let loader = ClipLoader(bytes)
+        let asset = AVURLAsset(url: URL(string: "pulshade-clip://clip/\(id.uuidString).mp4")!)
+        asset.resourceLoader.setDelegate(loader, queue: ClipLoader.queue)
+        objc_setAssociatedObject(asset, &ClipLoader.key, loader, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        return asset
+    }
+}
+
+/// Answers AVFoundation's requests for a clip's bytes from memory.
+final class ClipLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
+    nonisolated(unsafe) static var key: UInt8 = 0
+    static let queue = DispatchQueue(label: "pulshade.clip.loader", qos: .userInitiated)
+    private let bytes: Data
+    /// QuickTime files (the library's videos) and MP4 files are told apart by the first bytes.
+    private let type: String
+
+    init(_ bytes: Data) {
+        self.bytes = bytes
+        type = bytes.count > 12 && bytes[bytes.startIndex + 8..<bytes.startIndex + 12] == Data("qt  ".utf8)
+            ? "com.apple.quicktime-movie" : "public.mpeg-4"
+    }
+
+    func resourceLoader(_ resourceLoader: AVAssetResourceLoader,
+                        shouldWaitForLoadingOfRequestedResource request: AVAssetResourceLoadingRequest) -> Bool {
+        if let info = request.contentInformationRequest {
+            info.contentType = type
+            info.contentLength = Int64(bytes.count)
+            info.isByteRangeAccessSupported = true
+        }
+        if let wanted = request.dataRequest {
+            var offset = Int(wanted.requestedOffset)
+            let end = wanted.requestsAllDataToEndOfResource ? bytes.count : min(bytes.count, offset + wanted.requestedLength)
+            while offset < end {
+                let next = min(end, offset + 1_000_000)
+                wanted.respond(with: bytes.subdata(in: (bytes.startIndex + offset)..<(bytes.startIndex + next)))
+                offset = next
+            }
+        }
+        request.finishLoading()
+        return true
+    }
+}
+
+/// Collects a video writer's output as it is handed over in pieces: first the header, then the segments. Joined, they
+/// are one fragmented MP4 file that any player opens.
+final class SegmentSink: NSObject, AVAssetWriterDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var header = Data()
+    private var segments: [Data] = []
+
+    func assetWriter(_ writer: AVAssetWriter, didOutputSegmentData segmentData: Data, segmentType: AVAssetSegmentType,
+                     segmentReport: AVAssetSegmentReport?) {
+        lock.withLock {
+            if segmentType == .initialization { header = segmentData } else { segments.append(segmentData) }
+        }
+    }
+
+    var bytes: Data {
+        lock.withLock { segments.reduce(into: header) { $0.append($1) } }
+    }
+}
+
 /// Short, small story clips: at most 15 seconds, portrait 720p H.264, small enough for one encrypted message.
 enum StoryVideo {
     static let maxSeconds: Double = 15
@@ -196,16 +271,16 @@ enum StoryVideo {
     }
 
     /// How long the clip plays in a story, capped.
-    static func duration(of url: URL) async -> Double {
-        let seconds = (try? await AVURLAsset(url: url).load(.duration).seconds) ?? 0
+    static func duration(of clip: MemoryClip) async -> Double {
+        let seconds = (try? await clip.makeAsset().load(.duration).seconds) ?? 0
         return seconds.isFinite ? min(max(seconds, 0), maxSeconds) : 0
     }
 
     /// Re-encodes a recording or picked clip with the look baked in: first 15 seconds, portrait 720p, bitrate
     /// chosen to fit `maxBytes`, no location or device metadata. Returns the file's bytes.
-    static func export(from url: URL, filter: StoryFilter, zoom: ZoomTrack = .none, maxBytes: Int = StoryVideo.maxBytes,
+    static func export(from clip: MemoryClip, filter: StoryFilter, zoom: ZoomTrack = .none, maxBytes: Int = StoryVideo.maxBytes,
                        maxSeconds: Double = StoryVideo.maxSeconds, size: CGSize? = nil, text: CIImage? = nil) async throws -> Data {
-        let asset = AVURLAsset(url: url)
+        let asset = clip.makeAsset()
         guard let track = try? await asset.loadTracks(withMediaType: .video).first,
               let total = try? await asset.load(.duration), total.seconds.isFinite, total.seconds > 0 else { throw StoryVideoError.unreadable }
         let seconds = min(total.seconds, maxSeconds)
@@ -214,18 +289,15 @@ enum StoryVideo {
         let size = size ?? (max(abs(upright.width), abs(upright.height)) >= 1700 ? hdSize : StoryVideo.size)
         // Each retry spends less of the budget, in case the encoder overshoots on busy footage.
         for share in [0.85, 0.65, 0.45] {
-            let out = FileManager.default.temporaryDirectory.appendingPathComponent("story-\(UUID().uuidString).mp4")
-            defer { try? FileManager.default.removeItem(at: out) }
-            try await transcode(asset, to: out, seconds: seconds, filter: filter, zoom: zoom, size: size, text: text,
-                                bitsPerSecond: Int(Double(maxBytes) * share * 8 / seconds) - 48_000)
-            let data = try Data(contentsOf: out)
+            let data = try await transcode(asset, seconds: seconds, filter: filter, zoom: zoom, size: size, text: text,
+                                           bitsPerSecond: Int(Double(maxBytes) * share * 8 / seconds) - 48_000)
             if data.count <= maxBytes { return data }
         }
         throw StoryVideoError.tooLarge
     }
 
-    private static func transcode(_ asset: AVURLAsset, to out: URL, seconds: Double, filter: StoryFilter, zoom: ZoomTrack, size: CGSize,
-                                  text: CIImage? = nil, bitsPerSecond: Int) async throws {
+    private static func transcode(_ asset: AVURLAsset, seconds: Double, filter: StoryFilter, zoom: ZoomTrack, size: CGSize,
+                                  text: CIImage? = nil, bitsPerSecond: Int) async throws -> Data {
         let range = CMTimeRange(start: .zero, duration: CMTime(seconds: seconds, preferredTimescale: 600))
         let reader = try AVAssetReader(asset: asset)
         reader.timeRange = range
@@ -237,7 +309,13 @@ enum StoryVideo {
         guard reader.canAdd(readerVideo) else { throw StoryVideoError.unreadable }
         reader.add(readerVideo)
 
-        let writer = try AVAssetWriter(outputURL: out, fileType: .mp4)
+        // The finished clip is handed over in pieces and joined in memory: it never exists as a file.
+        let sink = SegmentSink()
+        let writer = AVAssetWriter(contentType: UTType.mpeg4Movie)
+        writer.outputFileTypeProfile = .mpeg4AppleHLS
+        writer.preferredOutputSegmentInterval = CMTime(seconds: 2, preferredTimescale: 1)
+        writer.initialSegmentStartTime = .zero
+        writer.delegate = sink
         // HEVC gives the same picture in about half the bits; H.264 is the fallback where it can't be encoded.
         func settings(_ codec: AVVideoCodecType) -> [String: Any] {
             var compression: [String: Any] = [
@@ -300,23 +378,17 @@ enum StoryVideo {
         if reader.status == .failed { writer.cancelWriting(); throw StoryVideoError.failed(reader.error?.localizedDescription ?? "read") }
         await writer.finishWriting()
         guard writer.status == .completed else { throw StoryVideoError.failed(writer.error?.localizedDescription ?? "write") }
+        return sink.bytes
     }
 
     /// A still from the first moment of a clip, for posters and thumbnails.
-    static func poster(of url: URL) async -> CGImage? {
-        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+    static func poster(of clip: MemoryClip) async -> CGImage? {
+        let generator = AVAssetImageGenerator(asset: clip.makeAsset())
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: 720, height: 1280)
         return try? await generator.image(at: .zero).image
     }
-
-    /// Writes a received clip to a temporary file for playback. The caller deletes it when done.
-    static func tempFile(for data: Data) -> URL? {
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("story-play-\(UUID().uuidString).mp4")
-        do { try data.write(to: url, options: [.atomic, .completeFileProtection]); return url } catch { return nil }
-    }
 }
-
 
 // MARK: - Sending a clip in pieces
 
@@ -339,16 +411,38 @@ enum ZoomMath {
     /// The most a story camera zooms in, even where the camera could go further: past this it's all noise.
     static let ceiling: CGFloat = 10
 
-    static func clamp(_ zoom: CGFloat, max hi: CGFloat) -> CGFloat {
+    /// `lo` is below 1 on an iPhone with a wide lens, where zooming out goes to 0.5×.
+    static func clamp(_ zoom: CGFloat, min lo: CGFloat = 1, max hi: CGFloat) -> CGFloat {
+        let floor = lo.isFinite ? min(lo, 1) : 1
         guard zoom.isFinite else { return 1 }
-        return min(max(zoom, 1), max(1, min(hi, ceiling)))
+        return min(max(zoom, floor), max(1, min(hi, ceiling)))
     }
 
-    static func zoom(start: CGFloat, drag dy: CGFloat, max hi: CGFloat) -> CGFloat {
-        clamp(start * pow(2, -dy / pointsPerDoubling), max: hi)
+    static func zoom(start: CGFloat, drag dy: CGFloat, min lo: CGFloat = 1, max hi: CGFloat) -> CGFloat {
+        clamp(start * pow(2, -dy / pointsPerDoubling), min: lo, max: hi)
     }
 
     static func label(_ zoom: CGFloat) -> String { String(format: "%.1f×", Double(zoom)) }
+}
+
+/// Clips used to be written to the temporary folder. They stay in memory now (see `MemoryClip`); this overwrites and
+/// deletes whatever an older version, a crash or a system file hand-over left there. Runs when Pulshade starts.
+enum TempFiles {
+    /// Whether a file in the temporary folder is one Pulshade made: only these exact names, since the Mac's
+    /// temporary folder is shared with other apps.
+    static func isOurs(_ name: String) -> Bool {
+        name.range(of: "^story-((rec|pick|play)-)?[0-9A-Fa-f-]{36}\\.(mov|mp4)$", options: .regularExpression) != nil
+    }
+
+    static func sweep() {
+        let files = FileManager.default
+        let stale = ((try? files.contentsOfDirectory(at: files.temporaryDirectory, includingPropertiesForKeys: nil)) ?? [])
+            .filter { isOurs($0.lastPathComponent) }
+        guard !stale.isEmpty else { return }
+        Task.detached(priority: .utility) {
+            for url in stale { Vault.scrub(item: url) }
+        }
+    }
 }
 
 /// How the shutter tells a tap (photo) from a hold (video).

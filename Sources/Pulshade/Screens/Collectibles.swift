@@ -22,7 +22,7 @@ struct CollectiblesView: View {
     var body: some View {
         Group {
             if inSettings {
-                SettingsScreen(title: "Collectibles") { content }
+                SettingsScreen(title: "Collectibles & Pets") { content }
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 22) {
@@ -47,32 +47,53 @@ struct CollectiblesView: View {
         .sheet(item: $viewing) { item in CollectibleViewerSheet(item: item) }
     }
 
+    private enum Tab: String, CaseIterable { case collectibles = "Collectibles", pets = "Pets" }
+    @State private var tab = Tab.collectibles
+
+    private func isPet(_ item: Collectible) -> Bool { item.kind?.category == .pets }
+    private var collectibleCount: Int { owned.filter { !isPet($0) }.count }
+    private var petCount: Int { owned.filter(isPet).count }
+
     private var content: some View {
-        VStack(alignment: .leading, spacing: 22) {
+        let pets = tab == .pets
+        let mine = owned.filter { isPet($0) == pets }
+        let notYet = missing.filter { ($0.category == .pets) == pets }
+        return VStack(alignment: .leading, spacing: 20) {
             preview
-            EggsSection()
-            if !owned.isEmpty { codeRow }
-            // Pets are kept in their own groups, after the rest.
-            ForEach(Collectible.Kind.Category.allCases, id: \.self) { category in
-                let mine = owned.filter { $0.kind?.category == category }
-                let notYet = missing.filter { $0.category == category }
-                if !mine.isEmpty {
-                    grid(title: category == .pets ? "Pets" : "Yours") {
-                        ForEach(mine) { item in ownedCard(item) }
-                    }
+            Picker("", selection: $tab.animation(.snappy)) {
+                Text("Collectibles · \(collectibleCount)").tag(Tab.collectibles)
+                Text("Pets · \(petCount)").tag(Tab.pets)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            if pets { EggsSection() }
+            if !pets && collectibleCount > 0 { codeRow }
+            if !mine.isEmpty {
+                grid(title: "\(mine.count) \(pets ? (mine.count == 1 ? "pet" : "pets") : (mine.count == 1 ? "collectible" : "collectibles"))") {
+                    ForEach(mine) { item in ownedCard(item) }
                 }
-                if !notYet.isEmpty {
-                    grid(title: category == .pets ? "Pets to find" : (owned.isEmpty ? "None yet" : "Not collected")) {
+            } else if !(pets && !model.eggs.isEmpty) {
+                Text(pets ? "No pets yet. Eggs hatch into them." : "No collectibles yet.")
+                    .font(.system(size: 13)).foregroundStyle(Ink.faint)
+            }
+            if !notYet.isEmpty {
+                DisclosureGroup {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 12)], spacing: 12) {
                         ForEach(notYet) { kind in missingCard(kind) }
                     }
+                    .padding(.top, 10)
+                } label: {
+                    Text(pets ? "Pets to find · \(notYet.count)" : "Not collected · \(notYet.count)")
+                        .font(.system(size: 13, weight: .semibold)).foregroundStyle(Ink.dim)
                 }
+                .tint(Ink.dim)
             }
             ClaimCodeCard()
-            Text(branded: "Collectibles are given out by PULSHADE. Each is numbered and belongs to this persona only. The one you choose shows after your name to your contacts and on your public profile. One backup code brings them all back if this account is ever burned or lost.")
+            Text(branded: "Each one is numbered and belongs to this persona only. The collectible you choose shows after your name. One backup code brings them all back if this account is ever burned or lost.")
                 .font(.system(size: 12)).foregroundStyle(Ink.faint)
                 .fixedSize(horizontal: false, vertical: true)
             if let problem {
-                Text(problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange)
+                ProblemText(problem)
             }
         }
     }

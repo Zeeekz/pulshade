@@ -33,7 +33,7 @@ reports mailbox's key, which the server keeps. Remove one under Team: they're cu
 they'd already opened. Run `pulshade-server update` once first so the server has the gate. The server's side is
 tested with `./scripts/server/test-mod-gate.sh`; it hasn't been run against a real server and its SSH setup yet.
 
-**Restarting drops waiting messages.** Envelopes live in memory only, so check `pulshade-server stats` first.
+**Restarting empties waiting messages.** They are held in memory only, so a restart loses what hasn't been collected.
 
 ## Running the relay on a server
 
@@ -57,7 +57,7 @@ Make an APNs key in your Apple developer account (Keys, with the Apple Push Noti
 and production) and put the `.p8` file on the server as `/var/lib/pulshade/apns.p8`, with its IDs in
 `/var/lib/pulshade/apns.json` (`{"key_id": "…", "team_id": "…", "topic": "your.app.bundle.id"}`), both readable only
 by the relay's user. Restart the relay to pick them up. Without them `GET /v1/push` says `{"enabled": false}` and
-phones don't register. A restart forgets every registration until the phones renew (every 15 minutes while open).
+phones don't register. Registrations are kept in memory only, so a restart clears them until each phone renews.
 
 On the server, `pulshade-server` runs it: `start`, `stop`, `restart`, `status`, `logs`, `stats`, `ban @name`,
 `backup` and the rest (`pulshade-server help` lists it all). `pulshade-server update` fetches the latest code and
@@ -75,12 +75,14 @@ Keep a copy of `/etc/pulshade/storage.key` somewhere safe: the server's backups 
   server's Wi-Fi address works (`http://192.168.x.x:7878`); remove it before making builds for anyone else.
 - **Saved data.** The handle directory is `pulshade-directory.json` beside the server (`PULSHADE_DIRECTORY` moves
   it), with moderation in `pulshade-moderation.json`. Both only ever hold what people chose to make public, and both
-  are sealed with a storage key from the Keychain. Detached accounts' sealed backups are in `pulshade-backups/` and
+  are sealed with a storage key from the Keychain. Accounts' sealed backups are in `pulshade-backups/` and
   are erased after 180 days.
 
 ## Keeping the server's disk quiet
 
-The server keeps waiting messages, calls and rate-limit counts in memory only. These keep it that way:
+The server keeps calls, rate-limit counts, waiting messages and wake-up registrations in memory only: none of them
+is ever written to disk. What does reach the disk is the handle directory, held handles and moderation lists (sealed
+with the storage key) and accounts' sealed backups (no chats). These keep the rest off the disk:
 
 - **Core dumps** are turned off by the server itself, so a crash never writes its memory to a file.
 - **Swap.** macOS encrypts swap. On Linux, use encrypted swap or none, or memory can still reach the disk.

@@ -44,7 +44,7 @@ struct LinkLoginFlow: View {
     private var entry: some View {
         OnboardingPage(title: "Log in with QR code",
                        subtitle: scanning ? "Hold up the code from Link a new device on your other device."
-                           : "On a device that's already logged in, open Settings, then Linked devices, then Link a new device, and scan this code.",
+                           : "On a device that's already logged in, open Settings, then Devices, then Link a new device, and scan this code.",
                        back: leave) {
             VStack(spacing: 16) {
                 ZStack {
@@ -67,7 +67,7 @@ struct LinkLoginFlow: View {
                     checkCode
                 }
                 if case let .failed(reason) = linker.stage {
-                    Text(branded: reason).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange)
+                    ProblemText(reason)
                 }
                 TextField("", text: $pasted, prompt: Text("Or paste the link code").foregroundStyle(Ink.faint))
                     .textFieldStyle(LargeFieldStyle())
@@ -198,7 +198,7 @@ struct LinkDeviceSheet: View {
                     }
                     .buttonStyle(PrimaryButtonStyle())
                     if let problem {
-                        Text(branded: problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange)
+                        ProblemText(problem)
                     }
                     Text("Or, if the new device can scan, show it this code.")
                         .font(.system(size: 12)).foregroundStyle(Ink.dim).multilineTextAlignment(.center)
@@ -235,6 +235,7 @@ struct LinkedDevicesCard: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     @State private var linking = false
+    @State private var pending: Pending?
 
     var body: some View {
         Card(title: "Linked devices") {
@@ -252,10 +253,15 @@ struct LinkedDevicesCard: View {
                     Text(device.session == nil ? "Connecting…" : "Linked")
                         .font(.system(size: 11)).foregroundStyle(device.session == nil ? Ink.faint : theme.accent)
                     Menu {
-                        Button("Stop syncing with this device", role: .destructive) { model.unlinkDevice(device.id) }
+                        Button("Stop syncing with this device", role: .destructive) {
+                            pending = Pending(title: "Stop syncing with \(device.name ?? "this device")?",
+                                              message: "It stops getting your messages and changes. What's already on it stays there until it's wiped.",
+                                              confirm: "Stop syncing") { model.unlinkDevice(device.id) }
+                        }
                     } label: {
-                        Image(systemName: "ellipsis").foregroundStyle(Ink.faint).frame(width: 22, height: 22)
+                        Image(systemName: "ellipsis").foregroundStyle(Ink.faint).frame(width: 30, height: 30).contentShape(.rect)
                     }
+                    .accessibilityLabel("More for \(device.name ?? "linked device")")
                     .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
                 }
             }
@@ -272,5 +278,6 @@ struct LinkedDevicesCard: View {
             .buttonStyle(.plain)
         }
         .sheet(isPresented: $linking) { LinkDeviceSheet() }
+        .confirms($pending)
     }
 }

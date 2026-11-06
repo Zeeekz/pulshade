@@ -83,4 +83,56 @@ struct ProfileNotesTests {
         #expect(!NoteSeal.looksSealed(bytes))
         #expect(NoteSeal.open(bytes, password: pw, aad: Data("a".utf8)) == nil)
     }
+
+    private let alice = String(repeating: "a1", count: 16)
+    private let bob = String(repeating: "b2", count: 16)
+    private let carol = String(repeating: "c3", count: 16)
+
+    @Test func aNoteForChosenContactsReachesOnlyThemAndNeverSaysWho() throws {
+        let everyone = try #require(ProfileNote.publicNote(title: "About", text: "Hi."))
+        let some = try #require(ProfileNote.contactsNote(title: "Address", text: "12 Elm Street", contacts: [alice, bob]))
+        #expect(some.sharedWith == [alice, bob] && some.text == "12 Elm Street" && !some.isLocked)
+        let notes = [everyone, some]
+
+        // Alice and Bob get both; the list of who else was chosen is not in what they get.
+        for chosen in [alice, bob] {
+            let got = try #require(ProfileNote.notes(notes, sentTo: chosen))
+            #expect(got.map(\.title) == ["About", "Address"])
+            #expect(got[1].sharedWith == nil && got[1].restricted == true && got[1].text == "12 Elm Street")
+            #expect(got[0].restricted == nil)
+            let json = String(decoding: try JSONEncoder().encode(got), as: UTF8.self)
+            #expect(!json.contains(alice) && !json.contains(bob))
+        }
+        // Carol, and the public listing, get only the note for everyone.
+        #expect(ProfileNote.notes(notes, sentTo: carol)?.map(\.title) == ["About"])
+        #expect(ProfileNote.notes(notes, sentTo: nil)?.map(\.title) == ["About"])
+        // Nothing for everyone and nobody chosen: nothing at all.
+        #expect(ProfileNote.notes([some], sentTo: carol) == nil)
+        #expect(ProfileNote.notes([some], sentTo: nil) == nil)
+    }
+
+    @Test func aNoteForContactsNeedsSomeoneAndRealFingerprints() {
+        #expect(ProfileNote.contactsNote(title: "T", text: "x", contacts: []) == nil)
+        #expect(ProfileNote.contactsNote(title: "T", text: "x", contacts: ["not a fingerprint"]) == nil)
+        #expect(ProfileNote.contactsNote(title: "T", text: "x", contacts: [alice, alice])?.sharedWith == [alice])
+    }
+
+    @Test func receivedNotesNeverCarryAnAudienceListButMayBeMarkedPrivate() throws {
+        var note = try #require(ProfileNote.contactsNote(title: "T", text: "x", contacts: [alice]))
+        // Someone else's list is dropped on receipt; the owner's own devices keep it.
+        #expect(ProfileNote.cleaned([note]).first?.sharedWith == nil)
+        #expect(ProfileNote.cleaned([note], keepAudience: true).first?.sharedWith == [alice])
+        // A received note's "just for you" label survives, and a locked note can't claim it or a list.
+        note.sharedWith = nil; note.restricted = true
+        #expect(ProfileNote.cleaned([note]).first?.restricted == true)
+        #expect(ProfileNote.cleaned([note]).first?.subtitle.hasPrefix("Just for you") == true)
+        let locked = try #require(ProfileNote.lockedNote(title: "L", text: "s", password: "twelve chars!", logN: 14))
+        var odd = locked; odd.sharedWith = [alice]
+        #expect(ProfileNote.cleaned([odd], keepAudience: true).isEmpty)
+        // It survives being sent as JSON, and an older app's note without the fields still reads.
+        let round = try JSONDecoder().decode(ProfileNote.self, from: JSONEncoder().encode(note))
+        #expect(round == note)
+        let old = try JSONDecoder().decode(ProfileNote.self, from: Data(#"{"id":"0011223344556677","title":"A","text":"b"}"#.utf8))
+        #expect(old.sharedWith == nil && old.restricted == nil && !old.isRestricted)
+    }
 }

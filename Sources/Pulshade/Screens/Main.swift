@@ -387,8 +387,12 @@ private struct ChatList: View {
     @State private var confirmDelete: Conversation?
     @State private var confirmClear = false
     @State private var scanningCode = false
+    /// The burn sheet, which only goes ahead once BURN is typed.
+    @State private var burningAccount = false
     /// How tall the search bar and stories are together, so the list can snap past them.
     @State private var storiesHeight: CGFloat = 0
+    /// Where the story strip is on screen, kept out of view state: it changes with every scroll frame.
+    @State private var stripBox = FrameBox()
 
     private var items: [Conversation] {
         model.sortedConversations.filter { c in
@@ -399,28 +403,39 @@ private struct ChatList: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            // Lock and burn on the left, scan and a new chat on the right, and the title between them.
             HStack(spacing: 8) {
-                Heading(title: "Chats")
+                Button { Haptics.tick(); model.lock() } label: { Image(systemName: "lock.fill") }
+                    .buttonStyle(BarButtonStyle())
+                    .help("Lock Pulshade")
+                    .accessibilityLabel("Lock")
+                Button { burningAccount = true } label: { Image(systemName: "flame.fill") }
+                    .buttonStyle(BarButtonStyle(tint: AnyShapeStyle(Burn.gradient)))
+                    .help("Burn your account")
+                    .accessibilityLabel("Burn")
+                Spacer(minLength: 4)
                 Menu {
                     Button("Clear all chats…", role: .destructive) { confirmClear = true }
                         .disabled(model.clearableChats.isEmpty)
                 } label: {
-                    Image(systemName: "ellipsis").font(.system(size: 13, weight: .medium)).foregroundStyle(Ink.dim)
-                        .frame(width: 30, height: 30)
-                        .background(Ink.raised, in: .rect(cornerRadius: 9))
-                        .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(Ink.line))
+                    HStack(spacing: 4) {
+                        Text("Chats").font(.system(size: 20, weight: .bold)).foregroundStyle(Ink.text)
+                        Image(systemName: "chevron.down").font(.system(size: 9, weight: .bold)).foregroundStyle(Ink.faint)
+                    }
+                    .contentShape(Rectangle())
                 }
                 .menuStyle(.button)
                 .buttonStyle(.plain)
                 .menuIndicator(.hidden)
                 .fixedSize()
-                .accessibilityLabel("More")
+                .accessibilityLabel("Chats, more")
+                Spacer(minLength: 4)
                 Button { scanningCode = true } label: { Image(systemName: "qrcode.viewfinder") }
-                    .buttonStyle(IconButtonStyle(size: 30))
+                    .buttonStyle(BarButtonStyle())
                     .help("Scan a code")
                     .accessibilityLabel("Scan a code")
                 Button { composing = true } label: { Image(systemName: "square.and.pencil") }
-                    .buttonStyle(IconButtonStyle(size: 30))
+                    .buttonStyle(BarButtonStyle(prominent: true))
                     .keyboardShortcut("n")
                     .help("New  ⌘N")
                     .accessibilityLabel("New chat")
@@ -437,6 +452,7 @@ private struct ChatList: View {
                         searchField
                         StoryStrip(composing: $composingStory, viewing: $viewingStory)
                             .padding(.vertical, 12)
+                            .onGeometryChange(for: CGRect.self) { $0.frame(in: .named("chatlist")) } action: { stripBox.rect = $0 }
                     }
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { storiesHeight = $0 }
                     SwiftUI.Section {
@@ -452,7 +468,19 @@ private struct ChatList: View {
             .scrollIndicators(.never)
             .scrollDismissesKeyboard(.immediately)
             .scrollTargetBehavior(StoriesSnap(height: storiesHeight))
+            .coordinateSpace(.named("chatlist"))
+            #if os(iOS)
+            // Swipe right on the chats, as "back" from the first page, and the story camera opens, as on Instagram.
+            // A swipe that starts on the story strip scrolls the strip instead.
+            .simultaneousGesture(DragGesture(minimumDistance: 30, coordinateSpace: .named("chatlist")).onEnded { drag in
+                let dx = drag.translation.width, dy = drag.translation.height
+                guard dx > 90, abs(dx) > abs(dy) * 2, !stripBox.rect.contains(drag.startLocation) else { return }
+                Haptics.tick()
+                composingStory = true
+            })
+            #endif
         }
+        .sheet(isPresented: $burningAccount) { BurnSheet() }
         .confirmationDialog(confirmDelete?.deleteWarning.title ?? "",
                             isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } }),
                             titleVisibility: .visible, presenting: confirmDelete) { c in
@@ -517,7 +545,7 @@ private struct ChatList: View {
             selection = c.id
             model.markRead(c.id)
         } label: {
-            ChatRow(conversation: c, selected: selection == c.id)
+            ChatRow(conversation: c, selected: selection == c.id) { viewingStory = $0 }
         }
         .buttonStyle(.plain)
         .accessibilityLabel(c.title)
@@ -583,10 +611,19 @@ private struct ChatRow: View {
     @Environment(\.theme) private var theme
     var conversation: Conversation
     var selected: Bool
+    /// Opens their story when the picture is tapped and they have one.
+    var openStory: (StoryReel) -> Void = { _ in }
     @State private var hover = false
+
+    /// Their live stories, when this is a one-to-one chat with someone who has posted.
+    private var stories: [Story] {
+        guard conversation.kind == .direct, let fp = conversation.members.first else { return [] }
+        return model.friendStories.first { $0.author == fp }?.stories ?? []
+    }
 
     var body: some View {
         let c = conversation
+        let stories = stories
         HStack(spacing: 12) {
             ZStack(alignment: .bottomTrailing) {
                 Avatar(image: c.avatar ?? (c.kind == .direct ? model.contact(c.members.first ?? "")?.avatar : nil),
@@ -597,6 +634,19 @@ private struct ChatRow: View {
                             Circle().strokeBorder(model.signature(fp).opacity(0.8), lineWidth: 1.5).padding(-2.5)
                         }
                     }
+                    .overlay {
+                        if !stories.isEmpty {
+                            let fresh = stories.contains { !$0.seen }
+                            Circle().strokeBorder(fresh ? theme.accent : Ink.faint, lineWidth: 2.5).padding(-5)
+                        }
+                    }
+                    .contentShape(Circle())
+                    .onTapGesture {
+                        guard !stories.isEmpty else { return }
+                        Haptics.tick()
+                        openStory(StoryReel(stories: stories, start: stories.firstIndex { !$0.seen } ?? 0))
+                    }
+                    .accessibilityAddTraits(stories.isEmpty ? [] : .isButton)
                 if let burner = model.burner(c.persona) {
                     Image(systemName: "flame.fill")
                         .font(.system(size: 9, weight: .bold))
@@ -619,6 +669,13 @@ private struct ChatRow: View {
                         .foregroundStyle(Ink.text)
                         .lineLimit(1)
                     if c.kind == .direct { BadgeMark(badge: model.contact(c.members.first ?? "")?.badge, size: 14) }
+                    if stories.contains(where: { !$0.seen }) {
+                        Text("New story")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(Ink.onAccent.opacity(0.9))
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(theme.accent, in: .capsule)
+                    }
                     if c.muted { Image(systemName: "bell.slash.fill").font(.system(size: 10)).foregroundStyle(Ink.faint) }
                     Spacer(minLength: 4)
                     Text(c.lastActivity.chatStamp)
@@ -700,6 +757,8 @@ private struct PersonaSwitcher: View {
                         .onSubmit(create)
                     Button(action: create) { Image(systemName: "checkmark") }
                         .buttonStyle(GlowButtonStyle(size: 36))
+                        .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                        .accessibilityLabel("Create persona")
                 }
                 .transition(.move(edge: .top).combined(with: .opacity))
             } else if model.canAddPersona {
@@ -762,4 +821,9 @@ private struct PersonaSwitcher: View {
         model.switchPersona(persona.id)
         done()
     }
+}
+
+/// A rectangle that can change without redrawing anything that holds it.
+private final class FrameBox {
+    var rect = CGRect.null
 }

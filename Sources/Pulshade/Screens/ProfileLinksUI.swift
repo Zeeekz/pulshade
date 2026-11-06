@@ -178,112 +178,19 @@ private struct WalletSheet: View {
 
 // MARK: - Editing your own
 
-/// The editor in Settings. What you've added is a tidy list with its logos; "Add" opens a picker of logos, then asks
-/// for just that one value. Remove one and its row goes from your profile. Nothing invalid is ever saved.
-struct ProfileLinksEditor: View {
-    @Environment(AppModel.self) private var model
-    @Environment(\.theme) private var theme
-    @State private var editing: Draft?
-
-    struct Draft: Identifiable {
-        var wallets: Bool
-        var kind: ProfileLinkKind?
-        var existing: ProfileLink?
-        var id: String { (wallets ? "w" : "l") + (kind?.rawValue ?? "pick") + (existing?.id ?? "new") }
-    }
-
-    private static let maxCustom = 6
-    private var saved: [ProfileLink] { model.activeProfile.links ?? [] }
-    private var used: Set<ProfileLinkKind> { Set(saved.map(\.kind)) }
-    private func free(wallets: Bool) -> [ProfileLinkKind] {
-        (wallets ? ProfileLinkKind.wallets : ProfileLinkKind.links).filter {
-            $0 == .custom ? saved.filter { $0.kind == .custom }.count < Self.maxCustom : !used.contains($0)
-        }
-    }
-
-    var body: some View {
-        section("Links", wallets: false,
-                footer: "Each one shows with its logo on your profile. People see the real web address before they open it.")
-        section("Wallets", wallets: true,
-                footer: "Addresses are public: anyone who opens your profile can read them. Use a fresh Monero subaddress if you'd rather not reuse one. Pulshade checks the format, not who owns it.")
-            .sheet(item: $editing) { draft in
-                AddLinkSheet(draft: draft, choices: free(wallets: draft.wallets)) { link in
-                    store { list in
-                        if let old = draft.existing { list.removeAll { $0.id == old.id } }
-                        if link.kind != .custom { list.removeAll { $0.kind == link.kind } }
-                        list.removeAll { $0.id == link.id }
-                        list.append(link)
-                    }
-                }
-            }
-    }
-
-    private func section(_ title: String, wallets: Bool, footer: String) -> some View {
-        let items = saved.filter { $0.kind.isWallet == wallets }
-        return SettingsGroup(title, footer: footer) {
-            ForEach(Array(items.enumerated()), id: \.element.id) { i, link in
-                if i > 0 { RowDivider(inset: 62) }
-                row(link, wallets: wallets)
-            }
-            if !items.isEmpty && !free(wallets: wallets).isEmpty { RowDivider(inset: 62) }
-            if !free(wallets: wallets).isEmpty {
-                Button { editing = Draft(wallets: wallets) } label: {
-                    HStack(spacing: 14) {
-                        Image(systemName: "plus")
-                            .font(.system(size: 15, weight: .bold)).foregroundStyle(theme.accent)
-                            .frame(width: 36, height: 36)
-                            .background(theme.accent.opacity(0.14), in: .rect(cornerRadius: 10, style: .continuous))
-                        Text(wallets ? "Add a wallet" : "Add a link").font(.system(size: 15, weight: .medium)).foregroundStyle(theme.accent)
-                        Spacer()
-                    }
-                    .padding(.horizontal, 12).padding(.vertical, 8).frame(minHeight: 54).contentShape(.rect)
-                }
-                .buttonStyle(.plain)
-            }
-        }
-    }
-
-    private func row(_ link: ProfileLink, wallets: Bool) -> some View {
-        HStack(spacing: 14) {
-            Button { editing = Draft(wallets: wallets, kind: link.kind, existing: link) } label: {
-                HStack(spacing: 14) {
-                    BrandTile(kind: link.kind, size: 36)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(link.displayTitle).font(.system(size: 15, weight: .medium)).foregroundStyle(Ink.text).lineLimit(1)
-                        Text(link.subtitle)
-                            .font(.system(size: 12.5, design: wallets ? .monospaced : .default))
-                            .foregroundStyle(Ink.faint).lineLimit(1).truncationMode(.middle)
-                    }
-                    Spacer(minLength: 8)
-                }
-                .contentShape(.rect)
-            }
-            .buttonStyle(.plain)
-            Button { store { list in list.removeAll { $0.id == link.id } } } label: {
-                Image(systemName: "trash").font(.system(size: 14)).foregroundStyle(Ink.faint).frame(width: 30, height: 30).contentShape(.rect)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Remove \(link.displayTitle)")
-        }
-        .padding(.horizontal, 12).padding(.vertical, 8).frame(minHeight: 54)
-    }
-
-    private func store(_ change: (inout [ProfileLink]) -> Void) {
-        model.updateProfile { profile in
-            var list = ProfileLink.cleaned(profile.links)
-            change(&list)
-            let order = Dictionary(uniqueKeysWithValues: ProfileLinkKind.allCases.enumerated().map { ($1, $0) })
-            list.sort { (order[$0.kind] ?? 0, $0.label ?? "") < (order[$1.kind] ?? 0, $1.label ?? "") }
-            profile.links = list.isEmpty ? nil : list
-        }
-    }
+/// What the add-a-link sheet is opened for: a link or a wallet, maybe one already saved.
+struct LinkDraft: Identifiable {
+    var wallets: Bool
+    var kind: ProfileLinkKind?
+    var existing: ProfileLink?
+    var id: String { (wallets ? "w" : "l") + (kind?.rawValue ?? "pick") + (existing?.id ?? "new") }
 }
 
 /// Pick a logo, then type one value. Says right away if it isn't valid, and saves only a valid one.
-private struct AddLinkSheet: View {
+struct AddLinkSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.theme) private var theme
-    var draft: ProfileLinksEditor.Draft
+    var draft: LinkDraft
     var choices: [ProfileLinkKind]
     var save: (ProfileLink) -> Void
     @State private var kind: ProfileLinkKind?
