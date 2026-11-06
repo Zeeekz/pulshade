@@ -948,7 +948,7 @@ struct AppData: Codable {
     /// `AppData`, `Profile` or `Contact` save.
     /// 4: a profile note can list the contacts it is for.
     /// 5: a sealed backup is kept on the relay, and when it was last saved.
-    static let currentFormat = 5
+    static let currentFormat = 6
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []
@@ -978,6 +978,9 @@ struct AppData: Codable {
     var decoySeed: Data?
     /// The identity the panic passcode opens, kept so it can be removed cleanly.
     var panicSeed: Data?
+    /// Only in the panic passcode's landing account: the public key a relay backup is filed under, to erase it with
+    /// the delete-only token (see `forgetToken`). Kept until the relay has answered, then dropped.
+    var pendingBackupForget: Data?
     /// Inside a decoy: the decoy and panic passcodes it pretends to have.
     var facade = Facade()
     /// Hashes of envelopes that came outside a ratchet session, so a replayed one is ignored.
@@ -1050,6 +1053,7 @@ struct AppData: Codable {
         blockedNames = (try? c.decodeIfPresent([String: String].self, forKey: .blockedNames)) ?? [:]
         activePersona = try c.decodeIfPresent(UUID.self, forKey: .activePersona)
         panicSeed = try c.decodeIfPresent(Data.self, forKey: .panicSeed)
+        pendingBackupForget = try c.decodeIfPresent(Data.self, forKey: .pendingBackupForget)
         facade = (try? c.decodeIfPresent(Facade.self, forKey: .facade)) ?? Facade()
         seenEnvelopes = (try? c.decodeIfPresent([String: Date].self, forKey: .seenEnvelopes)) ?? [:]
         handlesTidied = (try? c.decodeIfPresent(Bool.self, forKey: .handlesTidied)) ?? false

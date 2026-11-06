@@ -76,6 +76,8 @@ struct BurnSheet: View {
     @State private var confirm = ""
     @State private var working = false
     @State private var problem: String?
+    /// The relay couldn't be reached: offers to burn this device alone.
+    @State private var offline = false
 
     var body: some View {
         SheetBody(width: 460) {
@@ -94,18 +96,29 @@ struct BurnSheet: View {
                 if let problem {
                     ProblemText(problem)
                 }
-                BurnButton(working: working, enabled: confirm == "BURN", action: burn)
+                BurnButton(working: working, enabled: confirm == "BURN", action: { burn() })
+                if offline {
+                    Text("Or wipe only this device now. The relay's copy of your backup then stays there, opens only with your recovery code, and is erased within 180 days. Your @handles aren't retired and your contacts aren't told.")
+                        .font(.system(size: 13)).foregroundStyle(Ink.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Burn this device only") { burn(deviceOnly: true) }
+                        .disabled(working || confirm != "BURN")
+                }
             }
         }
     }
 
-    private func burn() {
+    private func burn(deviceOnly: Bool = false) {
         working = true
         problem = nil
         Task {
             do {
-                try await model.burn()
+                try await model.burn(thisDeviceOnly: deviceOnly)
+            } catch AppModel.LeaveError.backupNotRemoved {
+                offline = false
+                problem = "Your saved backup couldn't be removed from the relay, so nothing was burned. Try again."
             } catch {
+                offline = true
                 problem = "Can't reach the relay, so nothing was burned yet. Check your connection and try again."
             }
             working = false
@@ -214,6 +227,8 @@ struct LockedLeaveSheet: View {
                 try await model.leaveFromLock(burning: burning, recoveryCode: code)
             } catch AppModel.LeaveError.wrongRecoveryCode {
                 problem = "That isn't the recovery code of the account on this device"
+            } catch AppModel.LeaveError.backupNotRemoved {
+                problem = "Your saved backup couldn't be removed from the relay, so nothing was burned. Try again."
             } catch {
                 problem = "Can't reach the relay. Check your connection and try again."
             }
