@@ -15,7 +15,7 @@ struct LeaveView: View {
                     LeaveOption(symbol: "lock.fill", color: Ink.dim, title: "Lock",
                                 detail: "Close PULSHADE now. Your passcode opens it again.") { model.lock() }
                     LeaveOption(symbol: "person.crop.circle.badge.minus", color: .orange, title: "Detach",
-                                detail: "Wipes this device at once, with no questions: everything on it is overwritten and PULSHADE starts fresh. Nothing is sent, so your other devices keep the account.") { model.wipeNow() }
+                                detail: "Wipes this device at once, with no questions: everything on it is overwritten and PULSHADE starts fresh. Nothing is sent, so your other devices keep the account. \(model.data.security.keepBackup ? "Your recovery code brings back your profile, contacts and groups from the sealed backup (\(model.backupStatus.lowercased())), never your chats." : "Backups are off, so nothing comes back from the relay.")") { model.wipeNow() }
                     if model.activePersona != nil {
                         LeaveOption(symbol: "flame", color: .red, title: "Burn persona",
                                     detail: "Delete \(model.activeProfile.displayName) for good. Your main identity and other personas aren't touched.") { burningPersona = true }

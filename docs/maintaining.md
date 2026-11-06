@@ -75,7 +75,7 @@ Keep a copy of `/etc/pulshade/storage.key` somewhere safe: the server's backups 
   server's Wi-Fi address works (`http://192.168.x.x:7878`); remove it before making builds for anyone else.
 - **Saved data.** The handle directory is `pulshade-directory.json` beside the server (`PULSHADE_DIRECTORY` moves
   it), with moderation in `pulshade-moderation.json`. Both only ever hold what people chose to make public, and both
-  are sealed with a storage key from the Keychain. Detached accounts' sealed backups are in `pulshade-backups/` and
+  are sealed with a storage key from the Keychain. Accounts' sealed backups are in `pulshade-backups/` and
   are erased after 180 days.
 
 ## Keeping the server's disk quiet

@@ -18,15 +18,27 @@ empty account that would save over it. The recovery code is the only way back in
 
 **Lock, Detach and Burn.** The only three ways to leave, at the bottom of Settings.
 - *Lock* closes the vault. Everything stays on the device, encrypted; the passcode (or Touch ID) opens it again.
-- *Detach* takes the account off this device. With other linked devices you choose: only this one (the others keep
-  every chat, and a QR code from one of them logs you back in), or every device. Otherwise, and for every device,
-  the recovery code is asked for first: your profile, @handles, contacts, groups, personas and settings are sealed
-  and left on the server for it (for up to 180 days), but every chat, story and request is deleted for good.
+- *Detach* wipes this device at once, with no questions and no waiting on the network: everything on it is
+  overwritten and the app starts fresh. Nothing is sent, so your other linked devices keep the account (and every
+  chat; a QR code from one of them logs you back in). Your profile, @handles, contacts, groups, personas and
+  settings come back with the recovery code from the sealed backup (below), but every chat, story and request on
+  this device is gone for good. From the lock screen the flame can also do a Detach that first seals the account
+  with the recovery code and tells your other devices and contacts; every device is then wiped.
 - *Burn* deletes the account as if it never existed: every chat for both sides, every contact forgets you, every
   @handle is retired (unclaimable for three months, and tied to no one), the server's backup and waiting messages are gone, every device is wiped, and this one keeps
   nothing (not even a revoked Keychain key). The recovery code can't bring it back.
 
 The flame on the lock screen does Detach (this device) or Burn without the passcode, using the recovery code instead.
+
+**The sealed backup.** So that Detach can be instant, the app keeps one backup of your profile, @handles, contacts,
+groups, personas and settings (never chats, stories or requests) on the relay. It is sealed on the device with a key
+only the recovery code makes, filed under a throwaway public key derived from the recovery code and from nothing
+else, so the relay can't read it or tie it to your account. It is padded to a power of two (at least 64 KB), so its
+size says little. A few minutes after something in it changes (a random 1.5 to 10 minutes, so an upload can't be
+lined up with an edit) the app saves it again, over Tor if Tor is on; it is also saved once a week, which restarts
+the relay's 180-day clock. Only the main identity does this, never a decoy or panic account. Settings has a switch:
+off erases the copy at once. Burn erases it too. Restoring with the recovery code brings it back, and it stays on the
+relay, saved over as things change.
 
 **Decoy and panic passcodes.** `identity.lock` always holds three equal-sized slots and there are always four data
 files, real or random, padded to the same sizes and rewritten together whenever Pulshade locks, so the disk doesn't
@@ -218,9 +230,9 @@ the server do; a build someone makes themselves uses its own server, and isn't P
 
 **The server (relay).** A small Rust program. No accounts, no logs. Envelopes live in memory only and are deleted on
 pickup or after 7 days (so a restart drops any still waiting); their ids are random, so they don't reveal how busy it
-is. The handle directory, held handles, moderation lists and detached accounts' sealed backups (no chats) are saved to disk, the
-first three sealed again with a storage key kept in the server's Keychain (never beside them); a backup nobody has
-restored is erased after 180 days. The server turns off core dumps, so a crash never writes its memory to disk. Rate
+is. The handle directory, held handles, moderation lists and accounts' sealed backups (no chats) are saved to disk, the
+first three sealed again with a storage key kept in the server's Keychain (never beside them); a backup that hasn't
+been saved again for 180 days (a detached account's, once its device is gone) is erased. The server turns off core dumps, so a crash never writes its memory to disk. Rate
 limits never keep an IP address, only a hash with a salt that's replaced every hour. Admin actions need the token in
 `admin.token`, which only the server can read; the Pulshade app has no admin in it at all. Abuse reports are sealed to
 Pulshade Admin's reports key and go only to a mailbox signed by the admin key built into the app, from a throwaway key,

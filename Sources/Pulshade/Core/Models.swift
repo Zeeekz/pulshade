@@ -892,6 +892,9 @@ struct SecuritySettings: Codable, Equatable {
     /// about switching it off can truthfully say.
     var torSince: Date?
     var torFromStart = false
+    /// Keep a sealed copy of your profile, contacts, groups, handles and settings (never chats) on the relay, so Detach
+    /// can be an instant wipe and your recovery code still brings them back. The relay can't open it.
+    var keepBackup = true
 
     /// A new account's settings.
     init() {
@@ -926,6 +929,7 @@ struct SecuritySettings: Codable, Equatable {
         tor = try c.decodeIfPresent(Bool.self, forKey: .tor) ?? d.tor
         torSince = try c.decodeIfPresent(Date.self, forKey: .torSince)
         torFromStart = try c.decodeIfPresent(Bool.self, forKey: .torFromStart) ?? false
+        keepBackup = try c.decodeIfPresent(Bool.self, forKey: .keepBackup) ?? d.keepBackup
     }
 }
 
@@ -943,7 +947,8 @@ struct AppData: Codable {
     /// The newest shape this build understands. Raise it, and update `AppDataFormatTests`, with any change to what
     /// `AppData`, `Profile` or `Contact` save.
     /// 4: a profile note can list the contacts it is for.
-    static let currentFormat = 4
+    /// 5: a sealed backup is kept on the relay, and when it was last saved.
+    static let currentFormat = 5
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []
@@ -988,6 +993,10 @@ struct AppData: Codable {
     var clipParts: [UUID: ClipParts] = [:]
     /// Announcements already shown, so one deleted here doesn't come back.
     var announcementsSeen: [String] = []
+    /// When the sealed backup on the relay was last saved, and a hash of what it held (without these two fields),
+    /// so an unchanged account isn't uploaded again. Neither is ever in the backup itself.
+    var backupSavedAt: Date?
+    var backupDigest: Data?
     init() {}
 
     /// The relay new identities use. A build can set `PulshadeRelay` in its Info.plist (the iPhone
@@ -1048,6 +1057,8 @@ struct AppData: Codable {
         storyChoices = (try? c.decodeIfPresent([String: StoryChoice].self, forKey: .storyChoices)) ?? [:]
         clipParts = (try? c.decodeIfPresent([UUID: ClipParts].self, forKey: .clipParts)) ?? [:]
         announcementsSeen = (try? c.decodeIfPresent([String].self, forKey: .announcementsSeen)) ?? []
+        backupSavedAt = try? c.decodeIfPresent(Date.self, forKey: .backupSavedAt)
+        backupDigest = try? c.decodeIfPresent(Data.self, forKey: .backupDigest)
     }
 }
 

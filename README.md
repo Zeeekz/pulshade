@@ -20,8 +20,9 @@ Built by Zeekz.
   themselves on a timer.
 - **One-time chats.** A chat for a single conversation, shared by QR code, link or a 12-digit code you read out.
 - **Decoy and panic passcodes.** One opens a harmless empty account; the other quietly destroys the real one.
-- **Lock, Detach and Burn.** Lock the app; detach the account from a device, keeping everything but your chats; or
-  burn it everywhere, as if it never existed.
+- **Lock, Detach and Burn.** Lock the app; detach this device with one tap, which wipes it at once and keeps your
+  profile, contacts and groups in a sealed backup that only your recovery code opens (never your chats); or burn it
+  everywhere, as if it never existed.
 - **The rest of a messenger.** Groups, channels, broadcasts, voice notes, calls, reactions, replies, disappearing
   messages, linked devices, and in-person verification (Pulse check). Stories you choose the audience and length of,
   can edit after posting, and see who viewed, with the views encrypted like messages.
@@ -39,7 +40,9 @@ possible:
 - **Not where you are.** Over Tor the server sees a made-up address for each connection, never your IP address.
   Each persona and inbox uses its own Tor circuit, so they can't be linked by address.
 - **Nothing for long.** Envelopes live in memory only and are deleted once collected, or after 7 days. Nothing is
-  logged. A detached account's sealed backup waits at most 180 days for its recovery code.
+  logged. Your sealed backup (profile, contacts, groups; never chats) is saved again as things change and erased 180
+  days after its last save, so a detached account's waits at most that long for its recovery code. Turn it off in
+  Settings and it's erased at once.
 
 The full design, from the key derivations to the decoy passcode's disk layout, is in
 [How Pulshade works](docs/how-it-works.md).
