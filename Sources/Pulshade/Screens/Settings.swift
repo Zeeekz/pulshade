@@ -5,7 +5,7 @@ import PulshadeShared
 
 /// The pages Settings opens, each from a row on the main list.
 enum SettingsPage: String, Hashable {
-    case profile, handles, collectibles, privacy, notifications, appearance, devices, network, anonymity, account, updates
+    case profile, handles, collectibles, privacy, blocked, notifications, appearance, devices, network, anonymity, account, updates
 }
 
 /// Settings, laid out like a phone's own: your profile on top, then a short list of rows,
@@ -30,7 +30,7 @@ struct SettingsView: View {
                                 value: model.activeProfile.handle.map { "@\($0)" } ?? "Private")
                         if Platform.isPhone {
                             RowDivider(inset: 54)
-                            MenuRow(page: .collectibles, symbol: "crown.fill", color: .hex(0xE5383B), title: "Collectibles",
+                            MenuRow(page: .collectibles, symbol: "crown.fill", color: .hex(0xE5383B), title: "Collectibles & Pets",
                                     value: model.activeProfile.badge?.kind?.name)
                         }
                     }
@@ -91,6 +91,7 @@ struct SettingsView: View {
                     case .handles: HandleSettings()
                     case .collectibles: CollectiblesView(inSettings: true)
                     case .privacy: PrivacySettings()
+                    case .blocked: BlockedSettings()
                     case .notifications: NotificationSettings()
                     case .appearance: AppearanceSettings()
                     case .devices: DevicesSettings()
@@ -317,6 +318,66 @@ private struct ChoiceRows<Value: Hashable>: View {
     }
 }
 
+/// A row that opens a small menu of choices, so a short list takes one line instead of one row per choice.
+private struct MenuChoiceRow<Value: Hashable>: View {
+    var title: String
+    var values: [Value]
+    var selected: Value
+    var label: (Value) -> String
+    var choose: (Value) -> Void
+
+    var body: some View {
+        SettingRow(title) {
+            Menu {
+                ForEach(values, id: \.self) { v in
+                    Button { withAnimation(.snappy) { choose(v) } } label: {
+                        if v == selected { Label(label(v), systemImage: "checkmark") } else { Text(label(v)) }
+                    }
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Text(label(selected)).font(.system(size: 14)).foregroundStyle(Ink.dim)
+                    Image(systemName: "chevron.up.chevron.down").font(.system(size: 10, weight: .semibold)).foregroundStyle(Ink.faint)
+                }
+                .contentShape(.rect)
+            }
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+        }
+    }
+}
+
+/// Long explanations stay out of the way: a small line that opens the full text when tapped.
+private struct LearnMore: View {
+    var title = "How this works"
+    var text: String
+    @State private var open = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button { withAnimation(.snappy) { open.toggle() } } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "info.circle").font(.system(size: 12))
+                    Text(title).font(.system(size: 12, weight: .medium))
+                    Image(systemName: "chevron.right").font(.system(size: 9, weight: .bold)).rotationEffect(.degrees(open ? 90 : 0))
+                }
+                .foregroundStyle(Ink.dim)
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            if open {
+                Text(branded: text)
+                    .font(.system(size: 12)).foregroundStyle(Ink.faint)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 14)
+        .padding(.top, -14)
+    }
+}
+
 /// One settings page: a back button and title, then its groups.
 struct SettingsScreen<Content: View>: View {
     @Environment(\.dismiss) private var dismiss
@@ -376,6 +437,17 @@ private struct ProfileSettings: View {
     @State private var burningPersona = false
 
     private var listed: Bool { model.activeProfile.handle != nil }
+    private static let bioLimit = 120
+
+    private func hint(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(color)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 10)
+    }
 
     var body: some View {
         SettingsScreen(title: "Profile") {
@@ -397,20 +469,10 @@ private struct ProfileSettings: View {
                     .frame(minHeight: 50)
                     .onChange(of: name) { model.updateProfile { $0.name = name.trimmingCharacters(in: .whitespaces) } }
             }
-            SettingsGroup("Public profile",
-                          footer: listed ? "Anyone can find you by your @handle and send a chat request."
-                                         : "Turn this on to claim a @handle. Otherwise only people you give an invite code can reach you.") {
-                SettingRow("Discoverable") {
-                    Toggle("", isOn: Binding(get: { listed }, set: { on in
-                        if on { claim() } else { Task { await model.unpublishProfile() } }
-                    }))
-                    .toggleStyle(GlowToggleStyle())
-                    .disabled(claiming)
-                }
-                RowDivider()
+            SettingsGroup("Username") {
                 HStack(spacing: 4) {
                     Text("@").font(.system(size: 15)).foregroundStyle(Ink.faint)
-                    TextField("", text: $handle, prompt: Text("handle").foregroundStyle(Ink.faint))
+                    TextField("", text: $handle, prompt: Text("username").foregroundStyle(Ink.faint))
                         .textFieldStyle(.plain)
                         .font(.system(size: 15))
                         .foregroundStyle(Ink.text)
@@ -433,12 +495,11 @@ private struct ProfileSettings: View {
                 .padding(.horizontal, 16)
                 .frame(minHeight: 50)
                 if let handleProblem {
-                    Text(handleProblem)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(.orange)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 10)
+                    hint(handleProblem, color: .orange)
+                } else if !handle.isEmpty && handle != model.activeProfile.handle {
+                    hint("If you set a username you become discoverable: people can find you by it and send a chat request.", color: Ink.faint)
+                } else if listed {
+                    hint("Anyone can find you by @\(model.activeProfile.handle ?? "") and send a chat request.", color: Ink.faint)
                 }
                 if listed, let mine = model.activeProfile.handle, let me = model.me(model.activePersona) {
                     RowDivider()
@@ -446,6 +507,8 @@ private struct ProfileSettings: View {
                     ActionRow(title: "Copy profile link") {
                         copyToClipboard(DirectoryProfile.link(mine, key: me.card.signing))
                     }
+                    RowDivider()
+                    ActionRow(title: "Stop being discoverable") { Task { await model.unpublishProfile() } }
                 }
                 RowDivider()
                 NavigationLink(value: SettingsPage.handles) {
@@ -455,18 +518,27 @@ private struct ProfileSettings: View {
                     .contentShape(.rect)
                 }
                 .buttonStyle(.plain)
-                RowDivider()
-                TextField("", text: $bio, prompt: Text("Bio").foregroundStyle(Ink.faint), axis: .vertical)
+            }
+            SettingsGroup("Bio") {
+                TextField("", text: $bio, prompt: Text("A line about you").foregroundStyle(Ink.faint), axis: .vertical)
                     .textFieldStyle(.plain)
                     .font(.system(size: 15))
                     .foregroundStyle(Ink.text)
-                    .lineLimit(1...4)
+                    .lineLimit(1...3)
                     .padding(.horizontal, 16)
-                    .padding(.vertical, 15)
-                    .onChange(of: bio) { model.updateProfile { $0.bio = String(bio.prefix(160)) } }
+                    .padding(.top, 15)
+                    .padding(.bottom, 4)
+                    .onChange(of: bio) {
+                        if bio.count > Self.bioLimit { bio = String(bio.prefix(Self.bioLimit)) }
+                        model.updateProfile { $0.bio = bio }
+                    }
+                Text("\(bio.count) / \(Self.bioLimit)")
+                    .font(.system(size: 11)).monospacedDigit()
+                    .foregroundStyle(bio.count >= Self.bioLimit ? Color.orange : Ink.faint)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .padding(.horizontal, 16).padding(.bottom, 10)
             }
-            ProfileLinksEditor()
-            ProfileNotesEditor()
+            PinnedEditor()
             SettingsGroup("Signature colour", footer: "How your messages glow on other people's screens.") {
                 HStack(spacing: 0) {
                     ForEach(Signature.colors.indices, id: \.self) { i in
@@ -494,7 +566,7 @@ private struct ProfileSettings: View {
         .onChange(of: model.activePersona, initial: true) {
             name = model.activeProfile.name
             handle = model.activeProfile.handle ?? ""
-            bio = model.activeProfile.bio ?? ""
+            bio = String((model.activeProfile.bio ?? "").prefix(Self.bioLimit))
         }
     }
 
@@ -657,7 +729,7 @@ private struct PrivacySettings: View {
     var body: some View {
         SettingsScreen(title: "Privacy & Security") {
             SettingsGroup("Lock", footer: model.biometricsBlocked
-                          ? "\(Vault.biometryName) is off while a decoy or panic passcode is set: it would open your account without asking which."
+                          ? "\(Vault.biometryName) is off while a decoy or panic passcode is set."
                           : nil) {
                 if Vault.biometricsAvailable {
                     SettingRow("Unlock with \(Vault.biometryName)") {
@@ -670,18 +742,16 @@ private struct PrivacySettings: View {
                     }
                     RowDivider()
                 }
+                MenuChoiceRow(title: "Auto-lock", values: [1, 5, 15, 0], selected: model.data.security.autoLockMinutes,
+                              label: { $0 == 0 ? "Never" : $0 == 1 ? "1 minute" : "\($0) minutes" }) { m in
+                    model.updateSecurity { $0.autoLockMinutes = m }
+                }
+                RowDivider()
                 SecurityToggle(title: Platform.isPhone ? "Hide in app switcher" : "Blur when in background", key: \.blurWhenInactive)
                 RowDivider()
                 SecurityToggle(title: "Block screenshots & recording", key: \.blockCapture)
             }
-            SettingsGroup("Auto-lock", footer: "Locks PULSHADE after this long without use.") {
-                ChoiceRows(values: [1, 5, 15, 0], selected: model.data.security.autoLockMinutes,
-                           label: { $0 == 0 ? "Never" : $0 == 1 ? "After 1 minute" : "After \($0) minutes" }) { m in
-                    model.updateSecurity { $0.autoLockMinutes = m }
-                }
-            }
-            SettingsGroup("Messages",
-                          footer: "To make a link preview, your device visits the website over Tor, on a circuit of its own, so the website never sees your IP address (with Tor off, it does). People receiving it never contact the website. Receipts are sent a little later, together, so their timing gives nothing away. With read receipts or story views off you won't see other people's either, and one-time chats never send them. Online status shows a green dot while you have PULSHADE open. It goes only to contacts you've accepted who have it on too, never from a burner, and you see theirs only if you show yours. The relay can't read it, but it can see when it goes out and to whom, and switching persona shows it that two personas share a device, so it's off until you turn it on.") {
+            SettingsGroup("Messages") {
                 SecurityToggle(title: "Link previews", key: \.linkPreviews)
                 RowDivider()
                 SecurityToggle(title: "Delivery receipts", key: \.deliveryReceipts)
@@ -694,27 +764,27 @@ private struct PrivacySettings: View {
                 RowDivider()
                 SecurityToggle(title: "Story views", key: \.storyViews)
             }
-            SettingsGroup("Blocked",
-                          footer: "Anything blocked people send is dropped without telling them. Unblocking lets them send you a new request; your old chat doesn't come back.") {
-                if model.data.blocked.isEmpty {
-                    SettingRow("Nobody") { EmptyView() }
-                } else {
-                    ForEach(Array(model.data.blocked.enumerated()), id: \.element) { i, fp in
-                        if i > 0 { RowDivider() }
-                        SettingRow(model.data.blockedNames[fp] ?? "Unknown · \(fp.prefix(8))") {
-                            Button("Unblock") { model.unblock(fp) }
-                                .buttonStyle(.plain)
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(model.theme.accent)
-                        }
+            LearnMore(title: "What these do",
+                      text: "Link previews are made on your device over Tor, on a circuit of their own, so the website never sees your IP address (with Tor off, it does). People receiving the message never contact the website. Receipts are sent a little later, together, so their timing gives nothing away. With read receipts or story views off you won't see other people's either, and one-time chats never send them. Online status shows a green dot while you have PULSHADE open. It goes only to accepted contacts who have it on too, never from a burner, and you see theirs only if you show yours. The relay can't read it, but it can see when it goes out and to whom, and switching persona shows it that two personas share a device, so it's off until you turn it on.")
+            SettingsGroup("People & disguise", footer: "A decoy passcode opens an empty PULSHADE. A panic passcode erases everything, then does the same.") {
+                NavigationLink(value: SettingsPage.blocked) {
+                    SettingRow("Blocked") {
+                        Text(model.data.blocked.isEmpty ? "Nobody" : "\(model.data.blocked.count)")
+                            .font(.system(size: 14)).foregroundStyle(Ink.faint)
+                        Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Ink.faint)
                     }
+                    .contentShape(.rect)
                 }
-            }
-            SettingsGroup("Disguise",
-                          footer: "A decoy passcode opens an empty PULSHADE. A panic passcode silently erases everything, then does the same.") {
+                .buttonStyle(.plain)
+                RowDivider()
                 disguiseRow(.decoy, title: "Decoy passcode", isSet: model.hasDecoy)
                 RowDivider()
                 disguiseRow(.panic, title: "Panic passcode", isSet: model.hasPanic)
+            }
+            SettingsGroup {
+                MenuRow(page: .anonymity, symbol: "eye.slash.fill", color: .hex(0x64D2FF), title: "Anonymity Report")
+                RowDivider(inset: 54)
+                MenuRow(page: .network, symbol: "antenna.radiowaves.left.and.right", color: .hex(0x30D158), title: "Network & Tor")
             }
         }
         .onAppear { biometrics = model.biometricsOn }
@@ -740,6 +810,32 @@ private struct PrivacySettings: View {
     }
 }
 
+// MARK: - Blocked
+
+private struct BlockedSettings: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        SettingsScreen(title: "Blocked", back: "Privacy") {
+            SettingsGroup(footer: "Anything blocked people send is dropped without telling them. Unblocking lets them send you a new request; your old chat doesn't come back.") {
+                if model.data.blocked.isEmpty {
+                    SettingRow("Nobody") { EmptyView() }
+                } else {
+                    ForEach(Array(model.data.blocked.enumerated()), id: \.element) { i, fp in
+                        if i > 0 { RowDivider() }
+                        SettingRow(model.data.blockedNames[fp] ?? "Unknown · \(fp.prefix(8))") {
+                            Button("Unblock") { model.unblock(fp) }
+                                .buttonStyle(.plain)
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(model.theme.accent)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Notifications
 
 private struct NotificationSettings: View {
@@ -748,43 +844,41 @@ private struct NotificationSettings: View {
 
     var body: some View {
         let on = model.data.security.notifications
+        let security = model.data.security
         SettingsScreen(title: "Notifications") {
-            SettingsGroup {
+            SettingsGroup(footer: on && security.notificationContent != .hidden
+                          ? "The system keeps notification text outside PULSHADE's encryption." : nil) {
                 SecurityToggle(title: "Notifications", key: \.notifications)
                 if on {
                     RowDivider()
-                    SecurityToggle(title: "Sound", key: \.notificationSound)
-                }
-            }
-            if on && model.data.security.notificationSound {
-                SettingsGroup("Message tone", footer: "The sound a new message makes, on a locked iPhone too.") {
-                    ChoiceRows(values: MessageTone.allCases, selected: model.data.security.messageTone, label: \.label) { tone in
-                        model.updateSecurity { $0.messageTone = tone }
-                        tone.play()
-                    }
-                }
-            }
-            if on {
-                SettingsGroup("Show in notifications",
-                              footer: model.data.security.notificationContent == .hidden
-                                  ? "Notifications only say \"New message\"."
-                                  : "The system saves notification text in its own database, outside PULSHADE's encryption, and may keep it after PULSHADE clears the notification.") {
-                    ChoiceRows(values: NotificationContent.allCases, selected: model.data.security.notificationContent,
-                               label: \.label) { option in
+                    MenuChoiceRow(title: "Show in notifications", values: Array(NotificationContent.allCases),
+                                  selected: security.notificationContent, label: \.label) { option in
                         model.updateSecurity { $0.notificationContent = option }
                     }
+                    RowDivider()
+                    SecurityToggle(title: "Sound", key: \.notificationSound)
+                    if security.notificationSound {
+                        RowDivider()
+                        MenuChoiceRow(title: "Message tone", values: Array(MessageTone.allCases),
+                                      selected: security.messageTone, label: \.label) { tone in
+                            model.updateSecurity { $0.messageTone = tone }
+                            tone.play()
+                        }
+                    }
+                    #if os(iOS)
+                    RowDivider()
+                    SecurityToggle(title: "Wake when locked", key: \.pushWake)
+                    #endif
                 }
             }
             #if os(iOS)
             if on {
-                SettingsGroup("When locked",
-                              footer: "Lets the relay wake this iPhone through Apple when mail arrives, so you hear about it while the phone is locked. The wake-up only says \"New message\". Apple learns that your iPhone was woken, and when, and the relay keeps its push token. Turned off, you only hear about messages while PULSHADE is open. Only your main identity is covered.") {
-                    SecurityToggle(title: "Wake when locked", key: \.pushWake)
-                }
+                LearnMore(title: "About waking a locked iPhone",
+                          text: "Lets the relay wake this iPhone through Apple when mail arrives, so you hear about it while the phone is locked. The wake-up only says \"New message\". Apple learns that your iPhone was woken, and when, and the relay keeps its push token. Turned off, you only hear about messages while PULSHADE is open. Only your main identity is covered.")
             }
             #endif
             #if os(macOS)
-            SettingsGroup("Mac", footer: "Keeps PULSHADE, and its menu bar icon, running from when you log in.") {
+            SettingsGroup("Mac") {
                 SecurityToggle(title: "Menu bar icon", key: \.menuBarIcon)
                 RowDivider()
                 SettingRow("Open at login") {

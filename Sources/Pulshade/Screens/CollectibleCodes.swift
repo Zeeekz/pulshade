@@ -108,9 +108,9 @@ struct ClaimCodeCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Have a code?").font(.system(size: 13, weight: .semibold)).foregroundStyle(Ink.dim)
+            Text("Redeem a code").font(.system(size: 13, weight: .semibold)).foregroundStyle(Ink.dim)
             HStack(spacing: 8) {
-                TextField("", text: $code, prompt: Text("A backup or giveaway code").foregroundStyle(Ink.faint))
+                TextField("", text: $code, prompt: Text("Enter a code").foregroundStyle(Ink.faint))
                     .textFieldStyle(.plain)
                     .font(.system(size: 15, design: .monospaced))
                     .foregroundStyle(Ink.text)
@@ -133,7 +133,7 @@ struct ClaimCodeCard: View {
                     .foregroundStyle(result.failed ? .orange : theme.accent)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                Text(branded: "A backup code brings its collectibles to this persona, even from an account that burned. A giveaway code, announced by PULSHADE, wins a place in line for a new one. PULSHADE then signs them over, which can take a little while.")
+                Text("Collectibles and pets can be redeemed here.")
                     .font(.system(size: 12)).foregroundStyle(Ink.faint)
                     .fixedSize(horizontal: false, vertical: true)
             }
