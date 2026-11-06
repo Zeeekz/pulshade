@@ -10,8 +10,38 @@ import PhotosUI
 typealias PlatformImage = UIImage
 #endif
 
+/// Pictures already decoded, so a list that redraws doesn't decode every avatar again. Held in memory only, and
+/// emptied by the system when it needs the room.
+enum DecodedImages {
+    private static let cache: NSCache<NSString, PlatformImage> = {
+        let cache = NSCache<NSString, PlatformImage>()
+        cache.countLimit = 200
+        return cache
+    }()
+
+    static func image(_ data: Data) -> PlatformImage? {
+        let key = "\(data.count)-\(data.hashValue)" as NSString
+        if let hit = cache.object(forKey: key) { return hit }
+        guard let made = PlatformImage(data: data) else { return nil }
+        cache.setObject(made, forKey: key)
+        return made
+    }
+
+    /// Burn and lock: nothing decoded stays behind.
+    static func forget() { cache.removeAllObjects() }
+}
+
 /// The few things that differ between the Mac and iPhone apps, kept in one place.
 enum Platform {
+    /// Whether the person asked the system for less movement. Looping animations stay still when they did.
+    @MainActor static var reduceMotion: Bool {
+        #if os(iOS)
+        UIAccessibility.isReduceMotionEnabled
+        #else
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        #endif
+    }
+
     static var isPhone: Bool {
         #if os(iOS)
         true
@@ -325,11 +355,13 @@ final class KeyboardDismisser: NSObject, UIGestureRecognizerDelegate {
 
 #if os(iOS)
 /// Hiding the system navigation bar also switches off iOS's swipe-from-the-edge to go back.
-/// This turns it back on for every navigation stack in the app.
+/// This turns it back on for every navigation stack in the app, both from the edge and from anywhere on the screen.
 extension UINavigationController: @retroactive UIGestureRecognizerDelegate {
     override open func viewDidLoad() {
         super.viewDidLoad()
         interactivePopGestureRecognizer?.delegate = self
+        // Swiping right from anywhere on the screen goes back too, with the screen following the finger.
+        if #available(iOS 26.0, *) { interactiveContentPopGestureRecognizer?.delegate = self }
     }
 
     public func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {

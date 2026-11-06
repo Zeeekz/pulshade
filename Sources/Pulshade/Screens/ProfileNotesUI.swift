@@ -19,7 +19,7 @@ struct ProfileNoteList: View {
             ExpandableCard(title: "Notes", symbol: "doc.text", count: shown.count) {
                 HStack(spacing: 6) {
                     ForEach(shown.prefix(3)) { note in
-                        Image(systemName: note.isLocked ? "lock.fill" : "doc.text.fill")
+                        Image(systemName: Self.symbol(note))
                             .font(.system(size: 12)).foregroundStyle(Ink.dim)
                     }
                 }
@@ -36,10 +36,14 @@ struct ProfileNoteList: View {
         }
     }
 
+    private static func symbol(_ note: ProfileNote) -> String {
+        note.isLocked ? "lock.fill" : note.isRestricted ? "person.fill.checkmark" : "doc.text.fill"
+    }
+
     private func row(_ note: ProfileNote) -> some View {
         Button { reading = note } label: {
             HStack(spacing: 14) {
-                Image(systemName: note.isLocked ? "lock.fill" : "doc.text.fill")
+                Image(systemName: Self.symbol(note))
                     .font(.system(size: 15, weight: .semibold)).foregroundStyle(tint)
                     .frame(width: 34, height: 34)
                     .background(Ink.raised, in: .rect(cornerRadius: 9, style: .continuous))
@@ -120,11 +124,11 @@ struct NoteReaderSheet: View {
                 .background(Ink.surface, in: .rect(cornerRadius: 14, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Ink.line))
                 .onSubmit(tryOpen)
-            if let problem { Text(problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange) }
+            if let problem { ProblemText(problem) }
             Button(action: tryOpen) {
                 HStack(spacing: 8) {
                     if working { ProgressView().controlSize(.small) }
-                    Text(working ? "Unlocking..." : "Unlock").font(.system(size: 16, weight: .semibold))
+                    Text(working ? "Unlocking…" : "Unlock").font(.system(size: 16, weight: .semibold))
                 }
                 .foregroundStyle(Ink.onAccent).frame(maxWidth: .infinity, minHeight: 48)
                 .background(theme.gradient, in: .capsule)
@@ -162,94 +166,19 @@ struct NoteReaderSheet: View {
 
 // MARK: - Writing your own
 
-/// Your notes in Settings: what you've written, with a lock on the ones that have a password, and a way to add more.
-struct ProfileNotesEditor: View {
-    @Environment(AppModel.self) private var model
-    @Environment(\.theme) private var theme
-    @State private var editing: Draft?
-
-    struct Draft: Identifiable {
-        var existing: ProfileNote?
-        var id: String { existing?.id ?? "new" }
-    }
-
-    private var notes: [ProfileNote] { model.activeProfile.notes ?? [] }
-
-    var body: some View {
-        SettingsGroup("Notes", footer: "Text people can read by tapping it on your profile. Add a password and it's encrypted on this device: nobody else can read it, not even Pulshade, and if you forget the password it can't be recovered. Titles are always visible.") {
-            ForEach(Array(notes.enumerated()), id: \.element.id) { i, note in
-                if i > 0 { RowDivider(inset: 58) }
-                row(note)
-            }
-            if notes.count < ProfileNote.maxCount {
-                if !notes.isEmpty { RowDivider(inset: 58) }
-                Button { editing = Draft() } label: {
-                    HStack(spacing: 14) {
-                        Image(systemName: "plus")
-                            .font(.system(size: 15, weight: .bold)).foregroundStyle(theme.accent)
-                            .frame(width: 36, height: 36)
-                            .background(theme.accent.opacity(0.14), in: .rect(cornerRadius: 10, style: .continuous))
-                        Text("Add a note").font(.system(size: 15, weight: .medium)).foregroundStyle(theme.accent)
-                        Spacer()
-                    }
-                    .padding(.horizontal, 12).padding(.vertical, 8).frame(minHeight: 54).contentShape(.rect)
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .sheet(item: $editing) { draft in
-            NoteEditSheet(existing: draft.existing) { saved in
-                store { list in
-                    if let i = list.firstIndex(where: { $0.id == saved.id }) { list[i] = saved } else { list.append(saved) }
-                }
-            }
-        }
-    }
-
-    private func row(_ note: ProfileNote) -> some View {
-        HStack(spacing: 14) {
-            Button { editing = Draft(existing: note) } label: {
-                HStack(spacing: 14) {
-                    Image(systemName: note.isLocked ? "lock.fill" : "doc.text.fill")
-                        .font(.system(size: 14, weight: .semibold)).foregroundStyle(theme.accent)
-                        .frame(width: 36, height: 36)
-                        .background(Ink.base, in: .rect(cornerRadius: 10, style: .continuous))
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(note.title).font(.system(size: 15, weight: .medium)).foregroundStyle(Ink.text).lineLimit(1)
-                        Text(note.subtitle).font(.system(size: 12.5)).foregroundStyle(Ink.faint).lineLimit(1)
-                    }
-                    Spacer(minLength: 8)
-                }
-                .contentShape(.rect)
-            }
-            .buttonStyle(.plain)
-            Button { store { list in list.removeAll { $0.id == note.id } } } label: {
-                Image(systemName: "trash").font(.system(size: 14)).foregroundStyle(Ink.faint).frame(width: 30, height: 30).contentShape(.rect)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Delete \(note.title)")
-        }
-        .padding(.horizontal, 12).padding(.vertical, 8).frame(minHeight: 54)
-    }
-
-    private func store(_ change: (inout [ProfileNote]) -> Void) {
-        model.updateProfile { profile in
-            var list = ProfileNote.cleaned(profile.notes)
-            change(&list)
-            profile.notes = list.isEmpty ? nil : list
-        }
-    }
-}
-
 /// Write or change a note: a title, the words (typed, or read from a text file), and whether to lock it.
 struct NoteEditSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.theme) private var theme
+    @Environment(AppModel.self) private var model
     var existing: ProfileNote?
     var save: (ProfileNote) -> Void
     @State private var title = ""
     @State private var text = ""
     @State private var locked = false
+    /// Sent only to the contacts picked here (fingerprints), with no password.
+    @State private var forContacts = false
+    @State private var chosen: Set<String> = []
     @State private var password = ""
     @State private var generated: String?
     /// Changing a locked note starts by proving you know its password.
@@ -263,6 +192,12 @@ struct NoteEditSheet: View {
     private var canSave: Bool {
         !working && ProfileNote.cleanTitle(title) != nil && ProfileNote.cleanText(text) != nil
             && (!locked || NoteSeal.passwordProblem(password) == nil)
+            && (!forContacts || !chosen.isEmpty)
+    }
+
+    /// Everyone the active account could send a note to.
+    private var people: [Contact] {
+        model.visibleContacts.filter { !$0.isSelf }.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
     }
 
     var body: some View {
@@ -276,6 +211,7 @@ struct NoteEditSheet: View {
             guard let existing else { return }
             title = existing.title
             if existing.isLocked { needsUnlock = true; locked = true } else { text = existing.text ?? "" }
+            if let list = existing.sharedWith { forContacts = true; chosen = Set(list) }
         }
         .fileImporter(isPresented: $importing, allowedContentTypes: [.plainText, .text]) { result in
             guard case .success(let url) = result else { return }
@@ -301,8 +237,8 @@ struct NoteEditSheet: View {
                 .background(Ink.surface, in: .rect(cornerRadius: 14, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Ink.line))
                 .onSubmit(unlock)
-            if let problem { Text(problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange) }
-            primary(working ? "Unlocking..." : "Unlock", enabled: !unlockPassword.isEmpty && !working, action: unlock)
+            if let problem { ProblemText(problem) }
+            primary(working ? "Unlocking…" : "Unlock", enabled: !unlockPassword.isEmpty && !working, action: unlock)
             Spacer(minLength: 0)
         }
     }
@@ -328,16 +264,30 @@ struct NoteEditSheet: View {
                     }
                 }
                 box {
-                    HStack {
-                        Label("Lock with a password", systemImage: "lock.fill").font(.system(size: 15)).foregroundStyle(Ink.text)
-                        Spacer()
-                        Toggle("", isOn: $locked.animation(.snappy)).toggleStyle(GlowToggleStyle())
+                    VStack(spacing: 0) {
+                        HStack {
+                            Label("Lock with a password", systemImage: "lock.fill").font(.system(size: 15)).foregroundStyle(Ink.text)
+                            Spacer()
+                            Toggle("Lock with a password", isOn: Binding(get: { locked }, set: { on in
+                                withAnimation(.snappy) { locked = on; if on { forContacts = false } }
+                            })).toggleStyle(GlowToggleStyle())
+                        }
+                        .padding(.horizontal, 16).frame(minHeight: 50)
+                        Divider().overlay(Ink.line)
+                        HStack {
+                            Label("Only some contacts", systemImage: "person.2.fill").font(.system(size: 15)).foregroundStyle(Ink.text)
+                            Spacer()
+                            Toggle("Only some contacts", isOn: Binding(get: { forContacts }, set: { on in
+                                withAnimation(.snappy) { forContacts = on; if on { locked = false } }
+                            })).toggleStyle(GlowToggleStyle())
+                        }
+                        .padding(.horizontal, 16).frame(minHeight: 50)
                     }
-                    .padding(.horizontal, 16).frame(minHeight: 50)
                 }
                 if locked { lockOptions }
-                if let problem { Text(problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange) }
-                primary(working ? "Saving..." : "Save", enabled: canSave, action: commit)
+                if forContacts { contactOptions }
+                if let problem { ProblemText(problem) }
+                primary(working ? "Saving…" : "Save", enabled: canSave, action: commit)
             }
         }
         .scrollIndicators(.never)
@@ -353,7 +303,7 @@ struct NoteEditSheet: View {
                     .textInputAutocapitalization(.never).autocorrectionDisabled()
                     #endif
             }
-            if let passwordProblem { Text(passwordProblem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange) }
+            if let passwordProblem { ProblemText(passwordProblem) }
             HStack {
                 Button {
                     let made = NoteSeal.generatePassword()
@@ -374,6 +324,43 @@ struct NoteEditSheet: View {
                     .font(.system(size: 12)).foregroundStyle(Ink.faint)
             }
             Text("Anyone who opens your profile can copy a locked note and try passwords on their own computer, which is why a strong password is required. The title is not locked.")
+                .font(.system(size: 12)).foregroundStyle(Ink.faint)
+        }
+    }
+
+    /// Choose who is sent the note. They read it with no password, because nobody else is ever sent it.
+    private var contactOptions: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if people.isEmpty {
+                Text("You have no contacts yet. Add someone first, then choose them here.")
+                    .font(.system(size: 13)).foregroundStyle(Ink.dim)
+            } else {
+                box {
+                    VStack(spacing: 0) {
+                        ForEach(Array(people.enumerated()), id: \.element.fingerprint) { i, person in
+                            if i > 0 { Divider().overlay(Ink.line).padding(.leading, 16) }
+                            Button {
+                                if chosen.contains(person.fingerprint) { chosen.remove(person.fingerprint) } else { chosen.insert(person.fingerprint) }
+                            } label: {
+                                HStack(spacing: 12) {
+                                    Text(person.displayName).font(.system(size: 15)).foregroundStyle(Ink.text).lineLimit(1)
+                                    Spacer()
+                                    Image(systemName: chosen.contains(person.fingerprint) ? "checkmark.circle.fill" : "circle")
+                                        .font(.system(size: 20))
+                                        .foregroundStyle(chosen.contains(person.fingerprint) ? theme.accent : Ink.faint)
+                                }
+                                .padding(.horizontal, 16).frame(minHeight: 46).contentShape(.rect)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(person.displayName)
+                            .accessibilityValue(chosen.contains(person.fingerprint) ? "Selected" : "Not selected")
+                        }
+                    }
+                }
+                Text(chosen.isEmpty ? "Pick at least one contact." : chosen.count == 1 ? "1 contact will be able to read this." : "\(chosen.count) contacts will be able to read this.")
+                    .font(.system(size: 12, weight: .medium)).foregroundStyle(chosen.isEmpty ? Color.orange : Ink.dim)
+            }
+            Text("Only the contacts you pick are sent this note, inside their own encrypted chat with you, so they need no password. It is never in your public listing and other contacts never see it. If you take someone off later, it disappears for them, but they keep anything they already read or copied.")
                 .font(.system(size: 12)).foregroundStyle(Ink.faint)
         }
     }
@@ -433,10 +420,12 @@ struct NoteEditSheet: View {
         guard canSave else { return }
         working = true; problem = nil
         let (title, text, password, locked, id) = (title, text, password, locked, existing?.id ?? ProfileNote.newID())
+        let audience = forContacts ? Array(chosen) : nil
         Task {
             let made = await Task.detached(priority: .userInitiated) {
-                locked ? ProfileNote.lockedNote(id: id, title: title, text: text, password: password)
-                       : ProfileNote.publicNote(id: id, title: title, text: text)
+                if let audience { return ProfileNote.contactsNote(id: id, title: title, text: text, contacts: audience) }
+                return locked ? ProfileNote.lockedNote(id: id, title: title, text: text, password: password)
+                              : ProfileNote.publicNote(id: id, title: title, text: text)
             }.value
             working = false
             guard let made else { problem = "That couldn't be saved. Check the title, the text and the password."; return }

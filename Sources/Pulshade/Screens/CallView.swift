@@ -15,7 +15,7 @@ struct CallView: View {
                     VStack(spacing: 16) {
                         Avatar(image: contact?.avatar, seed: call.peer, size: 112)
                             .overlay {
-                                if call.phase == .ringing {
+                                if call.phase == .ringing, !Platform.reduceMotion {
                                     Circle().strokeBorder(theme.accent.opacity(0.5), lineWidth: 2)
                                         .phaseAnimator([1.0, 1.25]) { v, s in v.scaleEffect(s).opacity(2 - s * 1.4) } animation: { _ in
                                             .easeOut(duration: 1.4)
@@ -80,7 +80,7 @@ struct CallView: View {
             VStack(spacing: 8) {
                 Image(systemName: symbol)
                     .font(.system(size: 24, weight: .semibold))
-                    .foregroundStyle(tint == .white ? .black : .white)
+                    .foregroundStyle(tint == nil ? Ink.text : (tint == .white ? .black : .white))
                     .frame(width: 68, height: 68)
                     .background(tint ?? Ink.raised, in: .circle)
                     .overlay(Circle().strokeBorder(tint == nil ? Ink.line : .clear))

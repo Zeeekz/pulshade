@@ -1,10 +1,9 @@
 import SwiftUI
 
-/// The Burn tab: Lock, Detach and Burn in one place, each saying what it does before it's chosen. Detach and
-/// Burn open their own sheets, which ask again before anything happens.
+/// The Burn tab: Lock, Detach and Burn in one place, each saying what it does before it's chosen. Detach wipes this
+/// device the moment it's tapped; Burn opens a sheet that asks for BURN first.
 struct LeaveView: View {
     @Environment(AppModel.self) private var model
-    @State private var detaching = false
     @State private var burning = false
     @State private var burningPersona = false
 
@@ -16,7 +15,7 @@ struct LeaveView: View {
                     LeaveOption(symbol: "lock.fill", color: Ink.dim, title: "Lock",
                                 detail: "Close PULSHADE now. Your passcode opens it again.") { model.lock() }
                     LeaveOption(symbol: "person.crop.circle.badge.minus", color: .orange, title: "Detach",
-                                detail: "Log out of this device, or every device. Your recovery code brings the account back.") { detaching = true }
+                                detail: "Wipes this device at once, with no questions: everything on it is overwritten and PULSHADE starts fresh. Nothing is sent, so your other devices keep the account. \(model.data.security.keepBackup ? "Your recovery code brings back your profile, contacts and groups from the sealed backup (\(model.backupStatus.lowercased())), never your chats." : "Backups are off, so nothing comes back from the relay.")") { model.wipeNow() }
                     if model.activePersona != nil {
                         LeaveOption(symbol: "flame", color: .red, title: "Burn persona",
                                     detail: "Delete \(model.activeProfile.displayName) for good. Your main identity and other personas aren't touched.") { burningPersona = true }
@@ -32,7 +31,6 @@ struct LeaveView: View {
             .frame(maxWidth: .infinity)
         }
         .scrollIndicators(.never)
-        .sheet(isPresented: $detaching) { DetachSheet() }
         .sheet(isPresented: $burning) { BurnSheet() }
         .sheet(isPresented: $burningPersona) {
             if let id = model.activePersona { PersonaBurnSheet(persona: id) }
@@ -72,66 +70,14 @@ private struct LeaveOption: View {
     }
 }
 
-/// Detach: the account leaves this device (or every device), keeping everything but the chats.
-struct DetachSheet: View {
-    @Environment(AppModel.self) private var model
-    @State private var scope = AppModel.DetachScope.thisDevice
-    @State private var code = ""
-    @State private var working = false
-    @State private var problem: String?
-
-    private var needsCode: Bool { !model.hasOtherDevices || scope == .everyDevice }
-
-    var body: some View {
-        SheetBody(width: 460) {
-            VStack(alignment: .leading, spacing: 18) {
-                SheetHeader(symbol: "person.crop.circle.badge.minus", title: "Detach")
-                if model.hasOtherDevices {
-                    VStack(spacing: 8) {
-                        LeaveChoice(title: "Only this device", detail: "Your other devices keep the account and every chat. Log back in here with a QR code from one of them.",
-                                    chosen: scope == .thisDevice) { scope = .thisDevice }
-                        LeaveChoice(title: "Every device", detail: "Every device is logged out and every chat is deleted. Your recovery code brings back the rest.",
-                                    chosen: scope == .everyDevice) { scope = .everyDevice }
-                    }
-                }
-                if needsCode {
-                    Text("Your profile, @handles, contacts, groups and settings are sealed and kept on the relay for your recovery code, for up to 180 days. Every chat, story and request is deleted for good. Enter the code to make sure you have it.")
-                        .font(.system(size: 14)).foregroundStyle(Ink.dim)
-                        .fixedSize(horizontal: false, vertical: true)
-                    RecoveryCodeField(code: $code)
-                }
-                if let problem {
-                    Text(branded: problem).font(.system(size: 13, weight: .medium)).foregroundStyle(.orange)
-                }
-                Button(action: detach) { WorkingLabel(title: "Detach", working: working) }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .disabled(working || (needsCode && code.isEmpty))
-            }
-        }
-    }
-
-    private func detach() {
-        working = true
-        problem = nil
-        Task {
-            do {
-                try await model.detach(scope, recoveryCode: needsCode ? code : nil)
-            } catch AppModel.LeaveError.wrongRecoveryCode {
-                problem = "That isn't this account's recovery code"
-            } catch {
-                problem = "Can't reach the relay. Check your connection and try again."
-            }
-            working = false
-        }
-    }
-}
-
 /// Burn: the account is gone everywhere, as if it never existed. Typing BURN makes sure it's meant.
 struct BurnSheet: View {
     @Environment(AppModel.self) private var model
     @State private var confirm = ""
     @State private var working = false
     @State private var problem: String?
+    /// The relay couldn't be reached: offers to burn this device alone.
+    @State private var offline = false
 
     var body: some View {
         SheetBody(width: 460) {
@@ -148,20 +94,31 @@ struct BurnSheet: View {
                 }
                 BurnConfirmField(confirm: $confirm)
                 if let problem {
-                    Text(branded: problem).font(.system(size: 13, weight: .medium)).foregroundStyle(.orange)
+                    ProblemText(problem)
                 }
-                BurnButton(working: working, enabled: confirm == "BURN", action: burn)
+                BurnButton(working: working, enabled: confirm == "BURN", action: { burn() })
+                if offline {
+                    Text("Or wipe only this device now. The relay's copy of your backup then stays there, opens only with your recovery code, and is erased within 180 days. Your @handles aren't retired and your contacts aren't told.")
+                        .font(.system(size: 13)).foregroundStyle(Ink.dim)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Burn this device only") { burn(deviceOnly: true) }
+                        .disabled(working || confirm != "BURN")
+                }
             }
         }
     }
 
-    private func burn() {
+    private func burn(deviceOnly: Bool = false) {
         working = true
         problem = nil
         Task {
             do {
-                try await model.burn()
+                try await model.burn(thisDeviceOnly: deviceOnly)
+            } catch AppModel.LeaveError.backupNotRemoved {
+                offline = false
+                problem = "Your saved backup couldn't be removed from the relay, so nothing was burned. Try again."
             } catch {
+                offline = true
                 problem = "Can't reach the relay, so nothing was burned yet. Check your connection and try again."
             }
             working = false
@@ -199,7 +156,7 @@ struct PersonaBurnSheet: View {
                 }
                 BurnConfirmField(confirm: $confirm)
                 if let problem {
-                    Text(branded: problem).font(.system(size: 13, weight: .medium)).foregroundStyle(.orange)
+                    ProblemText(problem)
                 }
                 BurnButton(working: working, enabled: confirm == "BURN", action: burn)
             }
@@ -249,7 +206,7 @@ struct LockedLeaveSheet: View {
                     BurnConfirmField(confirm: $confirm)
                 }
                 if let problem {
-                    Text(branded: problem).font(.system(size: 13, weight: .medium)).foregroundStyle(.orange)
+                    ProblemText(problem)
                 }
                 if burning {
                     BurnButton(working: working, enabled: confirm == "BURN" && !code.isEmpty, action: leave)
@@ -270,6 +227,8 @@ struct LockedLeaveSheet: View {
                 try await model.leaveFromLock(burning: burning, recoveryCode: code)
             } catch AppModel.LeaveError.wrongRecoveryCode {
                 problem = "That isn't the recovery code of the account on this device"
+            } catch AppModel.LeaveError.backupNotRemoved {
+                problem = "Your saved backup couldn't be removed from the relay, so nothing was burned. Try again."
             } catch {
                 problem = "Can't reach the relay. Check your connection and try again."
             }

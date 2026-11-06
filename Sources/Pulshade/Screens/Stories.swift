@@ -7,7 +7,7 @@ enum StoryPalette {
         [.hex(0xB6FF3D), .hex(0x00494A)], [.hex(0xFF5FD2), .hex(0x2B0B4A)], [.hex(0xFFC93D), .hex(0x6A0F3A)],
     ]
     static func gradient(_ i: Int) -> LinearGradient {
-        LinearGradient(colors: all[i % all.count], startPoint: .topLeading, endPoint: .bottomTrailing)
+        LinearGradient(colors: all[i.wrapped(all.count)], startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 }
 
@@ -16,6 +16,7 @@ struct StoryStrip: View {
     @Environment(AppModel.self) private var model
     @Binding var composing: Bool
     @Binding var viewing: StoryReel?
+    @State private var pending: Pending?
 
     var body: some View {
         ScrollView(.horizontal) {
@@ -47,10 +48,13 @@ struct StoryStrip: View {
                     Button("New story", systemImage: "plus") { composing = true }
                     ForEach(model.myStories) { story in
                         Button("Delete story from \(story.date.formatted(date: .omitted, time: .shortened))",
-                               systemImage: "trash", role: .destructive) { model.deleteStory(story.id) }
+                               systemImage: "trash", role: .destructive) {
+                            pending = Pending(title: "Delete this story?", message: "It disappears for everyone who can see it.", confirm: "Delete") { model.deleteStory(story.id) }
+                        }
                     }
                 }
                 .accessibilityLabel(model.myStories.isEmpty ? "New story" : "Your story")
+                .confirms($pending)
 
                 ForEach(model.friendStories, id: \.author) { entry in
                     let contact = model.contact(entry.author)
@@ -218,8 +222,8 @@ struct StoryComposer: View {
     @State private var text = ""
     @State private var palette = 0
     @State private var image: Data?
-    /// A recorded or picked clip, not yet compressed. The composer deletes the file when it goes away.
-    @State private var clip: URL?
+    /// A recorded or picked clip, not yet compressed. Held in memory only.
+    @State private var clip: MemoryClip?
     /// Zoom recorded with the clip, for cameras that couldn't zoom for real.
     @State private var clipZoom = ZoomTrack.none
     @State private var clipPreview: ClipPreview?
@@ -243,7 +247,7 @@ struct StoryComposer: View {
     /// After posting, so the camera behind closes too.
     var posted: () -> Void = {}
 
-    init(image: Data? = nil, clip: URL? = nil, zoom: ZoomTrack = .none, filter: StoryFilter = .none, posted: @escaping () -> Void = {}) {
+    init(image: Data? = nil, clip: MemoryClip? = nil, zoom: ZoomTrack = .none, filter: StoryFilter = .none, posted: @escaping () -> Void = {}) {
         _image = State(initialValue: image)
         _clip = State(initialValue: clip)
         _clipZoom = State(initialValue: zoom)
@@ -289,12 +293,12 @@ struct StoryComposer: View {
             startTyping()
         }
         .onChange(of: image == nil && clip == nil) { _, plain in if plain { startTyping() } }
-        .task(id: clip) { openClip() }
+        .task(id: clip?.id) { openClip() }
         .task(id: [filter.rawValue, String(image?.count ?? 0)]) { await look() }
         .onChange(of: filter) { _, new in clipPreview?.set(new) }
         .onDisappear {
             clipPreview?.close()
-            if let clip { try? FileManager.default.removeItem(at: clip) }
+            clip = nil
         }
     }
 
@@ -366,7 +370,7 @@ struct StoryComposer: View {
                                 withAnimation {
                                     switch kind {
                                     case let .photo(data): image = data
-                                    case let .clip(url, zoom): clip = url; clipZoom = zoom
+                                    case let .clip(picked, zoom): clip = picked; clipZoom = zoom
                                     }
                                 }
                             }) {
@@ -492,7 +496,7 @@ struct StoryComposer: View {
                         withAnimation {
                             switch kind {
                             case let .photo(data): image = data
-                            case let .clip(url, zoom): clip = url; clipZoom = zoom
+                            case let .clip(picked, zoom): clip = picked; clipZoom = zoom
                             }
                         }
                     }) {
@@ -611,7 +615,7 @@ struct StoryComposer: View {
         clipPreview?.close()
         clipPreview = nil
         guard let clip else { return }
-        clipPreview = ClipPreview(url: clip, filter: filter, zoom: clipZoom)
+        clipPreview = ClipPreview(clip: clip, filter: filter, zoom: clipZoom)
     }
 
     /// Colours the photo for the preview.
@@ -903,7 +907,8 @@ extension View {
 
 /// Where a new story starts: the camera, with the library and text stories a tap away. Tap the button for a
 /// photo, hold it for a video (drag up and down while holding to zoom, up to 15 seconds). Swipe left or right on
-/// the picture to change the look, pinch to zoom. A photo is framed to the story's shape, then captioned and
+/// the picture to change the look, pinch to zoom (out to the ultra wide lens where there is one), tap to focus,
+/// double-tap to switch cameras, also while recording. A photo is framed to the story's shape, then captioned and
 /// posted; a clip goes straight to the composer.
 struct StoryCamera: View {
     @Environment(\.dismiss) private var dismiss
@@ -935,12 +940,39 @@ struct StoryCamera: View {
     @State private var pinching = false
     @State private var zoomShown = false
     @State private var zoomToken = UUID()
+    // Tap to focus: where, and a token so the ring fades by itself.
+    @State private var focusAt: CGPoint?
+    @State private var focusToken = UUID()
+    /// The picture blurs for a moment as the camera switches.
+    @State private var flipBlur: CGFloat = 0
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             if ready == true {
-                LayerView(layer: camera.preview).ignoresSafeArea()
+                GeometryReader { geo in
+                    ZStack {
+                        LayerView(layer: camera.preview)
+                            .blur(radius: flipBlur)
+                        if let focusAt {
+                            RoundedRectangle(cornerRadius: 6)
+                                .strokeBorder(Color.yellow, lineWidth: 1.5)
+                                .frame(width: 72, height: 72)
+                                .position(focusAt)
+                                .transition(.scale(scale: 1.3).combined(with: .opacity))
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                    .simultaneousGesture(ExclusiveGesture(SpatialTapGesture(count: 2), SpatialTapGesture(count: 1))
+                        .onEnded { result in
+                            switch result {
+                            case .first: flipCamera()
+                            case let .second(tap): focus(at: tap.location, in: geo.size)
+                            }
+                        })
+                }
+                .ignoresSafeArea()
                     .filterSwipe($filter, enabled: !pinching && pressStart == nil)
                     .simultaneousGesture(MagnifyGesture()
                         .onChanged { value in
@@ -995,6 +1027,7 @@ struct StoryCamera: View {
                     }
                 }
                 Spacer()
+                if camera.lensStops.count > 1 && ready == true { lensPills.padding(.bottom, 10) }
                 FilterDots(filter: $filter).padding(.bottom, 6)
                     .opacity(camera.recording ? 0 : 1)
                 HStack(alignment: .center) {
@@ -1008,15 +1041,15 @@ struct StoryCamera: View {
                     shutter
                     Spacer()
                     #if os(iOS)
-                    control("arrow.triangle.2.circlepath.camera", label: "Switch camera") { camera.flip() }
-                        .disabled(ready != true || camera.recording)
+                    control("arrow.triangle.2.circlepath.camera", label: "Switch camera") { flipCamera() }
+                        .disabled(ready != true)
                     #else
                     controlFace("camera").opacity(0)
                     #endif
                 }
                 .padding(.horizontal, 28)
                 HStack(spacing: 12) {
-                    Text("Tap for photo · Hold for video")
+                    Text("Tap for photo · Hold for video · Double-tap to flip")
                         .font(.system(size: 12, weight: .medium)).foregroundStyle(.white.opacity(0.7))
                     Button { cover = .writing } label: {
                         Text("Aa  Text")
@@ -1046,6 +1079,12 @@ struct StoryCamera: View {
             zoomToken = UUID()
         }
         .onChange(of: camera.recording) { _, now in if !now { holdRecording = false } }
+        .task(id: focusToken) {
+            guard focusAt != nil else { return }
+            try? await Task.sleep(for: .seconds(1.2))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.3)) { focusAt = nil }
+        }
         .task(id: zoomToken) {
             try? await Task.sleep(for: .seconds(1.2))
             guard !Task.isCancelled else { return }
@@ -1064,6 +1103,51 @@ struct StoryCamera: View {
         }
     }
 
+    // MARK: Camera controls
+
+    private func flipCamera() {
+        #if os(iOS)
+        guard ready == true else { return }
+        Haptics.tick()
+        camera.flip()
+        guard !reduceMotion else { return }
+        withAnimation(.easeIn(duration: 0.1)) { flipBlur = 24 }
+        Task {
+            try? await Task.sleep(for: .seconds(0.3))
+            withAnimation(.easeOut(duration: 0.25)) { flipBlur = 0 }
+        }
+        #endif
+    }
+
+    private func focus(at point: CGPoint, in size: CGSize) {
+        guard ready == true else { return }
+        camera.focus(at: point, in: size)
+        withAnimation(.spring(duration: 0.25)) { focusAt = point }
+        focusToken = UUID()
+    }
+
+    /// Jumps between the lenses, as 0.5 · 1 · 3 above the shutter.
+    private var lensPills: some View {
+        HStack(spacing: 6) {
+            ForEach(camera.lensStops, id: \.self) { stop in
+                let on = abs(camera.zoom - stop) < 0.08
+                Button { camera.setZoom(stop) } label: {
+                    Text(on ? ZoomMath.label(stop) : String(format: "%g", Double(stop)))
+                        .font(.system(size: on ? 13 : 12, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(on ? Color.yellow : .white)
+                        .frame(width: on ? 40 : 32, height: on ? 40 : 32)
+                        .background(.black.opacity(0.4), in: .circle)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Zoom \(String(format: "%g", Double(stop))) times")
+                .accessibilityAddTraits(on ? .isSelected : [])
+            }
+        }
+        .padding(4)
+        .background(.black.opacity(0.25), in: .capsule)
+        .animation(reduceMotion ? nil : .snappy, value: camera.zoom)
+    }
+
     // MARK: Shutter
 
     /// Down starts the clock; a press that lasts starts a clip, and dragging up or down then zooms.
@@ -1079,7 +1163,7 @@ struct StoryCamera: View {
             }
         }
         if holdRecording {
-            camera.setZoom(ZoomMath.zoom(start: zoomAtPress, drag: drag.translation.height, max: camera.maxZoom))
+            camera.setZoom(ZoomMath.zoom(start: zoomAtPress, drag: drag.translation.height, min: camera.minZoom, max: camera.maxZoom))
         }
     }
 
@@ -1102,8 +1186,8 @@ struct StoryCamera: View {
         guard !holdRecording, !camera.recording else { return }
         holdRecording = true
         Haptics.tick()
-        camera.record { url, track in
-            if let url { cover = .framed(StoryPick(kind: .clip(url, track), filter: filter)) }
+        camera.record { made, track in
+            if let made { cover = .framed(StoryPick(kind: .clip(made, track), filter: filter)) }
         }
     }
 

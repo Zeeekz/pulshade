@@ -42,7 +42,7 @@ struct Banner: View {
 
     var body: some View {
         ZStack {
-            if let image, let picture = PlatformImage(data: image) {
+            if let image, let picture = DecodedImages.image(image) {
                 Image(platformImage: picture).resizable().scaledToFill()
             } else {
                 let tint = Signature.tint(for: seed, model: model)
@@ -96,6 +96,43 @@ struct BannerPicker: View {
         .accessibilityLabel(image == nil ? "Add a banner" : "Change banner")
         .contextMenu {
             if image != nil { Button("Remove banner", role: .destructive) { withAnimation { image = nil } } }
+        }
+    }
+}
+
+/// A count with its noun, plural unless there is exactly one: "1 follower", "3 followers".
+func counted(_ count: Int, _ noun: String) -> String { count == 1 ? "1 \(noun)" : "\(count) \(noun)s" }
+
+/// Something went wrong, said in one quiet line under the control it belongs to.
+struct ProblemText: View {
+    var text: String
+    init(_ text: String) { self.text = text }
+    var body: some View {
+        Text(branded: text)
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(.orange)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// Something that can't be undone, waiting for a yes.
+struct Pending: Identifiable {
+    let id = UUID()
+    var title: String
+    var message: String?
+    var confirm: String
+    var run: () -> Void
+}
+
+extension View {
+    /// Asks before running whatever is put in `pending`.
+    func confirms(_ pending: Binding<Pending?>) -> some View {
+        confirmationDialog(pending.wrappedValue?.title ?? "",
+                           isPresented: Binding(get: { pending.wrappedValue != nil }, set: { if !$0 { pending.wrappedValue = nil } }),
+                           titleVisibility: .visible, presenting: pending.wrappedValue) { asked in
+            Button(asked.confirm, role: .destructive) { asked.run() }
+        } message: { asked in
+            if let message = asked.message { Text(branded: message) }
         }
     }
 }
@@ -189,6 +226,7 @@ struct SheetHeader: View {
             Button { dismiss() } label: { Image(systemName: "xmark") }
                 .buttonStyle(IconButtonStyle(size: 30))
                 .keyboardShortcut(.cancelAction)
+                .accessibilityLabel("Close")
         }
     }
 }

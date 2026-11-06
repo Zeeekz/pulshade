@@ -34,6 +34,8 @@ struct CollectibleArtTests {
         ("bonfire", BonfireFrame.loop, { AnyView(BonfireFrame(time: $0)) }),
         ("christmastree", ChristmasTreeFrame.loop, { AnyView(ChristmasTreeFrame(time: $0)) }),
         ("bitcoin", BitcoinFrame.loop, { AnyView(BitcoinFrame(time: $0)) }),
+        ("winnie", WinnieFrame.loop, { AnyView(WinnieFrame(time: $0)) }),
+        ("honeyjar", HoneyJarFrame.loop, { AnyView(HoneyJarFrame(time: $0)) }),
     ]
 
     private func frame(_ index: Int, _ time: Double, _ size: CGFloat) throws -> Data {

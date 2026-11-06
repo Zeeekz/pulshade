@@ -37,10 +37,9 @@ struct StoryEditorTests {
 
     @Test func textGoesOverEveryFrameOfAClip() async throws {
         let words = try #require(StoryOverlayRender.text([hello()]))
-        let url = try await StoryMediaTests.clip(seconds: 1)
-        defer { try? FileManager.default.removeItem(at: url) }
-        let plain = try await StoryVideo.export(from: url, filter: .none)
-        let withText = try await StoryVideo.export(from: url, filter: .none, text: words)
+        let clip = try await StoryMediaTests.clip(seconds: 1)
+        let plain = try await StoryVideo.export(from: clip, filter: .none)
+        let withText = try await StoryVideo.export(from: clip, filter: .none, text: words)
         #expect(!withText.isEmpty && plain != withText)
     }
 

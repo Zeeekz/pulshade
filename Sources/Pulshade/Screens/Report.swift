@@ -83,16 +83,18 @@ struct ReportSheet: View {
                 .background(Ink.raised, in: .rect(cornerRadius: 12))
                 .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Ink.line))
             if let mine = model.activeProfile.handle {
-                Toggle(isOn: $includeHandle) {
+                HStack(spacing: 12) {
                     Text("Say it's from @\(mine)").font(.system(size: 14)).foregroundStyle(Ink.text)
+                        .lineLimit(1).minimumScaleFactor(0.85)
+                    Spacer(minLength: 8)
+                    Toggle("Say it's from @\(mine)", isOn: $includeHandle).toggleStyle(GlowToggleStyle())
                 }
-                .toggleStyle(GlowToggleStyle())
             }
             Text(branded: "Only the PULSHADE team can read this. It's sent from a throwaway identity, so it doesn't say who you are unless you add your handle. The person you report is never told.")
                 .font(.system(size: 12)).foregroundStyle(Ink.faint)
                 .fixedSize(horizontal: false, vertical: true)
             if let problem {
-                Text(branded: problem).font(.system(size: 13, weight: .medium)).foregroundStyle(.orange)
+                ProblemText(problem)
             }
             Button(action: send) { WorkingLabel(title: "Send report", working: sending) }
                 .buttonStyle(PrimaryButtonStyle())

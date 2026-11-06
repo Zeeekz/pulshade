@@ -83,7 +83,7 @@ enum Signature {
     ]
 
     static func color(_ index: Int?, seed: String) -> Color {
-        colors[(index ?? abs(seed.stableHash)) % colors.count]
+        colors[(index ?? seed.stableHash).wrapped(colors.count)]
     }
 }
 
@@ -118,6 +118,12 @@ struct Heading: View {
             .foregroundStyle(Ink.text)
             .frame(maxWidth: .infinity, alignment: .leading)
     }
+}
+
+extension Int {
+    /// This number as an index into something `count` long. Negative ones wrap too, so a number sent by someone
+    /// else can never point outside.
+    func wrapped(_ count: Int) -> Int { ((self % count) + count) % count }
 }
 
 extension Color {
@@ -228,6 +234,32 @@ struct IconButtonStyle: ButtonStyle {
             .scaleEffect(configuration.isPressed ? 0.95 : 1)
             .animation(.snappy(duration: 0.15), value: configuration.isPressed)
             .contentShape(RoundedRectangle(cornerRadius: size * 0.3))
+    }
+}
+
+/// A round icon button for the top bar. `prominent` fills it with the accent, for the main action.
+struct BarButtonStyle: ButtonStyle {
+    var prominent = false
+    /// Colours the glyph, such as the burn gradient; plain buttons use the dim ink.
+    var tint: AnyShapeStyle?
+    var size: CGFloat = 38
+    @Environment(\.theme) private var theme
+    @Environment(\.isEnabled) private var enabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: size * 0.43, weight: .semibold))
+            .foregroundStyle(prominent ? AnyShapeStyle(Ink.onAccent.opacity(0.85)) : (tint ?? AnyShapeStyle(Ink.dim)))
+            .frame(width: size, height: size)
+            .background {
+                Circle().fill(prominent ? AnyShapeStyle(theme.accent) : AnyShapeStyle(configuration.isPressed ? Ink.hover : Ink.raised))
+            }
+            .overlay { if !prominent { Circle().strokeBorder(Ink.line) } }
+            .shadow(color: prominent ? theme.accent.opacity(0.35) : .clear, radius: 8, y: 2)
+            .scaleEffect(configuration.isPressed ? 0.92 : 1)
+            .opacity(enabled ? 1 : 0.4)
+            .animation(.snappy(duration: 0.15), value: configuration.isPressed)
+            .contentShape(Circle())
     }
 }
 

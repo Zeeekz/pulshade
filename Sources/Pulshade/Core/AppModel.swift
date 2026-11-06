@@ -39,7 +39,9 @@ final class AppModel {
     /// When a video was last sent again on someone's asking, as "fingerprint|id", so one asking can't make it
     /// go over and over.
     @ObservationIgnored private var clipResent: [String: Date] = [:]
-    var failedAttempts = 0
+    var failedAttempts = FileKeys.savedAttempts() {
+        didSet { if failedAttempts != oldValue { FileKeys.saveAttempts(failedAttempts) } }
+    }
     /// The passcode was right but the account's data wouldn't open, so nothing was opened (or touched).
     private(set) var dataUnreadable = false
     /// Another of your devices has a newer profile than this version can read. Set until PULSHADE is updated.
@@ -126,6 +128,10 @@ final class AppModel {
     let vault: Vault
     private var syncTask: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
+    /// The sealed backup upload waiting its turn, and how long it waits (seconds, picked at random each time so the
+    /// relay can't line an upload up with an edit). Tests shorten the wait.
+    @ObservationIgnored private var backupTask: Task<Void, Never>?
+    @ObservationIgnored static var backupWait: ClosedRange<Int> = 90...600
     private var activityMonitor: Any?
     private var lastActivity = Date()
     private var profileTask: Task<Void, Never>?
@@ -331,14 +337,14 @@ final class AppModel {
         }
         adoptConnectionChoice()
         didUnlock()
-        // It's on this device now. An old copy left behind could only fall out of step.
-        if backup != nil { Task { try? await deleteBackup(of: identity) } }
+        // It's on this device now. It stays on the relay and is saved over as things change, unless backups are off.
+        if backup != nil, !data.security.keepBackup { Task { try? await deleteBackup(of: identity) } }
     }
 
     func unlock(passcode: String) async -> Bool {
         // Each wrong guess makes the next one wait longer.
         if failedAttempts > 2 {
-            try? await Task.sleep(for: .seconds(min(30, 1 << (failedAttempts - 2))))
+            try? await Task.sleep(for: .seconds(min(30, 1 << min(failedAttempts - 2, 5))))
         }
         dataUnreadable = false
         do {
@@ -363,6 +369,7 @@ final class AppModel {
             }
             failedAttempts = 0
             didUnlock()
+            if data.pendingBackupForget != nil { Task { await forgetPendingBackup() } }
             // A decoy is an empty account: the real one's wake-ups stop until the real one is unlocked again.
             if !isPrimary { withdrawPush() }
             await bindToDevice(passcode: passcode)
@@ -429,6 +436,7 @@ final class AppModel {
         }
         connecting = true
         withAnimation(.smooth(duration: 0.6)) { phase = .unlocked }
+        scheduleBackup()
         // Ask straight away, and again until it answers, so the wait is only as long as Tor needs.
         Task { [weak self] in
             while let self, self.connecting, self.phase == .unlocked, let client = self.client(nil) {
@@ -454,7 +462,7 @@ final class AppModel {
             for persona in [nil] + data.personas.map(\.id)
             where !(profile(for: persona).bio ?? "").isEmpty || profile(for: persona).handle != nil
                 || !ProfileLink.cleaned(profile(for: persona).links).isEmpty {
-                for c in contacts(of: persona) { enqueue(profilePayload(persona), to: c) }
+                for c in contacts(of: persona) { enqueue(profilePayload(persona, for: c.fingerprint), to: c) }
             }
         }
     }
@@ -505,6 +513,7 @@ final class AppModel {
         slot = 0
         identity = nil
         data = AppData()
+        forgetSession()
         link = .offline
         openConversation = nil
         Platform.setBadge(0)
@@ -530,8 +539,12 @@ final class AppModel {
         if hadPush { withdrawPush() }
         syncTask?.cancel()
         tickTask?.cancel()
+        // Nothing more goes to the relay from here. The backup already there is what a recovery code brings back.
+        backupTask?.cancel()
+        backupTask = nil
         discardSaves()
         vault.destroy(leavingNoTrace: leavingNoTrace)
+        failedAttempts = 0
         AnnouncementWatch.forget()
         // The few display settings kept outside the vault, so the lock screen can look right.
         for key in ["pulshade.theme", "pulshade.menuBar", "pulshade.blockCapture", "pulshade.blur"] {
@@ -547,7 +560,25 @@ final class AppModel {
         forgetRoutes()
         identity = nil
         data = AppData()
+        forgetSession()
         withAnimation(.smooth(duration: 0.6)) { phase = .welcome }
+    }
+
+    /// What's held in memory only, for the account that was open: persona keys and its eggs. Whoever unlocks
+    /// next, a decoy included, must not find them.
+    private func forgetSession() {
+        identityCache = [:]
+        DecodedImages.forget()
+        eggs = []
+    }
+
+    /// Detach: wipes this device at once, with no questions and no waiting on the network. Everything is overwritten
+    /// and deleted (the vault, Keychain items, Tor's state, settings, caches and temporary files) and Pulshade
+    /// starts over as if it had just been installed. Nothing is sent: other devices keep the account, and the relay
+    /// is not told.
+    func wipeNow() {
+        destroyEverything(leavingNoTrace: true)
+        Vault.scrubLeftovers()
     }
 
     /// Whoever opens Pulshade next starts on new Tor circuits and new connections, so the relay can't tie two
@@ -577,6 +608,7 @@ final class AppModel {
             }
         }
         updateBadge()
+        scheduleBackup()
         AnnouncementWatch.mirror(.init(notifications: data.security.notifications, content: data.security.notificationContent,
                                        sound: data.security.notificationSound,
                                        muted: conversation(Conversation.announcementsID)?.muted ?? false))
@@ -761,10 +793,10 @@ final class AppModel {
                         signingKey: keys.signing, agreementKey: keys.agreement, sendID: sendID, device: deviceID(for: persona))
     }
 
-    /// The notes of a profile that are worth sending: checked again, none if there are none.
-    static func sharedNotes(_ profile: Profile) -> [ProfileNote]? {
-        let notes = ProfileNote.cleaned(profile.notes)
-        return notes.isEmpty ? nil : notes
+    /// The notes of a profile that one contact is sent: the ones for everyone and the ones chosen for them, checked
+    /// again, none if there are none. With no contact (the public listing), only the notes for everyone.
+    static func sharedNotes(_ profile: Profile, for fingerprint: String? = nil) -> [ProfileNote]? {
+        ProfileNote.notes(profile.notes, sentTo: fingerprint)
     }
 
     /// The links and wallets of a profile that are worth sending: checked again, none if there are none.
@@ -780,12 +812,12 @@ final class AppModel {
         return mine.isEmpty ? nil : Array(mine)
     }
 
-    private func profilePayload(_ persona: UUID?) -> Payload {
+    private func profilePayload(_ persona: UUID?, for contact: String) -> Payload {
         let profile = profile(for: persona)
         return .profile(name: profile.name, avatar: profile.avatar, color: profile.color, banner: profile.banner,
                         bio: profile.bio.flatMap { $0.isEmpty ? nil : $0 }, handle: profile.handle, badge: profile.badge,
                         links: Self.sharedLinks(profile), collectibles: Self.sharedCollectibles(profile),
-                        notes: Self.sharedNotes(profile))
+                        notes: Self.sharedNotes(profile, for: contact))
     }
 
     /// Someone's signature colour: what they chose, or one picked from their fingerprint.
@@ -885,9 +917,8 @@ final class AppModel {
         case let .image(data, _):
             image = PlatformImage(data: data)
         case let .video(data, _):
-            guard !data.isEmpty, let url = StoryVideo.tempFile(for: data) else { return nil }
-            defer { try? FileManager.default.removeItem(at: url) }
-            image = await StoryVideo.poster(of: url).map { PlatformImage.from(cgImage: $0) }
+            guard !data.isEmpty else { return nil }
+            image = await StoryVideo.poster(of: MemoryClip(data)).map { PlatformImage.from(cgImage: $0) }
         case .text:
             let renderer = ImageRenderer(content: StoryFace(story: story, compact: true).frame(width: 90, height: 160))
             renderer.scale = 2
@@ -1070,6 +1101,7 @@ final class AppModel {
         var changed = false
         for i in data.conversations.indices where data.conversations[i].messages.contains(where: { ($0.expiresAt ?? .distantFuture) <= now }) {
             withAnimation(.smooth) { data.conversations[i].messages.removeAll { ($0.expiresAt ?? .distantFuture) <= now } }
+            clampUnread(i)
             changed = true
         }
         // Stories past their time go from the vault too, not just from view, and so do old removal notes.
@@ -1136,7 +1168,7 @@ final class AppModel {
         guard let i = index(of: id), data.conversations[i].unread > 0 else { return }
         let convo = data.conversations[i]
         if sendsReadReceipts(convo), let sender = contact(convo.members.first ?? "", in: convo.persona) {
-            for message in convo.messages.filter({ !$0.isMine }).suffix(convo.unread) { queueReceipt(message.id, to: sender, read: true) }
+            for message in convo.messages.filter({ !$0.isMine && !$0.isSystem }).suffix(convo.unread) { queueReceipt(message.id, to: sender, read: true) }
         }
         data.conversations[i].unread = 0
         sync(.read(ref(data.conversations[i])))
@@ -1566,6 +1598,7 @@ final class AppModel {
         if data.security.onlineStatus, id != data.activePersona { sendPresence(false) }
         presenceDue = [:]
         openConversation = nil
+        if id != data.activePersona { eggs = [] }
         withAnimation(.smooth(duration: 0.4)) { data.activePersona = id }
         save()
     }
@@ -1667,7 +1700,7 @@ final class AppModel {
     /// Lists the active persona under @handle so anyone who knows it can send a request.
     func publishProfile(handle raw: String) async throws {
         guard let handle = DirectoryProfile.validHandle(raw) else { throw DirectoryError.invalidHandle }
-        guard let client = client(nil) else { throw DirectoryError.unreachable }
+        guard let client = client(nil, lane: Self.directoryLane(activePersona)) else { throw DirectoryError.unreachable }
         let persona = activePersona
         let entry = try signedEntry(handle: handle, persona: persona)
         do {
@@ -1686,8 +1719,9 @@ final class AppModel {
             // Anything else the relay said no with, a rate limit among them.
             throw DirectoryError.invalid
         }
+        if let old = profile(for: persona).handle, old != handle { await release(old, persona: persona) }
+        // Read after the wait, so nothing that changed the profile meanwhile is written over.
         var profile = profile(for: persona)
-        if let old = profile.handle, old != handle { await release(old, persona: persona) }
         profile.handle = handle
         profile.updatedAt = Date()
         setProfile(profile, for: persona)
@@ -1700,10 +1734,11 @@ final class AppModel {
     /// Takes the active persona out of the directory and stops reading its request mailbox.
     func unpublishProfile() async {
         let persona = activePersona
-        var profile = profile(for: persona)
-        guard profile.handle != nil else { return }
+        guard profile(for: persona).handle != nil else { return }
         await releaseHandles(persona: persona, keeping: nil)
         data.invites.removeAll { $0.isPublic && $0.persona == persona }
+        // Read after the wait, so nothing that changed the profile meanwhile is written over.
+        var profile = profile(for: persona)
         profile.handle = nil
         profile.updatedAt = Date()
         setProfile(profile, for: persona)
@@ -1712,7 +1747,7 @@ final class AppModel {
     }
 
     private func release(_ handle: String, persona: UUID?) async {
-        guard let me = me(persona), let client = client(nil) else { return }
+        guard let me = me(persona), let client = client(nil, lane: Self.directoryLane(persona)) else { return }
         let ts = UInt64(RelayClock.now.timeIntervalSince1970)
         let message = Data("pulshade.dir.del.v1".utf8) + Data(handle.utf8) + withUnsafeBytes(of: ts.bigEndian) { Data($0) }
         guard let sig = try? me.signingKey.signature(for: message) else { return }
@@ -1722,7 +1757,7 @@ final class AppModel {
     /// Burning: every handle the identity lists or holds stays unclaimable for a while, with nothing left on
     /// the relay to say whose it was.
     private func retireHandles(persona: UUID?) async {
-        guard let me = me(persona), let client = client(nil) else { return }
+        guard let me = me(persona), let client = client(nil, lane: Self.directoryLane(persona)) else { return }
         let ts = UInt64(RelayClock.now.timeIntervalSince1970)
         let key = me.card.signing
         let message = Data("pulshade.dir.retire.v1".utf8) + key + withUnsafeBytes(of: ts.bigEndian) { Data($0) }
@@ -1732,7 +1767,7 @@ final class AppModel {
 
     /// Keeps a listed profile in step with name, picture and bio changes.
     private func republish(_ persona: UUID?) async {
-        guard let handle = profile(for: persona).handle, let client = client(nil),
+        guard let handle = profile(for: persona).handle, let client = client(nil, lane: Self.directoryLane(persona)),
               let entry = try? signedEntry(handle: handle, persona: persona) else { return }
         try? await client.claim(handle, entry)
     }
@@ -1740,7 +1775,7 @@ final class AppModel {
     /// Looks up exactly one handle and checks its signature. Nil if nobody has it.
     func findProfile(_ raw: String) async throws -> DirectoryProfile? {
         guard let handle = DirectoryProfile.validHandle(raw) else { throw DirectoryError.invalidHandle }
-        guard let client = client(nil) else { throw DirectoryError.unreachable }
+        guard let client = client(nil, lane: "lookup") else { throw DirectoryError.unreachable }
         let found: RelayClient.DirectoryEntry?
         do { found = try await client.lookup(handle) } catch { throw DirectoryError.unreachable }
         guard let entry = found else { return nil }
@@ -1793,7 +1828,7 @@ final class AppModel {
 
     /// The handles kept for the active identity, soonest free first.
     func heldHandles() async throws -> [HeldHandle] {
-        guard let me = me(activePersona), let client = client(nil) else { throw DirectoryError.unreachable }
+        guard let me = me(activePersona), let client = client(nil, lane: Self.directoryLane(activePersona)) else { throw DirectoryError.unreachable }
         let (key, sig, ts) = try ownerProof("pulshade.dir.held.v1", about: me.card.signing, by: me)
         do {
             return try await client.held(key: key, sig: sig, ts: ts).map { HeldHandle(handle: $0.handle, until: $0.until) }
@@ -1802,7 +1837,7 @@ final class AppModel {
 
     /// Lets go of a handle kept for the active identity: anyone may claim it from now on.
     func letGo(of handle: String) async throws {
-        guard let me = me(activePersona), let client = client(nil) else { throw DirectoryError.unreachable }
+        guard let me = me(activePersona), let client = client(nil, lane: Self.directoryLane(activePersona)) else { throw DirectoryError.unreachable }
         let (key, sig, ts) = try ownerProof("pulshade.dir.unhold.v1", about: Data(handle.utf8), by: me)
         do { try await client.unhold(handle, key: key, sig: sig, ts: ts) } catch { throw DirectoryError.unreachable }
     }
@@ -1827,7 +1862,7 @@ final class AppModel {
     /// (made the first time), and an alert asks you to keep the code safe.
     func refreshCollectibles() async throws {
         let persona = activePersona
-        guard let me = me(persona), let client = client(nil) else { throw DirectoryError.unreachable }
+        guard let me = me(persona), let client = client(nil, lane: Self.directoryLane(persona)) else { throw DirectoryError.unreachable }
         let (key, sig, ts) = try ownerProof("pulshade.collect.mine.v1", about: me.card.signing, by: me)
         let given: [(collectible: Collectible, coded: Bool)]
         do { given = try await client.collectibles(key: key, sig: sig, ts: ts) } catch { throw DirectoryError.unreachable }
@@ -1860,7 +1895,7 @@ final class AppModel {
 
     func refreshEggs() async {
         let persona = activePersona
-        guard let me = me(persona), let client = client(nil),
+        guard let me = me(persona), let client = client(nil, lane: Self.directoryLane(persona)),
               let (key, sig, ts) = try? ownerProof("pulshade.eggs.mine.v1", about: me.card.signing, by: me),
               let list = try? await client.eggs(key: key, sig: sig, ts: ts), activePersona == persona else { return }
         eggsAsked = Date()
@@ -1876,7 +1911,7 @@ final class AppModel {
 
     /// Starts an egg's clock.
     func startEgg(_ id: String) async throws {
-        guard let me = me(activePersona), let client = client(nil) else { throw DirectoryError.unreachable }
+        guard let me = me(activePersona), let client = client(nil, lane: Self.directoryLane(activePersona)) else { throw DirectoryError.unreachable }
         let (key, sig, ts) = try ownerProof("pulshade.eggs.start.v1", about: Data(id.utf8), by: me)
         let started: RelayClient.EggInfo
         do { started = try await client.startEgg(key: key, sig: sig, ts: ts, id: id) } catch { throw DirectoryError.unreachable }
@@ -1888,7 +1923,7 @@ final class AppModel {
     /// showing it.
     func hatchEgg(_ id: String) async throws -> Collectible {
         let persona = activePersona
-        guard let me = me(persona), let client = client(nil) else { throw RelayClient.HatchError.unreachable }
+        guard let me = me(persona), let client = client(nil, lane: Self.directoryLane(persona)) else { throw RelayClient.HatchError.unreachable }
         let (key, sig, ts) = try ownerProof("pulshade.eggs.hatch.v1", about: Data(id.utf8), by: me)
         let pet = try await client.hatchEgg(key: key, sig: sig, ts: ts, id: id)
         guard pet.isGenuine(for: me.card.signing) else { throw RelayClient.HatchError.unreachable }
@@ -1899,7 +1934,7 @@ final class AppModel {
 
     /// Gives a collectible to a contact. They see it the next time their app checks.
     func gift(_ item: Collectible, to contact: Contact) async throws {
-        guard let me = me(activePersona), let client = client(nil) else { throw DirectoryError.unreachable }
+        guard let me = me(activePersona), let client = client(nil, lane: Self.directoryLane(activePersona)) else { throw DirectoryError.unreachable }
         let to = contact.signingKey
         let about = Data(item.item.utf8) + Data([0]) + withUnsafeBytes(of: item.serial.bigEndian) { Data($0) } + to
         let (key, sig, ts) = try ownerProof("pulshade.collect.gift.v1", about: about, by: me)
@@ -1910,7 +1945,7 @@ final class AppModel {
 
     /// Lets a collectible go. It goes back into circulation, and its number can hatch again for someone else.
     func release(_ item: Collectible) async throws {
-        guard let me = me(activePersona), let client = client(nil) else { throw DirectoryError.unreachable }
+        guard let me = me(activePersona), let client = client(nil, lane: Self.directoryLane(activePersona)) else { throw DirectoryError.unreachable }
         let about = Data(item.item.utf8) + Data([0]) + withUnsafeBytes(of: item.serial.bigEndian) { Data($0) }
         let (key, sig, ts) = try ownerProof("pulshade.collect.release.v1", about: about, by: me)
         do { try await client.releaseCollectible(key: key, sig: sig, ts: ts, item: item.item, serial: item.serial) }
@@ -1935,7 +1970,7 @@ final class AppModel {
     /// Returns the ones it reached.
     private func cover(_ items: [Collectible], with code: String) async throws -> [Collectible] {
         let persona = activePersona
-        guard let me = me(persona), let client = client(nil) else { throw DirectoryError.unreachable }
+        guard let me = me(persona), let client = client(nil, lane: Self.directoryLane(persona)) else { throw DirectoryError.unreachable }
         let hash = Collectible.codeHash(code)
         var covered: [Collectible] = []
         for item in items {
@@ -1960,7 +1995,7 @@ final class AppModel {
     /// Brings collectibles back with a backup code from another account (one that burned, say). PULSHADE then signs
     /// them over to this account, numbers unchanged; they show up here once it has. Returns what the code was for.
     func claimCollectibles(code: String) async throws -> [(item: String, serial: UInt32)] {
-        guard let me = me(activePersona), let client = client(nil) else { throw RelayClient.ClaimError.unreachable }
+        guard let me = me(activePersona), let client = client(nil, lane: Self.directoryLane(activePersona)) else { throw RelayClient.ClaimError.unreachable }
         let (key, sig, ts) = try ownerProof("pulshade.collect.claim.v1", about: Collectible.codeHash(code), by: me)
         return try await client.claimCollectibles(key: key, sig: sig, ts: ts, code: code)
     }
@@ -1976,7 +2011,7 @@ final class AppModel {
         do {
             return .restored(try await claimCollectibles(code: code))
         } catch RelayClient.ClaimError.unknownCode {
-            guard let me = me(activePersona), let client = client(nil) else { throw RelayClient.GiveawayError.unreachable }
+            guard let me = me(activePersona), let client = client(nil, lane: Self.directoryLane(activePersona)) else { throw RelayClient.GiveawayError.unreachable }
             let (key, sig, ts) = try ownerProof("pulshade.collect.giveaway.v1", about: Collectible.codeHash(code), by: me)
             let place = try await client.claimGiveaway(key: key, sig: sig, ts: ts, code: code)
             // Look for it every 45 seconds for a quarter of an hour, so it shows up soon after the operator signs it.
@@ -2074,7 +2109,7 @@ final class AppModel {
     /// The public profiles an account left in the directory, newest first: what a restore can bring back.
     /// Proving ownership with the account's key means nobody else can ask.
     func publicProfiles(of identity: Identity) async -> [DirectoryProfile] {
-        guard let client = client(nil) else { return [] }
+        guard let client = client(nil, lane: Self.directoryLane(nil)) else { return [] }
         let ts = UInt64(RelayClock.now.timeIntervalSince1970)
         let key = identity.card.signing
         let message = Data("pulshade.dir.mine.v1".utf8) + key + withUnsafeBytes(of: ts.bigEndian) { Data($0) }
@@ -2175,7 +2210,7 @@ final class AppModel {
     /// Declines and drops anything they send in future, without telling them.
     func blockRequest(_ id: FriendRequest.ID) {
         guard let request = data.requests.first(where: { $0.id == id }) else { return }
-        data.blocked.append(request.fingerprint)
+        if !data.blocked.contains(request.fingerprint) { data.blocked.append(request.fingerprint) }
         data.blockedNames[request.fingerprint] = request.card.name
         sync(.blocked(request.fingerprint))
         declineRequest(id)
@@ -2359,7 +2394,7 @@ final class AppModel {
         profileTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(1.5))
             guard !Task.isCancelled, let self else { return }
-            for c in self.contacts(of: persona) { self.enqueue(self.profilePayload(persona), to: c) }
+            for c in self.contacts(of: persona) { self.enqueue(self.profilePayload(persona, for: c.fingerprint), to: c) }
             self.sync(.profile(persona: persona, self.profile(for: persona)))
             self.save()
             await self.republish(persona)
@@ -2425,6 +2460,8 @@ final class AppModel {
 
     private func checkAutoLock() {
         let minutes = data.security.autoLockMinutes
+        // Locking hangs up, and nobody touches the screen with the phone at their ear.
+        if call != nil { lastActivity = Date(); return }
         guard minutes > 0, Date().timeIntervalSince(lastActivity) > Double(minutes) * 60 else { return }
         lock()
     }
@@ -2520,13 +2557,18 @@ final class AppModel {
         landingData.profile.name = data.profile.name
         landingData.theme = data.theme
         landingData.relay = data.relay
+        // What the landing account needs to take the real account's relay backup away after the panic passcode.
+        landingData.pendingBackupForget = backupProof("pulshade.backup.get.v1", main).key
         try await Task.detached { try vault.setSlot(2, identity: landing, passcode: passcode, panic: true) }.value
         try vault.save(landingData, with: landing)
         guard identity?.fingerprint == main.fingerprint else { return }
         data.panicSeed = landing.seed
+        // The next backup carries the token's hash to the relay.
+        data.backupDigest = nil
         vault.disableBiometrics()
         save()
         rebalanceFiles()
+        scheduleBackup(after: 5...30)
     }
 
     func removePanic() {
@@ -2621,7 +2663,7 @@ final class AppModel {
         data.contacts[i].devices[d].awaitingHello = nil
         data.contacts[i].devices[d].acceptedHello = request.ephemeral
         seal(.sessionAccept(answer), contact: i, device: d)
-        let first: Payload = data.contacts[i].isSelf ? .sync(.hello) : profilePayload(data.contacts[i].persona)
+        let first: Payload = data.contacts[i].isSelf ? .sync(.hello) : profilePayload(data.contacts[i].persona, for: data.contacts[i].fingerprint)
         data.contacts[i].devices[d].pending.insert(PendingPayload(payload: first, message: nil), at: 0)
         sendPending(contact: i)
     }
@@ -2679,6 +2721,8 @@ final class AppModel {
             data.contacts[i].devices[d].sendID = sendID
             return d
         }
+        // More than anyone owns: the oldest makes way, so a contact can't grow the list without end.
+        if data.contacts[i].devices.count >= Self.maxDevicesPerContact { data.contacts[i].devices.removeFirst() }
         data.contacts[i].devices.append(DeviceLink(id: id, sendID: sendID))
         return data.contacts[i].devices.count - 1
     }
@@ -2702,7 +2746,8 @@ final class AppModel {
         tickTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
-                self?.tick()
+                guard let self else { return }
+                self.tick()
             }
         }
     }
@@ -2750,7 +2795,8 @@ final class AppModel {
             // Tests: one round at a time, at a steady pace.
             syncTask = Task { [weak self] in
                 while !Task.isCancelled {
-                    await self?.syncOnce()
+                    guard let self else { return }
+                    await self.syncOnce()
                     try? await Task.sleep(for: .seconds(2))
                 }
             }
@@ -2871,7 +2917,11 @@ final class AppModel {
         watchStall()
         retryStaleHandshakes()
         resendUnconfirmedStories()
-        data.clipParts = data.clipParts.filter { $0.value.date.addingTimeInterval(StoryLifetime.twoDays.rawValue + 3600) > Date() }
+        // Only written when something is stale: assigning redraws every view that reads the data.
+        let clipCutoff = Date().addingTimeInterval(-(StoryLifetime.twoDays.rawValue + 3600))
+        if data.clipParts.contains(where: { $0.value.date <= clipCutoff }) {
+            data.clipParts = data.clipParts.filter { $0.value.date > clipCutoff }
+        }
         askForStalledClips()
         sendDueReceipts()
         drainStoryBacklog()
@@ -3172,6 +3222,10 @@ final class AppModel {
         refreshPush()
         #endif
     }
+
+    /// The connection for proving a profile's handles, collectibles and eggs are its own. Never the one its mail
+    /// is fetched on, so the relay can't tie a handle to a mailbox, or two personas to one account.
+    static func directoryLane(_ persona: UUID?) -> String { "dir|" + (persona?.uuidString ?? "main") }
 
     func client(_ relay: String?, lane: String = "main") -> RelayClient? {
         guard let address = reachable(relay), let url = URL(string: address) else { return nil }
@@ -3483,6 +3537,10 @@ final class AppModel {
         }
     }
 
+    static let maxAvatarBytes = 512 * 1024
+    static let maxBannerBytes = 2 * 1024 * 1024
+    static let maxDevicesPerContact = 16
+
     /// Longer than the relay keeps anything (seven days).
     static let replayWindow: TimeInterval = 8 * 24 * 3600
 
@@ -3527,9 +3585,10 @@ final class AppModel {
             let claimed = handle.flatMap(DirectoryProfile.validHandle)
             if claimed != sender.handle { sender.handle = nil }
             if let claimed, claimed != sender.handle { confirmHandle(claimed, of: sender) }
-            sender.avatar = avatar
-            sender.banner = banner
-            sender.color = color.map { abs($0) % Signature.colors.count }
+            // A picture bigger than any this app makes is not kept, so one contact can't fill the vault.
+            sender.avatar = avatar.flatMap { $0.count <= Self.maxAvatarBytes ? $0 : nil }
+            sender.banner = banner.flatMap { $0.count <= Self.maxBannerBytes ? $0 : nil }
+            sender.color = color.map { $0.wrapped(Signature.colors.count) }
             upsert(sender)
             refreshDirectTitle(fp)
         case let .message(wire):
@@ -3696,7 +3755,7 @@ final class AppModel {
             answer()
             guard let i = index(of: channelID) else { return }
             if !data.conversations[i].members.contains(fp) { data.conversations[i].members.append(fp) }
-            data.conversations[i].version += 1
+            data.conversations[i].version &+= 1
             let c = data.conversations[i]
             sendInfo(c, to: [fp] + c.admins.filter { $0 != "me" } + (c.amOwner ? [] : [c.owner]))
         } else {
@@ -3815,11 +3874,20 @@ final class AppModel {
     }
 
     private func applyUnsend(_ ids: [UUID], from sender: Contact) {
-        for i in data.conversations.indices {
+        let ids = Set(ids)
+        for i in data.conversations.indices
+        where data.conversations[i].messages.contains(where: { ids.contains($0.id) && $0.sender == sender.fingerprint }) {
             withAnimation(.snappy) {
                 data.conversations[i].messages.removeAll { ids.contains($0.id) && $0.sender == sender.fingerprint }
             }
+            clampUnread(i)
         }
+    }
+
+    /// The unread count can't be more than the messages from others still there, after some were taken away.
+    private func clampUnread(_ i: Int) {
+        let theirs = data.conversations[i].messages.count { !$0.isMine && !$0.isSystem }
+        if data.conversations[i].unread > theirs { data.conversations[i].unread = theirs }
     }
 
     private func applyReaction(_ emoji: String?, to messageID: UUID, from sender: Contact) {
@@ -4037,7 +4105,7 @@ final class AppModel {
 
     /// Bumps the version and tells everyone who needs to know.
     private func publishChange(_ i: Int, alsoTell extra: [String] = [], channelAdminsOnly: Bool = false) {
-        data.conversations[i].version += 1
+        data.conversations[i].version &+= 1
         let c = data.conversations[i]
         let everyone = c.members
         let admins = c.members.filter { c.isAdmin($0) }
@@ -4304,7 +4372,7 @@ extension AppModel {
             }
             var incoming = incoming
             incoming.links = Optional(ProfileLink.cleaned(incoming.links)).flatMap { $0.isEmpty ? nil : $0 }
-            incoming.notes = Optional(ProfileNote.cleaned(incoming.notes)).flatMap { $0.isEmpty ? nil : $0 }
+            incoming.notes = Optional(ProfileNote.cleaned(incoming.notes, keepAudience: true)).flatMap { $0.isEmpty ? nil : $0 }
             setProfile(incoming, for: persona)
         case let .persona(persona):
             if let i = data.personas.firstIndex(where: { $0.id == persona.id }) {
@@ -4353,6 +4421,7 @@ extension AppModel {
             unlinkDevice(id)
         case .accountErased:
             destroyEverything(leavingNoTrace: true)
+            Vault.scrubLeftovers()
         case .accountDetached:
             // Contacts stop writing to this device; the account itself waits in the backup.
             for c in data.contacts where !c.isSelf && !c.awaitingAcceptance { enqueue(.deviceRemoved, to: c) }
@@ -4592,7 +4661,7 @@ extension AppModel {
 // MARK: - Detach & burn
 
 extension AppModel {
-    enum LeaveError: Error { case wrongRecoveryCode, offline }
+    enum LeaveError: Error { case wrongRecoveryCode, offline, backupNotRemoved }
 
     /// Whether this account also lives on another device, so detaching only this one loses nothing.
     var hasOtherDevices: Bool { !linkedDevices.isEmpty }
@@ -4630,11 +4699,34 @@ extension AppModel {
     /// every @handle is retired (unclaimable for three months, tied to no key), the relay's backup and waiting
     /// envelopes are gone, every device it's on is
     /// wiped, and this one keeps nothing, not even a Keychain item.
-    func burn(recoveryCode: String? = nil) async throws {
+    ///
+    /// `thisDeviceOnly` is for when the relay can't be reached: it wipes this device at once and nothing else.
+    /// The relay's copy of the backup stays (it opens only with the recovery code and the relay erases it 180 days
+    /// after its last save), handles are not retired and contacts are not told.
+    func burn(recoveryCode: String? = nil, thisDeviceOnly: Bool = false) async throws {
         try open(recoveryCode: recoveryCode)
+        if thisDeviceOnly {
+            data.security.keepBackup = false
+            backupTask?.cancel()
+            backupTask = nil
+            destroyEverything(leavingNoTrace: true)
+            Vault.scrubLeftovers()
+            return
+        }
         guard let client = client(nil), await client.health(), let identity else { throw LeaveError.offline }
+        // No upload may land after the delete.
+        let hadBackup = data.security.keepBackup
+        data.security.keepBackup = false
+        backupTask?.cancel()
+        backupTask = nil
+        // The backup goes first, and if it can't be removed nothing else is touched: burning on while it stays on the
+        // relay would break the promise that nothing is left.
+        do { try await deleteBackup(of: identity) } catch {
+            data.security.keepBackup = hadBackup
+            scheduleBackup()
+            throw LeaveError.backupNotRemoved
+        }
         for persona in [nil] + data.personas.map(\.id) { await retireHandles(persona: persona) }
-        try? await deleteBackup(of: identity)
         for id in data.conversations.map(\.id) { delete(id) }
         for c in data.contacts where !c.isSelf {
             // Someone we only sent a request to has no session with us yet, so it goes straight to them.
@@ -4649,6 +4741,7 @@ extension AppModel {
         await syncOnce()
         trafficShaping = shaping
         destroyEverything(leavingNoTrace: true)
+        Vault.scrubLeftovers()
     }
 
     /// Burns one persona for good, leaving your main identity and other personas as they are: its @handles are
@@ -4717,23 +4810,25 @@ extension AppModel {
         return kept
     }
 
-    enum BackupLookup { case found(AppData), none, unreachable }
+    /// `unreadable`: a copy is on the relay but this version can't open it (it may come from a newer one). It must
+    /// not be taken for no backup, or starting over would later save across it.
+    enum BackupLookup { case found(AppData), none, unreachable, unreadable }
 
     /// The account a log out left on the relay, opened with the recovery code's key.
     func backup(of identity: Identity) async -> BackupLookup {
-        guard let client = client(nil) else { return .unreachable }
+        guard let client = client(nil, lane: "backup") else { return .unreachable }
         let (key, sig, ts) = backupProof("pulshade.backup.get.v1", identity)
         let sealed: Data?
         do { sealed = try await client.backup(key: key, sig: sig, ts: ts) } catch { return .unreachable }
         guard let sealed else { return .none }
         guard let box = try? AES.GCM.SealedBox(combined: sealed),
               let plain = try? AES.GCM.open(box, using: identity.backupKey),
-              let restored = try? JSONDecoder.pulshade.decode(AppData.self, from: plain) else { return .none }
+              let restored = try? JSONDecoder.pulshade.decode(AppData.self, from: Self.unpadded(plain)) else { return .unreadable }
         return .found(restored)
     }
 
     private func deleteBackup(of identity: Identity) async throws {
-        guard let client = client(nil) else { throw LeaveError.offline }
+        guard let client = client(nil, lane: "backup") else { throw LeaveError.offline }
         let (key, sig, ts) = backupProof("pulshade.backup.del.v1", identity)
         try await client.deleteBackup(key: key, sig: sig, ts: ts)
     }
@@ -4745,18 +4840,156 @@ extension AppModel {
         while syncing { try? await Task.sleep(for: .milliseconds(50)) }
         await flush()
         do {
-            guard let client = client(nil) else { throw LeaveError.offline }
-            let plain = try JSONEncoder.pulshade.encode(Self.withoutChats(data, keepingDevices: false))
-            let sealed = try AES.GCM.seal(plain, using: identity.backupKey).combined!
+            guard let client = client(nil, lane: "backup") else { throw LeaveError.offline }
+            let sealed = try Self.sealedBackup(of: data, with: identity)
             let (key, sig, ts) = backupProof("pulshade.backup.put.v1", identity, body: sealed)
-            try await client.putBackup(sealed, key: key, sig: sig, ts: ts)
+            try await client.putBackup(sealed, key: key, sig: sig, ts: ts, forgetHash: forgetHash)
         } catch {
             startSync()
             throw LeaveError.offline
         }
     }
 
+    // MARK: Keeping the backup fresh
+
+    /// A hash of the panic passcode's delete-only token, sent with each backup so the relay can honour it.
+    private var forgetHash: Data? {
+        data.panicSeed.map { Data(SHA256.hash(data: Self.forgetToken(landingSeed: $0))) }
+    }
+
+    /// What goes in a backup: everything but chats, and not the two fields that track the backup itself.
+    static func backupContents(of data: AppData) -> AppData {
+        var kept = withoutChats(data, keepingDevices: false)
+        kept.backupSavedAt = nil
+        kept.backupDigest = nil
+        // Nothing you wrote that is still waiting to be sent: that is chat, and chats never go in the backup.
+        // Session keys do stay, so mail sent to you while the device was detached can still be opened.
+        for c in kept.contacts.indices {
+            for d in kept.contacts[c].devices.indices {
+                kept.contacts[c].devices[d].pending.removeAll { $0.message != nil }
+            }
+        }
+        // Nor story video still arriving, or the decoy and panic identities, which live only on the device
+        // they were set up on.
+        kept.clipParts = [:]
+        kept.decoySeed = nil
+        kept.panicSeed = nil
+        kept.pendingBackupForget = nil
+        return kept
+    }
+
+    /// Pads to a power of two (at least 64 KB) behind a marker and the real length, so the relay learns a rough size
+    /// class and not how many contacts there are. The old, unpadded form starts with `{`, never with the marker.
+    static func padded(_ plain: Data) -> Data {
+        var size = 64 * 1024
+        while size < plain.count + 5 { size *= 2 }
+        var out = Data([0x01])
+        withUnsafeBytes(of: UInt32(plain.count).bigEndian) { out.append(contentsOf: $0) }
+        out.append(plain)
+        out.append(Data(count: size - out.count))
+        return out
+    }
+
+    static func unpadded(_ data: Data) -> Data {
+        guard data.first == 0x01, data.count >= 5 else { return data }
+        let length = data.dropFirst().prefix(4).reduce(0) { $0 << 8 | Int($1) }
+        guard 5 + length <= data.count else { return data }
+        return data.subdata(in: 5..<(5 + length))
+    }
+
+    static func sealedBackup(of data: AppData, with identity: Identity) throws -> Data {
+        let plain = try JSONEncoder.pulshade.encode(backupContents(of: data))
+        return try AES.GCM.seal(padded(plain), using: identity.backupKey).combined!
+    }
+
+    /// Called after every save: waits a random few minutes, then saves the backup if anything in it changed.
+    /// Only the main identity does it, never a decoy.
+    func scheduleBackup(after wait: ClosedRange<Int>? = nil) {
+        guard backupTask == nil, data.security.keepBackup, isPrimary, phase == .unlocked else { return }
+        let range = wait ?? Self.backupWait
+        backupTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Int.random(in: range)))
+            guard !Task.isCancelled, let self else { return }
+            self.backupTask = nil
+            await self.saveBackup()
+        }
+    }
+
+    /// Seals and uploads the backup if it changed (or is a week old). Quiet on failure: it tries again later.
+    @discardableResult
+    func saveBackup() async -> Bool {
+        guard data.security.keepBackup, isPrimary, phase == .unlocked, let identity, let client = client(nil, lane: "backup") else { return false }
+        // Keys in a fixed order, so the same account always encodes to the same bytes and an unchanged one is
+        // never uploaded again.
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .secondsSince1970
+        encoder.outputFormatting = .sortedKeys
+        guard let plain = try? encoder.encode(Self.backupContents(of: data)) else { return false }
+        let digest = Data(SHA256.hash(data: plain))
+        let week = data.backupSavedAt.map { Date().timeIntervalSince($0) > 7 * 24 * 3600 } ?? true
+        if digest == data.backupDigest, !week { return true }
+        guard let sealed = try? AES.GCM.seal(Self.padded(plain), using: identity.backupKey).combined else { return false }
+        let (key, sig, ts) = backupProof("pulshade.backup.put.v1", identity, body: sealed)
+        do { try await client.putBackup(sealed, key: key, sig: sig, ts: ts, forgetHash: forgetHash) } catch {
+            // Try again in a while.
+            scheduleBackup(after: 300...900)
+            return false
+        }
+        // Nothing of the account changed, so this save doesn't ask for another upload.
+        guard self.identity?.fingerprint == identity.fingerprint, data.security.keepBackup else { return true }
+        data.backupDigest = digest
+        data.backupSavedAt = Date()
+        save()
+        return true
+    }
+
+    /// One line for Settings and the Detach screen: how fresh the relay's copy is.
+    var backupStatus: String {
+        guard data.security.keepBackup else { return "Backups are off" }
+        guard let saved = data.backupSavedAt else { return "Not saved yet" }
+        let seconds = Int(Date().timeIntervalSince(saved))
+        if seconds < 60 { return "Saved just now" }
+        if seconds < 3600 { return "Saved \(seconds / 60) min ago" }
+        if seconds < 86400 { return "Saved \(seconds / 3600) h ago" }
+        return "Saved \(seconds / 86400) d ago"
+    }
+
+    /// The switch in Settings. Off also takes the copy off the relay.
+    func setKeepBackup(_ on: Bool) {
+        data.security.keepBackup = on
+        if on {
+            scheduleBackup(after: 0...5)
+        } else {
+            backupTask?.cancel()
+            backupTask = nil
+            data.backupSavedAt = nil
+            data.backupDigest = nil
+            if let identity { Task { try? await deleteBackup(of: identity) } }
+        }
+        save()
+    }
+
     /// `label | backup key | ts`, plus the contents' hash for an upload, signed with the backup key.
+    /// The delete-only token for the relay backup: made from the panic landing account's seed, so the panic passcode
+    /// (which opens that account and nothing real) can work it out without holding any key to the real account. It
+    /// can erase the backup and do nothing else with it.
+    static func forgetToken(landingSeed: Data) -> Data {
+        HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: landingSeed), info: Data("pulshade.backup.forget.v1".utf8),
+                               outputByteCount: 32).bytes
+    }
+
+    /// After the panic passcode: asks the relay to erase the real account's backup, trying again at each unlock
+    /// until it has answered.
+    func forgetPendingBackup() async {
+        guard let key = data.pendingBackupForget, let seed = identity?.seed, let client = client(nil, lane: "backup") else { return }
+        guard let status = try? await client.forgetBackup(key: key, token: Self.forgetToken(landingSeed: seed)) else { return }
+        // 410: nothing to erase. 404 would be a relay that doesn't know this yet, so it is tried again later.
+        if (200..<300).contains(status) || status == 410 || status == 401 {
+            data.pendingBackupForget = nil
+            save()
+        }
+    }
+
     private func backupProof(_ label: String, _ identity: Identity, body: Data? = nil) -> (key: Data, sig: Data, ts: UInt64) {
         let signer = identity.backupSigningKey
         let key = signer.publicKey.rawRepresentation
@@ -4811,7 +5044,7 @@ extension AppModel {
     /// @handle.
     func report(subjectKey: Data, handle: String?, name: String, reason: String, details: String,
                 includeHandle: Bool = false) async throws {
-        guard identity != nil, let client = client(nil) else { throw ReportError.unreachable }
+        guard identity != nil, let client = client(nil, lane: "report") else { throw ReportError.unreachable }
         let inbox: ReportInbox?
         do { inbox = try await client.reportInbox() } catch { throw ReportError.unreachable }
         guard let inbox, Self.genuine(inbox), let sendID = Data(base64Encoded: inbox.sendID),

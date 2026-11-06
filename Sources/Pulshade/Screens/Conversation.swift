@@ -45,14 +45,6 @@ struct ConversationView: View {
                 if model.canPost(in: c) { composer(c) } else { ReadOnlyBar(kind: c.kind, announcements: c.isAnnouncements) }
             }
             .background(Ink.base)
-            #if os(iOS)
-            // A firm swipe right anywhere goes back, as well as the usual swipe from the edge.
-            .simultaneousGesture(
-                DragGesture(minimumDistance: 30).onEnded { value in
-                    if value.translation.width > 110, abs(value.translation.height) < 70 { dismiss() }
-                }
-            )
-            #endif
             .onAppear {
                 focused = !Platform.isPhone
                 model.openConversation = id
@@ -85,64 +77,73 @@ struct ConversationView: View {
     // MARK: Header
 
     private func header(_ c: Conversation) -> some View {
-        HStack(spacing: 10) {
-            if Platform.isPhone {
-                Button { dismiss() } label: { Image(systemName: "chevron.left").font(.system(size: 17, weight: .semibold)) }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(theme.accent)
-                    .frame(width: 28, height: 36)
-                    .accessibilityLabel("Back")
-            }
+        let phone = Platform.isPhone
+        return ZStack {
+            // The name sits in the middle of the bar, whatever is on either side.
             Button { showInfo = true } label: {
-                HStack(spacing: 10) {
-                    Avatar(image: avatar(c), seed: seed(c), size: 34, symbol: c.kind == .direct ? nil : c.kind.symbol)
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 5) {
-                            Text(c.title)
-                                .font(.system(size: 14, weight: .semibold))
-                                .foregroundStyle(Ink.text)
-                            if c.kind == .direct { BadgeMark(badge: model.contact(c.members.first ?? "")?.badge, size: 14) }
-                            if c.isAnnouncements { Image(systemName: "checkmark.seal.fill").font(.system(size: 11)).foregroundStyle(theme.accent) }
-                            if c.kind == .direct, model.contact(c.members.first ?? "")?.verified == true {
-                                Image(systemName: "checkmark.seal.fill").font(.system(size: 11)).foregroundStyle(theme.accent)
-                            }
+                VStack(spacing: 2) {
+                    HStack(spacing: 5) {
+                        Text(c.title)
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(Ink.text)
+                            .lineLimit(1)
+                        if c.kind == .direct { BadgeMark(badge: model.contact(c.members.first ?? "")?.badge, size: 14) }
+                        if c.isAnnouncements { Image(systemName: "checkmark.seal.fill").font(.system(size: 11)).foregroundStyle(theme.accent) }
+                        if c.kind == .direct, model.contact(c.members.first ?? "")?.verified == true {
+                            Image(systemName: "checkmark.seal.fill").font(.system(size: 11)).foregroundStyle(theme.accent)
                         }
-                        let here = c.kind == .direct && c.members.first.map(model.isOnline) == true
-                        Text(here ? "Online" : subtitle(c))
-                            .font(.system(size: 11))
-                            .foregroundStyle(here ? OnlineDot.color : Ink.faint)
                     }
+                    let here = c.kind == .direct && c.members.first.map(model.isOnline) == true
+                    Text(here ? "Online" : subtitle(c))
+                        .font(.system(size: 11))
+                        .foregroundStyle(here ? OnlineDot.color : Ink.faint)
+                        .lineLimit(1)
                 }
+                .frame(maxWidth: .infinity)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            Spacer()
-            if let burner = model.burner(c.persona), let at = burner.burnsAt {
-                HStack(spacing: 5) {
-                    Image(systemName: "flame.fill")
-                    Text(at, style: .timer).monospacedDigit()
+            .padding(.horizontal, phone ? 96 : 300)
+            .accessibilityLabel("\(c.title), details")
+
+            HStack(spacing: 8) {
+                if phone {
+                    Button { dismiss() } label: { Image(systemName: "chevron.left") }
+                        .buttonStyle(BarButtonStyle())
+                        .accessibilityLabel("Back")
                 }
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(Burn.gradient)
-                .padding(.horizontal, 10).frame(height: 28)
-                .glass(8)
-                .help("This burner destroys itself when the timer ends")
+                Spacer(minLength: 0)
+                if let burner = model.burner(c.persona), let at = burner.burnsAt {
+                    HStack(spacing: 5) {
+                        Image(systemName: "flame.fill")
+                        Text(at, style: .timer).monospacedDigit()
+                    }
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Burn.gradient)
+                    .padding(.horizontal, 10).frame(height: 28)
+                    .glass(8)
+                    .help("This burner destroys itself when the timer ends")
+                }
+                if c.kind == .direct, let peer = c.members.first, model.contact(peer, in: c.persona) != nil {
+                    Button { model.startCall(with: peer, persona: c.persona) } label: { Image(systemName: "phone.fill") }
+                        .buttonStyle(BarButtonStyle())
+                        .disabled(model.call != nil)
+                        .help("Call")
+                        .accessibilityLabel("Call")
+                }
+                if c.kind == .direct || c.kind == .group { TimerMenu(conversation: c) }
+                // On the phone the relay indicator only speaks up when something is wrong.
+                if !phone || model.link != .online { LinkBadge() }
+                if !phone {
+                    Button { showInfo = true } label: { Image(systemName: "sidebar.right") }
+                        .buttonStyle(IconButtonStyle(size: 28))
+                        .help("Details")
+                        .accessibilityLabel("Details")
+                }
             }
-            if c.kind == .direct, let peer = c.members.first, model.contact(peer, in: c.persona) != nil {
-                Button { model.startCall(with: peer, persona: c.persona) } label: { Image(systemName: "phone") }
-                    .buttonStyle(IconButtonStyle(size: 28))
-                    .disabled(model.call != nil)
-                    .help("Call")
-                    .accessibilityLabel("Call")
-            }
-            if c.kind == .direct || c.kind == .group { TimerMenu(conversation: c) }
-            LinkBadge()
-            Button { showInfo = true } label: { Image(systemName: "sidebar.right") }
-                .buttonStyle(IconButtonStyle(size: 28))
-                .help("Details")
-                .accessibilityLabel("Details")
         }
-        .padding(.horizontal, Platform.isPhone ? 12 : 18)
-        .padding(.top, Platform.isPhone ? 6 : 30)
+        .padding(.horizontal, phone ? 12 : 18)
+        .padding(.top, phone ? 6 : 30)
         .padding(.bottom, 10)
         .background(Ink.base)
         .overlay(alignment: .bottom) { Rectangle().fill(Ink.line).frame(height: 1) }
@@ -153,7 +154,7 @@ struct ConversationView: View {
         case .direct: "End-to-end encrypted"
         case .group: "\(c.members.count + 1) members"
         case .channel where c.isAnnouncements: "@\(Announcement.handle) · Official"
-        case .channel: c.amAdmin ? "\(model.followers(of: c).count) followers" : "Channel"
+        case .channel: c.amAdmin ? counted(model.followers(of: c).count, "follower") : "Channel"
         case .broadcast: "Broadcast to \(c.members.count)"
         }
     }
@@ -937,7 +938,7 @@ private struct RecordingBar: View {
                 .buttonStyle(IconButtonStyle(size: 42))
                 .accessibilityLabel("Cancel recording")
             Circle().fill(.red).frame(width: 10, height: 10)
-                .phaseAnimator([1.0, 0.3]) { v, o in v.opacity(o) } animation: { _ in .easeInOut(duration: 0.6) }
+                .phaseAnimator(Platform.reduceMotion ? [1.0] : [1.0, 0.3]) { v, o in v.opacity(o) } animation: { _ in .easeInOut(duration: 0.6) }
             Waveform(levels: Array(recorder.levels.suffix(60)), progress: 1, color: theme.accent)
                 .frame(height: 30)
                 .animation(.linear(duration: 0.1), value: recorder.levels.count)
@@ -973,7 +974,7 @@ private struct TypingDots: View {
                 HStack(spacing: 4) {
                     ForEach(0..<3) { i in
                         Circle().fill(theme.gradient).frame(width: 7, height: 7)
-                            .phaseAnimator([0.0, -5.0, 0.0]) { v, y in v.offset(y: y) } animation: { _ in
+                            .phaseAnimator(Platform.reduceMotion ? [0.0] : [0.0, -5.0, 0.0]) { v, y in v.offset(y: y) } animation: { _ in
                                 .easeInOut(duration: 0.35).delay(Double(i) * 0.12)
                             }
                     }
@@ -1025,14 +1026,16 @@ private struct TimerMenu: View {
                 }
             }
         } label: {
-            HStack(spacing: 5) {
+            HStack(spacing: 4) {
                 Image(systemName: "timer")
                 if on { Text(Disappear.short(conversation.disappearAfter)) }
             }
-            .font(.system(size: 12, weight: .bold))
-            .foregroundStyle(on ? AnyShapeStyle(theme.gradient) : AnyShapeStyle(Ink.faint))
-            .padding(.horizontal, 11).frame(height: 30)
-            .glass(15)
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(on ? AnyShapeStyle(theme.gradient) : AnyShapeStyle(Ink.dim))
+            .padding(.horizontal, on ? 12 : 0)
+            .frame(minWidth: 38, minHeight: 38)
+            .background(Ink.raised, in: .capsule)
+            .overlay(Capsule().strokeBorder(Ink.line))
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
@@ -1061,7 +1064,7 @@ struct LinkBadge: View {
         let online = model.link == .online
         HStack(spacing: 7) {
             ZStack {
-                if online {
+                if online, !Platform.reduceMotion {
                     Circle().fill(theme.accent).frame(width: 8, height: 8)
                         .phaseAnimator([1.0, 2.6]) { v, s in v.scaleEffect(s).opacity(2.8 - s) } animation: { _ in .easeOut(duration: 1.4) }
                 }
@@ -1075,7 +1078,9 @@ struct LinkBadge: View {
         .padding(.horizontal, 11).frame(height: 30)
         .glass(15)
         .animation(.smooth, value: online)
-        .help(online ? "Connected to the relay" : "Relay unreachable. Messages wait, sealed, on this Mac.")
+        .help(online ? "Connected to the relay" : "Relay unreachable. Messages wait, sealed, on this \(Platform.isPhone ? "iPhone" : "Mac").")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(online ? "Connected to the relay" : "Relay unreachable")
     }
 }
 
@@ -1097,8 +1102,11 @@ private struct ConversationInfo: View {
     @State private var confirmDelete = false
     @State private var confirmRemove = false
     @State private var confirmBlock = false
+    @State private var pending: Pending?
     @State private var reporting: ReportSubject?
     @State private var adding = false
+    /// Flips on as the sheet opens, so the profile eases in instead of just appearing.
+    @State private var arrived = false
 
     var body: some View {
         if let c = model.conversation(id) {
@@ -1129,6 +1137,10 @@ private struct ConversationInfo: View {
                         actions(c)
                     }
                     .padding(20)
+                    .confirms($pending)
+                    .opacity(arrived ? 1 : 0)
+                    .offset(y: arrived ? 0 : 18)
+                    .scaleEffect(arrived ? 1 : 0.96, anchor: .top)
                 }
                 .scrollIndicators(.never)
             }
@@ -1136,6 +1148,7 @@ private struct ConversationInfo: View {
             .background(Ink.base)
             .preferredColorScheme(Ink.scheme)
             .onAppear {
+                withAnimation(.smooth(duration: 0.55).delay(0.08)) { arrived = true }
                 nickname = model.contact(c.members.first ?? "")?.nickname ?? ""
                 title = c.title
                 about = c.about ?? ""
@@ -1249,8 +1262,8 @@ private struct ConversationInfo: View {
         case .direct: "End-to-end encrypted"
         case .group: "Group · \(c.members.count + 1) members"
         case .channel where c.isAnnouncements: "@\(Announcement.handle) · Official"
-        case .channel: c.amAdmin ? "Channel · \(model.followers(of: c).count) followers" : "Channel"
-        case .broadcast: "Broadcast list · \(c.members.count) people"
+        case .channel: c.amAdmin ? "Channel · \(counted(model.followers(of: c).count, "follower"))" : "Channel"
+        case .broadcast: "Broadcast list · \(c.members.count == 1 ? "1 person" : "\(c.members.count) people")"
         }
     }
 
@@ -1260,8 +1273,12 @@ private struct ConversationInfo: View {
 
     private func burnButton(_ persona: UUID) -> some View {
         Button {
-            dismiss()
-            model.burn(persona)
+            pending = Pending(title: "Burn this persona now?",
+                              message: "It's deleted for good, with its chats and contacts. Your main identity and other personas aren't touched.",
+                              confirm: "Burn") {
+                dismiss()
+                model.burn(persona)
+            }
         } label: {
             Label("Burn now", systemImage: "flame.fill")
                 .font(.system(size: 13, weight: .semibold))
@@ -1283,6 +1300,11 @@ private struct ConversationInfo: View {
                         .textFieldStyle(.plain)
                         .multilineTextAlignment(.trailing)
                         .onSubmit { model.rename(fp, to: nickname.trimmingCharacters(in: .whitespaces)) }
+                        // On iPhone the sheet is usually closed without pressing Return.
+                        .onDisappear {
+                            let wanted = nickname.trimmingCharacters(in: .whitespaces)
+                            if wanted != contact.name { model.rename(fp, to: wanted) }
+                        }
                 }
                 Divider().overlay(Ink.line)
                 Button { pulseCheck = true } label: {
@@ -1434,12 +1456,16 @@ private struct ConversationInfo: View {
                     }
                     if c.canRemove(fp, by: "me") {
                         Button("Remove from \(c.kind == .channel ? "channel" : "group")", role: .destructive) {
-                            model.removeMember(c.id, fp)
+                            pending = Pending(title: "Remove \(name) from the \(c.kind == .channel ? "channel" : "group")?", confirm: "Remove") {
+                                model.removeMember(c.id, fp)
+                            }
                         }
                     }
                 } label: {
-                    Image(systemName: "ellipsis").font(.system(size: 12)).foregroundStyle(Ink.faint).frame(width: 22, height: 22)
+                    Image(systemName: "ellipsis").font(.system(size: 12)).foregroundStyle(Ink.faint).frame(width: 30, height: 30)
+                        .contentShape(.rect)
                 }
+                .accessibilityLabel("More for \(name)")
                 .menuStyle(.button)
                 .buttonStyle(.plain)
                 .menuIndicator(.hidden)
@@ -1590,6 +1616,7 @@ struct Field<Trailing: View>: View {
 /// Pick contacts to add to a group or channel.
 private struct AddPeopleSheet: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
     let id: Conversation.ID
     @State private var picked: Set<String> = []
@@ -1618,7 +1645,7 @@ private struct AddPeopleSheet: View {
                                             Text(person.displayName).font(.system(size: 13)).foregroundStyle(Ink.text)
                                             Spacer()
                                             Image(systemName: on ? "checkmark.circle.fill" : "circle")
-                                                .foregroundStyle(on ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Ink.faint))
+                                                .foregroundStyle(on ? AnyShapeStyle(theme.accent) : AnyShapeStyle(Ink.faint))
                                         }
                                         .padding(.horizontal, 10).padding(.vertical, 6)
                                         .background(on ? Ink.raised : .clear, in: .rect(cornerRadius: 8))

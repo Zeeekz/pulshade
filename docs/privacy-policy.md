@@ -20,17 +20,19 @@ to use Pulshade, and over Tor the server never sees your IP address. We don't se
 see your recovery code, your passcode, your keys or your contacts.
 
 **Messages and calls.** These are encrypted on your device before they leave it. Our server only passes on sealed
-envelopes, padded to a few fixed sizes. We can't read them. Envelopes wait in the server's memory only, are deleted
-once collected or after 7 days, and are not written to disk or logged.
+envelopes, padded to a few fixed sizes. We can't read them. Envelopes wait in the server's memory only, are deleted once collected or after 7 days, and are not written to disk or logged.
 
 **Public handles and profiles (only if you choose them).** If you claim a public @handle, its name, your picture and
 banner and the key it belongs to are stored on our server so anyone can look it up. This is public by your choice.
 A handle you let go of is held for a while so nobody else can take it straight away; a burned account's handles are
 retired and no longer tied to anyone.
 
-**Sealed backups (only if you detach an account).** Detaching can leave an encrypted copy of your profile, contacts,
-groups, personas and settings on the server so your recovery code can restore it. We can't open it. It is deleted
-after 180 days if nobody restores it. Chats are never included.
+**Sealed backup (on by default, switch in Settings).** So that Detaching a device can be instant, the app keeps an
+encrypted copy of your profile, contacts, groups, personas and settings on the server, saved again a few minutes
+after they change, so your recovery code can restore it. We can't open it, and it isn't tied to your account on the
+server. It is deleted when you switch the backup off or Burn, and 180 days after it was last saved if the app never
+saves it again (for instance after a Detach). Chats are never included. The server sees when it was saved and its
+rough size, and, if you connect without Tor, your IP address during the upload, as with any connection.
 
 **Collectibles.** If you are given a collectible, the server keeps what it needs to show it and let its owner claim it
 again with a backup code: the item, its number and a hash of the code.
@@ -41,7 +43,7 @@ throwaway key and carries your handle only if you add it.
 **Network information.** Over Tor, the server sees a made-up address for each connection, not your IP address. If you
 turn Tor off in Settings, the server sees your IP address and roughly where you are, and your personas could be tied
 together by it. To limit abuse, the server counts requests per sender using a hash of the address with a salt that is
-replaced every hour. It never keeps the address itself. Nothing is logged.
+replaced every hour. It never keeps the address itself. No request log is kept.
 
 **What the server can see about traffic.** It can see that a sealed envelope arrived at a random mailbox, when, and
 how large (within a few set sizes). It can't see who sent it, who you are behind Tor, or what is inside.
