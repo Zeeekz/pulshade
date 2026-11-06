@@ -20,8 +20,7 @@ to use Pulshade, and over Tor the server never sees your IP address. We don't se
 see your recovery code, your passcode, your keys or your contacts.
 
 **Messages and calls.** These are encrypted on your device before they leave it. Our server only passes on sealed
-envelopes, padded to a few fixed sizes. We can't read them. Envelopes wait in the server's memory, and reach its disk only in a sealed copy (so a restart doesn't lose
-them). They are deleted once collected or after 7 days, and are never logged.
+envelopes, padded to a few fixed sizes. We can't read them. Envelopes wait in the server's memory only, are deleted once collected or after 7 days, and are not written to disk or logged.
 
 **Public handles and profiles (only if you choose them).** If you claim a public @handle, its name, your picture and
 banner and the key it belongs to are stored on our server so anyone can look it up. This is public by your choice.
@@ -44,7 +43,7 @@ throwaway key and carries your handle only if you add it.
 **Network information.** Over Tor, the server sees a made-up address for each connection, not your IP address. If you
 turn Tor off in Settings, the server sees your IP address and roughly where you are, and your personas could be tied
 together by it. To limit abuse, the server counts requests per sender using a hash of the address with a salt that is
-replaced every hour. It never keeps the address itself. Nothing is logged.
+replaced every hour. It never keeps the address itself. No request log is kept.
 
 **What the server can see about traffic.** It can see that a sealed envelope arrived at a random mailbox, when, and
 how large (within a few set sizes). It can't see who sent it, who you are behind Tor, or what is inside.
@@ -61,7 +60,7 @@ how large (within a few set sizes). It can't see who sent it, who you are behind
 - Wherever you download Pulshade from, such as the App Store or our website, sees your IP address and what you
   download. Apple also checks the app when a Mac first opens it. These services have their own policies.
 - If you turn on "Wake when locked" on iPhone, notifications go through Apple's service: Apple sees your device token
-  and when a notification is delivered, never message contents, and Pulshade's server keeps your token, in memory and, sealed, on its disk so a restart doesn't silence you,
+  and when a notification is delivered, never message contents, and Pulshade's server keeps your token, in memory only,
   linked to your mailboxes while it's on. Pulshade recommends leaving this off if you need the strongest anonymity.
 - Your phone or computer may keep its own records of notifications and app use, which we can't control. By default,
   notifications say only "New message".

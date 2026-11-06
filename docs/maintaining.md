@@ -33,8 +33,7 @@ reports mailbox's key, which the server keeps. Remove one under Team: they're cu
 they'd already opened. Run `pulshade-server update` once first so the server has the gate. The server's side is
 tested with `./scripts/server/test-mod-gate.sh`; it hasn't been run against a real server and its SSH setup yet.
 
-**Restarting keeps waiting messages.** They are written, sealed, to `pulshade-spool.sealed` every 30 seconds and
-when the server stops, and read back when it starts; only a crash can lose the last half minute.
+**Restarting empties waiting messages.** They are held in memory only, so a restart loses what hasn't been collected.
 
 ## Running the relay on a server
 
@@ -58,7 +57,7 @@ Make an APNs key in your Apple developer account (Keys, with the Apple Push Noti
 and production) and put the `.p8` file on the server as `/var/lib/pulshade/apns.p8`, with its IDs in
 `/var/lib/pulshade/apns.json` (`{"key_id": "…", "team_id": "…", "topic": "your.app.bundle.id"}`), both readable only
 by the relay's user. Restart the relay to pick them up. Without them `GET /v1/push` says `{"enabled": false}` and
-phones don't register. Registrations are saved with the waiting mail, so a restart keeps them.
+phones don't register. Registrations are kept in memory only, so a restart clears them until each phone renews.
 
 On the server, `pulshade-server` runs it: `start`, `stop`, `restart`, `status`, `logs`, `stats`, `ban @name`,
 `backup` and the rest (`pulshade-server help` lists it all). `pulshade-server update` fetches the latest code and
@@ -81,11 +80,9 @@ Keep a copy of `/etc/pulshade/storage.key` somewhere safe: the server's backups 
 
 ## Keeping the server's disk quiet
 
-The server keeps calls and rate-limit counts in memory only. Waiting messages and wake-up registrations are in
-memory too, and reach the disk only sealed with the storage key, in `pulshade-spool.sealed`, so a restart doesn't
-lose them. The seal protects a copy of the data folder. It doesn't protect against someone who holds the whole disk
-of a Linux server, where the key is a file on that same disk: encrypt the disk itself if that matters. These keep
-the rest off the disk:
+The server keeps calls, rate-limit counts, waiting messages and wake-up registrations in memory only: none of them
+is ever written to disk. What does reach the disk is the handle directory, held handles and moderation lists (sealed
+with the storage key) and accounts' sealed backups (no chats). These keep the rest off the disk:
 
 - **Core dumps** are turned off by the server itself, so a crash never writes its memory to a file.
 - **Swap.** macOS encrypts swap. On Linux, use encrypted swap or none, or memory can still reach the disk.

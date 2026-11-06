@@ -16,8 +16,7 @@ keeps running.
 3. **Waking.** For a message, the relay sends Apple one push saying only "New message", and nothing about who or
    what. The phone then fetches and decrypts as usual. A phone is woken at most once every 3 seconds, however much
    mail lands, and the relay as a whole sends at most 30 pushes a second.
-4. **Staying registered.** The relay keeps registrations in memory and, so a restart doesn't forget them, writes
-   them to its disk with the waiting mail (every 30 seconds and when it stops), sealed with its storage key. It
+4. **Staying registered.** The relay keeps registrations in memory only, never on its disk, so a restart forgets them until each phone renews. It
    forgets one after 7 days without a renewal. The phone renews every 15 minutes while Pulshade is open and at every launch.
 5. **Removing.** Turning the switch off, Burn, Detach, a panic passcode or opening a decoy takes the phone's
    registrations off the relay.
@@ -28,7 +27,7 @@ keeps running.
 |---|---|
 | Message content | Hidden from everyone but the recipient |
 | Apple | That your iPhone was woken for Pulshade, and when. Never who wrote or what |
-| The relay | Which of your mailboxes belong to one device token (in memory, and sealed in its spool file on disk; see below), and whether each deposit to them is a message. It already saw when envelopes arrive and roughly how big they are |
+| The relay | Which of your mailboxes belong to one device token (in memory only), and whether each deposit to them is a message. It already saw when envelopes arrive and roughly how big they are |
 | Your IP address | Reaches Apple when the phone registers, outside Tor, and reaches the relay as for any request |
 | Other mail | Receipts, typing signals and reactions don't wake the phone |
 
@@ -39,7 +38,5 @@ Settings says so plainly beside the switch.
 
 Apple's push key (a `.p8` file) and its two IDs live on the relay's server only, never in this repository. See
 [Maintaining Pulshade](maintaining.md). A relay without a key answers `{"enabled": false}` to `GET /v1/push`, and
-phones don't register. Registrations are saved, sealed, with the waiting mail in `pulshade-spool.sealed`, so a
-restart keeps them. The seal is the relay's storage key: it keeps a copy of that file closed, but on a Linux server
-the key is a file on the same disk, so someone who holds the whole server can open it and see which device tokens
-go with which mailboxes.
+phones don't register. Registrations are kept in memory only and never written to disk, so a restart or crash clears them until
+each phone renews (every 15 minutes while Pulshade is open, and at every launch).

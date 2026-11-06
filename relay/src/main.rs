@@ -4,11 +4,8 @@
 //! the owner keeps a secret *receive key* and hands out its SHA-256 hash as the
 //! *send id*. Anyone with the send id can drop envelopes in; only the holder of
 //! the receive key can read them out. Envelopes are opaque, deleted on acknowledgement
-//! or after seven days, and nothing is ever logged. They wait in memory, and so that a
-//! restart doesn't lose them they are also written to disk every 30 seconds (the spool,
-//! below), sealed with the relay's storage key. That keeps a copy of the file closed. It
-//! does not hide which mailboxes hold mail from someone who has the key as well, as
-//! anyone who holds the whole disk of a Linux server does, where the key is a file.
+//! or after seven days, and no request is ever logged. They wait in memory and nowhere
+//! else: nothing about waiting mail or wake-ups is written to disk, so a restart empties them.
 
 mod admin;
 mod backup;
@@ -39,7 +36,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tokio::sync::{Notify, Semaphore};
 
@@ -70,8 +67,6 @@ const MAX_WAIT: u64 = 25;
 
 /// Wakes waiting fetches whenever anything is deposited, so mail goes out the moment it lands.
 static ARRIVALS: LazyLock<Notify> = LazyLock::new(Notify::new);
-/// Set whenever waiting mail changes, so the spool is only written when there's something new.
-static MAIL_CHANGED: AtomicBool = AtomicBool::new(false);
 /// Different every time the relay starts. The health check carries it, so an app can tell the relay restarted and
 /// register for wake-ups again straight away.
 static BOOT: LazyLock<String> = LazyLock::new(|| {
@@ -80,7 +75,6 @@ static BOOT: LazyLock<String> = LazyLock::new(|| {
     hex::encode(raw)
 });
 /// How often waiting mail and wake-up registrations are written out, at most.
-const SPOOL_EVERY: Duration = Duration::from_secs(30);
 
 type Id = [u8; 32];
 
@@ -183,7 +177,6 @@ async fn deposit(State(store): State<Shared>, Path(send_id): Path<String>, heade
     }
     queue.push_back(item);
     store.bytes += size;
-    MAIL_CHANGED.store(true, Ordering::SeqCst);
     drop(store);
     ARRIVALS.notify_waiters();
     // A phone that asked for it is woken, with nothing about the mail in the push.
@@ -214,7 +207,6 @@ fn make_room(store: &mut Store, need: usize, slot: bool) {
             if let Some(at) = next { fronts.push(Reverse((at, mailbox))); }
         }
     }
-    MAIL_CHANGED.store(true, Ordering::SeqCst);
 }
 
 /// What the route runs: the same deposit, after checking how much this caller has been sending. Deposits are
@@ -342,7 +334,6 @@ async fn ack(State(store): State<Shared>, Json(req): Json<AckRequest>) -> Status
             }
         }
         store.bytes = store.bytes.saturating_sub(freed);
-        if freed > 0 { MAIL_CHANGED.store(true, Ordering::SeqCst); }
     }
     StatusCode::NO_CONTENT
 }
@@ -896,235 +887,24 @@ fn purge(store: &Shared) {
         !queue.is_empty()
     });
     // Recounted, so the running total can't drift.
-    let before = store.bytes;
     store.bytes = store.queues.values().flat_map(|q| q.iter()).map(|item| item.blob.len()).sum();
-    if store.bytes != before { MAIL_CHANGED.store(true, Ordering::SeqCst); }
 }
 
-// MARK: Spool
+// MARK: Nothing waits on disk
 
-/// Waiting mail and wake-up registrations, as written to disk between runs: sealed with the relay's storage key, so
-/// the file shows nothing. Envelopes are end-to-end encrypted already; what the seal hides is which mailboxes hold
-/// mail and which phone each wake-up goes to. Without it, a restart lost everything waiting and left every locked
-/// phone unwoken until its owner opened the app.
-#[derive(Serialize, Deserialize)]
-struct Spool {
-    id_seed: String,
-    counter: u64,
-    queues: Vec<SpooledQueue>,
-    #[serde(default)]
-    push: Vec<push::Saved>,
+/// Waiting mail and wake-up registrations are kept in memory and nowhere else: a restart empties them, by design,
+/// and nothing about who has mail waiting or which phone to wake ever touches the server's disk. An earlier version
+/// wrote them out, sealed, so a restart wouldn't lose them. A file it left behind is overwritten with random bytes
+/// and deleted at start-up, before anything is served.
+fn forget_old_spool(path: &std::path::Path) {
+    let Ok(meta) = std::fs::metadata(path) else { return };
+    let mut noise = vec![0u8; usize::try_from(meta.len()).unwrap_or(0).min(512 * 1024 * 1024)];
+    if let Ok(mut random) = std::fs::File::open("/dev/urandom") { let _ = random.read_exact(&mut noise); }
+    let _ = std::fs::write(path, &noise);
+    let _ = std::fs::remove_file(path);
+    eprintln!("removed the old spool file; waiting mail is no longer written to disk");
 }
 
-#[derive(Serialize, Deserialize)]
-struct SpooledQueue {
-    mailbox: String,
-    items: Vec<SpooledItem>,
-}
-
-/// `deposited` is when it arrived, by the wall clock, so its age and expiry carry across a restart.
-#[derive(Serialize, Deserialize)]
-struct SpooledItem {
-    id: u64,
-    deposited: u64,
-    blob: String,
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-}
-
-fn spool_path(directory_path: &str) -> PathBuf {
-    PathBuf::from(directory_path).with_file_name("pulshade-spool.sealed")
-}
-
-/// The spool on disk is a short marker, then records, each a length and a sealed piece of JSON: first the header,
-/// then waiting mail in pieces of a few megabytes. Written and read a piece at a time, so a relay holding hundreds
-/// of megabytes of mail needs only a few more to save it or load it. (The first format was one sealed file of
-/// everything, which took three times the mail in memory to write, and a small server killed the relay for it.)
-const SPOOL_MARKER: &[u8; 4] = b"PSP2";
-/// About how much waiting mail goes into one record.
-const SPOOL_CHUNK: usize = 4 * 1024 * 1024;
-
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "t")]
-enum SpoolRecord {
-    #[serde(rename = "h")]
-    Header {
-        id_seed: String,
-        counter: u64,
-        #[serde(default)]
-        push: Vec<push::Saved>,
-    },
-    #[serde(rename = "q")]
-    Queue { mailbox: String, items: Vec<SpooledItem> },
-}
-
-fn write_record(out: &mut impl std::io::Write, sealer: &sealed::Sealer, record: &SpoolRecord) -> std::io::Result<()> {
-    let raw = serde_json::to_vec(record).map_err(std::io::Error::other)?;
-    let sealed = sealer.seal(&raw);
-    out.write_all(&(sealed.len() as u32).to_be_bytes())?;
-    out.write_all(&sealed)
-}
-
-/// Writes the spool if anything changed since the last time (or always, with `force`), sealed a piece at a time and
-/// swapped in whole, so nothing readable ever reaches the disk. The mail is only copied by reference while the lock is
-/// held, so the relay isn't kept waiting while it is written.
-fn save_spool(store: &Shared, path: &std::path::Path, sealer: &sealed::Sealer, force: bool) {
-    let mail_changed = MAIL_CHANGED.swap(false, Ordering::SeqCst);
-    let (push, push_changed) = push::global().saved();
-    if !force && !mail_changed && !push_changed {
-        return;
-    }
-    let now = unix_now();
-    let (id_seed, counter, queues) = {
-        let store = store.lock().unwrap();
-        let queues: Vec<(Id, Vec<(u64, u64, Bytes)>)> = store.queues.iter().map(|(id, queue)| {
-            (*id, queue.iter().map(|item| (item.id, now.saturating_sub(item.at.elapsed().as_secs()), item.blob.clone())).collect())
-        }).collect();
-        (hex::encode(store.id_seed), store.counter, queues)
-    };
-    let tmp = path.with_extension("tmp");
-    let written = (|| -> std::io::Result<()> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-        let mut out = std::io::BufWriter::new(file);
-        std::io::Write::write_all(&mut out, SPOOL_MARKER)?;
-        write_record(&mut out, sealer, &SpoolRecord::Header { id_seed, counter, push })?;
-        for (id, items) in queues {
-            let mailbox = hex::encode(id);
-            let mut piece: Vec<SpooledItem> = Vec::new();
-            let mut size = 0;
-            for (item_id, deposited, blob) in items {
-                size += blob.len();
-                piece.push(SpooledItem { id: item_id, deposited, blob: B64.encode(&blob) });
-                if size >= SPOOL_CHUNK {
-                    write_record(&mut out, sealer, &SpoolRecord::Queue { mailbox: mailbox.clone(), items: std::mem::take(&mut piece) })?;
-                    size = 0;
-                }
-            }
-            if !piece.is_empty() {
-                write_record(&mut out, sealer, &SpoolRecord::Queue { mailbox, items: piece })?;
-            }
-        }
-        std::io::Write::flush(&mut out)?;
-        out.into_inner().map_err(|e| e.into_error())?.sync_all()
-    })();
-    if written.is_ok() && std::fs::rename(&tmp, path).is_ok() {
-        return;
-    }
-    // Not written: try again next time.
-    let _ = std::fs::remove_file(&tmp);
-    MAIL_CHANGED.store(true, Ordering::SeqCst);
-}
-
-/// Puts a mailbox's saved mail back, dropping what is past its week. Mail already there keeps its place in front.
-fn restore_queue(store: &mut Store, mailbox: &str, items: Vec<SpooledItem>, now: u64) -> usize {
-    let Some(id) = parse_id(mailbox) else { return 0 };
-    let items: Vec<Item> = items.into_iter().filter_map(|item| {
-        let age = Duration::from_secs(now.saturating_sub(item.deposited));
-        if age >= TTL {
-            return None;
-        }
-        let blob = Bytes::from(B64.decode(item.blob).ok()?);
-        Some(Item { id: item.id, at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now), blob })
-    }).collect();
-    if items.is_empty() || (!store.queues.contains_key(&id) && store.queues.len() >= MAX_MAILBOXES) {
-        return 0;
-    }
-    let queue = store.queues.entry(id).or_default();
-    let room = MAX_QUEUE.saturating_sub(queue.len());
-    let kept: Vec<Item> = items.into_iter().take(room).collect();
-    let count = kept.len();
-    queue.extend(kept);
-    count
-}
-
-/// Brings back what the last run left waiting. Mail past its week, and anything unreadable, stays behind.
-fn load_spool(store: &Shared, path: &std::path::Path, sealer: &sealed::Sealer) -> (usize, usize) {
-    let Ok(file) = std::fs::File::open(path) else { return (0, 0) };
-    let mut input = std::io::BufReader::new(file);
-    let mut marker = [0u8; 4];
-    if input.read_exact(&mut marker).is_ok() && &marker == SPOOL_MARKER {
-        return load_pieces(store, &mut input, sealer);
-    }
-    drop(input);
-    load_whole(store, path, sealer)
-}
-
-fn load_pieces(store: &Shared, input: &mut impl Read, sealer: &sealed::Sealer) -> (usize, usize) {
-    let now = unix_now();
-    let (mut count, mut push) = (0, Vec::new());
-    loop {
-        let mut len = [0u8; 4];
-        if input.read_exact(&mut len).is_err() {
-            break;
-        }
-        let len = u32::from_be_bytes(len) as usize;
-        // A piece is a few megabytes at most; anything larger is damage, and not worth reading on.
-        if len > 64 * 1024 * 1024 {
-            eprintln!("the spool has a piece that is too large; the rest is left behind");
-            break;
-        }
-        let mut sealed_piece = vec![0u8; len];
-        if input.read_exact(&mut sealed_piece).is_err() {
-            eprintln!("the spool ends part-way; the rest is left behind");
-            break;
-        }
-        let Some(record) = sealer.open(&sealed_piece).and_then(|plain| serde_json::from_slice::<SpoolRecord>(&plain).ok()) else {
-            eprintln!("a piece of the spool couldn't be opened; it is left behind");
-            continue;
-        };
-        match record {
-            SpoolRecord::Header { id_seed, counter, push: saved } => {
-                let mut store = store.lock().unwrap();
-                if let Some(seed) = hex::decode(&id_seed).ok().and_then(|raw| <[u8; 32]>::try_from(raw).ok()) {
-                    store.id_seed = seed;
-                    store.counter = counter;
-                }
-                push = saved;
-            }
-            SpoolRecord::Queue { mailbox, items } => {
-                count += restore_queue(&mut store.lock().unwrap(), &mailbox, items, now);
-            }
-        }
-    }
-    {
-        let mut store = store.lock().unwrap();
-        store.bytes = store.queues.values().flat_map(|q| q.iter()).map(|item| item.blob.len()).sum();
-    }
-    let woken = push::global().restore(push);
-    (count, woken)
-}
-
-/// The first format: one sealed file holding everything. Still read, so the first start after an update finds
-/// what was waiting; it is written in the new format from then on.
-fn load_whole(store: &Shared, path: &std::path::Path, sealer: &sealed::Sealer) -> (usize, usize) {
-    let Ok(raw) = std::fs::read(path) else { return (0, 0) };
-    if !sealed::Sealer::is_sealed(&raw) {
-        return (0, 0);
-    }
-    let Some(spool) = sealer.open(&raw).and_then(|plain| serde_json::from_slice::<Spool>(&plain).ok()) else {
-        eprintln!("the spool at {} couldn't be opened; starting without it", path.display());
-        return (0, 0);
-    };
-    drop(raw);
-    let now = unix_now();
-    let mut count = 0;
-    {
-        let mut store = store.lock().unwrap();
-        if let Some(seed) = hex::decode(&spool.id_seed).ok().and_then(|raw| <[u8; 32]>::try_from(raw).ok()) {
-            store.id_seed = seed;
-            store.counter = spool.counter;
-        }
-        for queue in spool.queues {
-            count += restore_queue(&mut store, &queue.mailbox, queue.items, now);
-        }
-        store.bytes = store.queues.values().flat_map(|q| q.iter()).map(|item| item.blob.len()).sum();
-    }
-    let woken = push::global().restore(spool.push);
-    (count, woken)
-}
 
 /// Waits for Ctrl-C or the service manager's stop (SIGTERM), either of which ends the relay cleanly.
 async fn stop_signal() {
@@ -1192,8 +972,7 @@ fn pet_signing_key() -> Option<ed25519_dalek::SigningKey> {
 }
 
 /// Keeps memory off the disk: no core file if the relay crashes, and (on Linux) no other process of this user
-/// may read its memory. The addresses counted for rate limits only ever live there, and waiting envelopes reach
-/// the disk only sealed, in the spool.
+/// may read its memory. The addresses counted for rate limits and the waiting envelopes only ever live there.
 fn no_core_dumps() {
     let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
     // SAFETY: plain system calls with valid arguments.
@@ -1232,13 +1011,8 @@ async fn main() {
     }
     let bind = std::env::var("PULSHADE_BIND").unwrap_or_else(|_| "127.0.0.1:7878".into());
     let store: Shared = Arc::default();
-    // What the last run left waiting, before anyone can ask for it.
-    let spool = spool_path(&directory_path);
-    let spool_sealer = Arc::new(sealed::Sealer::standard(&PathBuf::from(&directory_path)));
-    let (waiting, woken) = load_spool(&store, &spool, &spool_sealer);
-    if waiting > 0 || woken > 0 {
-        eprintln!("brought back {waiting} waiting envelope(s) and {woken} wake-up registration(s)");
-    }
+    // A spool file an older version left behind is destroyed before anyone can ask for anything.
+    forget_old_spool(&PathBuf::from(&directory_path).with_file_name("pulshade-spool.sealed"));
     let state = AppState {
         store: store.clone(),
         calls: Arc::default(),
@@ -1261,15 +1035,6 @@ async fn main() {
             purge(&sweeper);
             push::global().sweep();
             backups.sweep(backup::BACKUP_TTL);
-        }
-    });
-    let (spooler, spool_file, sealer) = (store.clone(), spool.clone(), spool_sealer.clone());
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(SPOOL_EVERY);
-        loop {
-            tick.tick().await;
-            let (store, file, sealer) = (spooler.clone(), spool_file.clone(), sealer.clone());
-            let _ = tokio::task::spawn_blocking(move || save_spool(&store, &file, &sealer, false)).await;
         }
     });
     // Addresses are only kept while they count towards a limit, checked every minute.
@@ -1300,14 +1065,17 @@ async fn main() {
         .with_graceful_shutdown(stop_signal())
         .await
         .unwrap();
-    // Everything still waiting goes to disk before the process ends, so nothing is lost to a restart.
-    save_spool(&store, &spool, &spool_sealer, true);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::IpAddr;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unix_now() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    }
 
     #[tokio::test]
     async fn call_rooms_pass_packets_between_two_devices_only() {
@@ -1424,161 +1192,6 @@ mod tests {
         let Json(res) = fetch(State(store), Json(FetchRequest { keys: vec![hex::encode(other)], wait: 1 })).await.unwrap();
         assert!(res.items.is_empty());
         assert!(started.elapsed() >= Duration::from_secs(1), "nothing for it: waited out the second");
-    }
-
-    /// What's waiting and who to wake survive a restart: written out sealed, read back by the next run with the same
-    /// ids and ages, and nothing past its week comes back.
-    #[tokio::test]
-    async fn waiting_mail_and_wake_ups_survive_a_restart() {
-        let dir = std::env::temp_dir().join(format!("pulshade-spool-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("pulshade-spool.sealed");
-        let sealer = sealed::Sealer::with_key([7; 32]);
-        let store: Shared = Arc::default();
-        let receive = key(31);
-        let send = hex::encode(send_id_for(&receive));
-        assert_eq!(deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), Bytes::from_static(b"first")).await, StatusCode::ACCEPTED);
-        assert_eq!(deposit(State(store.clone()), Path(send), HeaderMap::new(), Bytes::from_static(b"second")).await, StatusCode::ACCEPTED);
-        // One that's been waiting longer than a relay keeps anything.
-        let stale = key(32);
-        store.lock().unwrap().queues.insert(send_id_for(&stale), VecDeque::from([Item {
-            id: 99, at: Instant::now().checked_sub(TTL + Duration::from_secs(60)).unwrap(), blob: Bytes::from_static(b"old"),
-        }]));
-        let token = "ab".repeat(32);
-        assert!(push::global().register(&[send_id_for(&receive)], &token, false, true));
-        let Json(before) = fetch(State(store.clone()), Json(FetchRequest { keys: vec![hex::encode(receive)], wait: 0 })).await.unwrap();
-
-        save_spool(&store, &path, &sealer, true);
-        let raw = std::fs::read(&path).unwrap();
-        assert!(raw.starts_with(SPOOL_MARKER), "written a piece at a time");
-        assert!(!raw.windows(5).any(|w| w == b"first") && !raw.windows(token.len()).any(|w| w == token.as_bytes()), "nothing readable");
-
-        // The next run starts empty, and the spool brings it back.
-        push::global().forget(&token);
-        let next: Shared = Arc::default();
-        let (waiting, woken) = load_spool(&next, &path, &sealer);
-        assert_eq!(waiting, 2, "the stale one stays behind");
-        assert!(woken >= 1);
-        let Json(after) = fetch(State(next.clone()), Json(FetchRequest { keys: vec![hex::encode(receive)], wait: 0 })).await.unwrap();
-        assert_eq!(after.items.iter().map(|i| (i.id, i.blob.clone())).collect::<Vec<_>>(),
-                   before.items.iter().map(|i| (i.id, i.blob.clone())).collect::<Vec<_>>(), "same envelopes, same ids");
-        assert_eq!(next.lock().unwrap().bytes, 5 + 6);
-        assert!(next.lock().unwrap().queues.get(&send_id_for(&stale)).is_none());
-        // New ids carry on from where the last run stopped, so none is ever handed out twice.
-        assert_eq!(next.lock().unwrap().counter, store.lock().unwrap().counter);
-        let (saved, _) = push::global().saved();
-        assert!(saved.iter().any(|s| s.token == token && s.mailbox == hex::encode(send_id_for(&receive))));
-        push::global().forget(&token);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The first format of the spool, as the relay wrote it before: one sealed file of everything.
-    fn save_spool_first_format(store: &Shared, path: &std::path::Path, sealer: &sealed::Sealer) {
-        let now = unix_now();
-        let (push, _) = push::global().saved();
-        let spool = {
-            let store = store.lock().unwrap();
-            Spool {
-                id_seed: hex::encode(store.id_seed),
-                counter: store.counter,
-                queues: store.queues.iter().map(|(id, queue)| SpooledQueue {
-                    mailbox: hex::encode(id),
-                    items: queue.iter().map(|item| SpooledItem {
-                        id: item.id,
-                        deposited: now.saturating_sub(item.at.elapsed().as_secs()),
-                        blob: B64.encode(&item.blob),
-                    }).collect(),
-                }).collect(),
-                push,
-            }
-        };
-        std::fs::write(path, sealer.seal(&serde_json::to_vec(&spool).unwrap())).unwrap();
-    }
-
-    /// An update must find the mail the old format left behind, and write the new one from then on.
-    #[tokio::test]
-    async fn a_spool_in_the_first_format_still_loads() {
-        let dir = std::env::temp_dir().join(format!("pulshade-spool-old-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("pulshade-spool.sealed");
-        let sealer = sealed::Sealer::with_key([8; 32]);
-        let store: Shared = Arc::default();
-        let receive = key(41);
-        let send = hex::encode(send_id_for(&receive));
-        for body in [&b"one"[..], b"two", b"three"] {
-            assert_eq!(deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), Bytes::copy_from_slice(body)).await, StatusCode::ACCEPTED);
-        }
-        save_spool_first_format(&store, &path, &sealer);
-        assert!(sealed::Sealer::is_sealed(&std::fs::read(&path).unwrap()));
-
-        let next: Shared = Arc::default();
-        let (waiting, _) = load_spool(&next, &path, &sealer);
-        assert_eq!(waiting, 3);
-        assert_eq!(next.lock().unwrap().bytes, 3 + 3 + 5);
-        MAIL_CHANGED.store(true, Ordering::SeqCst);
-        save_spool(&next, &path, &sealer, true);
-        assert!(std::fs::read(&path).unwrap().starts_with(SPOOL_MARKER), "written in the new format now");
-        let again: Shared = Arc::default();
-        assert_eq!(load_spool(&again, &path, &sealer).0, 3);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Lots of mail comes back whole and in order, from a file written in several pieces, and an unreadable piece costs
-    /// only itself.
-    #[tokio::test]
-    async fn a_large_spool_is_written_in_pieces_and_comes_back_in_order() {
-        let dir = std::env::temp_dir().join(format!("pulshade-spool-big-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("pulshade-spool.sealed");
-        let sealer = sealed::Sealer::with_key([9; 32]);
-        let store: Shared = Arc::default();
-        let mailboxes = [key(51), key(52)];
-        for (n, receive) in mailboxes.iter().enumerate() {
-            let items: VecDeque<Item> = (0..7u64).map(|i| Item {
-                id: n as u64 * 100 + i,
-                at: Instant::now(),
-                blob: Bytes::from(vec![(n as u8) * 16 + i as u8; 1_500_000]),
-            }).collect();
-            store.lock().unwrap().queues.insert(send_id_for(receive), items);
-        }
-        store.lock().unwrap().bytes = 2 * 7 * 1_500_000;
-        save_spool(&store, &path, &sealer, true);
-
-        // Several pieces, none of them the size of everything.
-        let raw = std::fs::read(&path).unwrap();
-        assert!(raw.starts_with(SPOOL_MARKER));
-        let (mut at, mut pieces, mut largest) = (4, 0, 0);
-        while at + 4 <= raw.len() {
-            let len = u32::from_be_bytes(raw[at..at + 4].try_into().unwrap()) as usize;
-            at += 4 + len;
-            pieces += 1;
-            largest = largest.max(len);
-        }
-        assert!(pieces >= 5, "{pieces} pieces");
-        assert!(largest < 12 * 1024 * 1024, "the largest piece is {largest} bytes");
-
-        let next: Shared = Arc::default();
-        let (waiting, _) = load_spool(&next, &path, &sealer);
-        assert_eq!(waiting, 14);
-        assert_eq!(next.lock().unwrap().bytes, 2 * 7 * 1_500_000);
-        for (n, receive) in mailboxes.iter().enumerate() {
-            let guard = next.lock().unwrap();
-            let queue = guard.queues.get(&send_id_for(receive)).unwrap();
-            let ids: Vec<u64> = queue.iter().map(|i| i.id).collect();
-            assert_eq!(ids, (0..7u64).map(|i| n as u64 * 100 + i).collect::<Vec<_>>(), "same order");
-            assert!(queue.iter().enumerate().all(|(i, item)| item.blob.iter().all(|b| *b == (n as u8) * 16 + i as u8)), "same bytes");
-        }
-
-        // Damage to one piece loses that piece only.
-        let mut damaged = raw.clone();
-        let first_len = u32::from_be_bytes(damaged[4..8].try_into().unwrap()) as usize;
-        let second = 4 + 4 + first_len;
-        damaged[second + 4 + 30] ^= 0xff;
-        std::fs::write(&path, &damaged).unwrap();
-        let hurt: Shared = Arc::default();
-        let (waiting, _) = load_spool(&hurt, &path, &sealer);
-        assert!(waiting > 0 && waiting < 14, "{waiting} came back");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A message sent after a story's pieces is handed over first, and a big piece at the front of one mailbox
