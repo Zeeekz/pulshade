@@ -47,6 +47,14 @@ struct WireMessage: Codable, Equatable {
     /// The quoted message; `author` is a fingerprint, never "me".
     var reply: ReplyRef?
     var preview: LinkPreview?
+    /// Set on a video: its clip follows in pieces (`storyPart`, under this message's id), and `image` is a still
+    /// from it. Apps from before chat videos leave this out and show the still as a photo.
+    var clip: ClipInfo?
+}
+
+/// What a message says about the video that follows it.
+struct ClipInfo: Codable, Equatable {
+    var seconds: Double
 }
 
 struct GroupInfo: Codable, Equatable {
@@ -75,6 +83,63 @@ struct GroupInfo: Codable, Equatable {
 ///
 /// Only the session setup cases travel bare. Everything people actually say goes inside
 /// `.ratchet`, so it gets a fresh key per message.
+/// A short description followed by raw bytes: `0`, the description's length (4 bytes, big-endian), the description,
+/// then the bytes. JSON never starts with a zero byte, so a reader can tell this from plain JSON at a glance.
+///
+/// Bytes inside JSON are written as base64, a third bigger each time, and a video piece sat inside three layers of
+/// it (the piece in its payload, the ciphertext in the ratchet message, that in the envelope): 1 MB went up as 3 MiB.
+/// Framed, the bytes ride along as they are.
+enum Frame {
+    static let mark: UInt8 = 0
+
+    static func join(_ header: Data, _ tail: Data) -> Data {
+        var out = Data(capacity: 5 + header.count + tail.count)
+        out.append(mark)
+        withUnsafeBytes(of: UInt32(header.count).bigEndian) { out.append(contentsOf: $0) }
+        out.append(header)
+        out.append(tail)
+        return out
+    }
+
+    static func split(_ data: Data) -> (header: Data, tail: Data)? {
+        let bytes = Data(data)
+        guard bytes.count >= 5, bytes[0] == mark else { return nil }
+        let length = bytes[1..<5].reduce(0) { $0 << 8 | Int($1) }
+        guard length <= bytes.count - 5 else { return nil }
+        return (Data(bytes[5..<(5 + length)]), Data(bytes[(5 + length)...]))
+    }
+}
+
+extension Payload {
+    /// The payload as it travels. `framed` (only for someone whose app says it reads frames, see `Envelope.reads`)
+    /// sends the one big field of a ratchet message or a video piece raw, after the rest as JSON; everything else,
+    /// and everything for an older app, is plain JSON as before.
+    func wire(framed: Bool) throws -> Data {
+        if framed {
+            switch self {
+            case let .ratchet(message) where !message.ciphertext.isEmpty:
+                let rest = Payload.ratchet(RatchetMessage(header: message.header, ciphertext: Data()))
+                return Frame.join(try JSONEncoder.pulshade.encode(rest), message.ciphertext)
+            case let .storyPart(id, index, of, bytes) where !bytes.isEmpty:
+                return Frame.join(try JSONEncoder.pulshade.encode(Payload.storyPart(id: id, index: index, of: of, bytes: Data())), bytes)
+            default: break
+            }
+        }
+        return try JSONEncoder.pulshade.encode(self)
+    }
+
+    /// Reads either form.
+    static func fromWire(_ data: Data) throws -> Payload {
+        guard data.first == Frame.mark else { return try JSONDecoder.pulshade.decode(Payload.self, from: data) }
+        guard let (header, tail) = Frame.split(data) else { throw EnvelopeError.malformed }
+        switch try JSONDecoder.pulshade.decode(Payload.self, from: header) {
+        case let .ratchet(message): return .ratchet(RatchetMessage(header: message.header, ciphertext: tail))
+        case let .storyPart(id, index, of, _): return .storyPart(id: id, index: index, of: of, bytes: tail)
+        default: throw EnvelopeError.malformed
+        }
+    }
+}
+
 enum Payload: Codable, Equatable {
     /// First message on a new invite: "this is me, write back here, and here's a handshake".
     case hello(PeerCard, SessionInit)

@@ -230,10 +230,10 @@ final class SegmentSink: NSObject, AVAssetWriterDelegate, @unchecked Sendable {
 /// Short, small story clips: at most 15 seconds, portrait 720p H.264, small enough for one encrypted message.
 enum StoryVideo {
     static let maxSeconds: Double = 15
-    /// What goes in a story, in bytes: four pieces of `StoryClipPieces.size`. Each piece is its own relay message
-    /// (a clip is wrapped in base64 twice on its way, so a piece grows by about 80%, which keeps it inside the
-    /// 2 MiB padding bucket and far under the relay's 4 MiB), and the receiver joins them. At 15 seconds this
-    /// leaves about 1.9 Mbit/s, plenty for 1080p HEVC.
+    /// What goes in a story, in bytes. It travels in pieces, each its own relay message, and the receiver joins them:
+    /// two of `StoryClipPieces.framedSize` to an app that reads frames (4 MiB on the wire), four of
+    /// `StoryClipPieces.size` to an older one (12 MiB, see there). At 15 seconds this leaves about 1.9 Mbit/s,
+    /// plenty for 1080p HEVC.
     static let maxBytes = 3_800_000
     /// Full HD, for clips shot at that size or more; smaller sources are kept at 720p rather than blown up.
     static let hdSize = CGSize(width: 1080, height: 1920)
@@ -390,15 +390,50 @@ enum StoryVideo {
     }
 }
 
+// MARK: - Videos in chats
+
+/// A video sent in a chat: up to 30 seconds, kept in its own shape (not cut to a story's), small enough to send.
+enum ChatVideo {
+    static let maxSeconds: Double = 30
+    /// About 1.3 Mbit/s at full length: three framed pieces.
+    static let maxBytes = 5_000_000
+    static let posterSide: CGFloat = 480
+
+    /// The clip made ready to send, with a still from it and its length. Nil if it can't be read.
+    static func prepare(_ clip: MemoryClip, zoom: ZoomTrack = .none) async -> (clip: Data, poster: Data?, seconds: Double)? {
+        let asset = clip.makeAsset()
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+              let (natural, transform) = try? await track.load(.naturalSize, .preferredTransform) else { return nil }
+        let upright = natural.applying(transform)
+        let (w, h) = (abs(upright.width), abs(upright.height))
+        guard w > 0, h > 0 else { return nil }
+        // The long side at 1280 at most, never blown up, and even numbers (the encoder needs them).
+        let scale = min(1, 1280 / max(w, h))
+        func even(_ v: CGFloat) -> CGFloat { max(2, (v * scale / 2).rounded() * 2) }
+        guard let made = try? await StoryVideo.export(from: clip, filter: .none, zoom: zoom, maxBytes: maxBytes, maxSeconds: maxSeconds,
+                                                      size: CGSize(width: even(w), height: even(h))) else { return nil }
+        let ready = MemoryClip(made)
+        let seconds = min((try? await ready.makeAsset().load(.duration).seconds) ?? 0, maxSeconds)
+        let poster = await StoryVideo.poster(of: ready).flatMap { cleanJPEG(PlatformImage.from(cgImage: $0), maxSide: posterSide) }
+        return (made, poster, seconds.isFinite ? max(seconds, 0) : 0)
+    }
+}
+
 // MARK: - Sending a clip in pieces
 
 /// A clip is cut into pieces that each fit one relay message, and sent as separate messages.
 enum StoryClipPieces {
+    /// For an app from before frames: base64 three times over takes this to 2.4 MB, sent as 3 MiB.
     static let size = 1_000_000
-    static let maxPieces = 5
+    /// For an app that reads frames: the piece travels raw and fills the 2 MiB padding bucket, with room left for
+    /// everything wrapped round it (the ratchet header with a post-quantum key, the envelope's own fields).
+    static let framedSize = 2_080_000
+    /// The most pieces one clip may come in: a chat video cut the older way takes six.
+    static let maxPieces = 8
 
-    static func split(_ clip: Data) -> [Data] {
-        stride(from: 0, to: clip.count, by: size).map { clip.subdata(in: $0..<min($0 + size, clip.count)) }
+    static func split(_ clip: Data, framed: Bool = false) -> [Data] {
+        let size = framed ? framedSize : size
+        return stride(from: 0, to: clip.count, by: size).map { clip.subdata(in: $0..<min($0 + size, clip.count)) }
     }
 }
 

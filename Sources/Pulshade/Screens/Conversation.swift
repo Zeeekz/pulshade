@@ -13,7 +13,11 @@ struct ConversationView: View {
     let id: Conversation.ID
     @State private var draft = ""
     @State private var attachments: [Data] = []
+    /// A video for the next message, while it's made ready and once it is.
+    @State private var videoDraft: VideoDraft?
+    @State private var videoTask: Task<Void, Never>?
     @State private var takingPhoto = false
+    @State private var quickSending = false
     @State private var showInfo = false
     @State private var recorder = VoiceRecorder()
     @State private var replyingTo: Message?
@@ -71,6 +75,9 @@ struct ConversationView: View {
             }
             .onChange(of: c.messages.count) { model.markRead(id) }
             .sheet(isPresented: $showInfo) { ConversationInfo(id: id) }
+            .sheet(isPresented: $quickSending) {
+                QuickSendSheet(conversation: id).presentationDetents([.medium, .large])
+            }
         }
     }
 
@@ -356,9 +363,15 @@ struct ConversationView: View {
                 }
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            if !attachments.isEmpty {
+            if !attachments.isEmpty || videoDraft != nil {
                 ScrollView(.horizontal) {
                     HStack(spacing: 12) {
+                        if let videoDraft {
+                            VideoDraftTile(draft: videoDraft) {
+                                videoTask?.cancel()
+                                withAnimation(.snappy) { self.videoDraft = nil }
+                            }
+                        }
                         ForEach(Array(attachments.enumerated()), id: \.offset) { i, data in
                             if let img = PlatformImage(data: data) {
                                 Image(platformImage: img).resizable().scaledToFill()
@@ -387,8 +400,15 @@ struct ConversationView: View {
                 HStack(alignment: .bottom, spacing: 8) {
                     Button { takingPhoto = true } label: { Image(systemName: "camera") }
                         .buttonStyle(IconButtonStyle(size: 36))
-                        .help("Take or choose a photo")
-                        .accessibilityLabel("Take or choose a photo")
+                        .help("Take or choose a photo or video")
+                        .accessibilityLabel("Take or choose a photo or video")
+                    // Only when there's something pinned to send, so the bar stays clear otherwise.
+                    if !(model.activeProfile.links ?? []).isEmpty || !(model.activeProfile.notes ?? []).isEmpty {
+                        Button { quickSending = true } label: { Image(systemName: "pin") }
+                            .buttonStyle(IconButtonStyle(size: 36))
+                            .help("Send something pinned to your profile")
+                            .accessibilityLabel("Send something pinned to your profile")
+                    }
 
                     TextField("", text: $draft, prompt: Text(placeholder(c)).foregroundStyle(Ink.faint), axis: .vertical)
                         .textFieldStyle(.plain)
@@ -426,7 +446,7 @@ struct ConversationView: View {
                             }
                         }
 
-                    if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty {
+                    if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty && videoDraft == nil {
                         Button { Task { _ = await recorder.start() } } label: { Image(systemName: "mic") }
                             .buttonStyle(IconButtonStyle(size: 36))
                             .help("Record a voice message")
@@ -437,10 +457,13 @@ struct ConversationView: View {
                             .buttonStyle(GlowButtonStyle(size: 36))
                             .keyboardShortcut(.return, modifiers: .command)
                             .accessibilityLabel("Send")
+                            // A video still being made ready can't go yet.
+                            .disabled(videoDraft?.preparing == true)
+                            .opacity(videoDraft?.preparing == true ? 0.4 : 1)
                             .transition(.opacity)
                     }
                 }
-                .animation(.snappy(duration: 0.2), value: draft.isEmpty && attachments.isEmpty)
+                .animation(.snappy(duration: 0.2), value: draft.isEmpty && attachments.isEmpty && videoDraft == nil)
             }
         }
         .padding(.horizontal, Platform.isPhone ? 10 : 18)
@@ -450,7 +473,10 @@ struct ConversationView: View {
         .overlay(alignment: .top) { Rectangle().fill(Ink.line).frame(height: 1) }
         .chatCamera(isPresented: $takingPhoto) { photos in
             withAnimation(.snappy) { attachments = Array((attachments + photos).prefix(10)) }
+        } filmed: { clip, zoom in
+            prepareVideo(clip, zoom)
         }
+        .animation(.snappy(duration: 0.25), value: videoDraft)
         .animation(.snappy(duration: 0.25), value: recorder.isRecording)
         .animation(.snappy(duration: 0.25), value: attachments.count)
         .animation(.snappy(duration: 0.25), value: replyingTo?.id)
@@ -481,10 +507,35 @@ struct ConversationView: View {
         }
     }
 
+    /// Shrinks a recorded or picked video to what a chat carries (30 seconds, its own shape), off the main thread;
+    /// the tile shows a spinner until it's done.
+    private func prepareVideo(_ clip: MemoryClip, _ zoom: ZoomTrack) {
+        videoTask?.cancel()
+        withAnimation(.snappy) { videoDraft = VideoDraft() }
+        videoTask = Task {
+            let made = await ChatVideo.prepare(clip, zoom: zoom)
+            guard !Task.isCancelled else { return }
+            if let made {
+                videoDraft = VideoDraft(poster: made.poster, clip: made.clip, seconds: made.seconds, preparing: false)
+            } else {
+                videoDraft = VideoDraft(preparing: false, failed: true)
+            }
+        }
+    }
+
     private func send() {
         let preview = draftPreview.flatMap { draft.contains($0.url) ? $0 : nil }
-        // Each photo goes as its own message; the text and reply ride along with the first.
-        if attachments.isEmpty {
+        if videoDraft?.preparing == true { return }
+        if let video = videoDraft, let clip = video.clip {
+            // The video takes the text and the reply; any photos follow as their own messages.
+            model.sendVideo(clip, poster: video.poster, seconds: video.seconds, caption: draft, replyTo: replyingTo, in: id)
+            for photo in attachments { model.send("", image: photo, in: id) }
+        } else if videoDraft != nil, attachments.isEmpty,
+                  draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // Only a video that couldn't be read: nothing to send.
+            videoDraft = nil
+            return
+        } else if attachments.isEmpty {
             model.send(draft, replyTo: replyingTo, preview: preview, in: id)
         } else {
             for (i, photo) in attachments.enumerated() {
@@ -495,6 +546,7 @@ struct ConversationView: View {
         model.playSendSound()
         draft = ""
         attachments = []
+        videoDraft = nil
         replyingTo = nil
         draftPreview = nil
         dismissedPreview = nil
@@ -677,8 +729,10 @@ private struct Bubble: View {
                     HStack(spacing: 8) {
                         Rectangle().fill(mine ? Ink.onAccent.opacity(0.35) : tint).frame(width: 2).clipShape(.capsule)
                         if let data = quote.picture, let img = PlatformImage(data: data) {
+                            // A story's quote is tall, like the story; a photo's is a small square.
+                            let tall = img.size.height > img.size.width * 1.5
                             Image(platformImage: img).resizable().scaledToFill()
-                                .frame(width: 36, height: 64)
+                                .frame(width: tall ? 36 : 44, height: tall ? 64 : 44)
                                 .clipShape(.rect(cornerRadius: 5))
                                 .accessibilityHidden(true)
                         }
@@ -700,7 +754,9 @@ private struct Bubble: View {
                 .buttonStyle(.plain)
                 .help("Show the original")
             }
-            if let data = message.image, let img = PlatformImage(data: data) {
+            if message.isVideo {
+                VideoBubble(message: message)
+            } else if let data = message.image, let img = PlatformImage(data: data) {
                 Image(platformImage: img).resizable().scaledToFit()
                     .frame(maxWidth: Platform.isPhone ? 250 : 320, maxHeight: 340)
                     .clipShape(.rect(cornerRadius: 10))
@@ -1110,23 +1166,32 @@ private struct ConversationInfo: View {
 
     var body: some View {
         if let c = model.conversation(id) {
+            let person = c.kind == .direct ? model.contact(c.members.first ?? "", in: c.persona) : nil
             VStack(spacing: 0) {
-                HStack {
-                    Text(c.kind == .direct ? "Profile" : c.kind.label)
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(Ink.text)
-                    Spacer()
-                    Button { dismiss() } label: { Image(systemName: "xmark") }
-                        .buttonStyle(IconButtonStyle(size: 26))
-                        .keyboardShortcut(.cancelAction)
-                        .accessibilityLabel("Close")
+                // A person's profile opens straight onto their banner; anything else keeps its title bar.
+                if person == nil {
+                    HStack {
+                        Text(c.kind == .direct ? "Profile" : c.kind.label)
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(Ink.text)
+                        Spacer()
+                        Button { dismiss() } label: { Image(systemName: "xmark") }
+                            .buttonStyle(IconButtonStyle(size: 26))
+                            .keyboardShortcut(.cancelAction)
+                            .accessibilityLabel("Close")
+                    }
+                    .padding(.horizontal, 20).padding(.vertical, 14)
+                    Rectangle().fill(Ink.line).frame(height: 1)
                 }
-                .padding(.horizontal, 20).padding(.vertical, 14)
-                Rectangle().fill(Ink.line).frame(height: 1)
 
                 ScrollView {
+                    if let person {
+                        personProfile(person, in: c)
+                            .opacity(arrived ? 1 : 0)
+                            .offset(y: arrived ? 0 : 18)
+                    }
                     VStack(spacing: 18) {
-                        identity(c)
+                        if person == nil { identity(c) }
                         if let persona = c.persona, model.isBurner(persona) { burnButton(persona) }
                         switch c.kind {
                         case .direct: directSection(c)
@@ -1143,8 +1208,23 @@ private struct ConversationInfo: View {
                     .scaleEffect(arrived ? 1 : 0.96, anchor: .top)
                 }
                 .scrollIndicators(.never)
+                .ignoresSafeArea(edges: person == nil ? [] : .top)
             }
-            .frame(width: Platform.isPhone ? nil : 440, height: Platform.isPhone ? nil : 600)
+            .overlay(alignment: .topTrailing) {
+                if person != nil {
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 13, weight: .bold)).foregroundStyle(.white)
+                            .frame(width: 32, height: 32)
+                            .background(.black.opacity(0.45), in: .circle)
+                    }
+                    .buttonStyle(.plain)
+                    .keyboardShortcut(.cancelAction)
+                    .padding(14)
+                    .accessibilityLabel("Close")
+                }
+            }
+            .frame(width: Platform.isPhone ? nil : 440, height: Platform.isPhone ? nil : 640)
             .background(Ink.base)
             .preferredColorScheme(Ink.scheme)
             .onAppear {
@@ -1187,74 +1267,130 @@ private struct ConversationInfo: View {
         }
     }
 
-    /// A person's whole profile, as they made it: banner, picture in their colour, name, @handle and bio.
+    /// A person's whole profile, as they made it. The banner runs edge to edge and fades into the page, their picture
+    /// sits half over it inside a ring of their own colour, then the name, @handle, bio and the things they've
+    /// pinned. Pulling down stretches the banner; everything eases in when the sheet opens.
     private func personProfile(_ peer: Contact, in c: Conversation) -> some View {
         let tint = Signature.color(peer.color, seed: peer.fingerprint)
         let theirName = peer.name.isEmpty ? "Anonymous" : peer.name
-        return VStack(spacing: 12) {
-            VStack(spacing: -48) {
-                Banner(image: peer.banner, seed: peer.fingerprint, height: 130)
-                    .clipShape(.rect(cornerRadius: 14))
-                Avatar(image: c.avatar ?? peer.avatar, seed: peer.fingerprint, size: 96)
-                    .overlay(Circle().strokeBorder(tint, lineWidth: 3).padding(-5))
-                    .shadow(color: tint.opacity(0.6), radius: 24)
-            }
-            VStack(spacing: 4) {
-                HStack(spacing: 6) {
-                    Text(peer.nickname.isEmpty ? theirName : peer.nickname)
-                        .font(.system(size: 21, weight: .semibold))
-                        .foregroundStyle(Ink.text)
-                    BadgeMark(badge: peer.badge, size: 21)
-                    if peer.verified {
-                        Image(systemName: "checkmark.seal.fill").font(.system(size: 14)).foregroundStyle(theme.accent)
-                            .help("You checked their safety code in person")
+        let bannerHeight: CGFloat = 196
+        return VStack(spacing: 0) {
+            Banner(image: peer.banner, seed: peer.fingerprint, height: bannerHeight)
+                .overlay {
+                    // Their colour comes up from under the picture, and the banner melts into the page.
+                    ZStack {
+                        RadialGradient(colors: [tint.opacity(0.45), .clear], center: .bottom, startRadius: 0, endRadius: 220)
+                        LinearGradient(stops: [.init(color: .clear, location: 0.35), .init(color: Ink.base.opacity(0.7), location: 0.8),
+                                               .init(color: Ink.base, location: 1)], startPoint: .top, endPoint: .bottom)
                     }
                 }
-                if !peer.nickname.isEmpty {
-                    Text("Calls themselves \(theirName)").font(.system(size: 12)).foregroundStyle(Ink.faint)
+                .visualEffect { content, proxy in
+                    let pull = max(0, proxy.frame(in: .scrollView).minY)
+                    return content.scaleEffect(1 + pull / bannerHeight, anchor: .bottom)
                 }
-            }
-            if let handle = peer.handle {
-                HStack(spacing: 6) {
-                    Text("@\(handle)").font(.system(size: 13, weight: .bold)).foregroundStyle(tint)
+                .accessibilityHidden(true)
+            VStack(spacing: 14) {
+                Avatar(image: c.avatar ?? peer.avatar, seed: peer.fingerprint, size: 112)
+                    .padding(5)
+                    .background(Ink.base, in: .circle)
+                    .overlay {
+                        Circle().strokeBorder(AngularGradient(colors: [tint, tint.opacity(0.35), tint], center: .center), lineWidth: 3)
+                    }
+                    .shadow(color: tint.opacity(0.55), radius: 28, y: 6)
+                    .scaleEffect(arrived ? 1 : 0.8)
+                VStack(spacing: 5) {
+                    HStack(spacing: 7) {
+                        Text(peer.nickname.isEmpty ? theirName : peer.nickname)
+                            .font(.system(size: 26, weight: .bold))
+                            .foregroundStyle(Ink.text)
+                            .lineLimit(2).multilineTextAlignment(.center).minimumScaleFactor(0.7)
+                        BadgeMark(badge: peer.badge, size: 24)
+                        if peer.verified {
+                            Image(systemName: "checkmark.seal.fill").font(.system(size: 16)).foregroundStyle(theme.accent)
+                                .help("You checked their safety code in person")
+                                .accessibilityLabel("Verified in person")
+                        }
+                    }
+                    if !peer.nickname.isEmpty {
+                        Text("Calls themselves \(theirName)").font(.system(size: 12)).foregroundStyle(Ink.faint)
+                    }
+                }
+                if let handle = peer.handle {
+                    HStack(spacing: 6) {
+                        Text("@\(handle)").font(.system(size: 13, weight: .bold)).foregroundStyle(tint)
+                            .textSelection(.enabled)
+                            .padding(.horizontal, 12).padding(.vertical, 5)
+                            .background(tint.opacity(0.14), in: .capsule)
+                            .overlay(Capsule().strokeBorder(tint.opacity(0.3)))
+                        if DirectoryProfile.isReserved(handle) {
+                            Label("Creator", systemImage: "checkmark.seal.fill")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(Ink.onAccent.opacity(0.85))
+                                .padding(.horizontal, 7).padding(.vertical, 3)
+                                .background(theme.gradient, in: .capsule)
+                                .help("This handle can only belong to PULSHADE's creator")
+                        }
+                    }
+                }
+                if let bio = peer.bio, !bio.isEmpty {
+                    Text(LinkPreviews.linked(bio))
+                        .font(.system(size: 15))
+                        .foregroundStyle(Ink.dim)
+                        .tint(tint)
+                        .lineSpacing(2)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 320)
                         .textSelection(.enabled)
-                    if DirectoryProfile.isReserved(handle) {
-                        Label("Creator", systemImage: "checkmark.seal.fill")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(Ink.onAccent.opacity(0.85))
-                            .padding(.horizontal, 7).padding(.vertical, 3)
-                            .background(theme.gradient, in: .capsule)
-                            .help("This handle can only belong to PULSHADE's creator")
+                }
+                HStack(spacing: 12) {
+                    profileAction("Message", "bubble.left.fill", tint: tint) { dismiss() }
+                    if !peer.isSelf {
+                        profileAction("Call", "phone.fill", tint: tint) {
+                            dismiss()
+                            model.startCall(with: peer.fingerprint, persona: c.persona)
+                        }
+                    }
+                    profileAction(c.muted ? "Unmute" : "Mute", c.muted ? "bell.fill" : "bell.slash.fill", tint: tint) {
+                        model.toggleMute(c.id)
                     }
                 }
-            }
-            if let bio = peer.bio, !bio.isEmpty {
-                Text(LinkPreviews.linked(bio))
-                    .font(.system(size: 14))
-                    .foregroundStyle(Ink.dim)
-                    .tint(tint)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 320)
-                    .textSelection(.enabled)
-            }
-            ContactCollectibles(items: peer.collectibles ?? [], tint: tint)
-            ProfileLinkList(links: peer.links ?? [], tint: tint, walletChangedAt: peer.walletChangedAt, isMine: peer.isSelf)
-            ProfileNoteList(notes: peer.notes ?? [], tint: tint)
-            HStack(spacing: 10) {
-                Button { dismiss() } label: { Label("Message", systemImage: "bubble.left.fill") }
-                    .buttonStyle(ProfileActionStyle())
-                if !peer.isSelf {
-                    Button {
-                        dismiss()
-                        model.startCall(with: peer.fingerprint, persona: c.persona)
-                    } label: { Label("Call", systemImage: "phone.fill") }
-                        .buttonStyle(ProfileActionStyle())
+                .padding(.top, 4)
+                HStack(spacing: 5) {
+                    Image(systemName: "lock.fill").font(.system(size: 9))
+                    Text(summary(c)).font(.system(size: 12))
                 }
+                .foregroundStyle(Ink.faint)
+                VStack(spacing: 14) {
+                    ContactCollectibles(items: peer.collectibles ?? [], tint: tint)
+                    ProfileLinkList(links: peer.links ?? [], tint: tint, walletChangedAt: peer.walletChangedAt, isMine: peer.isSelf)
+                    ProfileNoteList(notes: peer.notes ?? [], tint: tint)
+                }
+                .padding(.top, 6)
             }
-            .padding(.top, 4)
-            Text(summary(c)).font(.system(size: 12)).foregroundStyle(Ink.faint)
+            .padding(.horizontal, 20)
+            .offset(y: -62)
+            .padding(.bottom, -62)
         }
         .frame(maxWidth: .infinity)
+    }
+
+    /// One of the round buttons under a profile: an icon in the person's colour, with its name beneath.
+    private func profileAction(_ title: String, _ symbol: String, tint: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                Image(systemName: symbol)
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(tint)
+                    .frame(width: 52, height: 52)
+                    .background(tint.opacity(0.14), in: .circle)
+                    .overlay(Circle().strokeBorder(tint.opacity(0.28)))
+                Text(title).font(.system(size: 11, weight: .medium)).foregroundStyle(Ink.dim)
+            }
+            .frame(width: 72)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
     }
 
     private func summary(_ c: Conversation) -> String {

@@ -337,6 +337,9 @@ final class AppModel {
         }
         adoptConnectionChoice()
         didUnlock()
+        // Recovered from the sealed backup, with no chats: anyone still holding their side of one is told to clear
+        // it, in case the device this came from was wiped (Detach) before it could say so. Contacts stay.
+        if backup != nil, !hasOtherDevices { clearChatsForContacts() }
         // It's on this device now. It stays on the relay and is saved over as things change, unless backups are off.
         if backup != nil, !data.security.keepBackup { Task { try? await deleteBackup(of: identity) } }
     }
@@ -417,7 +420,6 @@ final class AppModel {
         lastRelayContact = Date()
         moveToOnionRelay()
         purgeExpired()
-        data.stories.removeAll { !$0.isLive }
         data.seenEnvelopes = data.seenEnvelopes.filter { $0.value > Date().addingTimeInterval(-Self.replayWindow) }
         // Unused contact invites die with the relay's 7-day retention.
         data.invites.removeAll { $0.channel == nil && !$0.isPublic && $0.createdAt < Date().addingTimeInterval(-7 * 24 * 3600) }
@@ -490,6 +492,7 @@ final class AppModel {
 
     func lock() {
         guard phase == .unlocked else { return }
+        dismissBanner()
         connecting = false
         relayUnreachable = false
         relayFailures = 0
@@ -579,6 +582,39 @@ final class AppModel {
     func wipeNow() {
         destroyEverything(leavingNoTrace: true)
         Vault.scrubLeftovers()
+    }
+
+    /// True while Detach is telling contacts to clear their chats, just before the wipe: the screen is covered.
+    var detaching = false
+
+    /// How long Detach waits to tell contacts before it wipes regardless.
+    @ObservationIgnored var detachPatience: Duration = .seconds(4)
+
+    /// Detach from the Burn tab. When this is the account's only device and the relay is in reach, everyone with a
+    /// chat with you is first told to clear it (they keep you as a contact), so no conversation outlives your side
+    /// of it; then the device is wiped as `wipeNow` does. It waits a few seconds at most: with no connection, or if
+    /// the messages can't go in time, it wipes anyway, and the chats are cleared when the account is next recovered
+    /// (see `restore`). With other devices on the account nothing is sent: they still have the chats.
+    func detachNow() async {
+        guard !detaching else { return }
+        guard identity != nil, phase == .unlocked, !hasOtherDevices, link == .online else { wipeNow(); return }
+        detaching = true
+        clearChatsForContacts()
+        var done = false
+        await withCheckedContinuation { (waiting: CheckedContinuation<Void, Never>) in
+            func finish() { if !done { done = true; waiting.resume() } }
+            Task { @MainActor in try? await self.sendEverything(); finish() }
+            Task { @MainActor in try? await Task.sleep(for: self.detachPatience); finish() }
+        }
+        wipeNow()
+        detaching = false
+    }
+
+    /// Tells every contact, in every persona, to delete their one-to-one chat with you. They keep the contact.
+    private func clearChatsForContacts() {
+        for c in data.contacts where !c.isSelf && !c.hidden && !c.awaitingAcceptance {
+            enqueue(.chatDeleted(conversation: nil), to: c)
+        }
     }
 
     /// Whoever opens Pulshade next starts on new Tor circuits and new connections, so the relay can't tie two
@@ -678,14 +714,41 @@ final class AppModel {
         let convo = data.conversations[i]
         guard data.security.notifications, !convo.muted else { return }
         if appActive && openConversation == convo.id { return }
-        #if os(iOS)
-        // On the phone, a message that lands while Pulshade is open is already in front of you (and counted on the
-        // list). A banner on top of that, after the wake-up banner from the lock screen, would be a second one.
-        if appActive { return }
-        #endif
         let content = Notifier.content(for: message, in: convo, sender: displayName(message.sender),
                                        style: data.security.notificationContent)
+        #if os(iOS)
+        // On the phone, a message that lands while Pulshade is open gets Pulshade's own banner at the top of the
+        // screen, not a system one (which would be a second banner after the wake-up one from the lock screen).
+        if appActive {
+            let named = data.security.notificationContent != .hidden
+            showBanner(InAppBanner(conversation: convo.id, title: content.title, body: content.body,
+                                   avatar: named ? (convo.kind == .direct ? contact(message.sender, in: convo.persona)?.avatar : convo.avatar) : nil,
+                                   seed: convo.kind == .direct ? message.sender : convo.id.uuidString, showsAvatar: named))
+            return
+        }
+        #endif
         Notifier.shared.post(content, conversation: convo.id, sound: data.security.notificationSound, tone: data.security.messageTone)
+    }
+
+    /// The banner showing at the top of the screen, if any. See `InAppBanner`.
+    var inAppBanner: InAppBanner?
+    @ObservationIgnored private var bannerTask: Task<Void, Never>?
+
+    /// Shows a banner for a few seconds; a newer one takes its place.
+    func showBanner(_ banner: InAppBanner) {
+        bannerTask?.cancel()
+        inAppBanner = banner
+        Haptics.tick()
+        bannerTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(4.5))
+            guard !Task.isCancelled else { return }
+            self?.inAppBanner = nil
+        }
+    }
+
+    func dismissBanner() {
+        bannerTask?.cancel()
+        inAppBanner = nil
     }
 
     // MARK: Contacts & invites
@@ -874,7 +937,8 @@ final class AppModel {
         guard canPost(in: convo) else { return }
 
         let now = Date()
-        let reply = replyTo.map { ReplyRef(id: $0.id, author: $0.sender, snippet: Self.snippet(of: $0)) } ?? quote
+        // Replying to a photo carries a small copy of it, so the quote shows what was answered.
+        let reply = replyTo.map { ReplyRef(id: $0.id, author: $0.sender, snippet: Self.snippet(of: $0), picture: Self.quotePicture($0.image)) } ?? quote
         let message = Message(sender: "me", text: trimmed, image: image, voice: voice, date: now,
                               expiresAt: convo.disappearAfter.map { now.addingTimeInterval($0) }, reply: reply,
                               preview: preview)
@@ -893,6 +957,55 @@ final class AppModel {
         save()
     }
 
+    /// Sends a video (already made ready by `ChatVideo.prepare`). The message goes first, with a still from the clip,
+    /// and the clip follows in pieces under the message's id, the way a video story's does. An app from before chat
+    /// videos shows the still as a photo.
+    func sendVideo(_ clip: Data, poster: Data?, seconds: Double, caption: String = "", replyTo: Message? = nil, in id: Conversation.ID) {
+        guard !clip.isEmpty, clip.count <= ChatVideo.maxBytes + 500_000, let i = index(of: id) else { return }
+        let convo = data.conversations[i]
+        guard canPost(in: convo) else { return }
+        let now = Date()
+        let words = caption.trimmingCharacters(in: .whitespacesAndNewlines)
+        let reply = replyTo.map { ReplyRef(id: $0.id, author: $0.sender, snippet: Self.snippet(of: $0), picture: Self.quotePicture($0.image)) }
+        var message = Message(sender: "me", text: words, image: poster, date: now,
+                              expiresAt: convo.disappearAfter.map { now.addingTimeInterval($0) }, reply: reply)
+        message.video = clip
+        message.clipSeconds = seconds
+        withAnimation(.snappy(duration: 0.4)) { data.conversations[i].messages.append(message) }
+        let wire = WireMessage(id: message.id, conversation: sharedID(convo), kind: convo.kind == .broadcast ? .direct : convo.kind,
+                               text: words, image: poster, voice: nil, date: RelayClock.relay(now), expiresIn: convo.disappearAfter,
+                               reply: reply.map { ReplyRef(id: $0.id, author: $0.author == "me" ? (me(convo.persona)?.fingerprint ?? "") : $0.author,
+                                                           snippet: $0.snippet, picture: $0.picture) },
+                               preview: nil, clip: ClipInfo(seconds: seconds))
+        let recipients = audience(convo)
+        for member in recipients {
+            enqueue(.message(wire), to: member, message: message.id)
+            sendClip(clip, id: message.id, to: member)
+        }
+        // Your other devices get the message and the clip too.
+        sync(.sent(ref(convo), wire))
+        if !applyingSync, let me = selfIndex, !data.contacts[me].devices.isEmpty { sendClip(clip, id: message.id, to: data.contacts[me]) }
+        if recipients.isEmpty { setStatus(.sent, for: [message.id]) }
+        lastTypingSent[id] = nil
+        save()
+    }
+
+    /// A clip in pieces, to one contact, cut the way their app takes them. `only` sends just those pieces.
+    private func sendClip(_ clip: Data, id: UUID, to contact: Contact, only wanted: [Int]? = nil) {
+        let pieces = StoryClipPieces.split(clip, framed: readsFrames(contact))
+        let fits = wanted.map { $0.allSatisfy(pieces.indices.contains) } ?? true
+        let indices = fits ? wanted.map { Set($0).sorted() } ?? Array(pieces.indices) : Array(pieces.indices)
+        for i in indices { enqueue(.storyPart(id: id, index: i, of: pieces.count, bytes: pieces[i]), to: contact) }
+    }
+
+    /// The message a clip belongs to, if it's a chat video: where it is, and who sent it.
+    private func videoMessage(_ id: UUID) -> (convo: Int, message: Int)? {
+        for c in data.conversations.indices {
+            if let m = data.conversations[c].messages.lastIndex(where: { $0.id == id && $0.isVideo }) { return (c, m) }
+        }
+        return nil
+    }
+
     /// Answers a friend's story in your chat with them: a like, or words. It arrives as an ordinary message
     /// quoting the story, so the relay sees nothing new and older builds show it too.
     func answerStory(_ story: Story, like: Bool = false, text: String = "") async {
@@ -906,6 +1019,13 @@ final class AppModel {
             data.stories[i].liked = true
             save()
         }
+    }
+
+    /// A photo shrunk for the quote above a reply to it. Nil when there's no photo, or it can't be made small enough.
+    static func quotePicture(_ photo: Data?) -> Data? {
+        guard let photo, let small = thumbnail(photo, side: 160), small.count <= ReplyRef.maxPicture,
+              PlatformImage(data: small) != nil else { return nil }
+        return small
     }
 
     /// A small picture of a story for the quote above a like or a reply: the photo shrunk, a video's first
@@ -957,6 +1077,7 @@ final class AppModel {
     static func snippet(of message: Message) -> String {
         if !message.text.isEmpty { return String(message.text.prefix(120)) }
         if message.voice != nil { return "Voice message" }
+        if message.isVideo { return "Video" }
         if message.image != nil { return "Photo" }
         return "Message"
     }
@@ -1106,6 +1227,7 @@ final class AppModel {
         }
         // Stories past their time go from the vault too, not just from view, and so do old removal notes.
         if data.stories.contains(where: { !$0.isLive }) {
+            for story in data.stories where !story.isLive && story.author == "me" { dropUnsent(story: story.id) }
             withAnimation(.smooth) { data.stories.removeAll { !$0.isLive } }
             changed = true
         }
@@ -1223,6 +1345,11 @@ final class AppModel {
         .story(id: story.id, style: story.style, date: RelayClock.relay(story.date), lasts: story.lifetime)
     }
 
+    /// Whether every device of a contact reads framed messages, so a clip can go to them in fewer, fuller pieces.
+    private func readsFrames(_ contact: Contact) -> Bool {
+        !contact.devices.isEmpty && contact.devices.allSatisfy { $0.readsFrames == true }
+    }
+
     /// Sends a story to one contact. A video goes as the story with an empty clip, then (for people who don't
     /// have the clip yet) the clip in pieces that each fit one relay message.
     private func sendStory(_ story: Story, to contact: Contact, withClip: Bool) {
@@ -1230,7 +1357,7 @@ final class AppModel {
         enqueue(.story(id: story.id, style: .video(Data(), caption: caption), date: RelayClock.relay(story.date),
                        lasts: story.lifetime), to: contact)
         guard withClip else { return }
-        let pieces = StoryClipPieces.split(clip)
+        let pieces = StoryClipPieces.split(clip, framed: readsFrames(contact))
         for (i, bytes) in pieces.enumerated() {
             enqueue(.storyPart(id: story.id, index: i, of: pieces.count, bytes: bytes), to: contact)
         }
@@ -1242,8 +1369,11 @@ final class AppModel {
         guard case let .video(clip, caption) = story.style, !clip.isEmpty else { enqueue(storyPayload(story), to: contact); return }
         enqueue(.story(id: story.id, style: .video(Data(), caption: caption), date: RelayClock.relay(story.date),
                        lasts: story.lifetime), to: contact)
-        let pieces = StoryClipPieces.split(clip)
-        let indices = wanted.map { Set($0).filter(pieces.indices.contains).sorted() } ?? Array(pieces.indices)
+        // Cut the way this person's app takes them now. If that changed since they got some (they updated), the
+        // pieces they asked for by number are from the old cut, so all of the new one goes.
+        let pieces = StoryClipPieces.split(clip, framed: readsFrames(contact))
+        let fits = wanted.map { $0.allSatisfy(pieces.indices.contains) } ?? true
+        let indices = fits ? wanted.map { Set($0).sorted() } ?? Array(pieces.indices) : Array(pieces.indices)
         for i in indices {
             enqueue(.storyPart(id: story.id, index: i, of: pieces.count, bytes: pieces[i]), to: contact)
         }
@@ -1255,9 +1385,24 @@ final class AppModel {
         let now = Date()
         var stalled = Set(data.clipParts.keys)
         for story in data.stories where story.author != "me" && story.isLive && !story.isReady { stalled.insert(story.id) }
+        // Chat videos whose message has come but whose pieces haven't all.
+        stalled.formUnion(clipActivity.keys)
         for id in stalled {
             let story = data.stories.first { $0.id == id }
             let parts = data.clipParts[id]
+            if story == nil, let at = videoMessage(id) {
+                // A chat video: asked of whoever sent it, in that chat's persona, while it's still unfinished.
+                let message = data.conversations[at.convo].messages[at.message]
+                guard message.video?.isEmpty == true, !message.isMine else { clipActivity[id] = nil; continue }
+                guard let last = clipActivity[id] else { clipActivity[id] = now; continue }
+                let asked = clipAsks[id], tries = asked?.count ?? 0
+                guard tries < Self.clipAskLimit, now.timeIntervalSince(last) >= clipQuiet,
+                      now.timeIntervalSince(asked?.at ?? .distantPast) >= clipQuiet * Double(1 << tries),
+                      let contact = contact(message.sender, in: data.conversations[at.convo].persona) else { continue }
+                clipAsks[id] = (tries + 1, now)
+                enqueue(.storyWant(id: id, parts: parts.map { p in (0..<p.of).filter { p.parts[$0] == nil } }), to: contact)
+                continue
+            }
             guard let author = story?.author ?? parts?.author, author != "me",
                   removedStories["\(author)|\(id)"] == nil else { continue }
             if story.map({ $0.isLive && !$0.isReady }) == false { continue }
@@ -1279,9 +1424,28 @@ final class AppModel {
     static let clipAskLimit = 4
 
     /// Joins a clip's pieces into its story once the story and every piece are here.
+    /// How much of a video that's still arriving is here: pieces in, out of how many. Nil before the first lands.
+    func clipProgress(of id: Story.ID) -> (have: Int, of: Int)? {
+        data.clipParts[id].map { ($0.parts.count, $0.of) }
+    }
+
     private func assembleClip(_ id: UUID) {
-        guard let pending = data.clipParts[id], pending.isComplete,
-              let i = data.stories.firstIndex(where: { $0.id == id && $0.author == pending.author && $0.persona == pending.persona }),
+        guard let pending = data.clipParts[id], pending.isComplete else { return }
+        // A video in a chat: from whoever wrote the message (or, for one of your own, from another of your devices).
+        if let at = videoMessage(id) {
+            let message = data.conversations[at.convo].messages[at.message]
+            let theirs = message.sender == pending.author
+            let mine = message.isMine && contact(pending.author, in: pending.persona)?.isSelf == true
+            guard message.video?.isEmpty == true, theirs || mine, data.conversations[at.convo].persona == pending.persona else { return }
+            let joined = (0..<pending.of).reduce(into: Data()) { $0.append(pending.parts[$1] ?? Data()) }
+            data.clipParts[id] = nil
+            clipActivity[id] = nil
+            clipAsks[id] = nil
+            guard !joined.isEmpty, joined.count <= ChatVideo.maxBytes + 500_000 else { return }
+            withAnimation(.snappy) { data.conversations[at.convo].messages[at.message].video = joined }
+            return
+        }
+        guard let i = data.stories.firstIndex(where: { $0.id == id && $0.author == pending.author && $0.persona == pending.persona }),
               case let .video(have, caption) = data.stories[i].style, have.isEmpty else { return }
         let joined = (0..<pending.of).reduce(into: Data()) { $0.append(pending.parts[$1] ?? Data()) }
         data.clipParts[id] = nil
@@ -1389,7 +1553,7 @@ final class AppModel {
     func deleteStory(_ id: Story.ID) {
         guard let story = data.stories.first(where: { $0.id == id && $0.author == "me" }) else { return }
         withAnimation(.snappy) { data.stories.removeAll { $0.id == id } }
-        storyBacklog[id] = nil
+        dropUnsent(story: id)
         noteRemoved("me|\(id)")
         for c in audience(of: story) { enqueue(.storyRemoved(id: id), to: c) }
         sync(.storyRemoved(id))
@@ -1463,6 +1627,22 @@ final class AppModel {
             n + c.devices.reduce(0) { $0 + $1.pending.filter { $0.payload.storyID == id }.count }
         }
         return waiting + data.outbox.filter { $0.story == id }.count
+    }
+
+    /// A story that's over (its time ran out, or you deleted it) stops going out: the copies still waiting to be
+    /// sent, sealed or not, are let go rather than uploaded for nobody to watch. One that's part-way up the wire
+    /// finishes; whoever gets it drops it as expired or removed.
+    private func dropUnsent(story id: Story.ID) {
+        storyBacklog[id] = nil
+        storyUploadTotal[id] = nil
+        if data.outbox.contains(where: { $0.story == id && !sendingIDs.contains($0.id) }) {
+            data.outbox.removeAll { $0.story == id && !sendingIDs.contains($0.id) }
+        }
+        for c in data.contacts.indices {
+            for d in data.contacts[c].devices.indices where data.contacts[c].devices[d].pending.contains(where: { $0.payload.storyID == id }) {
+                data.contacts[c].devices[d].pending.removeAll { $0.payload.storyID == id }
+            }
+        }
     }
 
     private func trackUpload(of id: Story.ID) {
@@ -1645,7 +1825,9 @@ final class AppModel {
     /// read for a week, for requests already on their way.
     private func publicInvite(for persona: UUID?, handle: String, me: Identity) -> OpenInvite {
         let key = me.publicInboxKey(handle: handle)
-        retirePublicInvites(of: persona, except: key)
+        // Every handle in use keeps its request mailbox; only ones no longer in use are wound down.
+        let inUse = Set(profile(for: persona).activeHandles.map { me.publicInboxKey(handle: $0) } + [key])
+        retirePublicInvites(of: persona, except: inUse)
         if let i = data.invites.firstIndex(where: { $0.receiveKey == key }) {
             data.invites[i].retiresAt = nil
             return data.invites[i]
@@ -1655,9 +1837,9 @@ final class AppModel {
         return invite
     }
 
-    private func retirePublicInvites(of persona: UUID?, except key: Data) {
+    private func retirePublicInvites(of persona: UUID?, except keys: Set<Data>) {
         for i in data.invites.indices where data.invites[i].isPublic && data.invites[i].persona == persona
-            && data.invites[i].receiveKey != key && data.invites[i].retiresAt == nil {
+            && !keys.contains(data.invites[i].receiveKey) && data.invites[i].retiresAt == nil {
             data.invites[i].retiresAt = Date().addingTimeInterval(7 * 24 * 3600)
         }
     }
@@ -1697,7 +1879,8 @@ final class AppModel {
                      sig: sig.base64EncodedString(), updated: updated)
     }
 
-    /// Lists the active persona under @handle so anyone who knows it can send a request.
+    /// Lists the active persona under @handle so anyone who knows it can send a request. The first handle becomes
+    /// the main one; a second or third is in use alongside it (up to `maxHandles`, counting any kept for you).
     func publishProfile(handle raw: String) async throws {
         guard let handle = DirectoryProfile.validHandle(raw) else { throw DirectoryError.invalidHandle }
         guard let client = client(nil, lane: Self.directoryLane(activePersona)) else { throw DirectoryError.unreachable }
@@ -1719,16 +1902,53 @@ final class AppModel {
             // Anything else the relay said no with, a rate limit among them.
             throw DirectoryError.invalid
         }
-        if let old = profile(for: persona).handle, old != handle { await release(old, persona: persona) }
         // Read after the wait, so nothing that changed the profile meanwhile is written over.
         var profile = profile(for: persona)
+        if profile.handle == nil {
+            profile.handle = handle
+        } else if !profile.activeHandles.contains(handle) {
+            profile.moreHandles = Array(((profile.moreHandles ?? []) + [handle]).prefix(Self.maxHandles - 1))
+        }
+        profile.updatedAt = Date()
+        setProfile(profile, for: persona)
+        syncPublicProfile(persona)
+        save()
+    }
+
+    /// Makes one of the active persona's handles in use the main one, shown on its profile. The others stay in use.
+    func makeMainHandle(_ handle: String) {
+        let persona = activePersona
+        var profile = profile(for: persona)
+        guard profile.activeHandles.contains(handle), profile.handle != handle else { return }
+        profile.moreHandles = profile.activeHandles.filter { $0 != handle }
         profile.handle = handle
         profile.updatedAt = Date()
         setProfile(profile, for: persona)
         syncPublicProfile(persona)
         save()
-        // One handle per identity: anything else it still holds goes.
-        await releaseHandles(persona: persona, keeping: handle)
+    }
+
+    /// Stops using one handle: it leaves the directory and is kept for this identity for three months (see
+    /// `heldHandles`), and its request mailbox winds down. If it was the main one, the next in use takes over.
+    func stopUsingHandle(_ handle: String) async {
+        let persona = activePersona
+        guard profile(for: persona).activeHandles.contains(handle) else { return }
+        await release(handle, persona: persona)
+        var profile = profile(for: persona)
+        let left = profile.activeHandles.filter { $0 != handle }
+        profile.handle = left.first
+        profile.moreHandles = left.count > 1 ? Array(left.dropFirst()) : nil
+        profile.updatedAt = Date()
+        setProfile(profile, for: persona)
+        if let me = me(persona) {
+            if left.isEmpty {
+                data.invites.removeAll { $0.isPublic && $0.persona == persona }
+            } else {
+                retirePublicInvites(of: persona, except: Set(left.map { me.publicInboxKey(handle: $0) }))
+            }
+        }
+        syncPublicProfile(persona)
+        save()
     }
 
     /// Takes the active persona out of the directory and stops reading its request mailbox.
@@ -1740,6 +1960,7 @@ final class AppModel {
         // Read after the wait, so nothing that changed the profile meanwhile is written over.
         var profile = profile(for: persona)
         profile.handle = nil
+        profile.moreHandles = nil
         profile.updatedAt = Date()
         setProfile(profile, for: persona)
         syncPublicProfile(persona)
@@ -1767,9 +1988,12 @@ final class AppModel {
 
     /// Keeps a listed profile in step with name, picture and bio changes.
     private func republish(_ persona: UUID?) async {
-        guard let handle = profile(for: persona).handle, let client = client(nil, lane: Self.directoryLane(persona)),
-              let entry = try? signedEntry(handle: handle, persona: persona) else { return }
-        try? await client.claim(handle, entry)
+        guard let client = client(nil, lane: Self.directoryLane(persona)) else { return }
+        // Every handle in use shows the same profile.
+        for handle in profile(for: persona).activeHandles {
+            guard let entry = try? signedEntry(handle: handle, persona: persona) else { continue }
+            try? await client.claim(handle, entry)
+        }
     }
 
     /// Looks up exactly one handle and checks its signature. Nil if nobody has it.
@@ -1801,18 +2025,25 @@ final class AppModel {
         for listed in await publicProfiles(of: me) where listed.handle != keep {
             await release(listed.handle, persona: persona)
         }
-        if let old = profile(for: persona).handle, old != keep { await release(old, persona: persona) }
+        for old in profile(for: persona).activeHandles where old != keep { await release(old, persona: persona) }
     }
 
     /// Clears handles left behind by older versions, which let each device claim its own. Only when this
     /// device's handle is the identity's newest, so a device with an out-of-date profile never releases
     /// the real one.
     func releaseLeftoverHandles() async {
+        // An identity may now use up to three handles at once, so nothing listed is released here any more. A
+        // handle the directory lists for this identity that this device doesn't know of (claimed on another of
+        // your devices before the two caught up) is taken as in use.
         for persona in [nil] + data.personas.filter { !$0.isBurner }.map(\.id) {
-            guard let current = profile(for: persona).handle, let me = me(persona) else { continue }
-            let listed = await publicProfiles(of: me)
-            guard listed.count > 1, listed.first?.handle == current else { continue }
-            for old in listed.dropFirst() { await release(old.handle, persona: persona) }
+            guard profile(for: persona).handle != nil, let me = me(persona) else { continue }
+            let listed = await publicProfiles(of: me).map(\.handle)
+            var profile = profile(for: persona)
+            let unknown = listed.filter { !profile.activeHandles.contains($0) }
+            guard !unknown.isEmpty else { continue }
+            profile.moreHandles = Array(((profile.moreHandles ?? []) + unknown).prefix(Self.maxHandles - 1))
+            setProfile(profile, for: persona)
+            save()
         }
     }
 
@@ -1823,7 +2054,7 @@ final class AppModel {
         var id: String { handle }
     }
 
-    /// How many handles an identity may have, the one in use and those kept for it together. The relay enforces it.
+    /// How many handles an identity may have, those in use and those kept for it together. The relay enforces it.
     static let maxHandles = 3
 
     /// The handles kept for the active identity, soonest free first.
@@ -2130,7 +2361,10 @@ final class AppModel {
             $0.color = chosen.color
         }
         try? await publishProfile(handle: chosen.handle)
-        for other in others where other.handle != chosen.handle { await release(other.handle, persona: nil) }
+        // The account's other handles stay in use alongside it, claimed afresh so requests reach this device.
+        for other in others.prefix(Self.maxHandles - 1) where other.handle != chosen.handle {
+            try? await publishProfile(handle: other.handle)
+        }
         save()
     }
 
@@ -2630,10 +2864,13 @@ final class AppModel {
             guard var session = data.contacts[i].devices[d].session, session.canSend,
                   !data.contacts[i].devices[d].pending.isEmpty else { continue }
             for item in data.contacts[i].devices[d].pending {
-                guard let plain = try? JSONEncoder.pulshade.encode(item.payload),
+                // To an app that reads frames, big things go without the base64 that nearly doubles them at each
+                // layer. Short messages are sent exactly as before.
+                let frames = data.contacts[i].devices[d].readsFrames == true
+                guard let plain = try? item.payload.wire(framed: frames),
                       let message = try? session.encrypt(plain) else { continue }
                 seal(.ratchet(message), contact: i, device: d, message: item.message, ephemeral: item.payload.isEphemeral,
-                     story: item.payload.storyID, rings: item.payload.rings)
+                     story: item.payload.storyID, rings: item.payload.rings, framed: frames && message.ciphertext.count > Self.smallEnvelope)
             }
             data.contacts[i].devices[d].session = session
             data.contacts[i].devices[d].pending = []
@@ -2670,10 +2907,10 @@ final class AppModel {
 
     /// Seals a payload to one of a contact's devices, as the persona that knows them, and queues it.
     private func seal(_ payload: Payload, contact i: Int, device d: Int, message: UUID? = nil, ephemeral: Bool = false,
-                      story: UUID? = nil, rings: Bool = false) {
+                      story: UUID? = nil, rings: Bool = false, framed: Bool = false) {
         let c = data.contacts[i]
         guard c.devices.indices.contains(d), let me = me(c.persona),
-              let blob = try? Envelope.seal(payload, from: me, device: deviceID(for: c.persona), to: c.agreementKey) else { return }
+              let blob = try? Envelope.seal(payload, from: me, device: deviceID(for: c.persona), to: c.agreementKey, framed: framed) else { return }
         let sendID = c.devices[d].sendID
         // Only the newest of these waits for a mailbox.
         if ephemeral { data.outbox.removeAll { $0.ephemeral == true && $0.sendID == sendID } }
@@ -2709,6 +2946,8 @@ final class AppModel {
         if let d = data.contacts[i].devices.firstIndex(where: { $0.id == id }) { return d }
         if !id.isEmpty, let d = data.contacts[i].devices.firstIndex(where: { $0.id.isEmpty }) {
             data.contacts[i].devices[d].id = id
+            // A group made before this was known filed their introduction mailbox under no id: see `refileIntros`.
+            introsStale = true
             return d
         }
         if id.isEmpty, data.contacts[i].devices.count == 1 { return 0 }
@@ -2916,6 +3155,7 @@ final class AppModel {
         watchTor()
         watchStall()
         retryStaleHandshakes()
+        if introsStale { refileIntros() }
         resendUnconfirmedStories()
         // Only written when something is stale: assigning redraws every view that reads the data.
         let clipCutoff = Date().addingTimeInterval(-(StoryLifetime.twoDays.rawValue + 3600))
@@ -3458,6 +3698,7 @@ final class AppModel {
             guard card.signingKey == signer,
                   let invite = data.invites.first(where: { $0.receiveKey == envelope.receiveKey && !$0.isPublic }) else { return }
             acceptHello(card, request, fingerprint: fp, device: device, via: invite)
+            noteReads(opened, from: fp, persona: invite.persona)
             return
         }
         if case let .request(card, request, note) = payload {
@@ -3485,6 +3726,7 @@ final class AppModel {
             return
         }
         guard let i = contactIndex(fp, persona) else { return }
+        noteReads(opened, from: fp, persona: persona)
         let viaIntro = data.conversations.contains { $0.introsMine.contains { $0.receiveKey == envelope.receiveKey } }
         defer { if viaIntro { moveOffIntro(fp, persona) } }
         let viaRequestMailbox = data.invites.contains { $0.isPublic && $0.receiveKey == envelope.receiveKey }
@@ -3526,7 +3768,7 @@ final class AppModel {
             // Kept before reading what it says, so a message this version can't read (one from a newer app)
             // still counts and doesn't leave the session behind.
             data.contacts[i].devices[d].session = session
-            guard let inner = try? JSONDecoder.pulshade.decode(Payload.self, from: plain), !inner.isSetup else { return }
+            guard let inner = try? Payload.fromWire(plain), !inner.isSetup else { return }
             handle(inner, from: fp, persona: persona, device: device)
             // The first message in lets a new session start sending. Look them up again: handling it may
             // have removed them (a burned burner, say).
@@ -3535,6 +3777,13 @@ final class AppModel {
             // Anything else arriving outside a session is refused.
             return
         }
+    }
+
+    /// Keeps what a device's app says it can read, as of the last thing it sent. Only written when it changes.
+    private func noteReads(_ opened: Envelope.Opened, from fp: String, persona: UUID?) {
+        guard let i = contactIndex(fp, persona), let d = deviceIndex(i, opened.device),
+              (data.contacts[i].devices[d].readsFrames == true) != opened.readsFrames else { return }
+        data.contacts[i].devices[d].readsFrames = opened.readsFrames ? true : nil
     }
 
     static let maxAvatarBytes = 512 * 1024
@@ -3631,10 +3880,13 @@ final class AppModel {
             guard removedStories["\(fp)|\(id)"] == nil else { break }
             // A piece sent again after the clip came together: nothing to do with it.
             if data.stories.contains(where: { $0.id == id && $0.author == fp && $0.isReady }) { break }
-            guard (1...StoryClipPieces.maxPieces).contains(of), (0..<of).contains(index), bytes.count <= StoryClipPieces.size,
+            if let at = videoMessage(id), data.conversations[at.convo].messages[at.message].video?.isEmpty == false { break }
+            guard (1...StoryClipPieces.maxPieces).contains(of), (0..<of).contains(index), bytes.count <= StoryClipPieces.framedSize,
                   data.clipParts[id] != nil || data.clipParts.count < 32 else { break }
             var pending = data.clipParts[id] ?? ClipParts(author: fp, persona: persona, of: of)
-            guard pending.author == fp, pending.persona == persona, pending.of == of else { break }
+            guard pending.author == fp, pending.persona == persona else { break }
+            // Cut differently from the pieces already here (their app or mine updated part-way): start over with these.
+            if pending.of != of { pending = ClipParts(author: fp, persona: persona, of: of) }
             pending.parts[index] = bytes
             data.clipParts[id] = pending
             clipActivity[id] = Date()
@@ -3646,6 +3898,17 @@ final class AppModel {
             delivery.confirmed.append(fp)
             data.stories[i].delivery = delivery
         case let .storyWant(id, parts):
+            // A video you sent them in a chat they're in: its pieces again.
+            if let at = videoMessage(id), data.conversations[at.convo].messages[at.message].isMine,
+               data.conversations[at.convo].persona == persona, data.conversations[at.convo].members.contains(fp),
+               let clip = data.conversations[at.convo].messages[at.message].video, !clip.isEmpty,
+               !sender.isSelf, !data.blocked.contains(fp) {
+                let key = "\(fp)|\(id)"
+                if let last = clipResent[key], Date().timeIntervalSince(last) < clipQuiet { break }
+                clipResent[key] = Date()
+                sendClip(clip, id: id, to: sender, only: parts)
+                break
+            }
             // Only for a story of yours that's still up, on this persona, and that they're meant to see.
             guard let story = data.stories.first(where: { $0.id == id && $0.author == "me" && $0.persona == persona }),
                   story.isLive, story.shownTo.includes(fp), removedStories["me|\(id)"] == nil,
@@ -3812,11 +4075,18 @@ final class AppModel {
                 : LinkPreview(url: p.url, title: p.title.map { String($0.prefix(200)) }, site: p.site.map { String($0.prefix(80)) },
                               image: p.image.flatMap { $0.count <= 400_000 ? $0 : nil })
         }
-        let message = Message(id: wire.id, sender: sender.fingerprint, text: String(wire.text.prefix(20_000)),
+        var message = Message(id: wire.id, sender: sender.fingerprint, text: String(wire.text.prefix(20_000)),
                               image: wire.image, voice: wire.voice, date: date, status: .delivered, expiresAt: expires,
                               reply: reply, preview: preview)
+        if let clip = wire.clip {
+            // A video: its clip comes in pieces after this (some may be here already).
+            message.video = Data()
+            message.clipSeconds = min(max(clip.seconds, 0), ChatVideo.maxSeconds)
+            clipActivity[wire.id] = Date()
+        }
         typing[data.conversations[i].id]?[sender.fingerprint] = nil
         withAnimation(.snappy(duration: 0.4)) { data.conversations[i].messages.append(message) }
+        if wire.clip != nil { assembleClip(wire.id) }
         if openConversation != data.conversations[i].id || !appActive { data.conversations[i].unread += 1 }
         notify(message, at: i)
         if wire.conversation == nil {
@@ -3908,7 +4178,8 @@ final class AppModel {
         let mine = me(persona)?.card.signing
         func fingerprint(_ key: Data) -> String { key == mine ? "me" : Identity.fingerprint(of: key) }
         // This device's introduction mailbox, from whoever runs the group.
-        let intro = info.intros?[deviceID(for: persona).hex].flatMap {
+        // Filed under no id when whoever runs the group hadn't heard from this device yet: then that one is ours.
+        let intro = (info.intros?[deviceID(for: persona).hex] ?? info.intros?[""]).flatMap {
             $0.count == 32 ? IntroMailbox(receiveKey: $0, relay: sender.relay) : nil
         }
         func keep(_ intro: IntroMailbox?, at i: Int) {
@@ -4094,6 +4365,28 @@ final class AppModel {
         }
         data.conversations[i].introsMade[member.fingerprint] = made
         return cards
+    }
+
+    /// Set when a contact's device id was just learnt, and at unlock, so `refileIntros` runs on the next beat.
+    @ObservationIgnored private var introsStale = true
+
+    /// Puts right the introduction mailboxes of groups you run that were made before you knew a member's device id
+    /// (you'd added them a moment earlier and they hadn't written back). Each was filed under no id, and their app
+    /// looks its own up by id, so it never found it: nobody else in the group could reach them, and they saw only
+    /// what you wrote. Once the id is known the mailbox is filed under it and the member is told again. The mailbox
+    /// itself doesn't change, so what the others were given for them still holds.
+    private func refileIntros() {
+        introsStale = false
+        for i in data.conversations.indices where data.conversations[i].amAdmin {
+            let convo = data.conversations[i]
+            for (fp, made) in convo.introsMade {
+                guard let key = made[""], let member = contact(fp, in: convo.persona),
+                      let id = member.devices.map(\.id.hex).first(where: { !$0.isEmpty && made[$0] == nil }) else { continue }
+                data.conversations[i].introsMade[fp]?[""] = nil
+                data.conversations[i].introsMade[fp]?[id] = key
+                sendInfo(data.conversations[i], to: [fp])
+            }
+        }
     }
 
     private func sendInfo(_ convo: Conversation, to recipients: [String]) {
@@ -4332,11 +4625,16 @@ extension AppModel {
             let mine = me(ref.persona)?.fingerprint
             let reply = wire.reply.map { ReplyRef(id: $0.id, author: $0.author == mine ? "me" : $0.author, snippet: $0.snippet,
                                                   picture: $0.picture.flatMap { $0.count <= ReplyRef.maxPicture ? $0 : nil }) }
-            let message = Message(id: wire.id, sender: "me", text: wire.text, image: wire.image, voice: wire.voice,
+            var message = Message(id: wire.id, sender: "me", text: wire.text, image: wire.image, voice: wire.voice,
                                   date: dated(wire.date), status: .sent,
                                   expiresAt: wire.expiresIn.map { dated(wire.date).addingTimeInterval($0) }, reply: reply,
                                   preview: wire.preview)
+            if let clip = wire.clip {
+                message.video = Data()
+                message.clipSeconds = min(max(clip.seconds, 0), ChatVideo.maxSeconds)
+            }
             withAnimation(.snappy) { data.conversations[i].messages.append(message) }
+            if wire.clip != nil { assembleClip(wire.id) }
         case let .reaction(id, emoji):
             for i in data.conversations.indices {
                 if let m = data.conversations[i].messages.firstIndex(where: { $0.id == id }) {
@@ -4366,14 +4664,13 @@ extension AppModel {
             guard theirFormat <= profileFormat else { profileNeedsUpdate = true; break }
             guard theirFormat >= (current.format ?? 0) else { break }
             guard (incoming.updatedAt ?? .distantPast) > (current.updatedAt ?? .distantPast) else { break }
-            if let old = current.handle, old != incoming.handle {
-                // Another device chose a different handle for this account: let go of the one this device held.
-                Task { await self.release(old, persona: persona) }
-            }
             var incoming = incoming
             incoming.links = Optional(ProfileLink.cleaned(incoming.links)).flatMap { $0.isEmpty ? nil : $0 }
             incoming.notes = Optional(ProfileNote.cleaned(incoming.notes, keepAudience: true)).flatMap { $0.isEmpty ? nil : $0 }
             setProfile(incoming, for: persona)
+            // Whichever device stopped using a handle let go of it there; this one only follows which are in use,
+            // and reads the request mailbox of each.
+            readPublicInboxes(of: persona)
         case let .persona(persona):
             if let i = data.personas.firstIndex(where: { $0.id == persona.id }) {
                 data.personas[i] = persona
@@ -4398,6 +4695,7 @@ extension AppModel {
         case let .storyRemoved(id):
             noteRemoved("me|\(id)")
             data.stories.removeAll { $0.id == id && $0.author == "me" }
+            dropUnsent(story: id)
         case let .blocked(fp):
             if !data.blocked.contains(fp) { data.blocked.append(fp) }
             data.requests.removeAll { $0.fingerprint == fp }
@@ -4446,9 +4744,26 @@ extension AppModel {
             data.invites.removeAll { $0.isPublic && $0.persona == persona }
             return
         }
-        retirePublicInvites(of: persona, except: receiveKey)
-        guard !data.invites.contains(where: { $0.receiveKey == receiveKey }) else { return }
-        data.invites.append(OpenInvite(receiveKey: receiveKey, persona: persona, relay: relay, isPublic: true))
+        if !data.invites.contains(where: { $0.receiveKey == receiveKey }) {
+            data.invites.append(OpenInvite(receiveKey: receiveKey, persona: persona, relay: relay, isPublic: true))
+        }
+        readPublicInboxes(of: persona, and: receiveKey)
+    }
+
+    /// Makes sure this device reads the request mailbox of every handle a persona has in use (each is worked out
+    /// from the account and the handle, so every device arrives at the same ones), and winds down any other.
+    private func readPublicInboxes(of persona: UUID?, and extra: Data? = nil) {
+        guard let me = me(persona) else { return }
+        var keys = Set(profile(for: persona).activeHandles.map { me.publicInboxKey(handle: $0) })
+        for key in keys {
+            if let i = data.invites.firstIndex(where: { $0.receiveKey == key }) {
+                data.invites[i].retiresAt = nil
+            } else {
+                data.invites.append(OpenInvite(receiveKey: key, persona: persona, isPublic: true))
+            }
+        }
+        if let extra { keys.insert(extra) }
+        retirePublicInvites(of: persona, except: keys)
     }
 
     /// Sends your other devices a persona's public mailbox and profile together.

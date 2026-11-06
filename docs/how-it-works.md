@@ -16,7 +16,10 @@ and so on. The folder is kept out of backups, and on iPhone the files can't be r
 the passcode is right but the data won't open, Pulshade stays locked and changes nothing, rather than opening an
 empty account that would save over it. The recovery code is the only way back in.
 
-**Lock, Detach and Burn.** The only three ways to leave, on the Burn tab.
+**Lock, Detach and Burn.** The only three ways to leave, on the Burn tab. Detach on an account's only device
+first tells the people you chat with to clear their one-to-one chat with you (they keep you as a contact), waiting
+four seconds at most; offline, or if that can't be sent in time, it wipes anyway and they are told when the account
+is next recovered.
 - *Lock* closes the vault. Everything stays on the device, encrypted; the passcode (or Touch ID) opens it again.
 - *Detach* wipes this device at once, with no questions and no waiting on the network: everything on it is
   overwritten and the app starts fresh. Nothing is sent, so your other linked devices keep the account (and every
@@ -98,6 +101,11 @@ signing key vouches once for your agreement key, never for a message. Each perso
 and anything sent outside a ratchet session (introductions, erasing) is stamped and counted once, so it can't be
 replayed. The server sees random blobs and send ids, and none of what's inside.
 
+Big things (photos, pieces of a video) travel inside the seals as raw bytes after a short description, a "frame",
+rather than as text within text, which used to make a 1 MB piece of video take 3 MiB. Every envelope says, inside
+its seal, that its sender's app reads frames; an app only sends them to a device that has said so, and anything for
+an older app goes the earlier way. A video story is cut into pieces that each fill one 2 MiB message.
+
 **Everything travels the same way.** Reactions, typing dots, unsends, story views, disappearing timers and their
 changes all go through the ratchet like any other message. Disappearing messages are removed from each device when their timer
 runs out.
@@ -157,6 +165,9 @@ someone takes it or the chat ends.
 small directory of signed entries: the first key to claim a handle owns it, entries can't be forged or replayed, and
 a handle that's let go of stays held for that key for three months, so it can't pass straight to someone else. An
 account has three handles at most, listed and held together, so nobody can use up names by claiming and letting go.
+Up to three can be in use at once for one identity (the main one, shown on the profile, and two more); each leads to
+the same profile and has its own request mailbox, and each has a switch: off, it leaves the directory and is held.
+A handle belongs to the identity whose key claimed it, so it can't be moved from one persona to another.
 A burned account's handles stay unclaimable for the three months too, but the server no longer knows whose they were.
 Letting go of a held handle early frees its spot at once, but the name then cools off for 30 days, tied to nobody,
 before anyone may claim it. If a handle you look up belongs to a different account than a contact who went by it, the
@@ -176,6 +187,13 @@ stories, and tells their app to forget you and your chat, the same message a bur
 chat goes on both sides. They can only reach you again with a new invite or a request. Someone you still share a
 group or channel with stays only as a member there, like people you've never added.
 
+**Videos in chats.** A video of up to 30 seconds, recorded by holding the chat camera's button or picked from the
+library, is shrunk on the device (its own shape, about 5 MB at most, no location or device metadata) and sent as a
+message carrying a still from it, followed by the clip in pieces under the message's id, the way a video story's
+goes. An app from before this shows the still as a photo. Replying to a photo carries a small copy of it, so the
+quote shows what was answered. Something pinned to your profile (a link, a wallet, a public note) can be sent into
+a chat with one tap; it goes as an ordinary message.
+
 **Profiles and stories.** A profile has a picture and a 3:1 banner, sent to contacts like your name; a public
 @handle shows them too. A story is a photo (framed to 9:16, with an optional caption) or text. Photos are redrawn
 before use, which drops their location and other metadata. Each story goes to all your contacts, only the ones you
@@ -184,7 +202,7 @@ A story can be edited after posting (its words, who sees it, how long it lasts, 
 out of the audience lose it, and the rest get the new version. The first time someone views a story, their app
 sends its author a view through the ratchet like any message, so the server can't see who watches what. Story views
 can be turned off in Privacy & Security; then you send none and don't see your own, and one-time chats never send
-them.
+them. A story whose time has run out, or that you delete, stops being sent: copies still waiting to go are dropped.
 
 **Groups, channels and broadcasts.** Groups and channels fan out one envelope per member; members who aren't your
 contacts are kept as hidden peers, used only inside that group. Each has an owner, optional admins and a posting
@@ -199,7 +217,8 @@ Members who don't know each other first meet through introduction mailboxes. Who
 makes one for each member's device, gives that device its key privately, and gives the other members only where to
 write. Nobody is ever given the mailbox a member uses with the owner. What arrives there is sealed to the member, so
 whoever made it can't read it. After the first hello, the member opens a mailbox just for that person and tells them
-to write there instead.
+to write there instead. If the group was made before its owner had heard from a member's device (someone added a
+moment earlier), that member is told its mailbox again once the owner knows the device.
 
 **Linked devices.** One account, several devices, like Signal. Your identity keys are shared between your devices,
 but each device has its own id, its own mailboxes and its own ratchet session with every contact device, so no

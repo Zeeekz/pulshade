@@ -272,9 +272,10 @@ struct StoryMediaTests {
         #expect(pieces.count <= StoryClipPieces.maxPieces)
         #expect(pieces.allSatisfy { $0.count <= StoryClipPieces.size })
         #expect(pieces.reduce(Data(), +) == clip)
-        // A piece is base64 inside JSON, then base64 again inside the sealed message, and padded to a bucket.
+        // To an app that reads frames the clip goes in fuller pieces, which travel raw.
+        let fuller = StoryClipPieces.split(clip, framed: true)
+        #expect(fuller.count == 2 && fuller.allSatisfy { $0.count <= StoryClipPieces.framedSize } && fuller.reduce(Data(), +) == clip)
         let json = try JSONEncoder.pulshade.encode(Payload.storyPart(id: UUID(), index: 0, of: 4, bytes: pieces[0]))
-        #expect(json.count * 4 / 3 + 4096 < 2_097_152)
         let decoded = try JSONDecoder.pulshade.decode(Payload.self, from: json)
         guard case let .storyPart(_, index, of, bytes) = decoded else { Issue.record("not a part"); return }
         #expect(index == 0 && of == 4 && bytes == pieces[0])

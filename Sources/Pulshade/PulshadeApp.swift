@@ -186,6 +186,19 @@ struct RootView: View {
             .background(WindowConfigurator(blockCapture: model.blockCapture))
             #endif
             .overlay {
+                // Detach is saying its goodbyes: nothing of the account shows while it does.
+                if model.detaching {
+                    ZStack {
+                        Ink.void.ignoresSafeArea()
+                        VStack(spacing: 14) {
+                            ProgressView().tint(.white)
+                            Text("Detaching…").font(.system(size: 14, weight: .semibold)).foregroundStyle(.white.opacity(0.8))
+                        }
+                    }
+                    .accessibilityAddTraits(.isModal)
+                }
+            }
+            .overlay {
                 // Privacy curtain: hides everything the moment Pulshade isn't the front app.
                 if (!active && model.blurWhenInactive) || (captured && model.blockCapture) {
                     ZStack {

@@ -40,9 +40,29 @@ struct MainView: View {
 }
 
 #if os(iOS)
+/// The story camera sliding in from the left of the chats, under the finger, as on Instagram.
+@Observable final class CameraSlide {
+    /// How far in the camera is, 0 to 1. Nil when it's away (and not running).
+    var progress: CGFloat?
+    /// The screen's width, which a full slide covers.
+    var width: CGFloat = 390
+    /// A drag has taken hold and is moving the camera.
+    var dragging = false
+
+    func settle(open: Bool) {
+        dragging = false
+        withAnimation(.spring(duration: 0.35, bounce: 0.05)) {
+            progress = open ? 1 : 0
+        } completion: { [self] in
+            if !open, !dragging, progress == 0 { progress = nil }
+        }
+    }
+}
+
 /// iPhone: tabs along the bottom, chats pushed onto a navigation stack.
 private struct PhoneMainView: View {
     @Environment(AppModel.self) private var model
+    @State private var slide = CameraSlide()
     @State private var section: Section = .chats
     @State private var selection: Conversation.ID?
     @State private var switchingPersona = false
@@ -78,6 +98,18 @@ private struct PhoneMainView: View {
             }
         }
         .tint(model.theme.accent)
+        // The chats give way a little as the camera comes across them.
+        .offset(x: (slide.progress ?? 0) * slide.width * 0.3)
+        .overlay {
+            if let progress = slide.progress {
+                StoryCamera(close: { slide.settle(open: false) })
+                    .offset(x: -(1 - progress) * slide.width)
+                    .accessibilityHidden(progress < 1)
+            }
+        }
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { slide.width = max($0, 1) }
+        .environment(slide)
+        .inAppBanners()
         .background(TabHold(tab: 4) { switchingPersona = true })
         .sheet(isPresented: $switchingPersona) {
             PersonaSwitcher(done: { switchingPersona = false })
@@ -272,6 +304,16 @@ private struct DesktopMainView: View {
         .background(Ink.base.opacity(0.85))
         .animation(.smooth(duration: 0.3), value: section)
         .animation(.smooth(duration: 0.3), value: selection)
+        #if DEBUG
+        .onAppear {
+            // Screenshots: PULSHADE_DEMO_CHAT=Kai opens the chat with that title.
+            if AppModel.demoRequested, let title = ProcessInfo.processInfo.environment["PULSHADE_DEMO_CHAT"],
+               let chat = model.data.conversations.first(where: { $0.title == title }) { selection = chat.id }
+            // PULSHADE_DEMO_SCREEN=settings (or contacts, burn, people) opens that section.
+            if AppModel.demoRequested, let name = ProcessInfo.processInfo.environment["PULSHADE_DEMO_SCREEN"],
+               let wanted = Section(rawValue: name) { section = wanted }
+        }
+        #endif
         .onChange(of: model.requestedConversation, initial: true) { _, id in
             guard let id, model.conversation(id) != nil else { return }
             withAnimation(.smooth) {
@@ -393,6 +435,9 @@ private struct ChatList: View {
     @State private var storiesHeight: CGFloat = 0
     /// Where the story strip is on screen, kept out of view state: it changes with every scroll frame.
     @State private var stripBox = FrameBox()
+    #if os(iOS)
+    @Environment(CameraSlide.self) private var slide
+    #endif
 
     private var items: [Conversation] {
         model.sortedConversations.filter { c in
@@ -472,12 +517,23 @@ private struct ChatList: View {
             #if os(iOS)
             // Swipe right on the chats, as "back" from the first page, and the story camera opens, as on Instagram.
             // A swipe that starts on the story strip scrolls the strip instead.
-            .simultaneousGesture(DragGesture(minimumDistance: 30, coordinateSpace: .named("chatlist")).onEnded { drag in
-                let dx = drag.translation.width, dy = drag.translation.height
-                guard dx > 90, abs(dx) > abs(dy) * 2, !stripBox.rect.contains(drag.startLocation) else { return }
-                Haptics.tick()
-                composingStory = true
-            })
+            // It follows the finger: let go past a third of the way (or with a flick) and it comes all the way in.
+            .simultaneousGesture(DragGesture(minimumDistance: 20, coordinateSpace: .named("chatlist"))
+                .onChanged { drag in
+                    let dx = drag.translation.width, dy = drag.translation.height
+                    if !slide.dragging {
+                        guard slide.progress == nil, dx > 24, abs(dx) > abs(dy) * 2,
+                              !stripBox.rect.contains(drag.startLocation) else { return }
+                        slide.dragging = true
+                    }
+                    slide.progress = min(max(dx / slide.width, 0), 1)
+                }
+                .onEnded { drag in
+                    guard slide.dragging else { return }
+                    let open = drag.translation.width > slide.width * 0.33 || drag.predictedEndTranslation.width > slide.width * 0.6
+                    if open { Haptics.tick() }
+                    slide.settle(open: open)
+                })
             #endif
         }
         .sheet(isPresented: $burningAccount) { BurnSheet() }

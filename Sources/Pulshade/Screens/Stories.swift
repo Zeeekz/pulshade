@@ -149,10 +149,18 @@ enum StoryImages {
 }
 
 struct StoryFace: View {
+    /// Not there when the face is drawn off-screen for a thumbnail.
+    @Environment(AppModel.self) private var model: AppModel?
     var story: Story
     var compact = false
     /// Set while a video story is playing.
     var clip: StoryClip?
+
+    /// A video still arriving says how far it has got, once its first piece is in.
+    private var loadingLabel: String {
+        guard let got = model?.clipProgress(of: story.id), got.have > 0, got.of > 1 else { return "Loading video" }
+        return "Loading video · \(got.have) of \(got.of)"
+    }
 
     var body: some View {
         ZStack {
@@ -178,10 +186,10 @@ struct StoryFace: View {
                     // Still arriving: it plays as soon as the last piece is in.
                     VStack(spacing: 10) {
                         ProgressView().tint(.white)
-                        if !compact { Text("Loading video").font(.system(size: 13, weight: .semibold)).foregroundStyle(.white.opacity(0.8)) }
+                        if !compact { Text(loadingLabel).font(.system(size: 13, weight: .semibold)).foregroundStyle(.white.opacity(0.8)).monospacedDigit() }
                     }
                     .accessibilityElement(children: .combine)
-                    .accessibilityLabel("Loading video")
+                    .accessibilityLabel(loadingLabel)
                 } else if let clip {
                     LayerView(layer: clip.layer).frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
@@ -913,6 +921,9 @@ extension View {
 struct StoryCamera: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.theme) private var theme
+    /// Set when the camera wasn't presented but slid in beside the chats: closing it is the owner's to do.
+    var close: (() -> Void)?
+    private func leave() { if let close { close() } else { dismiss() } }
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var camera = Camera()
     @State private var ready: Bool?
@@ -1006,7 +1017,7 @@ struct StoryCamera: View {
             }
             VStack {
                 HStack {
-                    control("xmark", label: "Close") { dismiss() }
+                    control("xmark", label: "Close") { leave() }
                     Spacer()
                     if camera.recording, let start = camera.recordingStart {
                         TimelineView(.periodic(from: start, by: 0.25)) { context in
@@ -1095,10 +1106,10 @@ struct StoryCamera: View {
             switch cover {
             case let .framed(pick):
                 switch pick.kind {
-                case let .photo(data): StoryComposer(image: data, filter: pick.filter, posted: { dismiss() })
-                case let .clip(url, zoom): StoryComposer(clip: url, zoom: zoom, filter: pick.filter, posted: { dismiss() })
+                case let .photo(data): StoryComposer(image: data, filter: pick.filter, posted: { leave() })
+                case let .clip(url, zoom): StoryComposer(clip: url, zoom: zoom, filter: pick.filter, posted: { leave() })
                 }
-            case .writing: StoryComposer(posted: { dismiss() })
+            case .writing: StoryComposer(posted: { leave() })
             }
         }
     }

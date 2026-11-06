@@ -423,10 +423,7 @@ private struct ProfileSettings: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     @State private var name = ""
-    @State private var handle = ""
     @State private var bio = ""
-    @State private var claiming = false
-    @State private var handleProblem: String?
     @State private var burningPersona = false
 
     private var listed: Bool { model.activeProfile.handle != nil }
@@ -514,9 +511,62 @@ private struct ProfileSettings: View {
         .glass(14)
     }
 
+    /// Which persona this page is editing, with a tap to switch: every persona has its own profile, handles and pins.
+    private var personaBar: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: 8) {
+                personaChip(nil, name: model.data.profile.displayName, avatar: model.data.profile.avatar,
+                            seed: model.identity?.fingerprint ?? "me", caption: "Main")
+                ForEach(model.personas) { persona in
+                    personaChip(persona.id, name: persona.profile.displayName, avatar: persona.profile.avatar,
+                                seed: persona.id.uuidString, caption: "Persona")
+                }
+            }
+            .padding(.horizontal, 2).padding(.vertical, 2)
+        }
+        .scrollIndicators(.never)
+    }
+
+    private func personaChip(_ id: UUID?, name: String, avatar: Data?, seed: String, caption: String) -> some View {
+        let on = model.activePersona == id
+        return Button { model.switchPersona(id) } label: {
+            HStack(spacing: 8) {
+                Avatar(image: avatar, seed: seed, size: 28)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(name).font(.system(size: 13, weight: .semibold)).foregroundStyle(on ? Ink.text : Ink.dim).lineLimit(1)
+                    Text(caption).font(.system(size: 10, weight: .medium)).foregroundStyle(Ink.faint)
+                }
+            }
+            .padding(.leading, 6).padding(.trailing, 12).padding(.vertical, 6)
+            .background(on ? theme.accent.opacity(0.16) : Ink.surface, in: .capsule)
+            .overlay(Capsule().strokeBorder(on ? theme.accent.opacity(0.6) : Ink.line))
+            .contentShape(.capsule)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(caption): \(name)")
+        .accessibilityAddTraits(on ? .isSelected : [])
+    }
+
+    private func sectionNote(_ text: String) -> some View {
+        Text(text).font(.system(size: 12)).foregroundStyle(Ink.faint)
+            .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 6)
+    }
+
     var body: some View {
         SettingsScreen(title: "Profile") {
-            hero
+            // 1. Who you're editing.
+            if !model.personas.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    sectionNote("Editing")
+                    personaBar
+                }
+            }
+            // 2. How it looks to others, changing as you edit. Tap the picture or banner to change it.
+            VStack(spacing: 8) {
+                hero
+                sectionNote("This is how people you chat with see you. Tap your picture or banner to change it.")
+            }
+            // 3. About you.
             SettingsGroup("About you", footer: "Only people you chat with see your name, picture and banner.") {
                 fieldRow("Name") {
                     TextField("", text: $name, prompt: Text("Your name").foregroundStyle(Ink.faint))
@@ -524,38 +574,6 @@ private struct ProfileSettings: View {
                         .font(.system(size: 15))
                         .foregroundStyle(Ink.text)
                         .onChange(of: name) { model.updateProfile { $0.name = name.trimmingCharacters(in: .whitespaces) } }
-                }
-                RowDivider()
-                fieldRow("Username") {
-                    HStack(spacing: 4) {
-                        Text("@").font(.system(size: 15)).foregroundStyle(Ink.faint)
-                        TextField("", text: $handle, prompt: Text("username").foregroundStyle(Ink.faint))
-                            .textFieldStyle(.plain)
-                            .font(.system(size: 15))
-                            .foregroundStyle(Ink.text)
-                            #if os(iOS)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            #endif
-                            .onSubmit(claim)
-                        if claiming { ProgressView().controlSize(.small) }
-                        if listed && handle == model.activeProfile.handle {
-                            Image(systemName: "checkmark.seal.fill").foregroundStyle(theme.accent)
-                        } else {
-                            Button("Claim", action: claim)
-                                .font(.system(size: 14, weight: .semibold))
-                                .buttonStyle(.plain)
-                                .foregroundStyle(handle.isEmpty ? Ink.faint : theme.accent)
-                                .disabled(handle.isEmpty || claiming)
-                        }
-                    }
-                }
-                if let handleProblem {
-                    hint(handleProblem, color: .orange)
-                } else if !handle.isEmpty && handle != model.activeProfile.handle {
-                    hint("If you set a username you become discoverable: people can find you by it and send a chat request.", color: Ink.faint)
-                } else if listed {
-                    hint("Anyone can find you by @\(model.activeProfile.handle ?? "") and send a chat request.", color: Ink.faint)
                 }
                 RowDivider()
                 fieldRow("Bio", top: true) {
@@ -575,25 +593,32 @@ private struct ProfileSettings: View {
                     }
                 }
             }
-            SettingsGroup("Discoverability") {
-                if listed, let mine = model.activeProfile.handle, let me = model.me(model.activePersona) {
-                    // Carries a check of your key, so it can never open someone else's profile.
-                    ActionRow(title: "Copy profile link") {
-                        copyToClipboard(DirectoryProfile.link(mine, key: me.card.signing))
-                    }
-                    RowDivider()
-                    ActionRow(title: "Stop being discoverable") { Task { await model.unpublishProfile() } }
-                    RowDivider()
+            // 4. Handles: how strangers find this persona.
+            HandlesEditor()
+            if listed {
+                SettingsGroup {
+                    ActionRow(title: "Stop being discoverable", destructive: true) { Task { await model.unpublishProfile() } }
                 }
-                NavigationLink(value: SettingsPage.handles) {
-                    SettingRow("Your handles", symbol: "at") {
-                        Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Ink.faint)
-                    }
-                    .contentShape(.rect)
-                }
-                .buttonStyle(.plain)
             }
+            // 5. What's pinned: links, wallets and notes.
             PinnedEditor()
+            // 6. What you own.
+            if Platform.isPhone {
+                SettingsGroup("Collectibles") {
+                    NavigationLink(value: SettingsPage.collectibles) {
+                        SettingRow("Collectibles & Pets", symbol: "crown") {
+                            HStack(spacing: 6) {
+                                if let worn = model.activeProfile.badge?.kind?.name {
+                                    Text(worn).font(.system(size: 13)).foregroundStyle(Ink.faint)
+                                }
+                                Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Ink.faint)
+                            }
+                        }
+                        .contentShape(.rect)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
             if let id = model.activePersona {
                 SettingsGroup(footer: "Burning this persona deletes it for good. Your main identity and other personas aren't touched.") {
                     ActionRow(title: "Burn persona", destructive: true) { burningPersona = true }
@@ -603,44 +628,26 @@ private struct ProfileSettings: View {
         }
         .onChange(of: model.activePersona, initial: true) {
             name = model.activeProfile.name
-            handle = model.activeProfile.handle ?? ""
             bio = String((model.activeProfile.bio ?? "").prefix(Self.bioLimit))
         }
     }
 
-    private func claim() {
-        guard !handle.isEmpty, !claiming else { return }
-        claiming = true
-        handleProblem = nil
-        Task {
-            do {
-                try await model.publishProfile(handle: handle)
-                handle = model.activeProfile.handle ?? handle
-            } catch AppModel.DirectoryError.taken {
-                handleProblem = "@\(handle.lowercased()) is taken"
-            } catch AppModel.DirectoryError.reserved {
-                handleProblem = "@\(handle.lowercased()) is reserved"
-            } catch AppModel.DirectoryError.held {
-                handleProblem = "@\(handle.lowercased()) was let go of recently, so nobody can claim it yet. It frees up within 3 months"
-            } catch AppModel.DirectoryError.full {
-                handleProblem = "You've used your 3 handles. One you let go of frees up 3 months later"
-            } catch AppModel.DirectoryError.invalidHandle {
-                handleProblem = "Use 3–24 letters, numbers or _"
-            } catch AppModel.DirectoryError.unreachable {
-                handleProblem = "Can't reach the relay"
-            } catch {
-                handleProblem = "Couldn't claim it"
-            }
-            claiming = false
-        }
-    }
 }
 
 // MARK: - Handles
 
-/// Every handle tied to this identity's key: the one in use, and the ones it stopped using that are kept for
-/// it for three months. A kept one can be used again, or let go of early to make room for another.
+/// The page for a persona's handles on its own (the same editor is on the Profile page).
 private struct HandleSettings: View {
+    var body: some View {
+        SettingsScreen(title: "Your handles", back: "Profile") { HandlesEditor() }
+    }
+}
+
+/// Every handle tied to the persona you're editing: up to three, each with a switch. A handle that's on is in the
+/// directory, leads to this profile and takes chat requests, and all that are on work at once. One that's off is
+/// kept for this persona for three months so nobody else can take it, and can be turned back on or let go of early.
+/// The main one is the one shown on the profile. A handle belongs to the persona that claimed it.
+struct HandlesEditor: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     @State private var held: [AppModel.HeldHandle] = []
@@ -648,109 +655,193 @@ private struct HandleSettings: View {
     @State private var working: String?
     @State private var problem: String?
     @State private var lettingGo: AppModel.HeldHandle?
+    @State private var draft = ""
+    @State private var copied: String?
 
-    private var current: String? { model.activeProfile.handle }
-    private var used: Int { held.count + (current == nil ? 0 : 1) }
+    private var active: [String] { model.activeProfile.activeHandles }
+    private var off: [AppModel.HeldHandle] { held.filter { !active.contains($0.handle) } }
+    private var used: Int { active.count + off.count }
 
     var body: some View {
-        SettingsScreen(title: "Your handles", back: "Profile") {
-            SettingsGroup("In use") {
-                SettingRow(current.map { "@\($0)" } ?? "No public handle") {
-                    if current != nil {
-                        Image(systemName: "checkmark.seal.fill").foregroundStyle(theme.accent)
-                    }
+        SettingsGroup("Handles", footer: "Each handle that's on leads to this profile and takes chat requests, all at the same time. You can have \(AppModel.maxHandles) per persona, counting ones that are off. A handle you turn off stays yours for 3 months. Handles belong to the persona that claimed them and can't be moved to another.") {
+            if active.isEmpty && off.isEmpty && !loading {
+                SettingRow("No public handle", symbol: "at") { Text("Private").font(.system(size: 13)).foregroundStyle(Ink.faint) }
+                RowDivider()
+            }
+            ForEach(active, id: \.self) { handle in
+                activeRow(handle)
+                RowDivider()
+            }
+            ForEach(off) { kept in
+                offRow(kept)
+                RowDivider()
+            }
+            if loading {
+                SettingRow("Checking with the relay…") { ProgressView().controlSize(.small) }
+            } else if used < AppModel.maxHandles {
+                HStack(spacing: 4) {
+                    Text("@").font(.system(size: 15)).foregroundStyle(Ink.faint)
+                    TextField("", text: $draft, prompt: Text(active.isEmpty ? "username" : "add another").foregroundStyle(Ink.faint))
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 15))
+                        .foregroundStyle(Ink.text)
+                        #if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        #endif
+                        .onSubmit { turnOn(draft) }
+                    if working == draft.lowercased(), !draft.isEmpty { ProgressView().controlSize(.small) }
+                    Button("Claim") { turnOn(draft) }
+                        .font(.system(size: 14, weight: .semibold))
+                        .buttonStyle(.plain)
+                        .foregroundStyle(draft.isEmpty ? Ink.faint : theme.accent)
+                        .disabled(draft.isEmpty || working != nil)
                 }
+                .padding(.horizontal, 16)
+                .frame(minHeight: 50)
+            } else {
+                SettingRow("All \(AppModel.maxHandles) handles used") { EmptyView() }
             }
-            SettingsGroup("Kept for you",
-                          footer: "You can have \(AppModel.maxHandles) handles, counting the ones kept for you. A handle you stop using stays yours for 3 months, so nobody else can take it. Let it go to make room for another.") {
-                if loading {
-                    SettingRow("Checking with the relay…") { ProgressView().controlSize(.small) }
-                } else if held.isEmpty {
-                    SettingRow("None") { EmptyView() }
-                } else {
-                    ForEach(Array(held.enumerated()), id: \.element.id) { i, kept in
-                        if i > 0 { RowDivider() }
-                        keptRow(kept)
-                    }
-                }
+            if let problem {
+                Text(problem)
+                    .font(.system(size: 12, weight: .medium)).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16).padding(.bottom, 10)
             }
-            HStack {
-                Text("\(used) of \(AppModel.maxHandles) used").font(.system(size: 13)).foregroundStyle(Ink.faint)
-                Spacer()
-                if let problem { ProblemText(problem) }
-            }
-            .padding(.horizontal, 14)
         }
         .task(id: model.activePersona) { await load() }
         .confirmationDialog(lettingGo.map { "Let go of @\($0.handle)?" } ?? "", isPresented: Binding(get: { lettingGo != nil }, set: { if !$0 { lettingGo = nil } }),
                             titleVisibility: .visible, presenting: lettingGo) { kept in
             Button("Let go", role: .destructive) { letGo(kept) }
         } message: { _ in
-            Text("It frees a spot for another handle. Nobody can claim it for 30 days, you included; after that anyone can. Links you shared won't open their profile.")
+            Text("It frees a spot for another handle. Nobody can claim it for 30 days, you included; after that anyone can. Links you shared won't open your profile.")
         }
     }
 
-    private func keptRow(_ kept: AppModel.HeldHandle) -> some View {
+    /// A handle in use: its name, whether it's the main one, a copy-link button and its switch.
+    private func activeRow(_ handle: String) -> some View {
+        let main = handle == model.activeProfile.handle
+        return HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text("@\(handle)").font(.system(size: 15, weight: .medium)).foregroundStyle(Ink.text).lineLimit(1)
+                    if main && active.count > 1 {
+                        Text("Main").font(.system(size: 10, weight: .bold)).foregroundStyle(Ink.onAccent)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(theme.accent, in: .capsule)
+                    }
+                }
+                if main || active.count == 1 {
+                    Text(active.count > 1 ? "Shown on your profile" : "On · anyone can find you by it")
+                        .font(.system(size: 12)).foregroundStyle(Ink.faint)
+                } else {
+                    Button("Make main") { withAnimation(.snappy) { model.makeMainHandle(handle) } }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 12, weight: .semibold)).foregroundStyle(theme.accent)
+                }
+            }
+            Spacer(minLength: 8)
+            if let me = model.me(model.activePersona) {
+                // Carries a check of your key, so it can never open someone else's profile.
+                Button {
+                    copyToClipboard(DirectoryProfile.link(handle, key: me.card.signing))
+                    withAnimation(.snappy) { copied = handle }
+                } label: { Image(systemName: copied == handle ? "checkmark" : "link") }
+                    .buttonStyle(IconButtonStyle(size: 28))
+                    .help("Copy profile link")
+                    .accessibilityLabel(copied == handle ? "Link copied" : "Copy the link to @\(handle)")
+            }
+            if working == handle { ProgressView().controlSize(.small) }
+            Toggle("", isOn: Binding(get: { true }, set: { on in if !on { turnOff(handle) } }))
+                .labelsHidden()
+                .toggleStyle(GlowToggleStyle())
+                .disabled(working != nil)
+                .accessibilityLabel("@\(handle) in use")
+        }
+        .padding(.horizontal, 16)
+        .frame(minHeight: 56)
+    }
+
+    /// A handle that's off: kept for this persona until a date, with a switch to use it again and a way to let it go.
+    private func offRow(_ kept: AppModel.HeldHandle) -> some View {
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("@\(kept.handle)").font(.system(size: 15)).foregroundStyle(Ink.text)
-                Text("Yours until \(kept.until.formatted(date: .long, time: .omitted))")
+                Text("@\(kept.handle)").font(.system(size: 15, weight: .medium)).foregroundStyle(Ink.dim).lineLimit(1)
+                Text("Off · yours until \(kept.until.formatted(date: .abbreviated, time: .omitted))")
                     .font(.system(size: 12)).foregroundStyle(Ink.faint)
             }
             Spacer(minLength: 8)
-            if working == kept.handle {
-                ProgressView().controlSize(.small)
-            } else {
-                Button("Use") { use(kept) }
-                    .font(.system(size: 14, weight: .semibold)).foregroundStyle(theme.accent)
-                Button("Let go") { lettingGo = kept }
-                    .font(.system(size: 14)).foregroundStyle(.red)
-            }
+            Button { lettingGo = kept } label: { Image(systemName: "trash") }
+                .buttonStyle(IconButtonStyle(size: 28))
+                .disabled(working != nil)
+                .help("Let go of it for good")
+                .accessibilityLabel("Let go of @\(kept.handle)")
+            if working == kept.handle { ProgressView().controlSize(.small) }
+            Toggle("", isOn: Binding(get: { false }, set: { on in if on { turnOn(kept.handle) } }))
+                .labelsHidden()
+                .toggleStyle(GlowToggleStyle())
+                .disabled(working != nil)
+                .accessibilityLabel("@\(kept.handle) in use")
         }
-        .buttonStyle(.plain)
-        .disabled(working != nil)
         .padding(.horizontal, 16)
         .frame(minHeight: 56)
     }
 
     private func load() async {
         loading = true
-        do {
-            held = try await model.heldHandles()
-            problem = nil
-        } catch {
-            problem = "Can't reach the relay"
-        }
+        do { held = try await model.heldHandles(); problem = nil } catch { problem = "Can't reach the relay to check which handles are kept for you" }
         loading = false
     }
 
-    /// Back in use: the one in use now is kept for you in its place.
-    private func use(_ kept: AppModel.HeldHandle) {
-        working = kept.handle
+    private func turnOn(_ raw: String) {
+        let handle = raw.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !handle.isEmpty, working == nil else { return }
+        working = handle
+        problem = nil
         Task {
             do {
-                try await model.publishProfile(handle: kept.handle)
-                problem = nil
+                try await model.publishProfile(handle: handle)
+                draft = ""
+                held.removeAll { $0.handle == handle }
+            } catch AppModel.DirectoryError.taken {
+                problem = "@\(handle) is taken"
+            } catch AppModel.DirectoryError.reserved {
+                problem = "@\(handle) is reserved"
+            } catch AppModel.DirectoryError.held {
+                problem = "@\(handle) was let go of recently, so nobody can claim it yet. It frees up within 3 months"
+            } catch AppModel.DirectoryError.full {
+                problem = "You've used your \(AppModel.maxHandles) handles. One you let go of frees up 3 months later"
+            } catch AppModel.DirectoryError.invalidHandle {
+                problem = "Use 3–24 letters, numbers or _"
             } catch AppModel.DirectoryError.unreachable {
                 problem = "Can't reach the relay"
             } catch {
-                problem = "Couldn't use @\(kept.handle)"
+                problem = "Couldn't claim it"
             }
+            working = nil
+        }
+    }
+
+    private func turnOff(_ handle: String) {
+        guard working == nil else { return }
+        working = handle
+        problem = nil
+        Task {
+            await model.stopUsingHandle(handle)
             await load()
             working = nil
         }
     }
 
     private func letGo(_ kept: AppModel.HeldHandle) {
+        guard working == nil else { return }
         working = kept.handle
         Task {
             do {
                 try await model.letGo(of: kept.handle)
-                withAnimation(.snappy) { held.removeAll { $0 == kept } }
-                problem = nil
-            } catch {
-                problem = "Can't reach the relay"
-            }
+                held.removeAll { $0.handle == kept.handle }
+            } catch { problem = "Couldn't let go of @\(kept.handle). Try again when the relay is in reach" }
             working = nil
         }
     }

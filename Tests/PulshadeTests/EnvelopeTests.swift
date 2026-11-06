@@ -32,6 +32,39 @@ import Foundation
         #expect(throws: (any Error).self) { try Envelope.open(blob, with: bob) }
     }
 
+    /// Framed, a big message goes without base64 round it: it opens the same, and takes about what it holds
+    /// rather than nearly twice that. Sealed the old way it still opens, for apps that haven't updated.
+    @Test func aFramedEnvelopeCarriesBigBytesRawAndOpensTheSame() throws {
+        let bytes = Data((0..<400_000).map { _ in UInt8.random(in: 0...255) })
+        let header = RatchetHeader(dh: Data(repeating: 7, count: 32), pn: 3, n: 9, kem: nil, kemCiphertext: nil)
+        let payload = Payload.ratchet(RatchetMessage(header: header, ciphertext: bytes))
+        let framed = try Envelope.seal(payload, from: alice, device: Data([1, 2]), to: bob.card.agreement, framed: true)
+        let plain = try Envelope.seal(payload, from: alice, device: Data([1, 2]), to: bob.card.agreement)
+        for blob in [framed, plain] {
+            let opened = try Envelope.openFull(blob, with: bob)
+            #expect(opened.payload == payload && opened.signer == alice.card.signing && opened.device == Data([1, 2]))
+            #expect(opened.readsFrames, "every envelope says its sender reads frames")
+        }
+        #expect(framed.count < 600_000, "400 KB fits the 512 KB bucket")
+        #expect(plain.count > 2_000_000, "base64 twice over pushed it into the 2 MiB one")
+        var broken = framed
+        broken[broken.count / 2] ^= 0x01
+        #expect(throws: (any Error).self) { try Envelope.open(broken, with: bob) }
+    }
+
+    @Test func framesAreReadStrictly() throws {
+        let part = Payload.storyPart(id: UUID(), index: 1, of: 2, bytes: Data([9, 8, 7, 0, 1]))
+        #expect(try Payload.fromWire(part.wire(framed: true)) == part)
+        #expect(try Payload.fromWire(part.wire(framed: false)) == part)
+        #expect(try part.wire(framed: true).first == Frame.mark)
+        // Short payloads have nothing worth framing, and stay plain JSON.
+        #expect(try message("hi").wire(framed: true).first == UInt8(ascii: "{"))
+        // A length that runs past the end, a frame round something that has no big field, and a bare mark are refused.
+        #expect(Frame.split(Data([0, 0, 0, 0, 9, 1, 2])) == nil)
+        #expect(throws: (any Error).self) { try Payload.fromWire(Frame.join(JSONEncoder.pulshade.encode(message("hi")), Data([1]))) }
+        #expect(throws: (any Error).self) { try Payload.fromWire(Data([0])) }
+    }
+
     @Test func sizesAreBucketed() throws {
         let short = try Envelope.seal(message("a"), from: alice, to: bob.card.agreement)
         let longer = try Envelope.seal(message(String(repeating: "b", count: 900)), from: alice, to: bob.card.agreement)
