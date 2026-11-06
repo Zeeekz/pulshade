@@ -635,6 +635,7 @@ async fn admin(
         admin::Traffic {
             mailboxes: store.queues.len(),
             waiting: store.queues.values().map(VecDeque::len).sum(),
+            waiting_bytes: store.bytes,
             uptime_secs: state.started.elapsed().as_secs(),
             calls: state.calls.active(),
         }
@@ -642,6 +643,16 @@ async fn admin(
     let mut directory = state.directory.lock().unwrap();
     if !admin::authorised(token, &state.admin_token) {
         return Err((StatusCode::UNAUTHORIZED, "not the operator".into()));
+    }
+    if req.action == "drop-mail" {
+        drop(directory);
+        let (age, big_only) = admin::drop_mail_arg(&req.arg).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        let (dropped, freed) = drop_waiting(&state.store, age, big_only);
+        let store = state.store.lock().unwrap();
+        return Ok(Json(serde_json::json!({
+            "dropped": dropped, "freedBytes": freed,
+            "waiting": store.queues.values().map(VecDeque::len).sum::<usize>(), "waitingBytes": store.bytes,
+        })));
     }
     admin::run(&mut directory, &req, traffic).map(Json).map_err(|e| (StatusCode::BAD_REQUEST, e))
 }
@@ -913,6 +924,25 @@ fn purge(store: &Shared) {
     });
     // Recounted, so the running total can't drift.
     store.bytes = store.queues.values().flat_map(|q| q.iter()).map(|item| item.blob.len()).sum();
+}
+
+/// The operator's broom: lets go of waiting mail left uncollected for `age` or longer, without a restart (which would
+/// drop everything). With `big_only`, short mail (texts and the like) stays and only the big pieces go. Says how many
+/// envelopes went and how many bytes that freed. The relay can't tell what any of it was, only its age and size.
+fn drop_waiting(store: &Shared, age: Duration, big_only: bool) -> (usize, usize) {
+    let mut store = store.lock().unwrap();
+    let now = Instant::now();
+    let (mut dropped, mut freed) = (0, 0);
+    store.queues.retain(|_, queue| {
+        queue.retain(|item| {
+            let goes = now.duration_since(item.at) >= age && (!big_only || item.blob.len() > SHORT_MAIL);
+            if goes { dropped += 1; freed += item.blob.len(); }
+            !goes
+        });
+        !queue.is_empty()
+    });
+    store.bytes = store.queues.values().flat_map(|q| q.iter()).map(|item| item.blob.len()).sum();
+    (dropped, freed)
 }
 
 // MARK: Nothing waits on disk
@@ -1265,6 +1295,32 @@ mod tests {
         let ids: Vec<u64> = res.items.iter().map(|i| i.id).collect();
         ack(State(store.clone()), Json(AckRequest { acks: vec![Ack { key: hex::encode(receive), ids }] })).await;
         assert_eq!(store.lock().unwrap().bytes, 0);
+    }
+
+    /// The operator can let go of mail nobody has collected for a while, all of it or only the big pieces, and the
+    /// rest stays where it was.
+    #[test]
+    fn the_operator_can_drop_old_uncollected_mail() {
+        let store: Shared = Arc::default();
+        let (stale, fresh) = ([1u8; 32], [2u8; 32]);
+        let past = Instant::now().checked_sub(Duration::from_secs(3 * 3600)).unwrap_or_else(Instant::now);
+        {
+            let mut s = store.lock().unwrap();
+            let old_text = Item { id: 1, at: past, blob: Bytes::from(vec![0u8; 100]) };
+            let old_piece = Item { id: 2, at: past, blob: Bytes::from(vec![0u8; SHORT_MAIL + 1]) };
+            let new_piece = Item { id: 3, at: Instant::now(), blob: Bytes::from(vec![0u8; SHORT_MAIL + 1]) };
+            s.queues.entry(stale).or_default().extend([old_text, old_piece]);
+            s.queues.entry(fresh).or_default().push_back(new_piece);
+            s.bytes = 100 + 2 * (SHORT_MAIL + 1);
+        }
+        if past.elapsed() < Duration::from_secs(3600) { return } // a machine up for under three hours can't backdate
+        assert_eq!(drop_waiting(&store, Duration::from_secs(2 * 3600), true), (1, SHORT_MAIL + 1), "only the old big piece");
+        assert_eq!(store.lock().unwrap().queues[&stale].iter().map(|i| i.id).collect::<Vec<_>>(), vec![1], "the old text stays");
+        assert_eq!(store.lock().unwrap().bytes, 100 + SHORT_MAIL + 1);
+        assert_eq!(drop_waiting(&store, Duration::from_secs(2 * 3600), false), (1, 100), "then the old text too");
+        let s = store.lock().unwrap();
+        assert!(!s.queues.contains_key(&stale), "an emptied mailbox is forgotten");
+        assert_eq!((s.queues[&fresh].len(), s.bytes), (1, SHORT_MAIL + 1), "newer mail isn't touched");
     }
 
     /// When the relay is full, the oldest mail anywhere goes first and newer mail stays.

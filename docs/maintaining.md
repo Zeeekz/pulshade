@@ -35,6 +35,11 @@ tested with `./scripts/server/test-mod-gate.sh`; it hasn't been run against a re
 
 **Restarting empties waiting messages.** They are held in memory only, so a restart loses what hasn't been collected.
 
+**Clearing out uncollected mail.** `pulshade-server drop-mail 48h` drops waiting messages nobody has collected for
+that long (`90m`, `48h`, `3d`), without a restart; add `big` to keep texts and drop only pieces over 64 KB (photos,
+videos, stories). `stats` shows how much is waiting. Left alone, waiting mail goes after a week, and when the relay
+is full the oldest makes way.
+
 ## Running the relay on a server
 
 The relay can run on any Debian or Ubuntu server with 2 GB of memory or more (smaller ones work, but build slowly).

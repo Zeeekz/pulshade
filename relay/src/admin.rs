@@ -19,6 +19,8 @@ pub struct AdminRequest {
 pub struct Traffic {
     pub mailboxes: usize,
     pub waiting: usize,
+    /// How much memory the waiting mail takes.
+    pub waiting_bytes: usize,
     pub uptime_secs: u64,
     /// Calls in progress right now.
     pub calls: usize,
@@ -28,6 +30,20 @@ pub struct Traffic {
 pub fn authorised(token: Option<&str>, expected_token: &str) -> bool {
     // Compare digests so the check takes the same time however much of the token matches.
     token.is_some_and(|token| !expected_token.is_empty() && Sha256::digest(token.as_bytes()) == Sha256::digest(expected_token.as_bytes()))
+}
+
+/// Reads `drop-mail`'s argument: an age such as `90m`, `48h` or `3d`, then optionally `big` to leave short mail
+/// alone. An age is always asked for, so nothing is dropped by a slip of the hand.
+pub fn drop_mail_arg(arg: &str) -> Result<(std::time::Duration, bool), String> {
+    let usage = "give an age such as 90m, 48h or 3d, then optionally: big";
+    let mut words = arg.split_whitespace();
+    let age = words.next().ok_or(usage)?;
+    let unit = match age.chars().last() { Some('m') => 60, Some('h') => 3600, Some('d') => 86_400, _ => return Err(usage.into()) };
+    let count: u64 = age[..age.len() - 1].parse().map_err(|_| usage)?;
+    if count == 0 || count > 10_000 { return Err(usage.into()) }
+    let big_only = match words.next() { None => false, Some("big") => true, Some(_) => return Err(usage.into()) };
+    if words.next().is_some() { return Err(usage.into()) }
+    Ok((std::time::Duration::from_secs(count * unit), big_only))
 }
 
 fn handle_arg(arg: &str) -> Result<String, String> {
@@ -54,6 +70,7 @@ pub fn run(dir: &mut Directory, req: &AdminRequest, traffic: Traffic) -> Result<
             "held": dir.held_count(),
             "mailboxes": traffic.mailboxes,
             "waiting": traffic.waiting,
+            "waitingBytes": traffic.waiting_bytes,
             "uptimeSeconds": traffic.uptime_secs,
             "calls": traffic.calls,
             "reportsSetUp": dir.moderation.report_inbox.is_some(),
@@ -252,6 +269,17 @@ pub fn run(dir: &mut Directory, req: &AdminRequest, traffic: Traffic) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drop_mail_wants_an_age_and_nothing_odd() {
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(drop_mail_arg("48h"), Ok((48 * hour, false)));
+        assert_eq!(drop_mail_arg(" 3d  big "), Ok((72 * hour, true)));
+        assert_eq!(drop_mail_arg("90m"), Ok((hour * 3 / 2, false)));
+        for bad in ["", "big", "0h", "48", "h", "-2h", "2w", "48h small", "48h big more", "99999d", "4\u{e9}"] {
+            assert!(drop_mail_arg(bad).is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn only_the_token_gets_in() {

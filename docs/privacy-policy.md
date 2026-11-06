@@ -67,7 +67,7 @@ how large (within a few set sizes). It can't see who sent it, who you are behind
 
 ## Your choices and rights
 
-- **Lock, Detach and Burn** in Settings control what stays on your device and the server. Burn deletes your account
+- **Lock, Detach and Burn** on the Burn tab control what stays on your device and the server. Burn deletes your account
   everywhere, and it can't be undone.
 - Because we hold no account details about you, we usually can't tell which data is yours. For a public handle or a
   collectible, contact us at [contact address] and we'll act on what we can verify.

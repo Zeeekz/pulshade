@@ -22,14 +22,16 @@ ${bold}pulshade-server${reset}: run the Pulshade relay on this server.
 
 ${bold}Relay${reset}
   start              Start it. It also starts by itself whenever the server does.
-  stop               Stop it. Waiting messages are kept, sealed, for the next start.
-  restart            Stop and start it.
+  stop               Stop it. Waiting messages live in memory only, so they are gone.
+  restart            Stop and start it. Waiting messages are dropped.
   status             Whether it's running and its onion address.
   logs               Follow its log.
   update             Rebuild from the latest source and restart.
 
 ${bold}Handles & accounts${reset}
   stats              Counts: handles, waiting messages, bans, uptime.
+  drop-mail AGE [big]  Drop waiting messages nobody has collected for AGE (90m, 48h, 3d) or longer, without a
+                     restart. With "big", texts stay and only pieces over 64 KB (photos, videos, stories) go.
   handles            Every public handle and its name.
   lookup @name       One handle: owner, bans, reserved.
   remove @name       Take a listing down. The name stays held for its owner for 3 months.
@@ -219,6 +221,8 @@ case "${1:-help}" in
   unban) [[ -n "${2:-}" ]] || fail "Which handle?"; admin unban-handle "$2" ;;
   ban-account|unban-account) [[ -n "${2:-}" ]] || fail "Which account?"; admin "$1" "$2" ;;
   give) [[ -n "${2:-}" && -n "${3:-}" ]] || fail "Give the handle and the account's key"; admin give "$2 $3" ;;
+  drop-mail) [[ "${2:-}" =~ ^[0-9]+[mhd]$ && "${3:-}" =~ ^(big)?$ ]] || fail "Give an age such as 90m, 48h or 3d, then optionally: big"
+    admin_raw drop-mail "$2 ${3:-}" | python3 -c 'import json,sys; d=json.load(sys.stdin); mb=lambda b: "%.1f MB" % (b/1048576); print("Dropped %d waiting messages (%s). Still waiting: %d (%s)." % (d["dropped"], mb(d["freedBytes"]), d["waiting"], mb(d["waitingBytes"])))' ;;
   backup) backup ;;
   mod-add) mod_add "${2:-}" "${3:-}" ;;
   mod-remove) mod_remove "${2:-}" ;;

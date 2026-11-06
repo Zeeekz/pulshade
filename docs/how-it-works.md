@@ -16,7 +16,7 @@ and so on. The folder is kept out of backups, and on iPhone the files can't be r
 the passcode is right but the data won't open, Pulshade stays locked and changes nothing, rather than opening an
 empty account that would save over it. The recovery code is the only way back in.
 
-**Lock, Detach and Burn.** The only three ways to leave, at the bottom of Settings.
+**Lock, Detach and Burn.** The only three ways to leave, on the Burn tab.
 - *Lock* closes the vault. Everything stays on the device, encrypted; the passcode (or Touch ID) opens it again.
 - *Detach* wipes this device at once, with no questions and no waiting on the network: everything on it is
   overwritten and the app starts fresh. Nothing is sent, so your other linked devices keep the account (and every

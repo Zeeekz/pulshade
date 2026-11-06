@@ -14,7 +14,6 @@ struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     @State private var path: [SettingsPage] = []
-    @State private var burning = false
     #if DEBUG
     @State private var demoCrop: PendingCrop?
     @State private var demoFrame = CropFrame.avatar
@@ -60,13 +59,6 @@ struct SettingsView: View {
                         }
                     }
                     #endif
-                    SettingsGroup(footer: "Lock closes PULSHADE until your passcode. Detach wipes this device at once, without asking. Burn deletes the account everywhere.") {
-                        ActionRow(title: "Lock") { model.lock() }
-                        RowDivider()
-                        ActionRow(title: "Detach") { model.wipeNow() }
-                        RowDivider()
-                        ActionRow(title: "Burn", destructive: true) { burning = true }
-                    }
                     HStack(spacing: 8) {
                         PulseMark(size: 18)
                         Wordmark(size: 9, color: Ink.faint)
@@ -111,7 +103,6 @@ struct SettingsView: View {
                 #endif
             }
         }
-        .sheet(isPresented: $burning) { BurnSheet() }
         #if DEBUG
         .onAppear {
             // Screenshots: PULSHADE_DEMO_SETTINGS=privacy opens that page.
