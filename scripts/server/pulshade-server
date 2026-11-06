@@ -186,7 +186,7 @@ mod_reports() {
 backup() {
   local dest; dest="$backups/$(date +%Y-%m-%d_%H-%M-%S)"
   install -d -m 700 "$backups" "$dest"
-  for f in pulshade-directory.json pulshade-moderation.json pulshade-held.json pulshade-collectibles.json pulshade-giveaways.json; do
+  for f in pulshade-directory.json pulshade-moderation.json pulshade-held.json pulshade-collectibles.json pulshade-giveaways.json pulshade-handle-history.json; do
     [[ -f "$data/$f" ]] && cp "$data/$f" "$dest/"
   done
   # Sealed with the storage key, so a copy of the backups alone can't take over the onion address.

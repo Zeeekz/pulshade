@@ -35,6 +35,27 @@ pub const COOL_OFF_SECS: u64 = 30 * 24 * 3600;
 /// claiming and letting go of them.
 pub const MAX_HANDLES: usize = 3;
 
+/// One thing that happened to a handle, for the operator's history: which name, what happened and when. Never who:
+/// no key, no profile and no address is kept with it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct HandleEvent {
+    /// Counts up from 1, so the admin app can ask for just what's new.
+    pub seq: u64,
+    /// Seconds since 1970.
+    pub at: u64,
+    pub handle: String,
+    /// `claimed`, `returned` (its old owner took it back), `released` (its owner let go), `let-go-early`, `burned`
+    /// (its account was burned), `taken-down`, `given` (set aside for someone), `freed`, `banned`, `unbanned`,
+    /// `account-banned`, `reserved` or `unreserved`.
+    pub what: String,
+}
+
+/// How many events the relay keeps: the oldest go first. The admin app keeps its own copy of everything it has seen.
+pub const MAX_HISTORY: usize = 20_000;
+
+/// The most events one answer carries.
+pub const HISTORY_PAGE: usize = 5_000;
+
 /// A handle no longer listed.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 struct Hold {
@@ -334,6 +355,9 @@ pub struct Directory {
     /// Handles no longer listed: only the key each is held for may list it again, until the hold runs out.
     held: HashMap<String, Hold>,
     held_path: Option<PathBuf>,
+    /// What has happened to handles, oldest first.
+    history: Vec<HandleEvent>,
+    history_path: Option<PathBuf>,
     /// Collectibles the creator gave out, for each owner to fetch.
     grants: Vec<Grant>,
     grants_path: Option<PathBuf>,
@@ -419,6 +443,7 @@ impl Directory {
     pub fn load(path: PathBuf, creator: Option<String>, sealer: Sealer) -> Self {
         let moderation_path = path.with_file_name("pulshade-moderation.json");
         let held_path = path.with_file_name("pulshade-held.json");
+        let history_path = path.with_file_name("pulshade-handle-history.json");
         let grants_path = path.with_file_name("pulshade-collectibles.json");
         let announcements_path = path.with_file_name("pulshade-announcements.json");
         let giveaways_path = path.with_file_name("pulshade-giveaways.json");
@@ -427,6 +452,7 @@ impl Directory {
         let (entries, plain_entries) = read_sealed(&path, &sealer);
         let (moderation, plain_moderation) = read_sealed(&moderation_path, &sealer);
         let (held, _): (HashMap<String, serde_json::Value>, _) = read_sealed(&held_path, &sealer);
+        let (history, _) = read_sealed(&history_path, &sealer);
         let (grants, _) = read_sealed(&grants_path, &sealer);
         let (announcements, _) = read_sealed(&announcements_path, &sealer);
         let (giveaways, _) = read_sealed(&giveaways_path, &sealer);
@@ -445,6 +471,8 @@ impl Directory {
             moderation_path: Some(moderation_path),
             held,
             held_path: Some(held_path),
+            history,
+            history_path: Some(history_path),
             grants,
             grants_path: Some(grants_path),
             announcements,
@@ -501,6 +529,37 @@ impl Directory {
         if let (Some(path), Ok(raw)) = (&self.held_path, serde_json::to_vec(&self.held)) {
             self.write_sealed(path, &raw);
         }
+    }
+
+    fn persist_history(&self) {
+        if let (Some(path), Ok(raw)) = (&self.history_path, serde_json::to_vec(&self.history)) {
+            self.write_sealed(path, &raw);
+        }
+    }
+
+    /// Notes that something happened to a handle.
+    fn log(&mut self, handle: &str, what: &str) {
+        let seq = self.history.last().map_or(1, |e| e.seq + 1);
+        self.history.push(HandleEvent { seq, at: now(), handle: handle.to_string(), what: what.to_string() });
+        if self.history.len() > MAX_HISTORY {
+            let extra = self.history.len() - MAX_HISTORY;
+            self.history.drain(..extra);
+        }
+        self.persist_history();
+    }
+
+    /// The history: `after N` for what's newer than event N, a handle for just its events, nothing for the latest.
+    pub fn history(&self, filter: &str) -> Vec<HandleEvent> {
+        let filter = filter.trim().trim_start_matches('@').to_lowercase();
+        if let Some(n) = filter.strip_prefix("after ") {
+            let after: u64 = n.trim().parse().unwrap_or(0);
+            return self.history.iter().filter(|e| e.seq > after).take(HISTORY_PAGE).cloned().collect();
+        }
+        if filter.is_empty() {
+            let skip = self.history.len().saturating_sub(HISTORY_PAGE);
+            return self.history[skip..].to_vec();
+        }
+        self.history.iter().filter(|e| e.handle == filter).cloned().collect()
     }
 
     fn persist_grants(&self) {
@@ -594,6 +653,7 @@ impl Directory {
         message.extend_from_slice(&entry.updated.to_be_bytes());
         message.extend_from_slice(&blob);
         owner.verify(&message, &sig).map_err(|_| StatusCode::UNAUTHORIZED)?;
+        let mut claimed = None;
         if let Some(existing) = self.entries.get(handle) {
             // Taken by someone else, or an old copy being replayed.
             if existing.key != entry.key {
@@ -613,10 +673,13 @@ impl Directory {
             if self.creator.as_deref() != Some(entry.key.as_str()) && self.handles_of(&entry.key, handle) >= MAX_HANDLES {
                 return Err(StatusCode::UNPROCESSABLE_ENTITY);
             }
+            // Still held, and not locked against it: its old owner is back.
+            claimed = Some(if self.live_hold(handle).is_some() { "returned" } else { "claimed" });
             if self.held.remove(handle).is_some() { self.persist_held(); }
         }
         self.entries.insert(handle.to_string(), entry);
         self.persist();
+        if let Some(what) = claimed { self.log(handle, what); }
         Ok(())
     }
 
@@ -647,6 +710,7 @@ impl Directory {
         self.entries.remove(handle);
         self.persist();
         self.hold(handle, Some(&key));
+        self.log(handle, "released");
         Ok(())
     }
 
@@ -673,6 +737,7 @@ impl Directory {
         let now = now();
         self.held.insert(handle.to_string(), Hold { key: None, since: now, until: Some(now + COOL_OFF_SECS) });
         self.persist_held();
+        self.log(handle, "let-go-early");
         Ok(())
     }
 
@@ -689,8 +754,9 @@ impl Directory {
             hold.key = None;
             count += 1;
         }
-        for h in listed { self.held.insert(h, Hold { key: None, since: now(), until: None }); }
+        for h in &listed { self.held.insert(h.clone(), Hold { key: None, since: now(), until: None }); }
         self.persist_held();
+        for h in &listed { self.log(h, "burned"); }
         // Its collectibles go with it, so nothing on the relay names the key any more. Their numbers stay used, and
         // one with a backup code stays claimable, tied to nobody, for whoever enters the code.
         let before = self.grants.clone();
@@ -1172,6 +1238,7 @@ impl Directory {
         let Some(entry) = self.entries.remove(handle) else { return false };
         self.persist();
         self.hold(handle, Some(&entry.key));
+        self.log(handle, "taken-down");
         true
     }
 
@@ -1181,13 +1248,14 @@ impl Directory {
         key(to).ok_or(StatusCode::BAD_REQUEST)?;
         if self.entries.remove(handle).is_some() { self.persist(); }
         self.hold(handle, Some(to));
+        self.log(handle, "given");
         Ok(())
     }
 
     /// Lets anyone claim a held name. Only the operator does this, on purpose.
     pub fn free(&mut self, handle: &str) -> bool {
         let found = self.held.remove(handle).is_some();
-        if found { self.persist_held(); }
+        if found { self.persist_held(); self.log(handle, "freed"); }
         found
     }
 
@@ -1196,11 +1264,13 @@ impl Directory {
         self.take_down(handle);
         self.moderation.banned_handles.insert(handle.to_string());
         self.persist_moderation();
+        self.log(handle, "banned");
     }
 
     pub fn unban_handle(&mut self, handle: &str) -> bool {
         let found = self.moderation.banned_handles.remove(handle);
         self.persist_moderation();
+        if found { self.log(handle, "unbanned"); }
         found
     }
 
@@ -1212,6 +1282,7 @@ impl Directory {
         // Held for the banned key, so nobody else can take up its names.
         for h in &gone { self.held.insert(h.clone(), Hold { key: Some(key_hash(key)), since: now(), until: None }); }
         self.persist_held();
+        for h in &gone { self.log(h, "account-banned"); }
         self.moderation.banned_keys.insert(key.to_string());
         self.persist_moderation();
         gone
@@ -1226,11 +1297,13 @@ impl Directory {
     pub fn reserve(&mut self, handle: &str) {
         self.moderation.reserved.insert(handle.to_string());
         self.persist_moderation();
+        self.log(handle, "reserved");
     }
 
     pub fn unreserve(&mut self, handle: &str) -> bool {
         let found = self.moderation.reserved.remove(handle);
         self.persist_moderation();
+        if found { self.log(handle, "unreserved"); }
         found
     }
 
@@ -1422,6 +1495,40 @@ mod tests {
         let creator = SigningKey::from_bytes(&[7; 32]);
         let mut mine = Directory::with_creator(&B64.encode(creator.verifying_key().to_bytes()));
         for h in ["aaa", "bbb", "ccc", "ddd"] { assert!(mine.put(h, signed(&creator, h, b"x", 1)).is_ok()); }
+    }
+
+    #[test]
+    fn the_history_notes_what_happened_to_a_name_and_never_who() {
+        let mut dir = Directory::default();
+        let alice = SigningKey::from_bytes(&[1; 32]);
+        dir.put("nova", signed(&alice, "nova", b"v1", 10)).unwrap();
+        dir.put("nova", signed(&alice, "nova", b"v2", 11)).unwrap();
+        remove_signed(&mut dir, &alice, "nova");
+        dir.put("nova", signed(&alice, "nova", b"v3", 12)).unwrap();
+        assert!(dir.take_down("nova"));
+        assert!(dir.free("nova"));
+        dir.ban_handle("spam");
+        dir.reserve("brand");
+        let all = dir.history("");
+        let what: Vec<(&str, &str)> = all.iter().map(|e| (e.handle.as_str(), e.what.as_str())).collect();
+        assert_eq!(what, [
+            ("nova", "claimed"), ("nova", "released"), ("nova", "returned"), ("nova", "taken-down"), ("nova", "freed"),
+            ("spam", "banned"), ("brand", "reserved"),
+        ], "an update to a profile isn't an event");
+        assert!(all.windows(2).all(|w| w[1].seq == w[0].seq + 1 && w[1].at >= w[0].at));
+        assert_eq!(dir.history("after 5").len(), 2, "only what's newer");
+        assert_eq!(dir.history("@nova").len(), 5);
+        let raw = serde_json::to_string(&all).unwrap();
+        assert!(!raw.contains(&B64.encode(alice.verifying_key().to_bytes())), "no key in it");
+    }
+
+    #[test]
+    fn the_history_forgets_the_oldest_past_its_limit() {
+        let mut dir = Directory::default();
+        for i in 0..(MAX_HISTORY + 5) { dir.log(&format!("n{}", i % 50), "reserved"); }
+        assert_eq!(dir.history.len(), MAX_HISTORY);
+        assert_eq!(dir.history[0].seq, 6, "the first five went");
+        assert_eq!(dir.history("after 0").len(), HISTORY_PAGE, "a page at a time");
     }
 
     #[test]
