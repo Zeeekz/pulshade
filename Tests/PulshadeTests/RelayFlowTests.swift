@@ -2420,6 +2420,26 @@ struct RelayFlowTests {
         #expect(me.canAddPersona, "Burning one frees a place")
     }
 
+    /// The Chats tab's red count covers only the chats the list shows. Another persona's unread chats show on the
+    /// account picture instead, so the tab never holds a count that opening the list can't clear.
+    @Test func chatsTabCountsOnlyThePersonaInView() async throws {
+        let me = try await makeUser("Me")
+        defer { me.lock() }
+        let mask = try #require(me.createPersona(name: "Mask"))
+        var here = Conversation(kind: .direct, title: "Here", members: ["a"], unread: 2)
+        here.persona = nil
+        var there = Conversation(kind: .direct, title: "There", members: ["b"], unread: 3)
+        there.persona = mask.id
+        me.data.conversations.append(contentsOf: [here, there])
+
+        #expect(me.unreadTotal == 5, "The app icon counts everything")
+        #expect(me.unreadInView == 2, "The tab counts what the list shows")
+        me.switchPersona(mask.id)
+        #expect(me.unreadInView == 3)
+        me.markRead(there.id)
+        #expect(me.unreadInView == 0 && me.unreadTotal == 2)
+    }
+
     @Test func personasDontShareADeviceID() async throws {
         let me = try await makeUser("Me")
         defer { me.lock() }

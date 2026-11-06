@@ -80,7 +80,7 @@ private struct PhoneMainView: View {
                         }
                 }
             }
-            .badge(model.unreadTotal)
+            .badge(model.unreadInView)
             Tab("Contacts", systemImage: "person.2", value: Section.contacts) {
                 ContactsView(openChat: open).background(Ink.base)
             }

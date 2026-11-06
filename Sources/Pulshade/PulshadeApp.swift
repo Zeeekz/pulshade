@@ -214,7 +214,10 @@ struct RootView: View {
             .animation(.smooth(duration: 0.25), value: active)
             #if os(macOS)
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in active = false }
-            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in active = true }
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                active = true
+                model.markOpenConversationRead()
+            }
             .onAppear { model.openMainWindow = { openWindow(id: "main") } }
             #else
             // In the app switcher iOS shows a snapshot; covering the app first keeps chats out of it.

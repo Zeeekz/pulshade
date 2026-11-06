@@ -270,6 +270,14 @@ final class AppModel {
         guard phase == .unlocked, let since = backgroundedAt else { return }
         let minutes = data.security.autoLockMinutes
         if minutes > 0, Date().timeIntervalSince(since) > Double(minutes) * 60 { lock() } else { lastActivity = Date() }
+        markOpenConversationRead()
+    }
+
+    /// A message that came in while the app was behind counts as unread, even in the chat left open. Coming back
+    /// to the front is when that chat is seen, so its count (and the red mark on the tab) goes now.
+    func markOpenConversationRead() {
+        guard phase == .unlocked, appActive, let open = openConversation else { return }
+        markRead(open)
     }
 
     /// After a spell in the background, where iOS shuts Tor's port and lets connections die: Tor listens again,
@@ -712,6 +720,15 @@ final class AppModel {
 
     var unreadTotal: Int {
         data.conversations.filter { !$0.muted }.reduce(0) { $0 + $1.unread }
+    }
+
+    /// Unread messages in the chats the list shows: the active persona's, the burners' and the announcements. The
+    /// Chats tab counts only these, so its red mark can always be cleared by opening what is in front of you; other
+    /// personas' unread shows on the account picture instead.
+    var unreadInView: Int {
+        data.conversations
+            .filter { !$0.muted && ($0.persona == activePersona || isBurner($0.persona) || $0.isAnnouncements) }
+            .reduce(0) { $0 + $1.unread }
     }
 
     /// Chats with something new, newest first, for the menu bar.
