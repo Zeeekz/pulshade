@@ -894,9 +894,8 @@ final class AppModel {
         case let .image(data, _):
             image = PlatformImage(data: data)
         case let .video(data, _):
-            guard !data.isEmpty, let url = StoryVideo.tempFile(for: data) else { return nil }
-            defer { try? FileManager.default.removeItem(at: url) }
-            image = await StoryVideo.poster(of: url).map { PlatformImage.from(cgImage: $0) }
+            guard !data.isEmpty else { return nil }
+            image = await StoryVideo.poster(of: MemoryClip(data)).map { PlatformImage.from(cgImage: $0) }
         case .text:
             let renderer = ImageRenderer(content: StoryFace(story: story, compact: true).frame(width: 90, height: 160))
             renderer.scale = 2
@@ -4658,6 +4657,7 @@ extension AppModel {
         await syncOnce()
         trafficShaping = shaping
         destroyEverything(leavingNoTrace: true)
+        Vault.scrubLeftovers()
     }
 
     /// Burns one persona for good, leaving your main identity and other personas as they are: its @handles are

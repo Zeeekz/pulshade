@@ -68,7 +68,7 @@ struct StoryMediaTests {
     }
 
     /// Writes a moving test clip (a sweeping colour field) of the given length and shape.
-    static func clip(seconds: Double, width: Int = 640, height: Int = 360, fps: Int = 15, sound: Bool = false) async throws -> URL {
+    static func clipFile(seconds: Double, width: Int = 640, height: Int = 360, fps: Int = 15, sound: Bool = false) async throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("test-\(UUID().uuidString).mp4")
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
         let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
@@ -107,6 +107,38 @@ struct StoryMediaTests {
         return url
     }
 
+    /// The same clip, held in memory as the app does; the file the test writer needs is gone again at once.
+    static func clip(seconds: Double, width: Int = 640, height: Int = 360, fps: Int = 15, sound: Bool = false) async throws -> MemoryClip {
+        let url = try await clipFile(seconds: seconds, width: width, height: height, fps: fps, sound: sound)
+        defer { try? FileManager.default.removeItem(at: url) }
+        return MemoryClip(try Data(contentsOf: url))
+    }
+
+    /// Camera-like frames, one picture at a time, with times that start well into the clock as a camera's do.
+    static func cameraFrame(_ n: Int, start: CMTime, width: Int, height: Int, fps: Int32) -> CMSampleBuffer {
+        var buffer: CVPixelBuffer?
+        CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA,
+                            [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary, &buffer)
+        let b = buffer!
+        CVPixelBufferLockBaseAddress(b, [])
+        let base = CVPixelBufferGetBaseAddress(b)!.assumingMemoryBound(to: UInt8.self)
+        let stride = CVPixelBufferGetBytesPerRow(b)
+        for x in 0..<width {
+            base[x * 4] = UInt8((x + n * 7) % 256); base[x * 4 + 1] = UInt8((x / 2 + n * 3) % 256)
+            base[x * 4 + 2] = UInt8(255 - (x + n * 5) % 256); base[x * 4 + 3] = 255
+        }
+        for y in 1..<height { memcpy(base + y * stride, base, width * 4) }
+        CVPixelBufferUnlockBaseAddress(b, [])
+        var format: CMVideoFormatDescription?
+        CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: b, formatDescriptionOut: &format)
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: fps),
+                                        presentationTimeStamp: start + CMTime(value: Int64(n), timescale: fps), decodeTimeStamp: .invalid)
+        var out: CMSampleBuffer?
+        CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: b, formatDescription: format!,
+                                                 sampleTiming: &timing, sampleBufferOut: &out)
+        return out!
+    }
+
     @Test func everyLookChangesThePhotoAndOriginalDoesNot() throws {
         let photo = Self.photo()
         let plain = try #require(StoryFilter.none.bake(into: photo))
@@ -136,12 +168,9 @@ struct StoryMediaTests {
 
     @Test func aLongClipIsCutToFifteenSecondsPortraitAndSmall() async throws {
         let source = try await Self.clip(seconds: 20)
-        defer { try? FileManager.default.removeItem(at: source) }
         let data = try await StoryVideo.export(from: source, filter: .none)
         #expect(data.count <= StoryVideo.maxBytes)
-        let url = try #require(StoryVideo.tempFile(for: data))
-        defer { try? FileManager.default.removeItem(at: url) }
-        let asset = AVURLAsset(url: url)
+        let asset = MemoryClip(data).makeAsset()
         let seconds = try await asset.load(.duration).seconds
         #expect(seconds > 14 && seconds <= 15.2)
         let track = try #require(try await asset.loadTracks(withMediaType: .video).first)
@@ -152,12 +181,9 @@ struct StoryMediaTests {
 
     @Test func aFullHDClipIsKeptFullHDAndSmall() async throws {
         let source = try await Self.clip(seconds: 4, width: 1920, height: 1080, fps: 30)
-        defer { try? FileManager.default.removeItem(at: source) }
         let data = try await StoryVideo.export(from: source, filter: .none)
         #expect(data.count <= StoryVideo.maxBytes)
-        let url = try #require(StoryVideo.tempFile(for: data))
-        defer { try? FileManager.default.removeItem(at: url) }
-        let asset = AVURLAsset(url: url)
+        let asset = MemoryClip(data).makeAsset()
         let track = try #require(try await asset.loadTracks(withMediaType: .video).first)
         let size = try await track.load(.naturalSize)
         #expect(Int(size.width) == 1080 && Int(size.height) == 1920)
@@ -171,12 +197,9 @@ struct StoryMediaTests {
 
     @Test func zoomRecordedOnTheMacIsBakedIntoTheClip() async throws {
         let source = try await Self.clip(seconds: 2)
-        defer { try? FileManager.default.removeItem(at: source) }
         func frame(_ zoom: ZoomTrack) async throws -> [Double] {
             let data = try await StoryVideo.export(from: source, filter: .none, zoom: zoom)
-            let url = try #require(StoryVideo.tempFile(for: data))
-            defer { try? FileManager.default.removeItem(at: url) }
-            return Self.pixels(try #require(await StoryVideo.poster(of: url)))
+            return Self.pixels(try #require(await StoryVideo.poster(of: MemoryClip(data))))
         }
         var zoomed = ZoomTrack.none
         zoomed.add(at: 0, zoom: 3)
@@ -186,12 +209,9 @@ struct StoryMediaTests {
 
     @Test func aLookIsBakedIntoTheVideoFrames() async throws {
         let source = try await Self.clip(seconds: 2)
-        defer { try? FileManager.default.removeItem(at: source) }
         func frame(_ look: StoryFilter) async throws -> [Double] {
             let data = try await StoryVideo.export(from: source, filter: look)
-            let url = try #require(StoryVideo.tempFile(for: data))
-            defer { try? FileManager.default.removeItem(at: url) }
-            let still = try #require(await StoryVideo.poster(of: url))
+            let still = try #require(await StoryVideo.poster(of: MemoryClip(data)))
             return Self.pixels(still)
         }
         let plain = try await frame(.none), mono = try await frame(.mono)
@@ -202,9 +222,39 @@ struct StoryMediaTests {
 
     @Test func aTightBudgetStillFitsOrFailsCleanly() async throws {
         let source = try await Self.clip(seconds: 3)
-        defer { try? FileManager.default.removeItem(at: source) }
         let data = try await StoryVideo.export(from: source, filter: .none, maxBytes: 400_000)
         #expect(data.count <= 400_000)
+    }
+
+    @Test func aRecordedClipIsBuiltInMemoryAndPlays() async throws {
+        let start = CMTime(seconds: 5000, preferredTimescale: 600)
+        let writer = try #require(ClipWriter(size: CGSize(width: 640, height: 360), audio: nil, start: start))
+        for n in 0..<90 {
+            while !writer.ready { try await Task.sleep(for: .milliseconds(2)) }
+            writer.append(picture: Self.cameraFrame(n, start: start, width: 640, height: 360, fps: 30))
+        }
+        let clip: MemoryClip = try #require(await withCheckedContinuation { done in writer.finish { done.resume(returning: $0) } })
+        #expect(!clip.bytes.isEmpty)
+        let asset = clip.makeAsset()
+        #expect(try await asset.load(.isPlayable))
+        let seconds = try await asset.load(.duration).seconds
+        #expect(seconds > 2.8 && seconds < 3.2)
+        // It can be read frame by frame, which is what editing and exporting do, with no file behind it.
+        let exported = try await StoryVideo.export(from: clip, filter: .none)
+        #expect(!exported.isEmpty && exported.count <= StoryVideo.maxBytes)
+        #expect(try await MemoryClip(exported).makeAsset().load(.duration).seconds > 2.8)
+    }
+
+    @Test func aPauseInTheFramesIsHeldNotLost() async throws {
+        // The camera was flipped: no frames for two thirds of a second, then they carry on.
+        let start = CMTime(seconds: 100, preferredTimescale: 600)
+        let writer = try #require(ClipWriter(size: CGSize(width: 640, height: 360), audio: nil, start: start))
+        for n in Array(0..<30) + Array(50..<80) {
+            while !writer.ready { try await Task.sleep(for: .milliseconds(2)) }
+            writer.append(picture: Self.cameraFrame(n, start: start, width: 640, height: 360, fps: 30))
+        }
+        let clip: MemoryClip = try #require(await withCheckedContinuation { done in writer.finish { done.resume(returning: $0) } })
+        #expect(try await clip.makeAsset().load(.duration).seconds > 2.5)
     }
 
     @Test func aVideoStoryRoundTripsOnTheWire() throws {

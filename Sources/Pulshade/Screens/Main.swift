@@ -391,6 +391,8 @@ private struct ChatList: View {
     @State private var burningAccount = false
     /// How tall the search bar and stories are together, so the list can snap past them.
     @State private var storiesHeight: CGFloat = 0
+    /// Where the story strip is on screen, kept out of view state: it changes with every scroll frame.
+    @State private var stripBox = FrameBox()
 
     private var items: [Conversation] {
         model.sortedConversations.filter { c in
@@ -450,6 +452,7 @@ private struct ChatList: View {
                         searchField
                         StoryStrip(composing: $composingStory, viewing: $viewingStory)
                             .padding(.vertical, 12)
+                            .onGeometryChange(for: CGRect.self) { $0.frame(in: .named("chatlist")) } action: { stripBox.rect = $0 }
                     }
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { storiesHeight = $0 }
                     SwiftUI.Section {
@@ -465,6 +468,17 @@ private struct ChatList: View {
             .scrollIndicators(.never)
             .scrollDismissesKeyboard(.immediately)
             .scrollTargetBehavior(StoriesSnap(height: storiesHeight))
+            .coordinateSpace(.named("chatlist"))
+            #if os(iOS)
+            // Swipe right on the chats, as "back" from the first page, and the story camera opens, as on Instagram.
+            // A swipe that starts on the story strip scrolls the strip instead.
+            .simultaneousGesture(DragGesture(minimumDistance: 30, coordinateSpace: .named("chatlist")).onEnded { drag in
+                let dx = drag.translation.width, dy = drag.translation.height
+                guard dx > 90, abs(dx) > abs(dy) * 2, !stripBox.rect.contains(drag.startLocation) else { return }
+                Haptics.tick()
+                composingStory = true
+            })
+            #endif
         }
         .sheet(isPresented: $burningAccount) { BurnSheet() }
         .confirmationDialog(confirmDelete?.deleteWarning.title ?? "",
@@ -776,4 +790,9 @@ private struct PersonaSwitcher: View {
         model.switchPersona(persona.id)
         done()
     }
+}
+
+/// A rectangle that can change without redrawing anything that holds it.
+private final class FrameBox {
+    var rect = CGRect.null
 }

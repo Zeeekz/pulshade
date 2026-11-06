@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import CoreImage
+import UniformTypeIdentifiers
 
 /// The camera for stories: a live preview with a look applied, one photo at a time or a clip of up to 15
 /// seconds, front or back, with flash on iPhone. The back camera zooms out to the ultra wide lens where the iPhone
@@ -28,7 +29,7 @@ final class Camera: NSObject {
     private(set) var hasFlash = false
     @ObservationIgnored private var micAllowed = false
     @ObservationIgnored private var taken: ((PlatformImage) -> Void)?
-    @ObservationIgnored private var recorded: ((URL?, ZoomTrack) -> Void)?
+    @ObservationIgnored private var recorded: ((MemoryClip?, ZoomTrack) -> Void)?
     @ObservationIgnored private var device: AVCaptureDevice?
     /// The zoom now as the person sees it: 1 is the main lens, below 1 is the ultra wide one.
     private(set) var zoom: CGFloat = 1
@@ -104,21 +105,21 @@ final class Camera: NSObject {
         output.capturePhoto(with: settings, delegate: self)
     }
 
-    /// Starts a clip; it stops by itself at 15 seconds. `done` gets the file, or nil if nothing was kept.
-    func record(_ done: @escaping (URL?, ZoomTrack) -> Void) {
+    /// Starts a clip; it stops by itself at 15 seconds. `done` gets the clip, or nil if nothing was kept. The clip is
+    /// built in memory and never written to a file.
+    func record(_ done: @escaping (MemoryClip?, ZoomTrack) -> Void) {
         guard running, !recording else { return }
         recorded = done
         zoomTrack = ZoomTrack()
         #if os(macOS)
         zoomTrack.add(at: 0, zoom: zoom)
         #endif
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("story-rec-\(UUID().uuidString).mov")
         setTorch(flash && hasFlash)
         recording = true
         recordingStart = Date()
-        let audio = micAllowed ? sound.recommendedAudioSettingsForAssetWriter(writingTo: .mov) as? [String: Any] : nil
-        framer.startClip(to: url, audio: audio) { [weak self] url in
-            Task { @MainActor in self?.finished(url) }
+        let audio = micAllowed ? sound.recommendedAudioSettingsForAssetWriter(writingTo: .mp4) as? [String: Any] : nil
+        framer.startClip(audio: audio) { [weak self] clip in
+            Task { @MainActor in self?.finished(clip) }
         }
     }
 
@@ -283,11 +284,11 @@ final class Camera: NSObject {
         taken = nil
     }
 
-    fileprivate func finished(_ url: URL?) {
+    fileprivate func finished(_ clip: MemoryClip?) {
         recording = false
         recordingStart = nil
         setTorch(false)
-        recorded?(url, zoomTrack)
+        recorded?(clip, zoomTrack)
         recorded = nil
     }
 }
@@ -314,7 +315,7 @@ private final class FrameFilter: NSObject, AVCaptureVideoDataOutputSampleBufferD
     nonisolated(unsafe) var layer: AVSampleBufferDisplayLayer?
     // The clip (queue only), and what's needed to start it on the first frame.
     private var clip: ClipWriter?
-    private var wanted: (url: URL, audio: [String: Any]?, ended: (URL?) -> Void)?
+    private var wanted: (audio: [String: Any]?, ended: (MemoryClip?) -> Void)?
 
     var filter: StoryFilter {
         get { lock.withLock { current } }
@@ -327,9 +328,9 @@ private final class FrameFilter: NSObject, AVCaptureVideoDataOutputSampleBufferD
         set { lock.withLock { zoomed = newValue } }
     }
 
-    /// Begins a clip with the next frame. `ended` gets the file once it's finished, or nil if nothing was kept.
-    func startClip(to url: URL, audio: [String: Any]?, ended: @escaping (URL?) -> Void) {
-        queue.async { self.wanted = (url, audio, ended) }
+    /// Begins a clip with the next frame. `ended` gets the clip once it's finished, or nil if nothing was kept.
+    func startClip(audio: [String: Any]?, ended: @escaping (MemoryClip?) -> Void) {
+        queue.async { self.wanted = (audio, ended) }
     }
 
     /// Finishes the clip; harmless when there isn't one.
@@ -342,7 +343,7 @@ private final class FrameFilter: NSObject, AVCaptureVideoDataOutputSampleBufferD
             self.clip = nil
             let ended = wanted?.ended
             wanted = nil
-            clip.finish { url in ended?(url) }
+            clip.finish { made in ended?(made) }
         } else if let wanted {
             // Stopped before a single frame came in.
             self.wanted = nil
@@ -357,7 +358,7 @@ private final class FrameFilter: NSObject, AVCaptureVideoDataOutputSampleBufferD
         }
         if clip == nil, let wanted, let source = CMSampleBufferGetImageBuffer(sampleBuffer) {
             let size = CGSize(width: CVPixelBufferGetWidth(source), height: CVPixelBufferGetHeight(source))
-            if let made = ClipWriter(url: wanted.url, size: size, audio: wanted.audio) { clip = made }
+            if let made = ClipWriter(size: size, audio: wanted.audio, start: CMSampleBufferGetPresentationTimeStamp(sampleBuffer)) { clip = made }
             else { self.wanted = nil; wanted.ended(nil) }
         }
         if let clip {
@@ -420,20 +421,26 @@ private final class FrameFilter: NSObject, AVCaptureVideoDataOutputSampleBufferD
     }
 }
 
-/// A clip being written from the camera's frames and sound. Both start together at the first frame, and it's full
-/// at 15 seconds. When the camera is flipped there are no frames for a moment: the clip holds the last picture
-/// while the sound carries on.
-private final class ClipWriter {
+/// A clip being built from the camera's frames and sound, entirely in memory: the writer hands over its output in
+/// pieces and they are joined into one fragmented MP4. Both start together at the first frame, and it's full at 15
+/// seconds. When the camera is flipped there are no frames for a moment: the clip holds the last picture while the
+/// sound carries on.
+final class ClipWriter {
     private let writer: AVAssetWriter
     private let picture: AVAssetWriterInput
     private let voice: AVAssetWriterInput?
-    private let url: URL
     private let size: CGSize
-    private var start: CMTime?
+    private let start: CMTime
+    private let sink = SegmentSink()
+    private var began = false
     private(set) var full = false
 
-    init?(url: URL, size: CGSize, audio: [String: Any]?) {
-        guard let writer = try? AVAssetWriter(outputURL: url, fileType: .mov) else { return nil }
+    init?(size: CGSize, audio: [String: Any]?, start: CMTime) {
+        let writer = AVAssetWriter(contentType: UTType.mpeg4Movie)
+        writer.outputFileTypeProfile = .mpeg4AppleHLS
+        writer.preferredOutputSegmentInterval = CMTime(seconds: 1, preferredTimescale: 1)
+        writer.initialSegmentStartTime = start
+        writer.delegate = sink
         let picture = AVAssetWriterInput(mediaType: .video, outputSettings: [
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: Int(size.width), AVVideoHeightKey: Int(size.height),
@@ -453,39 +460,41 @@ private final class ClipWriter {
             if writer.canAdd(input) { writer.add(input); voice = input }
         }
         guard writer.startWriting() else { return nil }
-        self.writer = writer; self.picture = picture; self.voice = voice; self.url = url; self.size = size
+        writer.startSession(atSourceTime: start)
+        self.writer = writer; self.picture = picture; self.voice = voice; self.size = size; self.start = start
     }
+
+    /// Whether the writer can take another picture now.
+    var ready: Bool { picture.isReadyForMoreMediaData }
 
     func append(picture buffer: CMSampleBuffer) {
         guard writer.status == .writing, let source = CMSampleBufferGetImageBuffer(buffer),
-              CGFloat(CVPixelBufferGetWidth(source)) == size.width, CGFloat(CVPixelBufferGetHeight(source)) == size.height else { return }
+              CGFloat(CVPixelBufferGetWidth(source)) == size.width, CGFloat(CVPixelBufferGetHeight(source)) == size.height,
+              picture.isReadyForMoreMediaData else { return }
         let time = CMSampleBufferGetPresentationTimeStamp(buffer)
-        if start == nil { start = time; writer.startSession(atSourceTime: time) }
-        guard picture.isReadyForMoreMediaData else { return }
+        guard time >= start else { return }
         picture.append(buffer)
-        if let start, (time - start).seconds >= StoryVideo.maxSeconds { full = true }
+        began = true
+        if (time - start).seconds >= StoryVideo.maxSeconds { full = true }
     }
 
     func append(sound buffer: CMSampleBuffer) {
-        guard let start, let voice, writer.status == .writing, voice.isReadyForMoreMediaData,
+        guard began, let voice, writer.status == .writing, voice.isReadyForMoreMediaData,
               CMSampleBufferGetPresentationTimeStamp(buffer) >= start else { return }
         voice.append(buffer)
     }
 
-    func finish(_ done: @escaping (URL?) -> Void) {
-        let url = url
-        guard start != nil, writer.status == .writing else {
+    func finish(_ done: @escaping (MemoryClip?) -> Void) {
+        guard began, writer.status == .writing else {
             writer.cancelWriting()
-            try? FileManager.default.removeItem(at: url)
             done(nil)
             return
         }
         picture.markAsFinished()
         voice?.markAsFinished()
-        let writer = writer
+        let writer = writer, sink = sink
         writer.finishWriting {
-            if writer.status == .completed { done(url) }
-            else { try? FileManager.default.removeItem(at: url); done(nil) }
+            done(writer.status == .completed ? MemoryClip(sink.bytes) : nil)
         }
     }
 }
