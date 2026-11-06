@@ -83,7 +83,7 @@ enum Signature {
     ]
 
     static func color(_ index: Int?, seed: String) -> Color {
-        colors[(index ?? abs(seed.stableHash)) % colors.count]
+        colors[(index ?? seed.stableHash).wrapped(colors.count)]
     }
 }
 
@@ -118,6 +118,12 @@ struct Heading: View {
             .foregroundStyle(Ink.text)
             .frame(maxWidth: .infinity, alignment: .leading)
     }
+}
+
+extension Int {
+    /// This number as an index into something `count` long. Negative ones wrap too, so a number sent by someone
+    /// else can never point outside.
+    func wrapped(_ count: Int) -> Int { ((self % count) + count) % count }
 }
 
 extension Color {
@@ -243,7 +249,7 @@ struct BarButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: size * 0.43, weight: .semibold))
-            .foregroundStyle(prominent ? AnyShapeStyle(Color.black.opacity(0.82)) : (tint ?? AnyShapeStyle(Ink.dim)))
+            .foregroundStyle(prominent ? AnyShapeStyle(Ink.onAccent.opacity(0.85)) : (tint ?? AnyShapeStyle(Ink.dim)))
             .frame(width: size, height: size)
             .background {
                 Circle().fill(prominent ? AnyShapeStyle(theme.accent) : AnyShapeStyle(configuration.isPressed ? Ink.hover : Ink.raised))

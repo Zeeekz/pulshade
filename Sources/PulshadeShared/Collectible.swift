@@ -143,7 +143,8 @@ public struct Collectible: Codable, Equatable, Hashable, Identifiable {
     public func isGenuine(for owner: Data, adminKey: Data?, petKey: Data? = nil) -> Bool {
         guard kind != nil, self.owner == owner else { return false }
         let message = Self.signedPart(item: item, serial: serial, owner: owner)
-        return [adminKey, petKey].contains { raw in
+        // The relay's key only counts for what can be hatched or passed on. A Guardian is the admin key's alone.
+        return [adminKey, kind?.transferable == true ? petKey : nil].contains { raw in
             guard let raw, let key = try? Curve25519.Signing.PublicKey(rawRepresentation: raw) else { return false }
             return key.isValidSignature(sig, for: message)
         }

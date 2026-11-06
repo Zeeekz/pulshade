@@ -242,7 +242,7 @@ struct CreateFlow: View {
                     StrengthBar(passcode: passcode).padding(.top, 4)
                 }
                 if let problem {
-                    Text(branded: problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange)
+                    ProblemText(problem)
                 }
             }
         } actions: {
@@ -261,6 +261,7 @@ struct CreateFlow: View {
                 // No copy button: clipboards sync between devices and clipboard apps keep history.
                 Text("Write it on paper. It isn't offered for copying, because clipboards sync to other devices and keep history.")
                     .font(.system(size: 12)).foregroundStyle(Ink.faint).multilineTextAlignment(.center)
+                if let problem { ProblemText(problem).multilineTextAlignment(.center) }
             }
         } actions: {
             Button(action: finish) { WorkingLabel(title: "I've saved it", working: working) }
@@ -288,7 +289,11 @@ struct CreateFlow: View {
         working = true
         Task {
             LockStyle.remembered = style
-            try? await model.create(identity: identity, profile: profile, passcode: passcode)
+            do {
+                try await model.create(identity: identity, profile: profile, passcode: passcode)
+            } catch {
+                withAnimation(.snappy) { problem = "Couldn't set up the account on this device. Check there's free space and try again." }
+            }
             working = false
         }
     }
@@ -377,10 +382,10 @@ struct RestoreFlow: View {
                     LookUpProgress(relay: model.data.relay, since: startedAt)
                 }
                 if let problem {
-                    Text(branded: problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange)
+                    ProblemText(problem)
                         .multilineTextAlignment(.center)
                 }
-                Text("If you logged out, everything comes back: your profile, contacts and chats.")
+                Text("If you detached, your profile, @handles, contacts and groups come back. Chats don't: they only ever lived on your devices.")
                     .font(.system(size: 12))
                     .foregroundStyle(Ink.faint)
                     .multilineTextAlignment(.center)
@@ -930,12 +935,13 @@ struct RecoveryCodeGrid: View {
     var code: String
     var body: some View {
         let groups = code.split(separator: " ").map(String.init)
-        LazyVGrid(columns: Array(repeating: GridItem(.fixed(Platform.isPhone ? 72 : 78), spacing: 10), count: Platform.isPhone ? 4 : 5), spacing: 10) {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: 60, maximum: 78), spacing: 10), count: Platform.isPhone ? 4 : 5), spacing: 10) {
             ForEach(Array(groups.enumerated()), id: \.offset) { i, g in
                 Text(g)
                     .font(.system(size: 15, weight: .semibold, design: .monospaced))
                     .foregroundStyle(Ink.text)
-                    .frame(width: 78, height: 36)
+                    .lineLimit(1).minimumScaleFactor(0.8)
+                    .frame(maxWidth: .infinity, minHeight: 36)
                     .glass(10)
                     .transition(.scale.combined(with: .opacity))
                     .animation(.snappy.delay(Double(i) * 0.03), value: code)

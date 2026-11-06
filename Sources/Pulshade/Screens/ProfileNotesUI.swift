@@ -124,11 +124,11 @@ struct NoteReaderSheet: View {
                 .background(Ink.surface, in: .rect(cornerRadius: 14, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Ink.line))
                 .onSubmit(tryOpen)
-            if let problem { Text(problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange) }
+            if let problem { ProblemText(problem) }
             Button(action: tryOpen) {
                 HStack(spacing: 8) {
                     if working { ProgressView().controlSize(.small) }
-                    Text(working ? "Unlocking..." : "Unlock").font(.system(size: 16, weight: .semibold))
+                    Text(working ? "Unlocking…" : "Unlock").font(.system(size: 16, weight: .semibold))
                 }
                 .foregroundStyle(Ink.onAccent).frame(maxWidth: .infinity, minHeight: 48)
                 .background(theme.gradient, in: .capsule)
@@ -237,8 +237,8 @@ struct NoteEditSheet: View {
                 .background(Ink.surface, in: .rect(cornerRadius: 14, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Ink.line))
                 .onSubmit(unlock)
-            if let problem { Text(problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange) }
-            primary(working ? "Unlocking..." : "Unlock", enabled: !unlockPassword.isEmpty && !working, action: unlock)
+            if let problem { ProblemText(problem) }
+            primary(working ? "Unlocking…" : "Unlock", enabled: !unlockPassword.isEmpty && !working, action: unlock)
             Spacer(minLength: 0)
         }
     }
@@ -268,7 +268,7 @@ struct NoteEditSheet: View {
                         HStack {
                             Label("Lock with a password", systemImage: "lock.fill").font(.system(size: 15)).foregroundStyle(Ink.text)
                             Spacer()
-                            Toggle("", isOn: Binding(get: { locked }, set: { on in
+                            Toggle("Lock with a password", isOn: Binding(get: { locked }, set: { on in
                                 withAnimation(.snappy) { locked = on; if on { forContacts = false } }
                             })).toggleStyle(GlowToggleStyle())
                         }
@@ -277,7 +277,7 @@ struct NoteEditSheet: View {
                         HStack {
                             Label("Only some contacts", systemImage: "person.2.fill").font(.system(size: 15)).foregroundStyle(Ink.text)
                             Spacer()
-                            Toggle("", isOn: Binding(get: { forContacts }, set: { on in
+                            Toggle("Only some contacts", isOn: Binding(get: { forContacts }, set: { on in
                                 withAnimation(.snappy) { forContacts = on; if on { locked = false } }
                             })).toggleStyle(GlowToggleStyle())
                         }
@@ -286,8 +286,8 @@ struct NoteEditSheet: View {
                 }
                 if locked { lockOptions }
                 if forContacts { contactOptions }
-                if let problem { Text(problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange) }
-                primary(working ? "Saving..." : "Save", enabled: canSave, action: commit)
+                if let problem { ProblemText(problem) }
+                primary(working ? "Saving…" : "Save", enabled: canSave, action: commit)
             }
         }
         .scrollIndicators(.never)
@@ -303,7 +303,7 @@ struct NoteEditSheet: View {
                     .textInputAutocapitalization(.never).autocorrectionDisabled()
                     #endif
             }
-            if let passwordProblem { Text(passwordProblem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange) }
+            if let passwordProblem { ProblemText(passwordProblem) }
             HStack {
                 Button {
                     let made = NoteSeal.generatePassword()

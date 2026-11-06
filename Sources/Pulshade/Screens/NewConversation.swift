@@ -53,18 +53,22 @@ struct NewConversationSheet: View {
             if kind != .channel {
                 ContactPicker(single: kind == .direct, picked: $picked)
             } else {
-                Image(systemName: "person.wave.2.fill")
-                    .font(.system(size: 28, weight: .light))
-                    .foregroundStyle(theme.gradient.opacity(0.7))
-                    .help("Followers join with the channel's invite link")
+                VStack(spacing: 8) {
+                    Image(systemName: "person.wave.2.fill")
+                        .font(.system(size: 28, weight: .light))
+                        .foregroundStyle(theme.gradient.opacity(0.7))
+                    Text("Followers join with the channel's invite link.")
+                        .font(.system(size: 12)).foregroundStyle(Ink.faint)
+                }
             }
             HStack(spacing: 12) {
                 Button { self.kind = nil; picked = [] } label: { Image(systemName: "chevron.left") }
                     .buttonStyle(IconButtonStyle(size: 46))
+                    .accessibilityLabel("Back")
                 Button { create(kind) } label: { Image(systemName: "checkmark") }
                     .buttonStyle(GlowButtonStyle(size: 46))
                     .disabled(!valid(kind))
-                    .opacity(valid(kind) ? 1 : 0.4)
+                    .accessibilityLabel("Create")
             }
         }
     }
@@ -108,7 +112,7 @@ private struct KindTile: View {
             }
             .frame(maxWidth: .infinity).frame(height: hot ? 84 : 110)
             .glass(14)
-            .overlay(RoundedRectangle(cornerRadius: 22).strokeBorder(theme.gradient.opacity(hover ? 0.7 : 0), lineWidth: 1.5))
+            .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(theme.gradient.opacity(hover ? 0.7 : 0), lineWidth: 1.5))
             .scaleEffect(hover ? 1.03 : 1)
         }
         .buttonStyle(.plain)
@@ -128,14 +132,14 @@ struct ContactPicker: View {
                 Image(systemName: "qrcode.viewfinder")
                     .font(.system(size: 34, weight: .light))
                     .foregroundStyle(theme.gradient)
-                Text("Swap invites first")
+                Text("Add someone from Invite first")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(Ink.faint)
             }
             .frame(height: 140)
         } else {
             ScrollView {
-                LazyVGrid(columns: Array(repeating: GridItem(.fixed(86), spacing: 10), count: 4), spacing: 14) {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 76, maximum: 96), spacing: 10)], spacing: 14) {
                     ForEach(model.visibleContacts) { c in
                         let on = picked.contains(c.fingerprint)
                         Button {
@@ -178,6 +182,7 @@ enum Burn {
 /// you; both sides are anonymous, and the chat is wiped from both when the time runs out.
 private struct ChatLinkForm: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.theme) private var theme
     var back: () -> Void
     var opened: (Conversation.ID) -> Void
 
@@ -207,7 +212,7 @@ private struct ChatLinkForm: View {
                         Text("Couldn't reach the relay to make a code. The QR code and link still work.")
                             .font(.system(size: 12)).foregroundStyle(Ink.faint).multilineTextAlignment(.center)
                         Button("Try again") { makeCode(for: link) }
-                            .font(.system(size: 13, weight: .semibold)).buttonStyle(.plain).foregroundStyle(Color.accentColor)
+                            .font(.system(size: 13, weight: .semibold)).buttonStyle(.plain).foregroundStyle(theme.accent)
                     } else {
                         HStack(spacing: 8) {
                             ProgressView().controlSize(.small)
@@ -267,7 +272,7 @@ private struct ChatLinkForm: View {
                         .disabled(theirLink.isEmpty || joining)
                 }
                 if let problem {
-                    Text(branded: problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange)
+                    ProblemText(problem)
                 }
             }
 

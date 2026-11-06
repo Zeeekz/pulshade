@@ -93,7 +93,7 @@ struct CollectiblesView: View {
                 .font(.system(size: 12)).foregroundStyle(Ink.faint)
                 .fixedSize(horizontal: false, vertical: true)
             if let problem {
-                Text(problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange)
+                ProblemText(problem)
             }
         }
     }

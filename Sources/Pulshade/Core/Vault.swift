@@ -262,7 +262,11 @@ struct Vault {
     /// A new Secure Enclave key for this vault. Nil where there's no Secure Enclave (the Simulator,
     /// older Macs), and when tests ask for none.
     private static func makeBinding() -> DeviceBinding? {
-        guard SecureEnclave.isAvailable, ProcessInfo.processInfo.environment["PULSHADE_NO_ENCLAVE"] == nil else { return nil }
+        guard SecureEnclave.isAvailable else { return nil }
+        #if DEBUG
+        // Tests only. A shipped build never lets its surroundings switch the binding off.
+        if ProcessInfo.processInfo.environment["PULSHADE_NO_ENCLAVE"] != nil { return nil }
+        #endif
         var error: Unmanaged<CFError>?
         guard let access = SecAccessControlCreateWithFlags(nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
                                                            [.privateKeyUsage], &error),
@@ -362,7 +366,10 @@ struct Vault {
             // Older builds used one fixed name; move it over on first unlock.
             try? FileManager.default.moveItem(at: legacyDataURL, to: url)
         }
-        guard let raw = try? Data(contentsOf: url) else { return nil }
+        // No file means a new account. A file that's there but can't be read is an error, never an empty account
+        // that would then be saved over it.
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let raw = try Data(contentsOf: url)
         let box = try AES.GCM.SealedBox(combined: raw)
         let plain = try AES.GCM.open(box, using: identity.storageKey)
         return try JSONDecoder.pulshade.decode(AppData.self, from: Self.unpad(plain))

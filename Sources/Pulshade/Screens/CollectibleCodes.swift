@@ -59,7 +59,7 @@ struct BackupCodeSheet: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 if let problem {
-                    Text(problem).font(.system(size: 13, weight: .medium)).foregroundStyle(.orange)
+                    ProblemText(problem)
                 }
                 Button(alert?.newCode == true ? "I've written it down" : "Done") { dismiss() }
                     .buttonStyle(PrimaryButtonStyle())

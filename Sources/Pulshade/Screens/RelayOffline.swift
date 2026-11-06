@@ -5,6 +5,7 @@ import SwiftUI
 /// open either way, anything sent waits in the outbox, and the strip goes once the server answers.
 struct ConnectionStrip: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.theme) private var theme
 
     var body: some View {
         HStack(spacing: 8) {
@@ -18,7 +19,7 @@ struct ConnectionStrip: View {
                 }
                 .font(.system(size: 13, weight: .semibold))
                 .buttonStyle(.plain)
-                .foregroundStyle(.tint)
+                .foregroundStyle(theme.accent)
                 .disabled(model.retryingRelay)
             } else {
                 ProgressView().controlSize(.small)
