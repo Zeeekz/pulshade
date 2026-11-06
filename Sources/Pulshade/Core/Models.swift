@@ -942,7 +942,8 @@ struct AppData: Codable {
     var format = AppData.currentFormat
     /// The newest shape this build understands. Raise it, and update `AppDataFormatTests`, with any change to what
     /// `AppData`, `Profile` or `Contact` save.
-    static let currentFormat = 3
+    /// 4: a profile note can list the contacts it is for.
+    static let currentFormat = 4
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []

@@ -71,4 +71,35 @@ struct ProfileDeliveryTests {
         await settle(alice, bob)
         #expect(bob.contact(aliceFP)?.notes == nil)
     }
+
+    @Test func aNoteForChosenContactsReachesOnlyThemWithNoPassword() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        let carol = try await makeUser("Carol")
+        defer { for m in [alice, bob, carol] { m.lock() } }
+        let bobFP = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        let carolFP = try #require(carol.addContact(code: alice.makeInviteCode(), nickname: ""))
+        _ = (bobFP, carolFP)
+        await settle(alice, bob, carol, seconds: 2)
+        let aliceFP = alice.fingerprint
+        let forBob = try #require(alice.visibleContacts.first { $0.name == "Bob" }?.fingerprint)
+
+        let open = try #require(ProfileNote.publicNote(title: "About me", text: "Hello."))
+        let private1 = try #require(ProfileNote.contactsNote(title: "My address", text: "12 Elm Street", contacts: [forBob]))
+        alice.updateProfile { $0.notes = [open, private1] }
+        await settle(alice, bob, carol)
+
+        // Bob reads it with no password; Carol never receives it, and neither is told who it was for.
+        let seenByBob = try #require(bob.contact(aliceFP)?.notes)
+        #expect(seenByBob.map(\.title) == ["About me", "My address"])
+        #expect(seenByBob[1].text == "12 Elm Street" && !seenByBob[1].isLocked && seenByBob[1].sharedWith == nil)
+        #expect(carol.contact(aliceFP)?.notes?.map(\.title) == ["About me"])
+
+        // Taking Bob off removes it from his view of the profile.
+        alice.updateProfile { profile in
+            profile.notes = profile.notes?.map { var n = $0; if n.sharedWith != nil { n.sharedWith = [String(repeating: "0", count: 32)] }; return n }
+        }
+        await settle(alice, bob, carol)
+        #expect(bob.contact(aliceFP)?.notes?.map(\.title) == ["About me"])
+    }
 }
