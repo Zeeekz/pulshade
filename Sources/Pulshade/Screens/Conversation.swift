@@ -19,6 +19,8 @@ struct ConversationView: View {
     @State private var takingPhoto = false
     @State private var quickSending = false
     @State private var showInfo = false
+    /// Their picture at full size, opened from the header on the phone.
+    @State private var headerPicture: Data?
     @State private var recorder = VoiceRecorder()
     @State private var replyingTo: Message?
     @State private var draftPreview: LinkPreview?
@@ -118,6 +120,16 @@ struct ConversationView: View {
                     Button { dismiss() } label: { Image(systemName: "chevron.left") }
                         .buttonStyle(BarButtonStyle())
                         .accessibilityLabel("Back")
+                    // Their picture beside the back button: tap it to see it full size, or the details if they have none.
+                    let picture = c.avatar ?? (c.kind == .direct ? model.contact(c.members.first ?? "", in: c.persona)?.avatar : nil)
+                    Button {
+                        if let picture { headerPicture = picture } else { showInfo = true }
+                    } label: {
+                        Avatar(image: picture, seed: c.kind == .direct ? (c.members.first ?? "") : c.id.uuidString,
+                               size: 34, symbol: c.kind == .direct ? nil : c.kind.symbol)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(picture != nil ? "\(c.title), picture" : "\(c.title), details")
                 }
                 Spacer(minLength: 0)
                 if let burner = model.burner(c.persona), let at = burner.burnsAt {
@@ -154,6 +166,8 @@ struct ConversationView: View {
         .padding(.bottom, 10)
         .background(Ink.base)
         .overlay(alignment: .bottom) { Rectangle().fill(Ink.line).frame(height: 1) }
+        .modifier(ImageViewerCover(isPresented: Binding(get: { headerPicture != nil }, set: { if !$0 { headerPicture = nil } }),
+                                   data: headerPicture ?? Data()))
     }
 
     private func subtitle(_ c: Conversation) -> String {
