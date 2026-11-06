@@ -1102,6 +1102,8 @@ private struct ConversationInfo: View {
     @State private var confirmBlock = false
     @State private var reporting: ReportSubject?
     @State private var adding = false
+    /// Flips on as the sheet opens, so the profile eases in instead of just appearing.
+    @State private var arrived = false
 
     var body: some View {
         if let c = model.conversation(id) {
@@ -1132,6 +1134,9 @@ private struct ConversationInfo: View {
                         actions(c)
                     }
                     .padding(20)
+                    .opacity(arrived ? 1 : 0)
+                    .offset(y: arrived ? 0 : 18)
+                    .scaleEffect(arrived ? 1 : 0.96, anchor: .top)
                 }
                 .scrollIndicators(.never)
             }
@@ -1139,6 +1144,7 @@ private struct ConversationInfo: View {
             .background(Ink.base)
             .preferredColorScheme(Ink.scheme)
             .onAppear {
+                withAnimation(.smooth(duration: 0.55).delay(0.08)) { arrived = true }
                 nickname = model.contact(c.members.first ?? "")?.nickname ?? ""
                 title = c.title
                 about = c.about ?? ""

@@ -551,27 +551,33 @@ struct UnlockView: View {
     @State private var shake = 0
     @State private var working = false
     @State private var leaving = false
-    /// The wallpaper covers the keypad until it's slid away: `drag` is how far a finger has pulled it right.
+    /// The wallpaper covers the keypad until it's slid away: `drag` is how far a finger has pulled it left.
     @State private var opened = false
     @State private var drag: CGFloat = 0
 
     var body: some View {
         GeometryReader { geo in
             let width = max(geo.size.width, 1)
-            let progress = opened ? 1 : min(max(drag / width, 0), 1)
+            let progress = opened ? 1 : min(max(-drag / width, 0), 1)
             ZStack {
-                if opened || drag > 0 {
+                if opened || drag < 0 {
                     pad
                         .opacity(0.25 + 0.75 * progress)
                         .scaleEffect(0.96 + 0.04 * progress)
+                        // Swipe right on the keypad to put the wallpaper back.
+                        .simultaneousGesture(DragGesture(minimumDistance: 30)
+                            .onEnded { v in
+                                guard opened, v.translation.width > 80, abs(v.translation.width) > abs(v.translation.height) * 2 else { return }
+                                close()
+                            })
                 }
                 LockWallpaper(onOpen: { open() })
-                    .offset(x: opened ? width : max(drag, 0))
+                    .offset(x: opened ? -width : min(drag, 0))
                     .allowsHitTesting(!opened)
                     .gesture(DragGesture(minimumDistance: 8)
-                        .onChanged { drag = max($0.translation.width, 0) }
+                        .onChanged { drag = min($0.translation.width, 0) }
                         .onEnded { value in
-                            let pushed = max(value.translation.width, value.predictedEndTranslation.width * 0.5)
+                            let pushed = max(-value.translation.width, -value.predictedEndTranslation.width * 0.5)
                             if pushed > width * 0.3 { open() } else { withAnimation(.snappy) { drag = 0 } }
                         })
             }
@@ -593,6 +599,11 @@ struct UnlockView: View {
 
     private func open() {
         withAnimation(.smooth(duration: 0.4)) { opened = true; drag = 0 }
+    }
+
+    private func close() {
+        passcode = ""
+        withAnimation(.smooth(duration: 0.4)) { opened = false; drag = 0 }
     }
 
     private var pad: some View {

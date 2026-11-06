@@ -129,7 +129,7 @@ struct SettingsView: View {
 
     private var anonymityValue: String {
         guard let relay = URL(string: model.data.relay) else { return "Direct" }
-        if Tor.isOnion(relay) { return "Tor" }
+        if Tor.isOnion(relay) && AppData.directRelay == nil { return "Tor" }
         let local = relay.host().map { Invite.isLocal($0.lowercased()) } ?? false
         return model.data.security.tor ? (local ? "Offline" : "Tor") : "Direct"
     }

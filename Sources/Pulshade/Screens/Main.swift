@@ -545,7 +545,7 @@ private struct ChatList: View {
             selection = c.id
             model.markRead(c.id)
         } label: {
-            ChatRow(conversation: c, selected: selection == c.id)
+            ChatRow(conversation: c, selected: selection == c.id) { viewingStory = $0 }
         }
         .buttonStyle(.plain)
         .accessibilityLabel(c.title)
@@ -611,10 +611,19 @@ private struct ChatRow: View {
     @Environment(\.theme) private var theme
     var conversation: Conversation
     var selected: Bool
+    /// Opens their story when the picture is tapped and they have one.
+    var openStory: (StoryReel) -> Void = { _ in }
     @State private var hover = false
+
+    /// Their live stories, when this is a one-to-one chat with someone who has posted.
+    private var stories: [Story] {
+        guard conversation.kind == .direct, let fp = conversation.members.first else { return [] }
+        return model.friendStories.first { $0.author == fp }?.stories ?? []
+    }
 
     var body: some View {
         let c = conversation
+        let stories = stories
         HStack(spacing: 12) {
             ZStack(alignment: .bottomTrailing) {
                 Avatar(image: c.avatar ?? (c.kind == .direct ? model.contact(c.members.first ?? "")?.avatar : nil),
@@ -625,6 +634,19 @@ private struct ChatRow: View {
                             Circle().strokeBorder(model.signature(fp).opacity(0.8), lineWidth: 1.5).padding(-2.5)
                         }
                     }
+                    .overlay {
+                        if !stories.isEmpty {
+                            let fresh = stories.contains { !$0.seen }
+                            Circle().strokeBorder(fresh ? theme.accent : Ink.faint, lineWidth: 2.5).padding(-5)
+                        }
+                    }
+                    .contentShape(Circle())
+                    .onTapGesture {
+                        guard !stories.isEmpty else { return }
+                        Haptics.tick()
+                        openStory(StoryReel(stories: stories, start: stories.firstIndex { !$0.seen } ?? 0))
+                    }
+                    .accessibilityAddTraits(stories.isEmpty ? [] : .isButton)
                 if let burner = model.burner(c.persona) {
                     Image(systemName: "flame.fill")
                         .font(.system(size: 9, weight: .bold))
@@ -647,6 +669,13 @@ private struct ChatRow: View {
                         .foregroundStyle(Ink.text)
                         .lineLimit(1)
                     if c.kind == .direct { BadgeMark(badge: model.contact(c.members.first ?? "")?.badge, size: 14) }
+                    if stories.contains(where: { !$0.seen }) {
+                        Text("New story")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(Ink.onAccent.opacity(0.9))
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(theme.accent, in: .capsule)
+                    }
                     if c.muted { Image(systemName: "bell.slash.fill").font(.system(size: 10)).foregroundStyle(Ink.faint) }
                     Spacer(minLength: 4)
                     Text(c.lastActivity.chatStamp)
