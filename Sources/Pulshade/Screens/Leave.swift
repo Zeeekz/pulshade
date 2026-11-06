@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// The Burn tab: Lock, Detach and Burn in one place, each saying what it does before it's chosen. Detach wipes this
-/// device the moment it's tapped; Burn opens a sheet that asks for BURN first.
+/// device as soon as it's tapped (after a few seconds at most spent telling contacts to clear their chats); Burn opens a sheet that asks for BURN first.
 struct LeaveView: View {
     @Environment(AppModel.self) private var model
     @State private var burning = false
@@ -15,7 +15,7 @@ struct LeaveView: View {
                     LeaveOption(symbol: "lock.fill", color: Ink.dim, title: "Lock",
                                 detail: "Close PULSHADE now. Your passcode opens it again.") { model.lock() }
                     LeaveOption(symbol: "person.crop.circle.badge.minus", color: .orange, title: "Detach",
-                                detail: "Wipes this device at once, with no questions: everything on it is overwritten and PULSHADE starts fresh. Nothing is sent, so your other devices keep the account. \(model.data.security.keepBackup ? "Your recovery code brings back your profile, contacts and groups from the sealed backup (\(model.backupStatus.lowercased())), never your chats." : "Backups are off, so nothing comes back from the relay.")") { model.wipeNow() }
+                                detail: "Wipes this device, with no questions: everything on it is overwritten and PULSHADE starts fresh. \(model.hasOtherDevices ? "Nothing is sent, so your other devices keep the account and its chats." : "If you're online, the people you chat with are first told to clear their chat with you (they keep you as a contact); it waits a few seconds at most.") \(model.data.security.keepBackup ? "Your recovery code brings back your profile, contacts and groups from the sealed backup (\(model.backupStatus.lowercased())), never your chats." : "Backups are off, so nothing comes back from the relay.")") { Task { await model.detachNow() } }
                     if model.activePersona != nil {
                         LeaveOption(symbol: "flame", color: .red, title: "Burn persona",
                                     detail: "Delete \(model.activeProfile.displayName) for good. Your main identity and other personas aren't touched.") { burningPersona = true }

@@ -242,9 +242,9 @@ final class LibraryPicker: NSObject, PHPickerViewControllerDelegate {
     private var done: ((StoryPick.Kind?, UIImage?) -> Void)?
 
     /// A clip comes back as `.clip` (already copied somewhere that stays), a picture as an image to be framed.
-    static func present(done: @escaping (StoryPick.Kind?, UIImage?) -> Void) {
+    static func present(videosOnly: Bool = false, done: @escaping (StoryPick.Kind?, UIImage?) -> Void) {
         var configuration = PHPickerConfiguration(photoLibrary: .shared())
-        configuration.filter = .any(of: [.images, .videos])
+        configuration.filter = videosOnly ? .videos : .any(of: [.images, .videos])
         configuration.selectionLimit = 1
         configuration.preferredAssetRepresentationMode = .current
         let controller = PHPickerViewController(configuration: configuration)

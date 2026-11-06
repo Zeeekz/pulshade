@@ -29,7 +29,12 @@ enum Envelope {
         var device: Data?
         /// When it was sealed, in whole seconds, so an old envelope can't be replayed later.
         var at: UInt64
+        /// What the sender's app can read, as bits (see `reads`). Older apps leave it out and ignore it.
+        var caps: UInt8?
     }
+
+    /// What this app tells everyone it can read. Bit 0: framed messages (`Frame`), which carry big fields raw.
+    static let reads: UInt8 = 1
 
     /// Opened envelope: the payload, who sent it, from which of their devices, and when.
     struct Opened {
@@ -37,20 +42,27 @@ enum Envelope {
         var signer: Data
         var device: Data
         var sentAt: Date
+        /// What the sender's app says it can read (0 from apps before this).
+        var caps: UInt8 = 0
+        var readsFrames: Bool { caps & 1 == 1 }
     }
 
-    static func seal(_ payload: Payload, from me: Identity, device: Data = Data(), to agreementKey: Data) throws -> Data {
+    /// `framed` sends the payload and the inside of the envelope in frames, without the base64 that makes a big
+    /// message nearly twice its size. Only for a recipient whose app reads them: an older one can't open it.
+    static func seal(_ payload: Payload, from me: Identity, device: Data = Data(), to agreementKey: Data, framed: Bool = false) throws -> Data {
         let recipient = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: agreementKey)
         let sender = me.agreementKey.publicKey.rawRepresentation
-        let inner = Inner(from: me.signingKey.publicKey.rawRepresentation, bind: try binding(me), body: try JSONEncoder.pulshade.encode(payload),
-                          device: device.isEmpty ? nil : device, at: UInt64(RelayClock.now.timeIntervalSince1970))
+        let body = try payload.wire(framed: framed)
+        let inner = Inner(from: me.signingKey.publicKey.rawRepresentation, bind: try binding(me), body: framed ? Data() : body,
+                          device: device.isEmpty ? nil : device, at: UInt64(RelayClock.now.timeIntervalSince1970), caps: reads)
+        let innerPlain = framed ? Frame.join(try JSONEncoder().encode(inner), body) : try JSONEncoder().encode(inner)
 
         let ephemeral = Curve25519.KeyAgreement.PrivateKey()
         let ephemeralRaw = ephemeral.publicKey.rawRepresentation
         let outerSecret = try ephemeral.sharedSecretFromKeyAgreement(with: recipient)
         let staticSecret = try me.agreementKey.sharedSecretFromKeyAgreement(with: recipient)
         let innerKey = deriveInner(outerSecret, staticSecret, ephemeral: ephemeralRaw, recipient: agreementKey, sender: sender)
-        let sealedInner = try ChaChaPoly.seal(JSONEncoder().encode(inner), using: innerKey).combined
+        let sealedInner = try ChaChaPoly.seal(innerPlain, using: innerKey).combined
 
         let outerKey = deriveOuter(outerSecret, ephemeral: ephemeralRaw, recipient: agreementKey)
         let sealed = try ChaChaPoly.seal(pad(sender + sealedInner), using: outerKey)
@@ -77,12 +89,19 @@ enum Envelope {
         let innerKey = deriveInner(outerSecret, staticSecret, ephemeral: ephemeralRaw, recipient: mine, sender: sender)
         guard let plain = try? ChaChaPoly.open(ChaChaPoly.SealedBox(combined: outer.dropFirst(32)), using: innerKey)
         else { throw EnvelopeError.badSignature }
-        let inner = try JSONDecoder().decode(Inner.self, from: plain)
+        var inner: Inner
+        if plain.first == Frame.mark {
+            guard let (header, tail) = Frame.split(plain) else { throw EnvelopeError.malformed }
+            inner = try JSONDecoder().decode(Inner.self, from: header)
+            inner.body = tail
+        } else {
+            inner = try JSONDecoder().decode(Inner.self, from: plain)
+        }
 
         let signer = try Curve25519.Signing.PublicKey(rawRepresentation: inner.from)
         guard signer.isValidSignature(inner.bind, for: bindLabel + sender) else { throw EnvelopeError.badSignature }
-        return Opened(payload: try JSONDecoder.pulshade.decode(Payload.self, from: inner.body), signer: inner.from,
-                      device: inner.device ?? Data(), sentAt: Date(timeIntervalSince1970: TimeInterval(inner.at)))
+        return Opened(payload: try Payload.fromWire(inner.body), signer: inner.from,
+                      device: inner.device ?? Data(), sentAt: Date(timeIntervalSince1970: TimeInterval(inner.at)), caps: inner.caps ?? 0)
     }
 
     /// Ties an identity's agreement key to its signing key.

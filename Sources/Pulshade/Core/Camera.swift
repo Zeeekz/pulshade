@@ -105,7 +105,10 @@ final class Camera: NSObject {
         output.capturePhoto(with: settings, delegate: self)
     }
 
-    /// Starts a clip; it stops by itself at 15 seconds. `done` gets the clip, or nil if nothing was kept. The clip is
+    /// How long a clip may run before it stops by itself: a story's 15 seconds unless the chat camera says more.
+    var clipLimit = StoryVideo.maxSeconds
+
+    /// Starts a clip; it stops by itself at `clipLimit` seconds. `done` gets the clip, or nil if nothing was kept. The clip is
     /// built in memory and never written to a file.
     func record(_ done: @escaping (MemoryClip?, ZoomTrack) -> Void) {
         guard running, !recording else { return }
@@ -118,7 +121,7 @@ final class Camera: NSObject {
         recording = true
         recordingStart = Date()
         let audio = micAllowed ? sound.recommendedAudioSettingsForAssetWriter(writingTo: .mp4) as? [String: Any] : nil
-        framer.startClip(audio: audio) { [weak self] clip in
+        framer.startClip(audio: audio, limit: clipLimit) { [weak self] clip in
             Task { @MainActor in self?.finished(clip) }
         }
     }
@@ -329,9 +332,11 @@ private final class FrameFilter: NSObject, AVCaptureVideoDataOutputSampleBufferD
     }
 
     /// Begins a clip with the next frame. `ended` gets the clip once it's finished, or nil if nothing was kept.
-    func startClip(audio: [String: Any]?, ended: @escaping (MemoryClip?) -> Void) {
-        queue.async { self.wanted = (audio, ended) }
+    func startClip(audio: [String: Any]?, limit: Double, ended: @escaping (MemoryClip?) -> Void) {
+        queue.async { self.wanted = (audio, ended); self.limit = limit }
     }
+    /// How long the clip being made may run (queue only).
+    private var limit = StoryVideo.maxSeconds
 
     /// Finishes the clip; harmless when there isn't one.
     func endClip() {
@@ -358,7 +363,7 @@ private final class FrameFilter: NSObject, AVCaptureVideoDataOutputSampleBufferD
         }
         if clip == nil, let wanted, let source = CMSampleBufferGetImageBuffer(sampleBuffer) {
             let size = CGSize(width: CVPixelBufferGetWidth(source), height: CVPixelBufferGetHeight(source))
-            if let made = ClipWriter(size: size, audio: wanted.audio, start: CMSampleBufferGetPresentationTimeStamp(sampleBuffer)) { clip = made }
+            if let made = ClipWriter(size: size, audio: wanted.audio, start: CMSampleBufferGetPresentationTimeStamp(sampleBuffer), limit: limit) { clip = made }
             else { self.wanted = nil; wanted.ended(nil) }
         }
         if let clip {
@@ -434,8 +439,10 @@ final class ClipWriter {
     private let sink = SegmentSink()
     private var began = false
     private(set) var full = false
+    private let limit: Double
 
-    init?(size: CGSize, audio: [String: Any]?, start: CMTime) {
+    init?(size: CGSize, audio: [String: Any]?, start: CMTime, limit: Double = StoryVideo.maxSeconds) {
+        self.limit = limit
         let writer = AVAssetWriter(contentType: UTType.mpeg4Movie)
         writer.outputFileTypeProfile = .mpeg4AppleHLS
         writer.preferredOutputSegmentInterval = CMTime(seconds: 1, preferredTimescale: 1)
@@ -475,7 +482,7 @@ final class ClipWriter {
         guard time >= start else { return }
         picture.append(buffer)
         began = true
-        if (time - start).seconds >= StoryVideo.maxSeconds { full = true }
+        if (time - start).seconds >= limit { full = true }
     }
 
     func append(sound buffer: CMSampleBuffer) {

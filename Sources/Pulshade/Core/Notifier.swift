@@ -76,6 +76,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
             let body: String
             if message.voice != nil { body = "🎤 Voice note" }
             else if !message.text.isEmpty { body = String(message.text.prefix(200)) }
+            else if message.isVideo { body = "🎥 Video" }
             else if message.image != nil { body = "📷 Photo" }
             else { body = "New message" }
             let prefix = conversation.kind == .group ? "\(sender): " : ""

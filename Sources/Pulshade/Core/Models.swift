@@ -12,8 +12,16 @@ struct Profile: Codable, Equatable {
     var banner: Data?
     /// Your signature colour, an index into `Signature.colors`. Others see your messages glow in it.
     var color: Int?
-    /// Your public @handle, if this identity is listed in the directory. Nil means private.
+    /// Your public @handle, if this identity is listed in the directory. Nil means private. With more than one
+    /// handle in use, this is the main one: the one shown on your profile.
     var handle: String?
+    /// Other @handles in use for this identity at the same time (two at most, three with the main one). Each leads
+    /// to the same profile and takes chat requests. A handle belongs to the identity whose key claimed it, so it
+    /// can't be moved to another persona.
+    var moreHandles: [String]?
+
+    /// Every handle in use, the main one first.
+    var activeHandles: [String] { (handle.map { [$0] } ?? []) + (moreHandles ?? []).filter { $0 != handle } }
     /// A line about you, shown on your public profile.
     var bio: String?
     /// Links and wallets, each shown as an icon on your profile.
@@ -73,6 +81,9 @@ struct DeviceLink: Codable {
     var awaitingHello: Bool?
     /// The handshake behind the current session, so a redelivered copy is recognised and ignored.
     var acceptedHello: Data?
+    /// Their app reads framed messages (it said so on what it last sent), so big ones go to it without the base64
+    /// bloat. Nil for an app from before, which gets everything the old way.
+    var readsFrames: Bool?
 
     init(id: Data = Data(), sendID: Data) {
         self.id = id
@@ -457,7 +468,13 @@ struct Message: Codable, Identifiable, Equatable {
     var reactions: [String: String] = [:]
     var reply: ReplyRef?
     var preview: LinkPreview?
+    /// A video's clip. Nil when the message isn't a video; empty while its pieces are still arriving (`image` is a
+    /// still from it meanwhile).
+    var video: Data?
+    /// How long the video runs.
+    var clipSeconds: Double?
 
+    var isVideo: Bool { video != nil }
     var isMine: Bool { sender == "me" }
     var isSystem: Bool { sender == "system" }
 
@@ -488,6 +505,8 @@ struct Message: Codable, Identifiable, Equatable {
         reactions = try c.decodeIfPresent([String: String].self, forKey: .reactions) ?? [:]
         reply = try? c.decodeIfPresent(ReplyRef.self, forKey: .reply)
         preview = try? c.decodeIfPresent(LinkPreview.self, forKey: .preview)
+        video = try? c.decodeIfPresent(Data.self, forKey: .video)
+        clipSeconds = try? c.decodeIfPresent(Double.self, forKey: .clipSeconds)
     }
 }
 
@@ -948,7 +967,8 @@ struct AppData: Codable {
     /// `AppData`, `Profile` or `Contact` save.
     /// 4: a profile note can list the contacts it is for.
     /// 5: a sealed backup is kept on the relay, and when it was last saved.
-    static let currentFormat = 6
+    /// 7: a profile can have more than one @handle in use; messages can be videos; a device says if it reads frames.
+    static let currentFormat = 7
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []

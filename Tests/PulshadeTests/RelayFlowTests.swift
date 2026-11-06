@@ -590,6 +590,99 @@ struct RelayFlowTests {
         #expect(bob.data.stories.first { $0.id == id }?.style == .video(clip, caption: "clip"))
     }
 
+    /// A video goes to an updated app in two pieces that each fill one 2 MiB message, and to an app from before
+    /// frames the old way (four pieces, 3 MiB each), which it still reads. Either way it arrives whole.
+    @Test func aVideoGoesInFullerPiecesToAnAppThatReadsFrames() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, bob)
+        #expect(alice.data.contacts.first?.devices.allSatisfy { $0.readsFrames == true } == true, "learnt from what Bob sent")
+        #expect(bob.data.contacts.first?.devices.allSatisfy { $0.readsFrames == true } == true, "and Bob from what Alice sent")
+        let clip = Data((0..<StoryVideo.maxBytes).map { _ in UInt8.random(in: 0...255) })
+
+        alice.postStory(.video(clip, caption: "new"))
+        let framed = alice.data.outbox.filter { $0.story != nil }.map(\.blob.count).sorted()
+        #expect(framed.count == 3 && framed.suffix(2).allSatisfy { $0 > 1_000_000 && $0 < 2_097_152 + 200 }, "\(framed)")
+        await settle(alice, bob)
+        #expect(bob.data.stories.first?.style == .video(clip, caption: "new"))
+
+        // As if Bob's app were an older one: nothing framed goes to it.
+        for d in alice.data.contacts[0].devices.indices { alice.data.contacts[0].devices[d].readsFrames = nil }
+        alice.postStory(.video(clip, caption: "old"))
+        let plain = alice.data.outbox.filter { $0.story != nil }.map(\.blob.count).sorted()
+        #expect(plain.count == 5 && plain.filter { $0 > 3_000_000 }.count == 3, "three full pieces at 3 MiB and a last short one: \(plain)")
+        #expect(plain.reduce(0, +) > 2 * framed.reduce(0, +), "more than twice what the framed copy took")
+        await settle(alice, bob)
+        #expect(bob.data.stories.contains { $0.style == .video(clip, caption: "old") })
+    }
+
+    /// A video sent in a chat arrives as a message with its still, then the clip in pieces, and plays once whole.
+    /// A photo's reply carries a small copy of the photo.
+    @Test func aVideoSentInAChatArrivesWholeAndAPhotoReplyShowsThePhoto() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        let b = try #require(alice.addContact(code: bob.makeInviteCode(), nickname: ""))
+        await settle(alice, bob)
+        let chat = alice.startConversation(kind: .direct, title: "", members: [b.fingerprint])
+        let clip = Data((0..<4_500_000).map { _ in UInt8.random(in: 0...255) })
+        let still = StoryMediaTests.photo()
+        alice.sendVideo(clip, poster: still, seconds: 21, caption: "look", in: chat.id)
+        #expect(alice.conversation(chat.id)?.messages.last?.video == clip)
+        await settle(alice, bob)
+        await settle(alice, bob)
+        let got = try #require(bob.data.conversations.first?.messages.last)
+        #expect(got.isVideo && got.video == clip && got.text == "look" && got.image == still && got.clipSeconds == 21)
+        #expect(bob.data.clipParts.isEmpty)
+        #expect(AppModel.snippet(of: got) == "look")
+
+        alice.send("nice", image: still, in: chat.id)
+        await settle(alice, bob)
+        let photo = try #require(bob.data.conversations.first?.messages.last)
+        bob.send("love it", replyTo: photo, in: try #require(bob.data.conversations.first?.id))
+        await settle(alice, bob)
+        let reply = try #require(alice.conversation(chat.id)?.messages.last?.reply)
+        #expect(reply.picture != nil && reply.picture!.count <= ReplyRef.maxPicture)
+    }
+
+    /// Detach on an account's only device first tells contacts to clear their chat with it; they keep the contact.
+    @Test func detachClearsTheChatOnTheOtherSideAndKeepsTheContact() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        let b = try #require(alice.addContact(code: bob.makeInviteCode(), nickname: ""))
+        await settle(alice, bob)
+        let chat = alice.startConversation(kind: .direct, title: "", members: [b.fingerprint])
+        alice.send("remember this", in: chat.id)
+        await settle(alice, bob)
+        #expect(bob.data.conversations.first?.messages.map(\.text) == ["remember this"])
+        #expect(alice.link == .online)
+        await alice.detachNow()
+        #expect(alice.identity == nil && alice.phase == .welcome, "wiped")
+        await settle(bob)
+        #expect(bob.data.conversations.isEmpty, "Bob's side of the chat is gone")
+        #expect(bob.visibleContacts.count == 1, "and Alice is still a contact")
+    }
+
+    /// A story that's over stops going out: what was still waiting to be sent is dropped.
+    @Test func aDeletedStoryStopsUploading() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, bob)
+        alice.postStory(.video(Data((0..<3_000_000).map { _ in UInt8.random(in: 0...255) }), caption: "gone"))
+        let id = try #require(alice.myStories.first?.id)
+        #expect(alice.data.outbox.contains { $0.story == id })
+        alice.deleteStory(id)
+        #expect(!alice.data.outbox.contains { $0.story == id }, "its pieces are let go")
+        #expect(alice.isUploading(id) == false)
+        await settle(alice, bob)
+        #expect(bob.data.stories.isEmpty)
+    }
+
     @Test func likingOrReplyingToAStoryMessagesItsAuthor() async throws {
         let alice = try await makeUser("Alice")
         let bob = try await makeUser("Bob")
@@ -1053,6 +1146,28 @@ struct RelayFlowTests {
         #expect(bob.conversation(group.id)?.members.count == 3, "Existing members hear about the new one")
     }
 
+    /// Two friends you added a moment ago, put in a group before either had written back, can still talk to each
+    /// other there, not just to you. (The owner didn't know their devices' ids yet, so the mailboxes it made for them
+    /// to meet through were filed under no id, and neither friend found theirs: each saw only the owner's messages.)
+    @Test func friendsAddedAMomentAgoCanTalkToEachOtherInAGroup() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        let cara = try await makeUser("Cara")
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let b = try #require(alice.addContact(code: bob.makeInviteCode(), nickname: ""))
+        let c = try #require(alice.addContact(code: cara.makeInviteCode(), nickname: ""))
+        let group = alice.startConversation(kind: .group, title: "Now", members: [b.fingerprint, c.fingerprint])
+        await settle(alice, bob, cara, rounds: 12)
+        alice.send("welcome", in: group.id)
+        bob.send("hi cara", in: group.id)
+        await settle(alice, bob, cara, rounds: 12)
+        #expect(cara.conversation(group.id)?.messages.map(\.text).sorted() == ["hi cara", "welcome"])
+        cara.send("hi bob", in: group.id)
+        await settle(alice, bob, cara, rounds: 12)
+        #expect(bob.conversation(group.id)?.messages.map(\.text).contains("hi bob") == true)
+        #expect(alice.conversation(group.id)?.messages.map(\.text).sorted() == ["hi bob", "hi cara", "welcome"])
+    }
+
     /// A group announcement carries everyone's avatar. With full-size ones it was hundreds of kilobytes, far
     /// bigger than any message, and the one a slow Tor circuit fails to carry; shrunk, it's an ordinary size.
     @Test func groupAnnouncementsStaySmallWithRealAvatars() async throws {
@@ -1413,11 +1528,19 @@ struct RelayFlowTests {
         #expect(phone.data.conversations.contains { $0.messages.contains { $0.text == "hello both" } })
         #expect(mac.data.conversations.contains { $0.messages.contains { $0.text == "hello both" } })
 
-        // Changing the handle on the phone moves the Mac too, and the old one is let go.
+        // A second handle on the phone is in use alongside the first, on the Mac too, and both are found.
         let newHandle = "zee2_\(Int.random(in: 10000...99999))"
         try await phone.publishProfile(handle: newHandle)
         await settle(mac, phone)
-        #expect(mac.activeProfile.handle == newHandle)
+        #expect(mac.activeProfile.activeHandles == [handle, newHandle])
+        #expect(try await friend.findProfile(handle) != nil)
+        #expect(try await friend.findProfile(newHandle) != nil)
+        #expect(mac.data.invites.filter { $0.isPublic && $0.retiresAt == nil }.count == 2, "the Mac reads both request mailboxes")
+        // Making it the main one, and turning the first off, reach the Mac as well.
+        phone.makeMainHandle(newHandle)
+        await phone.stopUsingHandle(handle)
+        await settle(mac, phone)
+        #expect(mac.activeProfile.handle == newHandle && mac.activeProfile.activeHandles == [newHandle])
         #expect(try await friend.findProfile(handle) == nil)
         await phone.unpublishProfile()
         #expect(try await friend.findProfile(newHandle) == nil, "Tests leave nothing behind in the directory")
@@ -1568,14 +1691,25 @@ struct RelayFlowTests {
         let (first, second) = ("first_\(n)", "second_\(n)")
         try await zee.publishProfile(handle: first)
         try await zee.publishProfile(handle: second)
-        #expect(try await zee.heldHandles().map(\.handle) == [first], "the old one is kept, the one in use isn't listed")
+        #expect(zee.activeProfile.activeHandles == [first, second], "both are in use, the first one the main")
+        #expect(try await cara.findProfile(first) != nil)
+        #expect(try await cara.findProfile(second) != nil)
+        #expect(try await zee.heldHandles().isEmpty)
+        await zee.stopUsingHandle(first)
+        #expect(zee.activeProfile.handle == second && zee.activeProfile.moreHandles == nil, "the other takes over as main")
+        #expect(try await cara.findProfile(first) == nil)
+        #expect(try await zee.heldHandles().map(\.handle) == [first], "one turned off is kept, the one in use isn't listed")
         let until = try #require(try await zee.heldHandles().first?.until)
         #expect(until.timeIntervalSinceNow > 89 * 24 * 3600)
         await #expect(throws: AppModel.DirectoryError.held) { try await cara.publishProfile(handle: first) }
 
-        // Using a kept one again swaps the two.
+        // Turning a kept one back on puts it in use again, beside the other.
         try await zee.publishProfile(handle: first)
+        #expect(zee.activeProfile.activeHandles == [second, first])
+        #expect(try await zee.heldHandles().isEmpty)
+        zee.makeMainHandle(first)
         #expect(zee.activeProfile.handle == first)
+        await zee.stopUsingHandle(second)
         #expect(try await zee.heldHandles().map(\.handle) == [second])
 
         // Letting go frees the spot at once, but the name cools off before anyone may take it.
@@ -1659,7 +1793,9 @@ struct RelayFlowTests {
         #expect(fresh.messages.map(\.text) == ["while you were gone"])
         restored.send("back again", in: fresh.id)
         await settle(restored, bob)
-        #expect(bob.conversation(bobsChat.id)?.messages.contains { $0.text == "back again" } == true)
+        // Bob's side of the old chat was cleared when the account came back; what's said now is in a fresh one.
+        #expect(bob.conversation(bobsChat.id) == nil)
+        #expect(bob.data.conversations.filter { $0.kind == .direct }.flatMap(\.messages).map(\.text) == ["back again"])
         try await Task.sleep(for: .milliseconds(500))
         // The copy stays, and is saved over as things change.
         guard case .found = await restored.backup(of: identity) else {
@@ -1831,7 +1967,8 @@ struct RelayFlowTests {
         #expect(restored.activeProfile.handle == keep && restored.activeProfile.name == "Zeeko")
         #expect(restored.activeProfile.avatar == Data([0xFF, 0xD8, 0x07]) && restored.activeProfile.bio == "creator")
         #expect(restored.activeProfile.color == 4)
-        #expect(try await friend.findProfile(extra) == nil, "The other handle is released")
+        #expect(try await friend.findProfile(extra) != nil, "The account's other handle stays in use")
+        #expect(restored.activeProfile.moreHandles == [extra])
 
         // Requests to the kept handle reach the restored device.
         let listed = try #require(try await friend.findProfile(keep))
@@ -1885,36 +2022,37 @@ struct RelayFlowTests {
         #expect(phone.unreadTotal == 0, "Old messages don't count as new")
     }
 
-    @Test func oneHandlePerAccount() async throws {
+    /// An account can have three handles in use at once, each leading to the same profile; a fourth is refused.
+    @Test func upToThreeHandlesInUseAtOnce() async throws {
         let me = try await makeUser("Me")
         let friend = try await makeUser("Friend")
         defer { for m in [me, friend] { m.lock() } }
-        let first = "one_\(Int.random(in: 10000...99999))"
-        let second = "two_\(Int.random(in: 10000...99999))"
+        let n = Int.random(in: 10000...99999)
+        let (first, second, third) = ("one_\(n)", "two_\(n)", "three_\(n)")
         try await me.publishProfile(handle: first)
         try await me.publishProfile(handle: second)
-        #expect(try await friend.findProfile(first) == nil, "Claiming a new handle lets go of the old one")
+        #expect(try await friend.findProfile(first)?.signingKey == me.identity?.card.signing, "A second handle doesn't let go of the first")
+        #expect(try await friend.findProfile(second)?.signingKey == me.identity?.card.signing)
 
-        // A leftover from an older version that's newer than the current handle stays: this device might be the
-        // out-of-date one.
+        // One the directory lists for this account that this device didn't know of (claimed on another device) is
+        // taken as in use, not released.
         let client = try #require(me.client(nil))
-        let leftover = "old_\(Int.random(in: 10000...99999))"
-        try await client.claim(leftover, me.signedEntry(handle: leftover, persona: nil))
+        try await client.claim(third, me.signedEntry(handle: third, persona: nil))
         await me.releaseLeftoverHandles()
-        #expect(try await friend.findProfile(leftover) != nil, "Not when the current handle isn't the newest")
+        #expect(me.activeProfile.activeHandles == [first, second, third])
+        #expect(try await friend.findProfile(third) != nil)
+        #expect(me.data.invites.filter { $0.isPublic && $0.retiresAt == nil }.count == 3, "each has its request mailbox")
+        await #expect(throws: AppModel.DirectoryError.full) { try await me.publishProfile(handle: "four_\(n)") }
 
-        // Once the current handle is the newest, unlocking clears the leftover.
-        try await Task.sleep(for: .milliseconds(5))
-        try await client.claim(second, me.signedEntry(handle: second, persona: nil))
-        await me.releaseLeftoverHandles()
-        #expect(try await friend.findProfile(leftover) == nil)
-        #expect(try await friend.findProfile(second) != nil)
+        // A profile change reaches every handle in use.
+        me.updateProfile { $0.bio = "same everywhere" }
+        // An edit is gathered for a moment and a half before it's published.
+        try await Task.sleep(for: .milliseconds(2300))
+        for handle in [first, second, third] { #expect(try await friend.findProfile(handle)?.bio == "same everywhere", "\(handle)") }
 
         // Going private lets go of every handle.
-        try await #require(me.client(nil)).claim(leftover, me.signedEntry(handle: leftover, persona: nil))
         await me.unpublishProfile()
-        #expect(try await friend.findProfile(second) == nil)
-        #expect(try await friend.findProfile(leftover) == nil)
+        for handle in [first, second, third] { #expect(try await friend.findProfile(handle) == nil) }
     }
 
     /// An operator action with the throwaway relay's admin token, as `pulshade-server` sends it for the admin app.
