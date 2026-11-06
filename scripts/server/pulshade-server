@@ -22,7 +22,7 @@ ${bold}pulshade-server${reset}: run the Pulshade relay on this server.
 
 ${bold}Relay${reset}
   start              Start it. It also starts by itself whenever the server does.
-  stop               Stop it. Waiting messages are kept, sealed, for the next start.
+  stop               Stop it. Waiting messages are dropped.
   restart            Stop and start it.
   status             Whether it's running and its onion address.
   logs               Follow its log.
@@ -98,23 +98,20 @@ admin_json() {
 }
 
 # For the Pulshade Admin app: what's waiting in its reports mailbox, and letting go of what it has read. The
-# mailbox key is the app's; the relay only ever sees sealed reports. The key goes to curl on standard input, not
-# as an argument, so it never shows in the list of running programs.
+# mailbox key is the app's; the relay only ever sees sealed reports.
 mailbox() {
   local cmd="$1" key="${2:-}"
   [[ "$key" =~ ^[0-9a-f]{64}$ ]] || fail "That isn't a mailbox key"
   if [[ "$cmd" == fetch ]]; then
-    printf '{"keys":["%s"],"wait":0}' "$key" \
-      | curl -sf -m 10 -X POST "$relay_url/v1/fetch" -H 'Content-Type: application/json' -d @- \
+    curl -sf -m 10 -X POST "$relay_url/v1/fetch" -H 'Content-Type: application/json' -d "{\"keys\":[\"$key\"],\"wait\":0}" \
       || fail "Can't reach the relay"
     printf '\n'
   else
     shift 2
     local ids; ids=$(IFS=,; printf '%s' "$*")
     [[ "$ids" =~ ^[0-9,]+$ ]] || fail "Which envelopes?"
-    printf '{"acks":[{"key":"%s","ids":[%s]}]}' "$key" "$ids" \
-      | curl -sf -m 10 -X POST "$relay_url/v1/ack" -H 'Content-Type: application/json' -d @- >/dev/null \
-      || fail "Can't reach the relay"
+    curl -sf -m 10 -X POST "$relay_url/v1/ack" -H 'Content-Type: application/json' \
+      -d "{\"acks\":[{\"key\":\"$key\",\"ids\":[$ids]}]}" >/dev/null || fail "Can't reach the relay"
     ok "Done"
   fi
 }
@@ -189,7 +186,7 @@ mod_reports() {
 backup() {
   local dest; dest="$backups/$(date +%Y-%m-%d_%H-%M-%S)"
   install -d -m 700 "$backups" "$dest"
-  for f in pulshade-directory.json pulshade-moderation.json pulshade-held.json pulshade-collectibles.json pulshade-giveaways.json pulshade-handle-history.json; do
+  for f in pulshade-directory.json pulshade-moderation.json pulshade-held.json pulshade-collectibles.json pulshade-giveaways.json; do
     [[ -f "$data/$f" ]] && cp "$data/$f" "$dest/"
   done
   # Sealed with the storage key, so a copy of the backups alone can't take over the onion address.

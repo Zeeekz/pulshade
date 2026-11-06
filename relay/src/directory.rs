@@ -16,7 +16,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    net::{IpAddr, Ipv6Addr},
+    net::IpAddr,
     path::PathBuf,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -35,39 +35,6 @@ pub const COOL_OFF_SECS: u64 = 30 * 24 * 3600;
 /// claiming and letting go of them.
 pub const MAX_HANDLES: usize = 3;
 
-/// Handles the directory lists at most.
-pub const MAX_ENTRIES: usize = 50_000;
-
-/// The most profile data all listings hold together, as stored (in base64). The whole directory is sealed and
-/// written again on every change, so this is also what one save costs in memory, a few times over.
-pub const MAX_DIRECTORY_BYTES: usize = 64 * 1024 * 1024;
-
-/// How far ahead of the relay's clock an entry's `updated` may be: a day, in the milliseconds the apps count in.
-/// Nothing honest is signed further ahead than a wrong clock, and a date far in the future would lock its handle
-/// against every later update.
-pub const MAX_AHEAD_MS: u64 = 24 * 3600 * 1000;
-
-/// One thing that happened to a handle, for the operator's history: which name, what happened and when. Never who:
-/// no key, no profile and no address is kept with it.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
-pub struct HandleEvent {
-    /// Counts up from 1, so the admin app can ask for just what's new.
-    pub seq: u64,
-    /// Seconds since 1970.
-    pub at: u64,
-    pub handle: String,
-    /// `claimed`, `returned` (its old owner took it back), `released` (its owner let go), `let-go-early`, `burned`
-    /// (its account was burned), `taken-down`, `given` (set aside for someone), `freed`, `banned`, `unbanned`,
-    /// `account-banned`, `reserved` or `unreserved`.
-    pub what: String,
-}
-
-/// How many events the relay keeps: the oldest go first. The admin app keeps its own copy of everything it has seen.
-pub const MAX_HISTORY: usize = 20_000;
-
-/// The most events one answer carries.
-pub const HISTORY_PAGE: usize = 5_000;
-
 /// A handle no longer listed.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 struct Hold {
@@ -79,11 +46,6 @@ struct Hold {
     /// When it frees up, if not three months after `since`: a handle let go of early cools off for less.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     until: Option<u64>,
-    /// The `updated` of the entry last listed under it. Whoever it's held for must sign something newer to take it
-    /// back, so an old signed copy, which anyone may have looked up, can't list it again. Holds saved before this
-    /// have none, and count as zero.
-    #[serde(default)]
-    updated: u64,
 }
 
 impl Hold {
@@ -104,8 +66,7 @@ pub struct Entry {
     pub blob: String,
     /// Base64 signature over `"pulshade.dir.v1" | handle | updated (u64 BE) | blob`.
     pub sig: String,
-    /// Milliseconds since 1970 by the owner's clock. Each update must be newer than the last, and none may be more
-    /// than `MAX_AHEAD_MS` ahead of the relay's clock.
+    /// Seconds since 1970, chosen by the owner. Each update must be newer than the last.
     pub updated: u64,
 }
 
@@ -373,9 +334,6 @@ pub struct Directory {
     /// Handles no longer listed: only the key each is held for may list it again, until the hold runs out.
     held: HashMap<String, Hold>,
     held_path: Option<PathBuf>,
-    /// What has happened to handles, oldest first.
-    history: Vec<HandleEvent>,
-    history_path: Option<PathBuf>,
     /// Collectibles the creator gave out, for each owner to fetch.
     grants: Vec<Grant>,
     grants_path: Option<PathBuf>,
@@ -457,15 +415,10 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
-}
-
 impl Directory {
     pub fn load(path: PathBuf, creator: Option<String>, sealer: Sealer) -> Self {
         let moderation_path = path.with_file_name("pulshade-moderation.json");
         let held_path = path.with_file_name("pulshade-held.json");
-        let history_path = path.with_file_name("pulshade-handle-history.json");
         let grants_path = path.with_file_name("pulshade-collectibles.json");
         let announcements_path = path.with_file_name("pulshade-announcements.json");
         let giveaways_path = path.with_file_name("pulshade-giveaways.json");
@@ -474,7 +427,6 @@ impl Directory {
         let (entries, plain_entries) = read_sealed(&path, &sealer);
         let (moderation, plain_moderation) = read_sealed(&moderation_path, &sealer);
         let (held, _): (HashMap<String, serde_json::Value>, _) = read_sealed(&held_path, &sealer);
-        let (history, _) = read_sealed(&history_path, &sealer);
         let (grants, _) = read_sealed(&grants_path, &sealer);
         let (announcements, _) = read_sealed(&announcements_path, &sealer);
         let (giveaways, _) = read_sealed(&giveaways_path, &sealer);
@@ -482,7 +434,7 @@ impl Directory {
         let (eggs, _) = read_sealed(&eggs_path, &sealer);
         // The first holds were just the key's hash, with no date: their three months start now.
         let held = held.into_iter().filter_map(|(h, v)| match v {
-            serde_json::Value::String(key) => Some((h, Hold { key: Some(key), since: now(), until: None, updated: 0 })),
+            serde_json::Value::String(key) => Some((h, Hold { key: Some(key), since: now(), until: None })),
             other => serde_json::from_value(other).ok().map(|hold| (h, hold)),
         }).collect();
         let dir = Directory {
@@ -493,8 +445,6 @@ impl Directory {
             moderation_path: Some(moderation_path),
             held,
             held_path: Some(held_path),
-            history,
-            history_path: Some(history_path),
             grants,
             grants_path: Some(grants_path),
             announcements,
@@ -541,12 +491,9 @@ impl Directory {
         }
     }
 
-    /// Saves the listings, and says whether they are safely on disk (or there is no disk to save to, in tests).
-    fn persist(&self) -> bool {
-        match (&self.path, serde_json::to_vec(&self.entries)) {
-            (Some(path), Ok(raw)) => self.write_sealed(path, &raw),
-            (None, _) => true,
-            _ => false,
+    fn persist(&self) {
+        if let (Some(path), Ok(raw)) = (&self.path, serde_json::to_vec(&self.entries)) {
+            self.write_sealed(path, &raw);
         }
     }
 
@@ -554,37 +501,6 @@ impl Directory {
         if let (Some(path), Ok(raw)) = (&self.held_path, serde_json::to_vec(&self.held)) {
             self.write_sealed(path, &raw);
         }
-    }
-
-    fn persist_history(&self) {
-        if let (Some(path), Ok(raw)) = (&self.history_path, serde_json::to_vec(&self.history)) {
-            self.write_sealed(path, &raw);
-        }
-    }
-
-    /// Notes that something happened to a handle.
-    fn log(&mut self, handle: &str, what: &str) {
-        let seq = self.history.last().map_or(1, |e| e.seq + 1);
-        self.history.push(HandleEvent { seq, at: now(), handle: handle.to_string(), what: what.to_string() });
-        if self.history.len() > MAX_HISTORY {
-            let extra = self.history.len() - MAX_HISTORY;
-            self.history.drain(..extra);
-        }
-        self.persist_history();
-    }
-
-    /// The history: `after N` for what's newer than event N, a handle for just its events, nothing for the latest.
-    pub fn history(&self, filter: &str) -> Vec<HandleEvent> {
-        let filter = filter.trim().trim_start_matches('@').to_lowercase();
-        if let Some(n) = filter.strip_prefix("after ") {
-            let after: u64 = n.trim().parse().unwrap_or(0);
-            return self.history.iter().filter(|e| e.seq > after).take(HISTORY_PAGE).cloned().collect();
-        }
-        if filter.is_empty() {
-            let skip = self.history.len().saturating_sub(HISTORY_PAGE);
-            return self.history[skip..].to_vec();
-        }
-        self.history.iter().filter(|e| e.handle == filter).cloned().collect()
     }
 
     fn persist_grants(&self) {
@@ -617,21 +533,10 @@ impl Directory {
         }
     }
 
-    /// Keeps a handle that's no longer listed for the key that owned it, or for nobody once it's retired. `updated`
-    /// is that of the entry this key had listed under it, if it had one.
-    fn hold(&mut self, handle: &str, key: Option<&str>, updated: u64) {
-        let key = key.map(key_hash);
-        let updated = self.last_updated(handle, key.as_deref(), updated);
-        self.held.insert(handle.to_string(), Hold { key, since: now(), until: None, updated });
+    /// Keeps a handle that's no longer listed for the key that owned it, or for nobody once it's retired.
+    fn hold(&mut self, handle: &str, key: Option<&str>) {
+        self.held.insert(handle.to_string(), Hold { key: key.map(key_hash), since: now(), until: None });
         self.persist_held();
-    }
-
-    /// What a new hold on a handle remembers as its last `updated`: the newest of the entry coming down and a hold
-    /// already there for the same key (by its hash). Never further ahead than an entry may be, so a date from
-    /// before that was checked can't keep the handle from the key it's held for.
-    fn last_updated(&self, handle: &str, key: Option<&str>, updated: u64) -> u64 {
-        let held = self.held.get(handle).filter(|hold| hold.key.as_deref() == key).map_or(0, |hold| hold.updated);
-        updated.max(held).min(now_ms() + MAX_AHEAD_MS)
     }
 
     /// Forgets holds whose three months are up.
@@ -652,16 +557,15 @@ impl Directory {
             + self.held.iter().filter(|(h, hold)| *h != except && hold.live() && hold.key.as_deref() == Some(hash.as_str())).count()
     }
 
-    /// Seals in memory, then swaps the file in whole, so nothing readable ever reaches the disk. Says whether the
-    /// file was written.
-    fn write_sealed(&self, path: &PathBuf, plain: &[u8]) -> bool {
-        let Some(sealer) = &self.sealer else { return true };
+    /// Seals in memory, then swaps the file in whole, so nothing readable ever reaches the disk.
+    fn write_sealed(&self, path: &PathBuf, plain: &[u8]) {
+        let Some(sealer) = &self.sealer else { return };
         let tmp = path.with_extension("tmp");
-        if crate::sealed::write_private(&tmp, &sealer.seal(plain)).is_ok() && std::fs::rename(&tmp, path).is_ok() {
-            return true;
+        if std::fs::write(&tmp, sealer.seal(plain)).is_ok() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::rename(tmp, path);
         }
-        let _ = std::fs::remove_file(&tmp);
-        false
     }
 
     pub fn get(&self, handle: &str) -> Option<Entry> {
@@ -683,12 +587,6 @@ impl Directory {
         if blob.is_empty() || blob.len() > MAX_PROFILE {
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
         }
-        // Nothing dated far ahead. The signed message has no mark between the handle and the date, so a signature
-        // for `alice` also fits `alic` with every byte after it moved along one; the date then starts with a letter
-        // of the handle, which puts it millions of years ahead, and it is refused here.
-        if entry.updated > now_ms() + MAX_AHEAD_MS {
-            return Err(StatusCode::BAD_REQUEST);
-        }
         let owner = key(&entry.key).ok_or(StatusCode::BAD_REQUEST)?;
         let sig = signature(&entry.sig).ok_or(StatusCode::BAD_REQUEST)?;
         let mut message = b"pulshade.dir.v1".to_vec();
@@ -696,12 +594,6 @@ impl Directory {
         message.extend_from_slice(&entry.updated.to_be_bytes());
         message.extend_from_slice(&blob);
         owner.verify(&message, &sig).map_err(|_| StatusCode::UNAUTHORIZED)?;
-        // Only so many listings and so much in them, all told, so the directory can't outgrow the relay's memory.
-        let others: usize = self.entries.iter().filter(|(h, _)| h.as_str() != handle).map(|(_, e)| e.blob.len()).sum();
-        if others + entry.blob.len() > MAX_DIRECTORY_BYTES || (!self.entries.contains_key(handle) && self.entries.len() >= MAX_ENTRIES) {
-            return Err(StatusCode::INSUFFICIENT_STORAGE);
-        }
-        let mut claimed = None;
         if let Some(existing) = self.entries.get(handle) {
             // Taken by someone else, or an old copy being replayed.
             if existing.key != entry.key {
@@ -717,30 +609,14 @@ impl Directory {
                 if hold.key.as_deref() != Some(key_hash(&entry.key).as_str()) {
                     return Err(StatusCode::LOCKED);
                 }
-                // An old copy of its listing, which anyone could have kept, doesn't bring it back.
-                if entry.updated <= hold.updated {
-                    return Err(StatusCode::CONFLICT);
-                }
             }
             if self.creator.as_deref() != Some(entry.key.as_str()) && self.handles_of(&entry.key, handle) >= MAX_HANDLES {
                 return Err(StatusCode::UNPROCESSABLE_ENTITY);
             }
-            // Still held, and not locked against it: its old owner is back.
-            claimed = Some(if self.live_hold(handle).is_some() { "returned" } else { "claimed" });
-        }
-        let before = self.entries.insert(handle.to_string(), entry);
-        if !self.persist() {
-            // Not on disk, so a restart would lose it: it's taken back, and the owner is told it didn't work.
-            match before {
-                Some(old) => { self.entries.insert(handle.to_string(), old); }
-                None => { self.entries.remove(handle); }
-            }
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-        if let Some(what) = claimed {
             if self.held.remove(handle).is_some() { self.persist_held(); }
-            self.log(handle, what);
         }
+        self.entries.insert(handle.to_string(), entry);
+        self.persist();
         Ok(())
     }
 
@@ -767,11 +643,10 @@ impl Directory {
         message.extend_from_slice(handle.as_bytes());
         message.extend_from_slice(&removal.ts.to_be_bytes());
         owner.verify(&message, &sig).map_err(|_| StatusCode::UNAUTHORIZED)?;
-        let (key, updated) = (existing.key.clone(), existing.updated);
+        let key = existing.key.clone();
         self.entries.remove(handle);
         self.persist();
-        self.hold(handle, Some(&key), updated);
-        self.log(handle, "released");
+        self.hold(handle, Some(&key));
         Ok(())
     }
 
@@ -795,10 +670,9 @@ impl Directory {
         if hold.key.as_deref() != Some(key_hash(&proof.key).as_str()) {
             return Err(StatusCode::NOT_FOUND);
         }
-        let (now, updated) = (now(), hold.updated);
-        self.held.insert(handle.to_string(), Hold { key: None, since: now, until: Some(now + COOL_OFF_SECS), updated });
+        let now = now();
+        self.held.insert(handle.to_string(), Hold { key: None, since: now, until: Some(now + COOL_OFF_SECS) });
         self.persist_held();
-        self.log(handle, "let-go-early");
         Ok(())
     }
 
@@ -807,7 +681,7 @@ impl Directory {
     pub fn retire(&mut self, proof: &OwnerProof) -> Result<usize, StatusCode> {
         proof.check(b"pulshade.dir.retire.v1", None)?;
         let listed: Vec<String> = self.entries.iter().filter(|(_, e)| e.key == proof.key).map(|(h, _)| h.clone()).collect();
-        let updated: Vec<u64> = listed.iter().map(|h| self.entries.remove(h).map_or(0, |e| e.updated)).collect();
+        for h in &listed { self.entries.remove(h); }
         if !listed.is_empty() { self.persist(); }
         let hash = key_hash(&proof.key);
         let mut count = listed.len();
@@ -815,12 +689,8 @@ impl Directory {
             hold.key = None;
             count += 1;
         }
-        for (h, updated) in listed.iter().zip(updated) {
-            let updated = self.last_updated(h, None, updated);
-            self.held.insert(h.clone(), Hold { key: None, since: now(), until: None, updated });
-        }
+        for h in listed { self.held.insert(h, Hold { key: None, since: now(), until: None }); }
         self.persist_held();
-        for h in &listed { self.log(h, "burned"); }
         // Its collectibles go with it, so nothing on the relay names the key any more. Their numbers stay used, and
         // one with a backup code stays claimable, tied to nobody, for whoever enters the code.
         let before = self.grants.clone();
@@ -1301,8 +1171,7 @@ impl Directory {
     pub fn take_down(&mut self, handle: &str) -> bool {
         let Some(entry) = self.entries.remove(handle) else { return false };
         self.persist();
-        self.hold(handle, Some(&entry.key), entry.updated);
-        self.log(handle, "taken-down");
+        self.hold(handle, Some(&entry.key));
         true
     }
 
@@ -1310,18 +1179,15 @@ impl Directory {
     /// down, and only that key may claim it for the next three months.
     pub fn give(&mut self, handle: &str, to: &str) -> Result<(), StatusCode> {
         key(to).ok_or(StatusCode::BAD_REQUEST)?;
-        let listed = self.entries.remove(handle);
-        if listed.is_some() { self.persist(); }
-        // Only what this key signed itself counts against its old copies; someone else's listing says nothing of them.
-        self.hold(handle, Some(to), listed.filter(|entry| entry.key == to).map_or(0, |entry| entry.updated));
-        self.log(handle, "given");
+        if self.entries.remove(handle).is_some() { self.persist(); }
+        self.hold(handle, Some(to));
         Ok(())
     }
 
     /// Lets anyone claim a held name. Only the operator does this, on purpose.
     pub fn free(&mut self, handle: &str) -> bool {
         let found = self.held.remove(handle).is_some();
-        if found { self.persist_held(); self.log(handle, "freed"); }
+        if found { self.persist_held(); }
         found
     }
 
@@ -1330,29 +1196,22 @@ impl Directory {
         self.take_down(handle);
         self.moderation.banned_handles.insert(handle.to_string());
         self.persist_moderation();
-        self.log(handle, "banned");
     }
 
     pub fn unban_handle(&mut self, handle: &str) -> bool {
         let found = self.moderation.banned_handles.remove(handle);
         self.persist_moderation();
-        if found { self.log(handle, "unbanned"); }
         found
     }
 
     /// Stops an account listing itself, and takes down everything it already has. Returns the handles removed.
     pub fn ban_key(&mut self, key: &str) -> Vec<String> {
         let gone: Vec<String> = self.entries.iter().filter(|(_, e)| e.key == key).map(|(h, _)| h.clone()).collect();
-        let updated: Vec<u64> = gone.iter().map(|h| self.entries.remove(h).map_or(0, |e| e.updated)).collect();
+        for h in &gone { self.entries.remove(h); }
         self.persist();
         // Held for the banned key, so nobody else can take up its names.
-        let hash = key_hash(key);
-        for (h, updated) in gone.iter().zip(updated) {
-            let updated = self.last_updated(h, Some(&hash), updated);
-            self.held.insert(h.clone(), Hold { key: Some(hash.clone()), since: now(), until: None, updated });
-        }
+        for h in &gone { self.held.insert(h.clone(), Hold { key: Some(key_hash(key)), since: now(), until: None }); }
         self.persist_held();
-        for h in &gone { self.log(h, "account-banned"); }
         self.moderation.banned_keys.insert(key.to_string());
         self.persist_moderation();
         gone
@@ -1367,13 +1226,11 @@ impl Directory {
     pub fn reserve(&mut self, handle: &str) {
         self.moderation.reserved.insert(handle.to_string());
         self.persist_moderation();
-        self.log(handle, "reserved");
     }
 
     pub fn unreserve(&mut self, handle: &str) -> bool {
         let found = self.moderation.reserved.remove(handle);
         self.persist_moderation();
-        if found { self.log(handle, "unreserved"); }
         found
     }
 
@@ -1410,30 +1267,12 @@ impl Limiter {
         salt
     }
 
-    /// What an address counts as. An IPv6 customer is given a whole /64 and can pick any address in it, so the
-    /// second half is left out and they all share one allowance. (An onion circuit's made-up address keeps 56 random
-    /// bits that way, still its own.) An IPv4 address written as IPv6 counts as the IPv4 address it is.
-    fn counted(ip: IpAddr) -> IpAddr {
-        match ip {
-            IpAddr::V4(_) => ip,
-            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-                Some(v4) => IpAddr::V4(v4),
-                None => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !u128::from(u64::MAX))),
-            },
-        }
-    }
-
     fn tag(&self, ip: IpAddr) -> [u8; 16] {
-        let digest = Sha256::new().chain_update(self.salt).chain_update(Self::counted(ip).to_string()).finalize();
+        let digest = Sha256::new().chain_update(self.salt).chain_update(ip.to_string()).finalize();
         digest[..16].try_into().unwrap()
     }
 
     pub fn allow(&mut self, ip: IpAddr, kind: &'static str, max: u32, window: Duration) -> bool {
-        self.allow_n(ip, kind, max, window, 1)
-    }
-
-    /// As `allow`, but the request counts as `weight` (a deposit by its size in KiB, say).
-    pub fn allow_n(&mut self, ip: IpAddr, kind: &'static str, max: u32, window: Duration, weight: u32) -> bool {
         let now = Instant::now();
         if now.duration_since(self.salted_at) >= Self::SALT_LIFETIME {
             // A new salt makes every old entry meaningless, so they go with it.
@@ -1446,7 +1285,7 @@ impl Limiter {
         if now.duration_since(entry.0) >= entry.1 {
             *entry = (now, window, 0);
         }
-        entry.2 = entry.2.saturating_add(weight);
+        entry.2 += 1;
         entry.2 <= max
     }
 
@@ -1533,7 +1372,7 @@ mod tests {
         dir.remove("nova", Removal { sig: B64.encode(alice.sign(&m).to_bytes()), ts }).unwrap();
         assert!(dir.get("nova").is_none() && dir.is_held("nova"));
         assert_eq!(dir.put("nova", signed(&mallory, "nova", b"evil", 99)), Err(StatusCode::LOCKED));
-        // The owner takes it back whenever they like, with something signed since.
+        // The owner takes it back whenever they like, newer copy or not.
         assert!(dir.put("nova", signed(&alice, "nova", b"back", 11)).is_ok());
         assert!(!dir.is_held("nova"));
         assert_eq!(B64.decode(dir.get("nova").unwrap().blob).unwrap(), b"back");
@@ -1583,40 +1422,6 @@ mod tests {
         let creator = SigningKey::from_bytes(&[7; 32]);
         let mut mine = Directory::with_creator(&B64.encode(creator.verifying_key().to_bytes()));
         for h in ["aaa", "bbb", "ccc", "ddd"] { assert!(mine.put(h, signed(&creator, h, b"x", 1)).is_ok()); }
-    }
-
-    #[test]
-    fn the_history_notes_what_happened_to_a_name_and_never_who() {
-        let mut dir = Directory::default();
-        let alice = SigningKey::from_bytes(&[1; 32]);
-        dir.put("nova", signed(&alice, "nova", b"v1", 10)).unwrap();
-        dir.put("nova", signed(&alice, "nova", b"v2", 11)).unwrap();
-        remove_signed(&mut dir, &alice, "nova");
-        dir.put("nova", signed(&alice, "nova", b"v3", 12)).unwrap();
-        assert!(dir.take_down("nova"));
-        assert!(dir.free("nova"));
-        dir.ban_handle("spam");
-        dir.reserve("brand");
-        let all = dir.history("");
-        let what: Vec<(&str, &str)> = all.iter().map(|e| (e.handle.as_str(), e.what.as_str())).collect();
-        assert_eq!(what, [
-            ("nova", "claimed"), ("nova", "released"), ("nova", "returned"), ("nova", "taken-down"), ("nova", "freed"),
-            ("spam", "banned"), ("brand", "reserved"),
-        ], "an update to a profile isn't an event");
-        assert!(all.windows(2).all(|w| w[1].seq == w[0].seq + 1 && w[1].at >= w[0].at));
-        assert_eq!(dir.history("after 5").len(), 2, "only what's newer");
-        assert_eq!(dir.history("@nova").len(), 5);
-        let raw = serde_json::to_string(&all).unwrap();
-        assert!(!raw.contains(&B64.encode(alice.verifying_key().to_bytes())), "no key in it");
-    }
-
-    #[test]
-    fn the_history_forgets_the_oldest_past_its_limit() {
-        let mut dir = Directory::default();
-        for i in 0..(MAX_HISTORY + 5) { dir.log(&format!("n{}", i % 50), "reserved"); }
-        assert_eq!(dir.history.len(), MAX_HISTORY);
-        assert_eq!(dir.history[0].seq, 6, "the first five went");
-        assert_eq!(dir.history("after 0").len(), HISTORY_PAGE, "a page at a time");
     }
 
     #[test]
@@ -2346,141 +2151,5 @@ mod tests {
         std::thread::sleep(Duration::from_millis(40));
         limits.sweep();
         assert_eq!(limits.remembered(), 1, "only the address whose window is still open stays");
-    }
-
-    /// A listing is public, so anyone can keep a signed copy of it. Once the handle has come down, that copy must
-    /// not list it again: only something its owner signed afterwards does.
-    #[test]
-    fn an_old_signed_copy_cannot_bring_a_removed_handle_back() {
-        let mut dir = Directory::default();
-        let alice = SigningKey::from_bytes(&[1; 32]);
-        let t = now_ms();
-        dir.put("nova", signed(&alice, "nova", b"v1", t)).unwrap();
-        // What anyone gets from a lookup.
-        let seen = dir.get("nova").unwrap();
-        remove_signed(&mut dir, &alice, "nova");
-        assert_eq!(dir.put("nova", seen.clone()), Err(StatusCode::CONFLICT), "the copy that was listed");
-        assert_eq!(dir.put("nova", signed(&alice, "nova", b"older", t - 5)), Err(StatusCode::CONFLICT), "or an older one");
-        assert!(dir.get("nova").is_none() && dir.is_held("nova"));
-        assert!(dir.put("nova", signed(&alice, "nova", b"back", t + 1)).is_ok(), "its owner, signing anew");
-
-        // The same when the operator takes it down, gives it back to its owner, or bans the account.
-        let latest = dir.get("nova").unwrap();
-        assert!(dir.take_down("nova"));
-        assert_eq!(dir.put("nova", latest.clone()), Err(StatusCode::CONFLICT));
-        dir.give("nova", &latest.key).unwrap();
-        assert_eq!(dir.put("nova", latest.clone()), Err(StatusCode::CONFLICT), "a new hold keeps what the last one knew");
-        assert_eq!(dir.put("nova", seen), Err(StatusCode::CONFLICT));
-        assert!(dir.put("nova", signed(&alice, "nova", b"again", t + 2)).is_ok());
-        let last = dir.get("nova").unwrap();
-        dir.ban_key(&last.key);
-        dir.unban_key(&last.key);
-        assert_eq!(dir.put("nova", last), Err(StatusCode::CONFLICT));
-
-        // A hold saved before this was remembered still loads, with nothing to compare against.
-        let old: Hold = serde_json::from_str(r#"{"key":"k","since":5}"#).unwrap();
-        assert_eq!(old, Hold { key: Some("k".into()), since: 5, until: None, updated: 0 });
-    }
-
-    /// The signed message runs the handle straight into the date, so a signature for `alice` also fits `alic` with
-    /// the bytes after it moved along one. The date that makes is far in the future, which is refused.
-    #[test]
-    fn a_signature_for_one_handle_does_not_list_a_shorter_one() {
-        let mut dir = Directory::default();
-        let alice = SigningKey::from_bytes(&[1; 32]);
-        let t = now_ms();
-        let real = signed(&alice, "alice", b"profile", t);
-        dir.put("alice", real.clone()).unwrap();
-
-        let date = t.to_be_bytes();
-        let mut moved = [b'e'; 8];
-        moved[1..].copy_from_slice(&date[..7]);
-        let mut blob = vec![date[7]];
-        blob.extend_from_slice(b"profile");
-        let forged = Entry { key: real.key.clone(), blob: B64.encode(&blob), sig: real.sig.clone(), updated: u64::from_be_bytes(moved) };
-        // The signature really does fit, so it is the date that has to stop it.
-        let mut message = b"pulshade.dir.v1alic".to_vec();
-        message.extend_from_slice(&forged.updated.to_be_bytes());
-        message.extend_from_slice(&blob);
-        assert!(alice.verifying_key().verify(&message, &signature(&real.sig).unwrap()).is_ok());
-        assert_eq!(dir.put("alic", forged), Err(StatusCode::BAD_REQUEST));
-        assert!(dir.get("alic").is_none() && !dir.is_held("alic"));
-
-        // A clock that is a little out is fine; a date further ahead than a day is not.
-        assert_eq!(dir.put("nova", signed(&alice, "nova", b"x", t + MAX_AHEAD_MS + 60_000)), Err(StatusCode::BAD_REQUEST));
-        assert!(dir.put("nova", signed(&alice, "nova", b"x", t + MAX_AHEAD_MS - 60_000)).is_ok());
-    }
-
-    #[test]
-    fn the_directory_takes_only_so_many_listings_and_so_much_in_them() {
-        let alice = SigningKey::from_bytes(&[1; 32]);
-        let filler = |blob: String| Entry { key: String::new(), blob, sig: String::new(), updated: 1 };
-
-        // Nearly full of profile data: a megabyte of room left.
-        let mut dir = Directory::default();
-        for i in 0..(MAX_DIRECTORY_BYTES / (1024 * 1024) - 1) {
-            dir.entries.insert(format!("filler{i}"), filler("A".repeat(1024 * 1024)));
-        }
-        let picture = vec![7u8; 300 * 1024];
-        assert!(dir.put("one", signed(&alice, "one", &picture, 1)).is_ok());
-        assert!(dir.put("two", signed(&alice, "two", &picture, 1)).is_ok());
-        assert_eq!(dir.put("three", signed(&alice, "three", &picture, 1)), Err(StatusCode::INSUFFICIENT_STORAGE));
-        assert!(dir.get("three").is_none());
-        assert!(dir.put("one", signed(&alice, "one", &picture, 2)).is_ok(), "one already listed is replaced, not added");
-        assert!(dir.put("three", signed(&alice, "three", b"small", 1)).is_ok(), "what still fits is taken");
-
-        // Full of listings, however small.
-        let mut dir = Directory::default();
-        dir.put("mine", signed(&alice, "mine", b"v1", 1)).unwrap();
-        for i in 1..MAX_ENTRIES { dir.entries.insert(format!("filler{i}"), filler("QQ==".into())); }
-        assert_eq!(dir.put("more", signed(&alice, "more", b"x", 1)), Err(StatusCode::INSUFFICIENT_STORAGE));
-        assert!(dir.put("mine", signed(&alice, "mine", b"v2", 2)).is_ok(), "an update isn't a new listing");
-    }
-
-    /// A claim is only answered with success once it is on disk; otherwise a restart would quietly lose it.
-    #[test]
-    fn a_claim_that_cannot_be_saved_is_refused_and_not_kept() {
-        use std::os::unix::fs::PermissionsExt;
-        let folder = std::env::temp_dir().join(format!("pulshade-unsaved-{}-{}", std::process::id(), now_ms()));
-        std::fs::create_dir_all(&folder).unwrap();
-        let path = folder.join("pulshade-directory.json");
-        let alice = SigningKey::from_bytes(&[1; 32]);
-        let mut dir = Directory::load(path.clone(), None, Sealer::with_key([3; 32]));
-        dir.put("kept", signed(&alice, "kept", b"v1", 10)).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600, "only the relay reads it");
-        remove_signed(&mut dir, &alice, "kept");
-        dir.put("kept", signed(&alice, "kept", b"v2", 11)).unwrap();
-        remove_signed(&mut dir, &alice, "kept");
-
-        // The disk goes away.
-        std::fs::remove_dir_all(&folder).unwrap();
-        assert_eq!(dir.put("lost", signed(&alice, "lost", b"x", 1)), Err(StatusCode::INTERNAL_SERVER_ERROR));
-        assert!(dir.get("lost").is_none(), "not kept in memory either");
-        assert_eq!(dir.put("kept", signed(&alice, "kept", b"v3", 12)), Err(StatusCode::INTERNAL_SERVER_ERROR));
-        assert!(dir.get("kept").is_none() && dir.is_held("kept"), "and still held for its owner");
-
-        // Back again, the same claims go through.
-        std::fs::create_dir_all(&folder).unwrap();
-        assert!(dir.put("kept", signed(&alice, "kept", b"v3", 12)).is_ok());
-        assert!(!dir.is_held("kept"));
-        let _ = std::fs::remove_dir_all(&folder);
-    }
-
-    #[test]
-    fn limiter_counts_an_ipv6_network_as_one_caller() {
-        let mut limits = Limiter::default();
-        let minute = Duration::from_secs(60);
-        let mut allow = |ip: &str| limits.allow(ip.parse().unwrap(), "x", 5, minute);
-        for i in 0..5 { assert!(allow(&format!("2001:db8:1:2::{i:x}"))); }
-        assert!(!allow("2001:db8:1:2:ffff:ffff:ffff:ffff"), "another address in the same /64 is the same caller");
-        assert!(allow("2001:db8:1:3::1"), "the next network has its own allowance");
-        // Onion circuits' made-up addresses differ in the first half, and stay apart.
-        for _ in 0..5 { assert!(allow("fd12:3456:789a:bcde::1")); }
-        assert!(!allow("fd12:3456:789a:bcde::1"));
-        assert!(allow("fd12:3456:789a:bcdf::1"));
-        // An IPv4 address written as IPv6 is that IPv4 address, not one of a /64 of them.
-        for _ in 0..5 { assert!(allow("::ffff:192.0.2.1")); }
-        assert!(!allow("192.0.2.1"));
-        assert!(allow("::ffff:192.0.2.2"));
     }
 }

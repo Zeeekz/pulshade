@@ -110,7 +110,7 @@ struct ContactsView: View {
                 Button(action: search) {
                     HStack(spacing: 10) {
                         Image(systemName: "at").font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(Ink.onAccent)
+                            .foregroundStyle(.white)
                             .frame(width: 30, height: 30)
                             .background(theme.accent.opacity(0.85), in: .rect(cornerRadius: 8))
                         Text("Find @\(handle)").font(.system(size: 15)).foregroundStyle(Ink.text)
@@ -181,7 +181,7 @@ struct ContactsView: View {
             Text("No one has @\(handle ?? query). Handles are exact, so check the spelling.")
                 .font(.system(size: 13)).foregroundStyle(Ink.dim)
         } else if let problem {
-            ProblemText(problem)
+            Text(branded: problem).font(.system(size: 13, weight: .medium)).foregroundStyle(.orange)
         }
     }
 
@@ -285,7 +285,7 @@ struct ContactsView: View {
             .frame(maxWidth: .infinity)
             .padding(.top, 30)
         } else {
-            SettingsGroup(query.isEmpty ? (contacts.count == 1 ? "1 contact" : "\(contacts.count) contacts") : "Matching contacts") {
+            SettingsGroup(query.isEmpty ? "\(contacts.count) contacts" : "Matching contacts") {
                 ForEach(Array(contacts.enumerated()), id: \.element.id) { i, c in
                     if i > 0 { RowDivider(inset: 66) }
                     Button { message(c) } label: { ContactRow(contact: c, detail: nil) }

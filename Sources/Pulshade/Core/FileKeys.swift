@@ -67,28 +67,6 @@ struct FileKeys {
         SecItemDelete(Self.query(account) as CFDictionary)
     }
 
-    // MARK: Wrong-passcode count
-
-    /// How many wrong passcodes in a row, kept in the Keychain so quitting and reopening doesn't start the
-    /// waiting over. A number and nothing else; Burn and Detach delete it.
-    private static let attemptsAccount = "failed-attempts"
-
-    static func savedAttempts() -> Int {
-        guard let raw = read(attemptsAccount), raw.count == 4 else { return 0 }
-        return Int(raw.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }.littleEndian)
-    }
-
-    static func saveAttempts(_ count: Int) {
-        if count <= 0 { forgetAttempts(); return }
-        var value = UInt32(clamping: count).littleEndian
-        try? write(attemptsAccount, Data(bytes: &value, count: 4))
-    }
-
-    static func forgetAttempts() {
-        if inMemory { _ = lock.withLock { memory.removeValue(forKey: attemptsAccount) }; return }
-        SecItemDelete(query(attemptsAccount) as CFDictionary)
-    }
-
     // MARK: Keychain
 
     private static func query(_ account: String) -> [String: Any] {

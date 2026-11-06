@@ -4,10 +4,9 @@
 //! them with their receive keys. When an envelope is deposited, the relay sends Apple one push with no
 //! message in it: only "New message". The phone then fetches the real thing over Tor as usual.
 //!
-//! What the relay holds is a token per mailbox. They are kept in memory and written to disk with the waiting
-//! mail, in the sealed spool, so a restart keeps them; a week without the phone opening Pulshade and registering
-//! again forgets one. Whoever has the spool and the storage key can see which token goes with which mailbox.
-//! Apple learns that a device was woken, and when. Nothing else leaves.
+//! What the relay holds is a token per mailbox, in memory only (a restart forgets them until the phone next
+//! opens Pulshade and registers again, and so does a week without it opening). Apple learns that a device was
+//! woken, and when. Nothing else leaves.
 //!
 //! The limits are there so this can't be turned on the relay or on Apple: a token can hold only so many mailboxes,
 //! the table has a ceiling (the oldest registrations make way), a device is woken at most once in a while however
@@ -16,10 +15,11 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64URL};
 use p256::ecdsa::{Signature, SigningKey, signature::Signer};
 use p256::pkcs8::DecodePrivateKey;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::{Arc, LazyLock, Mutex},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -106,6 +106,21 @@ pub enum Wake {
     Call,
 }
 
+/// A registration as the relay keeps it on disk between runs (sealed, with the waiting mail), so a restart doesn't
+/// silence every phone until its owner next opens the app. `registered` is when, by the wall clock.
+#[derive(Serialize, Deserialize)]
+pub struct Saved {
+    pub mailbox: String,
+    pub token: String,
+    pub sandbox: bool,
+    pub sound: bool,
+    #[serde(default)]
+    pub tone: Option<String>,
+    #[serde(default)]
+    pub voip: Option<String>,
+    pub registered: u64,
+}
+
 struct Signed {
     jwt: String,
     made: Instant,
@@ -122,6 +137,8 @@ pub struct Push {
     rate: Mutex<(Instant, u32)>,
     jwt: Mutex<Option<Signed>>,
     http: reqwest::Client,
+    /// Registrations changed since they were last written out.
+    changed: AtomicBool,
 }
 
 /// The one the relay runs with, set up from `apns.json` when there is one.
@@ -140,6 +157,7 @@ impl Push {
             last_call: Mutex::default(),
             rate: Mutex::new((Instant::now(), 0)),
             jwt: Mutex::default(),
+            changed: AtomicBool::new(false),
             http: reqwest::Client::builder().timeout(Duration::from_secs(15)).build().expect("http client"),
         }
     }
@@ -147,6 +165,41 @@ impl Push {
     /// Whether the operator has put an APNs key beside the relay.
     pub fn enabled(&self) -> bool {
         self.config.is_some()
+    }
+
+    /// Every live registration, to write to disk, and whether any changed since the last time this was asked.
+    pub fn saved(&self) -> (Vec<Saved>, bool) {
+        let changed = self.changed.swap(false, Ordering::SeqCst);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let targets = self.targets.lock().unwrap();
+        let saved = targets.iter().map(|(id, t)| Saved {
+            mailbox: hex::encode(id),
+            token: t.token.clone(),
+            sandbox: t.sandbox,
+            sound: t.sound,
+            tone: t.tone.clone(),
+            voip: t.voip.clone(),
+            registered: now.saturating_sub(t.at.elapsed().as_secs()),
+        }).collect();
+        (saved, changed)
+    }
+
+    /// Registrations written out by the last run. Ones past their week are left behind.
+    pub fn restore(&self, saved: Vec<Saved>) -> usize {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let mut targets = self.targets.lock().unwrap();
+        for s in saved {
+            let age = Duration::from_secs(now.saturating_sub(s.registered));
+            let Some(mailbox) = hex::decode(&s.mailbox).ok().and_then(|raw| Id::try_from(raw).ok()) else { continue };
+            if age >= TTL || !valid_token(&s.token) || targets.len() >= MAX_TARGETS {
+                continue;
+            }
+            let at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+            let voip = s.voip.filter(|v| valid_token(v));
+            let tone = s.tone.filter(|t| TONES.contains(&t.as_str()));
+            targets.insert(mailbox, Target { token: s.token, sandbox: s.sandbox, sound: s.sound, tone, voip, at });
+        }
+        targets.len()
     }
 
     /// Remembers `token` for these mailboxes (by send id), replacing any earlier one. False if the token already holds
@@ -158,6 +211,7 @@ impl Push {
     pub fn register_with(&self, mailboxes: &[Id], token: &str, sandbox: bool, sound: bool, extras: Extras) -> bool {
         let tone = extras.tone.filter(|t| TONES.contains(&t.as_str()));
         let voip = extras.voip.map(|v| v.to_lowercase()).filter(|v| valid_token(v));
+        self.changed.store(true, Ordering::SeqCst);
         let mut targets = self.targets.lock().unwrap();
         let held = targets.values().filter(|t| t.token == token).count();
         let new = mailboxes.iter().filter(|id| targets.get(*id).is_none_or(|t| t.token != token)).count();
@@ -182,16 +236,19 @@ impl Push {
     }
 
     pub fn remove(&self, mailboxes: &[Id]) {
+        self.changed.store(true, Ordering::SeqCst);
         self.targets.lock().unwrap().retain(|id, _| !mailboxes.contains(id));
     }
 
     /// Everything registered for a device token, for a phone that has no keys to name its mailboxes with.
     pub fn forget(&self, token: &str) {
+        self.changed.store(true, Ordering::SeqCst);
         self.targets.lock().unwrap().retain(|_, t| t.token != token);
         self.last.lock().unwrap().remove(token);
     }
 
     fn drop_voip(&self, voip: &str) {
+        self.changed.store(true, Ordering::SeqCst);
         for t in self.targets.lock().unwrap().values_mut() {
             if t.voip.as_deref() == Some(voip) { t.voip = None; }
         }
@@ -201,7 +258,9 @@ impl Push {
     pub fn sweep(&self) {
         let now = Instant::now();
         let mut targets = self.targets.lock().unwrap();
+        let before = targets.len();
         targets.retain(|_, t| now.duration_since(t.at) < TTL);
+        if targets.len() != before { self.changed.store(true, Ordering::SeqCst); }
         drop(targets);
         self.last.lock().unwrap().retain(|_, at| now.duration_since(*at) < COOLDOWN);
         self.last_call.lock().unwrap().retain(|_, at| now.duration_since(*at) < CALL_COOLDOWN);

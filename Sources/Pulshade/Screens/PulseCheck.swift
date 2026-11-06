@@ -38,7 +38,7 @@ struct PulseCheckView: View {
                                 Text(code.emoji[i]).font(.system(size: 28))
                                     .frame(width: 46, height: 48)
                                     .glass(12)
-                                    .phaseAnimator(Platform.reduceMotion ? [0.0] : [0.0, -4.0, 0.0]) { v, y in v.offset(y: y) } animation: { _ in
+                                    .phaseAnimator([0.0, -4.0, 0.0]) { v, y in v.offset(y: y) } animation: { _ in
                                         .easeInOut(duration: 0.4).delay(Double(i) * 0.06 + 2)
                                     }
                             }
@@ -127,7 +127,7 @@ private struct BeatBridge: View {
     var success: Bool
 
     var body: some View {
-        TimelineView(.animation(paused: Platform.reduceMotion)) { context in
+        TimelineView(.animation) { context in
             let t = context.date.timeIntervalSinceReferenceDate
             let head = (t.truncatingRemainder(dividingBy: 1.6)) / 1.6 * 1.4
             ZStack {

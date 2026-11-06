@@ -19,16 +19,6 @@ fn random<const N: usize>() -> [u8; N] {
     raw
 }
 
-/// Writes a file only this user can read. It is made that way when it is opened, so its contents are never on
-/// disk under looser permissions, and one left over from before is narrowed before anything is written to it.
-pub fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(contents)
-}
-
 fn parse(hex_key: &str) -> Option<[u8; 32]> {
     hex::decode(hex_key.trim()).ok()?.try_into().ok()
 }
@@ -62,7 +52,9 @@ impl Sealer {
                 return parse(&existing).map(Self::with_key).ok_or(format!("{path} doesn't hold a storage key"));
             }
             let key: [u8; 32] = random();
-            write_private(file, hex::encode(key).as_bytes()).map_err(|e| format!("could not write {path}: {e}"))?;
+            std::fs::write(file, hex::encode(key)).map_err(|e| format!("could not write {path}: {e}"))?;
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600));
             return Ok(Self::with_key(key));
         }
         let old = beside.with_file_name("storage.key");
@@ -128,20 +120,5 @@ mod tests {
         let mut tampered = sealed.clone();
         *tampered.last_mut().unwrap() ^= 1;
         assert!(sealer.open(&tampered).is_none());
-    }
-
-    /// A secret is never readable by anyone else, not even for the moment between writing it and narrowing it.
-    #[test]
-    fn private_files_are_made_readable_by_their_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-        let path = std::env::temp_dir().join(format!("pulshade-private-{}-{}", std::process::id(), hex::encode(random::<8>())));
-        write_private(&path, b"secret").unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        // One left behind with looser permissions is narrowed too.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_private(&path, b"again").unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        assert_eq!(std::fs::read(&path).unwrap(), b"again");
-        let _ = std::fs::remove_file(&path);
     }
 }

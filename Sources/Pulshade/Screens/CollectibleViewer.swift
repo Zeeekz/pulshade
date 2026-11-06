@@ -82,7 +82,7 @@ struct CollectibleViewerSheet: View {
                 }
                 otherButton("Let go", symbol: "xmark.bin", tint: .red) { letting = true }
             }
-            if let problem { ProblemText(problem) }
+            if let problem { Text(problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange) }
             }
         }
         .sheet(isPresented: $gifting) { GiftSheet(item: item) { dismiss() } }

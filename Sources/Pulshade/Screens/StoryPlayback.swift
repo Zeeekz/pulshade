@@ -7,13 +7,14 @@ import PhotosUI
 
 // MARK: - Playing a received clip
 
-/// A story clip being played, straight from memory: the player is given the bytes without a file.
+/// A story clip being played: the bytes go to a temporary file (the player needs one) which is deleted when
+/// the viewer lets go of it.
 @MainActor
 @Observable
 final class StoryClip {
     @ObservationIgnored let player: AVPlayer
     @ObservationIgnored let layer: AVPlayerLayer
-    @ObservationIgnored private let clip: MemoryClip
+    @ObservationIgnored private var file: URL?
     @ObservationIgnored private var ticker: Any?
     @ObservationIgnored private var end: NSObjectProtocol?
     /// How long it plays, in seconds; 0 until the file has been read.
@@ -24,9 +25,9 @@ final class StoryClip {
     var muted = false { didSet { player.isMuted = muted } }
 
     init?(data: Data) {
-        guard !data.isEmpty else { return nil }
-        clip = MemoryClip(data)
-        let item = AVPlayerItem(asset: clip.makeAsset())
+        guard let url = StoryVideo.tempFile(for: data) else { return nil }
+        file = url
+        let item = AVPlayerItem(url: url)
         player = AVPlayer(playerItem: item)
         player.actionAtItemEnd = .pause
         layer = AVPlayerLayer(player: player)
@@ -56,7 +57,7 @@ final class StoryClip {
         player.play()
     }
 
-    /// Stops playing and lets go of the clip.
+    /// Stops playing and deletes the temporary file.
     func close() {
         player.pause()
         if let ticker { player.removeTimeObserver(ticker) }
@@ -64,6 +65,8 @@ final class StoryClip {
         if let end { NotificationCenter.default.removeObserver(end) }
         end = nil
         player.replaceCurrentItem(with: nil)
+        if let file { try? FileManager.default.removeItem(at: file) }
+        file = nil
     }
 }
 
@@ -82,8 +85,9 @@ struct StoryPoster: View {
                 .background(.black.opacity(0.4), in: .circle)
         }
         .task(id: data.count) {
-            guard !data.isEmpty else { return }
-            if let cg = await StoryVideo.poster(of: MemoryClip(data)) { image = PlatformImage.from(cgImage: cg) }
+            guard let url = StoryVideo.tempFile(for: data) else { return }
+            defer { try? FileManager.default.removeItem(at: url) }
+            if let cg = await StoryVideo.poster(of: url) { image = PlatformImage.from(cgImage: cg) }
         }
     }
 }
@@ -100,8 +104,8 @@ final class ClipPreview {
     @ObservationIgnored private let zoom: ZoomTrack
     @ObservationIgnored private var end: NSObjectProtocol?
 
-    init(clip: MemoryClip, filter: StoryFilter, zoom: ZoomTrack = .none) {
-        asset = clip.makeAsset()
+    init(url: URL, filter: StoryFilter, zoom: ZoomTrack = .none) {
+        asset = AVURLAsset(url: url)
         self.zoom = zoom
         let item = AVPlayerItem(asset: asset)
         item.videoComposition = StoryVideo.composition(for: asset, filter: filter, zoom: zoom)
@@ -225,7 +229,7 @@ struct FilterDots: View {
 
 /// What a story starts from.
 struct StoryPick: Identifiable {
-    enum Kind { case photo(Data), clip(MemoryClip, ZoomTrack) }
+    enum Kind { case photo(Data), clip(URL, ZoomTrack) }
     let id = UUID()
     let kind: Kind
     var filter = StoryFilter.none
@@ -269,15 +273,18 @@ final class LibraryPicker: NSObject, PHPickerViewControllerDelegate {
         }
         if provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier) {
             provider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { url, _ in
-                // The file is only there until this returns, so it is read into memory now. Pulshade makes no copy of it
-                // on disk. Anything past 250 MB is too big to hold; the story only uses 15 seconds of it anyway.
-                guard let url, let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size <= 250_000_000,
-                      let bytes = try? Data(contentsOf: url) else {
+                // The file is only there until this returns, so it is copied now.
+                guard let url else {
                     Task { @MainActor in self.finish(nil, nil) }
                     return
                 }
-                let clip = MemoryClip(bytes)
-                Task { @MainActor in self.finish(.clip(clip, .none), nil) }
+                let copy = FileManager.default.temporaryDirectory.appendingPathComponent("story-pick-\(UUID().uuidString).mov")
+                do {
+                    try FileManager.default.copyItem(at: url, to: copy)
+                    Task { @MainActor in self.finish(.clip(copy, .none), nil) }
+                } catch {
+                    Task { @MainActor in self.finish(nil, nil) }
+                }
             }
         } else if provider.canLoadObject(ofClass: UIImage.self) {
             provider.loadObject(ofClass: UIImage.self) { object, _ in
@@ -317,8 +324,8 @@ struct StoryMediaPicker<Label: View>: View {
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         if let type = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType, type.conforms(to: .movie) {
-            // Read in place and held in memory: no copy is made on disk.
-            if let bytes = try? Data(contentsOf: url, options: .mappedIfSafe) { picked(.clip(MemoryClip(bytes), .none)) }
+            let copy = FileManager.default.temporaryDirectory.appendingPathComponent("story-pick-\(UUID().uuidString).mov")
+            if (try? FileManager.default.copyItem(at: url, to: copy)) != nil { picked(.clip(copy, .none)) }
         } else if let image = NSImage(contentsOf: url) {
             pending = PendingCrop(image: image)
         }

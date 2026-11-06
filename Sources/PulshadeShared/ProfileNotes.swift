@@ -3,8 +3,7 @@ import CryptoKit
 
 /// A piece of text on a profile, read by tapping it. Public notes are plain text for anyone who opens the profile.
 /// A locked note is encrypted on the owner's device with a password only they and the people they tell know: no
-/// server, and not Pulshade, ever has the password or the words. A note can instead be for chosen contacts only: plain
-/// text that is sent just to them, over their own encrypted chats, so none of them needs a password.
+/// server, and not Pulshade, ever has the password or the words.
 public struct ProfileNote: Codable, Equatable, Hashable, Sendable, Identifiable {
     public var id: String
     /// Always readable, even on a locked note, so people know what they'd be unlocking.
@@ -13,15 +12,8 @@ public struct ProfileNote: Codable, Equatable, Hashable, Sendable, Identifiable 
     public var text: String?
     /// The encrypted words, on a locked note (see `NoteSeal`).
     public var sealed: Data?
-    /// Fingerprints of the contacts who may read this note, on the owner's devices only. Nil means everyone who sees the
-    /// profile (a public or locked note); a list means only those contacts are sent it. Never sent to anyone.
-    public var sharedWith: [String]?
-    /// Set on a note someone received that was sent to them alone, so it can say so. Only a label: it grants nothing.
-    public var restricted: Bool?
 
     public var isLocked: Bool { sealed != nil }
-    /// Sent to chosen contacts only.
-    public var isRestricted: Bool { sharedWith != nil || restricted == true }
 
     public static let maxCount = 8
     public static let maxTitle = 60
@@ -29,14 +21,11 @@ public struct ProfileNote: Codable, Equatable, Hashable, Sendable, Identifiable 
     /// Total size of everything sent for notes on one profile.
     public static let maxTotalBytes = 64 * 1024
 
-    public init(id: String, title: String, text: String? = nil, sealed: Data? = nil, sharedWith: [String]? = nil,
-                restricted: Bool? = nil) {
+    public init(id: String, title: String, text: String? = nil, sealed: Data? = nil) {
         self.id = id
         self.title = title
         self.text = text
         self.sealed = sealed
-        self.sharedWith = sharedWith
-        self.restricted = restricted
     }
 
     /// Never fails on one odd entry, so a newer app's profile still opens in an older one.
@@ -46,11 +35,9 @@ public struct ProfileNote: Codable, Equatable, Hashable, Sendable, Identifiable 
         title = (try? c.decode(String.self, forKey: .title)) ?? ""
         text = try? c.decodeIfPresent(String.self, forKey: .text)
         sealed = try? c.decodeIfPresent(Data.self, forKey: .sealed)
-        sharedWith = try? c.decodeIfPresent([String].self, forKey: .sharedWith)
-        restricted = try? c.decodeIfPresent(Bool.self, forKey: .restricted)
     }
 
-    private enum CodingKeys: String, CodingKey { case id, title, text, sealed, sharedWith, restricted }
+    private enum CodingKeys: String, CodingKey { case id, title, text, sealed }
 
     public static func newID() -> String { (0..<8).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined() }
 
@@ -58,10 +45,7 @@ public struct ProfileNote: Codable, Equatable, Hashable, Sendable, Identifiable 
     public var subtitle: String {
         if isLocked { return "Locked with a password" }
         let words = (text ?? "").split { $0.isWhitespace }.count
-        let size = words == 1 ? "1 word" : "\(words) words"
-        if restricted == true { return "Just for you · \(size)" }
-        if let sharedWith { return sharedWith.count == 1 ? "1 contact · \(size)" : "\(sharedWith.count) contacts · \(size)" }
-        return size
+        return words == 1 ? "1 word" : "\(words) words"
     }
 
     // MARK: Cleaning what's typed or received
@@ -90,22 +74,6 @@ public struct ProfileNote: Codable, Equatable, Hashable, Sendable, Identifiable 
         return ProfileNote(id: id, title: title, text: text)
     }
 
-    /// Makes a note that only the chosen contacts are sent. Plain text: they read it without a password, because nobody
-    /// else is ever sent it. Nil if the title or text isn't acceptable or nobody is chosen.
-    public static func contactsNote(id: String = newID(), title: String, text: String, contacts: [String]) -> ProfileNote? {
-        guard let title = cleanTitle(title), let text = cleanText(text) else { return nil }
-        let chosen = cleanAudience(contacts)
-        guard !chosen.isEmpty else { return nil }
-        return ProfileNote(id: id, title: title, text: text, sharedWith: chosen)
-    }
-
-    /// Fingerprints only (32 hex characters), once each, in order, and no more than the app has room for.
-    public static func cleanAudience(_ list: [String]) -> [String] {
-        var seen = Set<String>()
-        return list.filter { $0.count == 32 && $0.allSatisfy(\.isHexDigit) && seen.insert($0).inserted }.prefix(maxAudience).map { $0 }
-    }
-    public static let maxAudience = 500
-
     /// Makes a locked note: the text is encrypted with the password, which must pass `NoteSeal.passwordProblem`.
     /// Slow on purpose (it is what makes guessing passwords slow), so call it off the main thread.
     public static func lockedNote(id: String = newID(), title: String, text: String, password: String,
@@ -121,22 +89,13 @@ public struct ProfileNote: Codable, Equatable, Hashable, Sendable, Identifiable 
         return NoteSeal.open(sealed, password: password, aad: NoteSeal.aad(id: id, title: title))
     }
 
-    /// Valid notes only, within the limits, one per id. Run on everything sent and everything received. Who a note is
-    /// for is the owner's own business, so it is kept only when `keepAudience` is true (the owner's profile, and the
-    /// owner's other devices); everywhere else it is dropped, and a note can't claim to be restricted without a list.
-    public static func cleaned(_ notes: [ProfileNote]?, keepAudience: Bool = false) -> [ProfileNote] {
+    /// Valid notes only, within the limits, one per id. Run on everything sent and everything received.
+    public static func cleaned(_ notes: [ProfileNote]?) -> [ProfileNote] {
         var seen = Set<String>(), out: [ProfileNote] = [], bytes = 0
         for note in (notes ?? []).prefix(maxCount * 2) {
             guard note.id.count == 16, note.id.allSatisfy(\.isHexDigit), let title = cleanTitle(note.title), seen.insert(note.id).inserted
             else { continue }
             var clean = ProfileNote(id: note.id, title: title)
-            if keepAudience, let list = note.sharedWith {
-                let chosen = cleanAudience(list)
-                guard !chosen.isEmpty, note.sealed == nil else { continue }
-                clean.sharedWith = chosen
-            } else if !keepAudience, note.restricted == true, note.sealed == nil {
-                clean.restricted = true
-            }
             if let sealed = note.sealed {
                 guard note.text == nil, NoteSeal.looksSealed(sealed) else { continue }
                 clean.sealed = sealed
@@ -152,23 +111,6 @@ public struct ProfileNote: Codable, Equatable, Hashable, Sendable, Identifiable 
             if out.count == maxCount { break }
         }
         return out
-    }
-}
-
-extension ProfileNote {
-    /// What one contact is sent: every note meant for everyone, plus the ones this contact was chosen for (marked so
-    /// they can tell). With no fingerprint, as for the public listing, only the notes for everyone. The list of
-    /// chosen contacts is never included.
-    public static func notes(_ notes: [ProfileNote]?, sentTo fingerprint: String?) -> [ProfileNote]? {
-        let mine: [ProfileNote] = cleaned(notes, keepAudience: true).compactMap { note in
-            guard let chosen = note.sharedWith else { return note }
-            guard let fingerprint, chosen.contains(fingerprint) else { return nil }
-            var sent = note
-            sent.sharedWith = nil
-            sent.restricted = true
-            return sent
-        }
-        return mine.isEmpty ? nil : mine
     }
 }
 

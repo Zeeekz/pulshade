@@ -262,7 +262,7 @@ struct EggSheet: View {
                         } else if left == 0 {
                             button("Open") { let pet = try await model.hatchEgg(egg.id); dismiss(); opened(pet) }
                         }
-                        if let problem { ProblemText(problem) }
+                        if let problem { Text(problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange) }
                         Text("You can't tell what's inside until it hatches.").font(.system(size: 12)).foregroundStyle(Ink.faint)
                     }
                 }
@@ -283,7 +283,7 @@ struct EggSheet: View {
     private func status(_ egg: RelayClient.EggInfo, _ left: TimeInterval?) -> String {
         guard let left else { return "Takes \(EggNames.minutes(egg.seconds)) to hatch" }
         if left == 0 { return "Ready to open" }
-        let s = Int(min(left.rounded(.up), 360_000))
+        let s = Int(left.rounded(.up))
         return s >= 3600 ? String(format: "Hatching · %d:%02d:%02d", s / 3600, s % 3600 / 60, s % 60) : String(format: "Hatching · %d:%02d", s / 60, s % 60)
     }
 

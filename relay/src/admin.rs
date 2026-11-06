@@ -76,8 +76,6 @@ pub fn run(dir: &mut Directory, req: &AdminRequest, traffic: Traffic) -> Result<
                 "retired": dir.is_retired(&h),
             }))
         }
-        // What has happened to handles and when, never who: `after N` for what's newer, a handle for just its own.
-        "handle-history" => Ok(json!(dir.history(arg))),
         "lists" => Ok(json!({
             "bannedHandles": dir.moderation.banned_handles,
             "bannedAccounts": dir.moderation.banned_keys,

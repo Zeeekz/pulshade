@@ -1585,30 +1585,6 @@ struct RelayFlowTests {
         await zee.unpublishProfile()
     }
 
-    /// The panic passcode takes the relay's copy of the real account's backup away, with a token that can do nothing
-    /// else, and the real account's recovery code then finds nothing.
-    @Test func thePanicPasscodeErasesTheRelayBackup() async throws {
-        let model = try await makeUser("Real")
-        let seed = try #require(model.identity?.seed)
-        try await model.setPanic(passcode: "panic-pass-1")
-        #expect(await model.saveBackup(), "A backup is on the relay")
-        let looker = testModel("pulshade-panic-look")
-        defer { looker.lock() }
-        guard case .found = await looker.backup(of: try Identity(seed: seed)) else {
-            Issue.record("No backup to begin with")
-            return
-        }
-        model.lock()
-        #expect(await model.unlock(passcode: "panic-pass-1"), "It looks like an ordinary unlock")
-        await model.forgetPendingBackup()
-        guard case .none = await looker.backup(of: try Identity(seed: seed)) else {
-            Issue.record("The real account's backup is still on the relay")
-            return
-        }
-        #expect(model.data.pendingBackupForget == nil)
-        model.lock()
-    }
-
     @Test func detachingTheOnlyDeviceKeepsEverythingButChats() async throws {
         let zee = try await makeUser("Zee")
         let bob = try await makeUser("Bob")
@@ -1661,9 +1637,8 @@ struct RelayFlowTests {
         await settle(restored, bob)
         #expect(bob.conversation(bobsChat.id)?.messages.contains { $0.text == "back again" } == true)
         try await Task.sleep(for: .milliseconds(500))
-        // The copy stays, and is saved over as things change.
-        guard case .found = await restored.backup(of: identity) else {
-            Issue.record("The backup was erased after restoring, with backups on")
+        guard case .none = await restored.backup(of: identity) else {
+            Issue.record("The backup stayed on the relay after restoring")
             return
         }
 
@@ -1674,63 +1649,6 @@ struct RelayFlowTests {
         #expect(try await cara.findProfile(handle) == nil)
         await #expect(throws: AppModel.DirectoryError.held) { try await cara.publishProfile(handle: handle) }
         #expect(cara.activeProfile.handle == nil)
-    }
-
-    @Test func theBackupIsKeptFreshSoDetachingNeedsNoNetwork() async throws {
-        let zee = try await makeUser("Zee")
-        let bob = try await makeUser("Bob")
-        defer { for m in [zee, bob] { m.lock() } }
-        _ = try #require(bob.addContact(code: zee.makeInviteCode(), nickname: ""))
-        await settle(zee, bob)
-        let bobFP = try #require(zee.visibleContacts.first).fingerprint
-        let chat = zee.startConversation(kind: .direct, title: "", members: [bobFP])
-        zee.send("never in a backup", in: chat.id)
-        // Delivered and receipted first, so nothing about the account changes between the two saves below.
-        await settle(zee, bob)
-        let seed = try #require(zee.identity?.seed)
-        let identity = try Identity(seed: seed)
-
-        #expect(zee.data.backupSavedAt == nil)
-        #expect(await zee.saveBackup())
-        #expect(zee.data.backupSavedAt != nil && zee.data.backupDigest != nil)
-        // Unchanged, so nothing new is sent: the time stays.
-        let first = zee.data.backupSavedAt
-        #expect(await zee.saveBackup())
-        #expect(zee.data.backupSavedAt == first)
-
-        // Detach is the instant wipe: no recovery code, nothing sent. The contacts come back from the relay.
-        zee.destroyEverything()
-        #expect(zee.identity == nil && zee.phase == .welcome)
-        let restored = testModel("pulshade-instant-detach")
-        defer { restored.lock() }
-        guard case let .found(backup) = await restored.backup(of: identity) else {
-            Issue.record("Detaching left nothing to restore")
-            return
-        }
-        #expect(backup.conversations.allSatisfy { $0.kind != .direct && $0.messages.isEmpty }, "No chat comes back")
-        try await restored.restore(seed: seed, passcode: "new-device", from: backup)
-        #expect(restored.visibleContacts.map(\.fingerprint) == [bobFP])
-
-        // Switching it off erases the copy from the relay; burning does too.
-        restored.setKeepBackup(false)
-        try await Task.sleep(for: .milliseconds(500))
-        guard case .none = await restored.backup(of: identity) else {
-            Issue.record("Switching backups off left the copy on the relay")
-            return
-        }
-        #expect(!(await restored.saveBackup()), "off means no upload")
-    }
-
-    @Test func aBackupIsPaddedAndOldOnesStillOpen() throws {
-        let small = AppModel.padded(Data(repeating: 7, count: 100))
-        #expect(small.count == 64 * 1024)
-        #expect(AppModel.unpadded(small) == Data(repeating: 7, count: 100))
-        let big = AppModel.padded(Data(repeating: 9, count: 70_000))
-        #expect(big.count == 128 * 1024)
-        #expect(AppModel.unpadded(big).count == 70_000)
-        // A backup left by an older build is plain JSON.
-        let legacy = Data(#"{"format":4}"#.utf8)
-        #expect(AppModel.unpadded(legacy) == legacy)
     }
 
     @Test func detachingEveryDeviceWipesThemAllAndKeepsTheAccount() async throws {

@@ -3,9 +3,8 @@
 //! It knows no users, no names and no keys. A mailbox is two random values:
 //! the owner keeps a secret *receive key* and hands out its SHA-256 hash as the
 //! *send id*. Anyone with the send id can drop envelopes in; only the holder of
-//! the receive key can read them out. Envelopes are opaque, deleted on acknowledgement
-//! or after seven days, and no request is ever logged. They wait in memory and nowhere
-//! else: nothing about waiting mail or wake-ups is written to disk, so a restart empties them.
+//! the receive key can read them out. Envelopes are opaque, kept in memory only,
+//! deleted on acknowledgement or after seven days, and nothing is ever logged.
 
 mod admin;
 mod backup;
@@ -32,27 +31,19 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}},
-    time::{Duration, Instant},
+    sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, Ordering}},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::Notify;
 
 const MAX_ENVELOPE: usize = 4 * 1024 * 1024;
 const MAX_QUEUE: usize = 2_000;
 /// Everything waiting in memory, all mailboxes together. Past this, deposits are refused (507) instead of letting
 /// the process grow until it's killed, which would lose every queued envelope at once.
 const MAX_TOTAL_BYTES: usize = 384 * 1024 * 1024;
-/// Request bodies being received at once, all requests together, apart from the first `SHORT_MAIL` bytes of each. An
-/// upload is held in memory whole until it is stored or refused, so without this a few dozen slow, large uploads
-/// could take all the memory there is. Past it, a large upload is refused (503) and tried again by the app; short
-/// messages never count, so they always get through.
-const MAX_IN_FLIGHT: usize = 96 * 1024 * 1024;
-/// Envelope ids one mailbox's acknowledgement may name: twice what a mailbox can hold, and many times what a fetch
-/// hands over.
-const MAX_ACK_IDS: usize = 2 * MAX_QUEUE;
 /// Mailboxes holding mail at once.
 const MAX_MAILBOXES: usize = 200_000;
 /// Receive keys per push registration, so a phone with more registers in several goes.
@@ -67,6 +58,8 @@ const MAX_WAIT: u64 = 25;
 
 /// Wakes waiting fetches whenever anything is deposited, so mail goes out the moment it lands.
 static ARRIVALS: LazyLock<Notify> = LazyLock::new(Notify::new);
+/// Set whenever waiting mail changes, so the spool is only written when there's something new.
+static MAIL_CHANGED: AtomicBool = AtomicBool::new(false);
 /// Different every time the relay starts. The health check carries it, so an app can tell the relay restarted and
 /// register for wake-ups again straight away.
 static BOOT: LazyLock<String> = LazyLock::new(|| {
@@ -75,6 +68,7 @@ static BOOT: LazyLock<String> = LazyLock::new(|| {
     hex::encode(raw)
 });
 /// How often waiting mail and wake-up registrations are written out, at most.
+const SPOOL_EVERY: Duration = Duration::from_secs(30);
 
 type Id = [u8; 32];
 
@@ -120,8 +114,6 @@ struct AppState {
     releases: Arc<release::Releases>,
     calls: Arc<calls::Rooms>,
     limits: Arc<Mutex<Limiter>>,
-    /// Room for request bodies being received, counted in bytes: `MAX_IN_FLIGHT` in all.
-    in_flight: Arc<Semaphore>,
     /// The operator's token, from `admin.token` beside the relay.
     admin_token: Arc<String>,
     started: Instant,
@@ -160,13 +152,7 @@ async fn deposit(State(store): State<Shared>, Path(send_id): Path<String>, heade
         return StatusCode::PAYLOAD_TOO_LARGE;
     }
     let mut store = store.lock().unwrap();
-    // Full: the oldest waiting mail makes way, so the relay never stops taking new messages. (Refusing instead let
-    // anyone who filled it with junk silence everybody until the junk expired.)
-    let new_mailbox = !store.queues.contains_key(&id);
-    if store.bytes + body.len() > MAX_TOTAL_BYTES || (new_mailbox && store.queues.len() >= MAX_MAILBOXES) {
-        make_room(&mut store, body.len(), new_mailbox);
-    }
-    if store.bytes + body.len() > MAX_TOTAL_BYTES {
+    if store.bytes + body.len() > MAX_TOTAL_BYTES || (!store.queues.contains_key(&id) && store.queues.len() >= MAX_MAILBOXES) {
         return StatusCode::INSUFFICIENT_STORAGE;
     }
     let item = Item { id: store.next_id(), at: Instant::now(), blob: body };
@@ -177,6 +163,7 @@ async fn deposit(State(store): State<Shared>, Path(send_id): Path<String>, heade
     }
     queue.push_back(item);
     store.bytes += size;
+    MAIL_CHANGED.store(true, Ordering::SeqCst);
     drop(store);
     ARRIVALS.notify_waiters();
     // A phone that asked for it is woken, with nothing about the mail in the push.
@@ -184,50 +171,6 @@ async fn deposit(State(store): State<Shared>, Path(send_id): Path<String>, heade
         push::global().notify_as(id, if rings(&headers) { push::Wake::Call } else { push::Wake::Message });
     }
     StatusCode::ACCEPTED
-}
-
-/// Drops the oldest waiting mail, whoever it is for, until there is room for `need` bytes (and a new mailbox, if
-/// `slot`) with a twentieth of the budget to spare, so this runs once in a long while, not on every deposit.
-fn make_room(store: &mut Store, need: usize, slot: bool) {
-    use std::cmp::Reverse;
-    use std::collections::BinaryHeap;
-    let bytes_goal = MAX_TOTAL_BYTES - MAX_TOTAL_BYTES / 20;
-    let slots_goal = MAX_MAILBOXES - MAX_MAILBOXES / 20;
-    let mut fronts: BinaryHeap<Reverse<(Instant, Id)>> = store.queues.iter()
-        .filter_map(|(mailbox, queue)| queue.front().map(|item| Reverse((item.at, *mailbox))))
-        .collect();
-    while store.bytes + need > bytes_goal || (slot && store.queues.len() >= slots_goal) {
-        let Some(Reverse((_, mailbox))) = fronts.pop() else { break };
-        let Some(queue) = store.queues.get_mut(&mailbox) else { continue };
-        if let Some(item) = queue.pop_front() {
-            let size = item.blob.len();
-            let next = queue.front().map(|next| next.at);
-            if queue.is_empty() { store.queues.remove(&mailbox); }
-            store.bytes = store.bytes.saturating_sub(size);
-            if let Some(at) = next { fronts.push(Reverse((at, mailbox))); }
-        }
-    }
-}
-
-/// What the route runs: the same deposit, after checking how much this caller has been sending. Deposits are
-/// anonymous, so without it one client could fill the relay with junk. Each Tor circuit counts on its own address.
-async fn deposit_limited(State(state): State<AppState>, caller::Caller(who): caller::Caller, Path(send_id): Path<String>,
-                         headers: HeaderMap, body: Bytes) -> StatusCode {
-    let new_mailbox = parse_id(&send_id).is_some_and(|id| !state.store.lock().unwrap().queues.contains_key(&id));
-    {
-        // Straight from this machine (the proxy always names the real client): the operator, or a test.
-        if who.is_loopback() { return deposit(State(state.store), Path(send_id), headers, body).await; }
-        let mut limits = state.limits.lock().unwrap();
-        let kib = u32::try_from(body.len() / 1024 + 1).unwrap_or(u32::MAX);
-        // Generous on purpose: typing signals, receipts and several devices or housemates behind one address all count.
-        // The aim is to stop a flood, not to notice a busy chat.
-        if !limits.allow(who, "deposit", 12_000, Duration::from_secs(3600))
-            || !limits.allow_n(who, "deposit-size", 512 * 1024, Duration::from_secs(3600), kib)
-            || (new_mailbox && !limits.allow(who, "deposit-new", 2_500, Duration::from_secs(3600))) {
-            return StatusCode::TOO_MANY_REQUESTS;
-        }
-    }
-    deposit(State(state.store), Path(send_id), headers, body).await
 }
 
 #[derive(Deserialize)]
@@ -312,22 +255,14 @@ struct AckRequest {
 }
 
 async fn ack(State(store): State<Shared>, Json(req): Json<AckRequest>) -> StatusCode {
-    if req.acks.iter().any(|a| a.ids.len() > MAX_ACK_IDS) {
-        return StatusCode::BAD_REQUEST;
-    }
-    // Gathered by mailbox before the lock is taken, so each queue is gone through once and looking an id up costs
-    // the same however many were sent.
-    let mut gone: HashMap<Id, HashSet<u64>> = HashMap::new();
+    let mut store = store.lock().unwrap();
     for a in req.acks {
         let Some(receive_key) = parse_id(&a.key) else { continue };
-        gone.entry(send_id_for(&receive_key)).or_default().extend(a.ids);
-    }
-    let mut store = store.lock().unwrap();
-    for (send_id, ids) in gone {
+        let send_id = send_id_for(&receive_key);
         let mut freed = 0;
         if let Some(queue) = store.queues.get_mut(&send_id) {
             queue.retain(|item| {
-                let keep = !ids.contains(&item.id);
+                let keep = !a.ids.contains(&item.id);
                 if !keep { freed += item.blob.len(); }
                 keep
             });
@@ -336,6 +271,7 @@ async fn ack(State(store): State<Shared>, Json(req): Json<AckRequest>) -> Status
             }
         }
         store.bytes = store.bytes.saturating_sub(freed);
+        if freed > 0 { MAIL_CHANGED.store(true, Ordering::SeqCst); }
     }
     StatusCode::NO_CONTENT
 }
@@ -681,7 +617,9 @@ fn admin_token() -> String {
     let mut raw = [0u8; 32];
     std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut raw)).expect("no randomness");
     let token = hex::encode(raw);
-    sealed::write_private(std::path::Path::new("admin.token"), token.as_bytes()).expect("could not write admin.token");
+    std::fs::write("admin.token", &token).expect("could not write admin.token");
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions("admin.token", std::fs::Permissions::from_mode(0o600));
     token
 }
 
@@ -697,10 +635,8 @@ async fn backup_put(
     caller::Caller(ip): caller::Caller,
     Path(key): Path<String>,
     headers: HeaderMap,
-    body: axum::body::Body,
+    body: Bytes,
 ) -> StatusCode {
-    // The backup itself is only read once the request has passed everything that can be checked without it, so
-    // one that will be refused anyway never takes up memory.
     let who = pow::rate_key(ip, &headers, &format!("backup|{key}"));
     if !state.limits.lock().unwrap().allow(who, "backup", 20, Duration::from_secs(3600)) {
         return StatusCode::TOO_MANY_REQUESTS;
@@ -709,64 +645,10 @@ async fn backup_put(
     let (Some(sig), Some(ts)) = (header("x-pulshade-sig"), header("x-pulshade-ts").and_then(|t| t.parse().ok())) else {
         return StatusCode::BAD_REQUEST;
     };
-    let declared = header("content-length").and_then(|n| n.parse::<usize>().ok());
-    if declared.is_some_and(|n| n > backup::MAX_BACKUP) {
-        return StatusCode::PAYLOAD_TOO_LARGE;
-    }
-    use futures_util::StreamExt;
-    // Grown as the pieces come, never set aside ahead on the request's say-so.
-    let mut blob = Vec::new();
-    let mut pieces = body.into_data_stream();
-    while let Some(piece) = pieces.next().await {
-        let Ok(piece) = piece else { return StatusCode::BAD_REQUEST };
-        if blob.len() + piece.len() > backup::MAX_BACKUP {
-            return StatusCode::PAYLOAD_TOO_LARGE;
-        }
-        blob.extend_from_slice(&piece);
-    }
-    match state.backups.put(&key, &sig, ts, &blob) {
-        Ok(()) => {
-            // A delete-only token's hash, if the app sent one, kept beside the backup.
-            if let Some(hash) = header("x-pulshade-forget").and_then(|h| hex::decode(h).ok()).and_then(|r| <[u8; 32]>::try_from(r).ok()) {
-                state.backups.set_forget_hash(&key, &hash);
-            }
-            StatusCode::NO_CONTENT
-        }
-        Err(code) => code,
-    }
-}
-
-#[derive(Deserialize)]
-struct Forget {
-    token: String,
-}
-
-/// Erases a backup for the holder of its delete-only token (the panic passcode's), with no signature.
-async fn backup_forget(State(state): State<AppState>, caller::Caller(ip): caller::Caller, Path(key): Path<String>,
-                       Json(body): Json<Forget>) -> StatusCode {
-    if !ip.is_loopback() && !state.limits.lock().unwrap().allow(ip, "backup-forget", 20, Duration::from_secs(3600)) {
-        return StatusCode::TOO_MANY_REQUESTS;
-    }
-    match state.backups.forget(&key, &body.token) {
+    match state.backups.put(&key, &sig, ts, &body) {
         Ok(()) => StatusCode::NO_CONTENT,
         Err(code) => code,
     }
-}
-
-/// A file as the body of an answer, read a piece at a time, so a large one is never in memory whole.
-fn in_pieces(file: std::fs::File) -> axum::body::Body {
-    axum::body::Body::from_stream(futures_util::stream::unfold(Some(file), |file| async move {
-        let mut file = file?;
-        let mut piece = vec![0u8; 64 * 1024];
-        match file.read(&mut piece) {
-            Ok(0) => None,
-            Ok(n) => {
-                piece.truncate(n);
-                Some((Ok(Bytes::from(piece)), Some(file)))
-            }
-            Err(e) => Some((Err(e), None)),
-        }
-    }))
 }
 
 async fn backup_get(
@@ -775,15 +657,12 @@ async fn backup_get(
     Path(key): Path<String>,
     headers: HeaderMap,
     Json(proof): Json<backup::Proof>,
-) -> Result<axum::response::Response, StatusCode> {
-    use axum::{http::header, response::IntoResponse};
+) -> Result<Vec<u8>, StatusCode> {
     let who = pow::rate_key(ip, &headers, &format!("backup-read|{key}"));
     if !state.limits.lock().unwrap().allow(who, "backup-read", 60, Duration::from_secs(3600)) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
-    let (file, size) = state.backups.open(&key, &proof)?;
-    let about = [(header::CONTENT_TYPE, "application/octet-stream".to_string()), (header::CONTENT_LENGTH, size.to_string())];
-    Ok((about, in_pieces(file)).into_response())
+    state.backups.get(&key, &proof)
 }
 
 async fn backup_remove(State(state): State<AppState>, Path(key): Path<String>, Json(proof): Json<backup::Proof>) -> StatusCode {
@@ -848,62 +727,6 @@ async fn update_archive(
     }
 }
 
-/// What one request has taken of the room for bodies being received, given back when the request is done.
-struct Room {
-    budget: Arc<Semaphore>,
-    taken: AtomicUsize,
-    /// Set when there was no room left for the next piece.
-    full: AtomicBool,
-}
-
-impl Room {
-    fn take(&self, bytes: usize) -> bool {
-        match self.budget.try_acquire_many(bytes as u32) {
-            Ok(room) => {
-                room.forget();
-                self.taken.fetch_add(bytes, Ordering::SeqCst);
-                true
-            }
-            Err(_) => {
-                self.full.store(true, Ordering::SeqCst);
-                false
-            }
-        }
-    }
-}
-
-impl Drop for Room {
-    fn drop(&mut self) {
-        self.budget.add_permits(self.taken.load(Ordering::SeqCst));
-    }
-}
-
-/// Counts every request's body against `MAX_IN_FLIGHT` as it arrives, whatever reads it, and answers 503 when there
-/// is no room. The count is by what has really arrived, not by what the request says it will send, and is given back
-/// once the request has been answered: by then the body is stored, and counted there, or gone.
-async fn in_flight(State(state): State<AppState>, request: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    use futures_util::StreamExt;
-    let room = Arc::new(Room { budget: state.in_flight.clone(), taken: AtomicUsize::new(0), full: AtomicBool::new(false) });
-    let (parts, body) = request.into_parts();
-    let (counting, mut seen) = (room.clone(), 0usize);
-    let counted = body.into_data_stream().map(move |piece| {
-        let piece = piece?;
-        // The first bytes of every request are free, so a message or a receipt is never turned away.
-        let before = seen.max(SHORT_MAIL);
-        seen += piece.len();
-        if seen > before && !counting.take(seen - before) {
-            return Err(axum::Error::new(std::io::Error::other("no room for more uploads")));
-        }
-        Ok(piece)
-    });
-    let response = next.run(axum::extract::Request::from_parts(parts, axum::body::Body::from_stream(counted))).await;
-    if room.full.load(Ordering::SeqCst) {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    }
-    response
-}
-
 fn purge(store: &Shared) {
     let mut store = store.lock().unwrap();
     let now = Instant::now();
@@ -912,24 +735,235 @@ fn purge(store: &Shared) {
         !queue.is_empty()
     });
     // Recounted, so the running total can't drift.
+    let before = store.bytes;
     store.bytes = store.queues.values().flat_map(|q| q.iter()).map(|item| item.blob.len()).sum();
+    if store.bytes != before { MAIL_CHANGED.store(true, Ordering::SeqCst); }
 }
 
-// MARK: Nothing waits on disk
+// MARK: Spool
 
-/// Waiting mail and wake-up registrations are kept in memory and nowhere else: a restart empties them, by design,
-/// and nothing about who has mail waiting or which phone to wake ever touches the server's disk. An earlier version
-/// wrote them out, sealed, so a restart wouldn't lose them. A file it left behind is overwritten with random bytes
-/// and deleted at start-up, before anything is served.
-fn forget_old_spool(path: &std::path::Path) {
-    let Ok(meta) = std::fs::metadata(path) else { return };
-    let mut noise = vec![0u8; usize::try_from(meta.len()).unwrap_or(0).min(512 * 1024 * 1024)];
-    if let Ok(mut random) = std::fs::File::open("/dev/urandom") { let _ = random.read_exact(&mut noise); }
-    let _ = std::fs::write(path, &noise);
-    let _ = std::fs::remove_file(path);
-    eprintln!("removed the old spool file; waiting mail is no longer written to disk");
+/// Waiting mail and wake-up registrations, as written to disk between runs: sealed with the relay's storage key, so
+/// the file shows nothing. Envelopes are end-to-end encrypted already; what the seal hides is which mailboxes hold
+/// mail and which phone each wake-up goes to. Without it, a restart lost everything waiting and left every locked
+/// phone unwoken until its owner opened the app.
+#[derive(Serialize, Deserialize)]
+struct Spool {
+    id_seed: String,
+    counter: u64,
+    queues: Vec<SpooledQueue>,
+    #[serde(default)]
+    push: Vec<push::Saved>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct SpooledQueue {
+    mailbox: String,
+    items: Vec<SpooledItem>,
+}
+
+/// `deposited` is when it arrived, by the wall clock, so its age and expiry carry across a restart.
+#[derive(Serialize, Deserialize)]
+struct SpooledItem {
+    id: u64,
+    deposited: u64,
+    blob: String,
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn spool_path(directory_path: &str) -> PathBuf {
+    PathBuf::from(directory_path).with_file_name("pulshade-spool.sealed")
+}
+
+/// The spool on disk is a short marker, then records, each a length and a sealed piece of JSON: first the header,
+/// then waiting mail in pieces of a few megabytes. Written and read a piece at a time, so a relay holding hundreds
+/// of megabytes of mail needs only a few more to save it or load it. (The first format was one sealed file of
+/// everything, which took three times the mail in memory to write, and a small server killed the relay for it.)
+const SPOOL_MARKER: &[u8; 4] = b"PSP2";
+/// About how much waiting mail goes into one record.
+const SPOOL_CHUNK: usize = 4 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "t")]
+enum SpoolRecord {
+    #[serde(rename = "h")]
+    Header {
+        id_seed: String,
+        counter: u64,
+        #[serde(default)]
+        push: Vec<push::Saved>,
+    },
+    #[serde(rename = "q")]
+    Queue { mailbox: String, items: Vec<SpooledItem> },
+}
+
+fn write_record(out: &mut impl std::io::Write, sealer: &sealed::Sealer, record: &SpoolRecord) -> std::io::Result<()> {
+    let raw = serde_json::to_vec(record).map_err(std::io::Error::other)?;
+    let sealed = sealer.seal(&raw);
+    out.write_all(&(sealed.len() as u32).to_be_bytes())?;
+    out.write_all(&sealed)
+}
+
+/// Writes the spool if anything changed since the last time (or always, with `force`), sealed a piece at a time and
+/// swapped in whole, so nothing readable ever reaches the disk. The mail is only copied by reference while the lock is
+/// held, so the relay isn't kept waiting while it is written.
+fn save_spool(store: &Shared, path: &std::path::Path, sealer: &sealed::Sealer, force: bool) {
+    let mail_changed = MAIL_CHANGED.swap(false, Ordering::SeqCst);
+    let (push, push_changed) = push::global().saved();
+    if !force && !mail_changed && !push_changed {
+        return;
+    }
+    let now = unix_now();
+    let (id_seed, counter, queues) = {
+        let store = store.lock().unwrap();
+        let queues: Vec<(Id, Vec<(u64, u64, Bytes)>)> = store.queues.iter().map(|(id, queue)| {
+            (*id, queue.iter().map(|item| (item.id, now.saturating_sub(item.at.elapsed().as_secs()), item.blob.clone())).collect())
+        }).collect();
+        (hex::encode(store.id_seed), store.counter, queues)
+    };
+    let tmp = path.with_extension("tmp");
+    let written = (|| -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        let mut out = std::io::BufWriter::new(file);
+        std::io::Write::write_all(&mut out, SPOOL_MARKER)?;
+        write_record(&mut out, sealer, &SpoolRecord::Header { id_seed, counter, push })?;
+        for (id, items) in queues {
+            let mailbox = hex::encode(id);
+            let mut piece: Vec<SpooledItem> = Vec::new();
+            let mut size = 0;
+            for (item_id, deposited, blob) in items {
+                size += blob.len();
+                piece.push(SpooledItem { id: item_id, deposited, blob: B64.encode(&blob) });
+                if size >= SPOOL_CHUNK {
+                    write_record(&mut out, sealer, &SpoolRecord::Queue { mailbox: mailbox.clone(), items: std::mem::take(&mut piece) })?;
+                    size = 0;
+                }
+            }
+            if !piece.is_empty() {
+                write_record(&mut out, sealer, &SpoolRecord::Queue { mailbox, items: piece })?;
+            }
+        }
+        std::io::Write::flush(&mut out)?;
+        out.into_inner().map_err(|e| e.into_error())?.sync_all()
+    })();
+    if written.is_ok() && std::fs::rename(&tmp, path).is_ok() {
+        return;
+    }
+    // Not written: try again next time.
+    let _ = std::fs::remove_file(&tmp);
+    MAIL_CHANGED.store(true, Ordering::SeqCst);
+}
+
+/// Puts a mailbox's saved mail back, dropping what is past its week. Mail already there keeps its place in front.
+fn restore_queue(store: &mut Store, mailbox: &str, items: Vec<SpooledItem>, now: u64) -> usize {
+    let Some(id) = parse_id(mailbox) else { return 0 };
+    let items: Vec<Item> = items.into_iter().filter_map(|item| {
+        let age = Duration::from_secs(now.saturating_sub(item.deposited));
+        if age >= TTL {
+            return None;
+        }
+        let blob = Bytes::from(B64.decode(item.blob).ok()?);
+        Some(Item { id: item.id, at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now), blob })
+    }).collect();
+    if items.is_empty() || (!store.queues.contains_key(&id) && store.queues.len() >= MAX_MAILBOXES) {
+        return 0;
+    }
+    let queue = store.queues.entry(id).or_default();
+    let room = MAX_QUEUE.saturating_sub(queue.len());
+    let kept: Vec<Item> = items.into_iter().take(room).collect();
+    let count = kept.len();
+    queue.extend(kept);
+    count
+}
+
+/// Brings back what the last run left waiting. Mail past its week, and anything unreadable, stays behind.
+fn load_spool(store: &Shared, path: &std::path::Path, sealer: &sealed::Sealer) -> (usize, usize) {
+    let Ok(file) = std::fs::File::open(path) else { return (0, 0) };
+    let mut input = std::io::BufReader::new(file);
+    let mut marker = [0u8; 4];
+    if input.read_exact(&mut marker).is_ok() && &marker == SPOOL_MARKER {
+        return load_pieces(store, &mut input, sealer);
+    }
+    drop(input);
+    load_whole(store, path, sealer)
+}
+
+fn load_pieces(store: &Shared, input: &mut impl Read, sealer: &sealed::Sealer) -> (usize, usize) {
+    let now = unix_now();
+    let (mut count, mut push) = (0, Vec::new());
+    loop {
+        let mut len = [0u8; 4];
+        if input.read_exact(&mut len).is_err() {
+            break;
+        }
+        let len = u32::from_be_bytes(len) as usize;
+        // A piece is a few megabytes at most; anything larger is damage, and not worth reading on.
+        if len > 64 * 1024 * 1024 {
+            eprintln!("the spool has a piece that is too large; the rest is left behind");
+            break;
+        }
+        let mut sealed_piece = vec![0u8; len];
+        if input.read_exact(&mut sealed_piece).is_err() {
+            eprintln!("the spool ends part-way; the rest is left behind");
+            break;
+        }
+        let Some(record) = sealer.open(&sealed_piece).and_then(|plain| serde_json::from_slice::<SpoolRecord>(&plain).ok()) else {
+            eprintln!("a piece of the spool couldn't be opened; it is left behind");
+            continue;
+        };
+        match record {
+            SpoolRecord::Header { id_seed, counter, push: saved } => {
+                let mut store = store.lock().unwrap();
+                if let Some(seed) = hex::decode(&id_seed).ok().and_then(|raw| <[u8; 32]>::try_from(raw).ok()) {
+                    store.id_seed = seed;
+                    store.counter = counter;
+                }
+                push = saved;
+            }
+            SpoolRecord::Queue { mailbox, items } => {
+                count += restore_queue(&mut store.lock().unwrap(), &mailbox, items, now);
+            }
+        }
+    }
+    {
+        let mut store = store.lock().unwrap();
+        store.bytes = store.queues.values().flat_map(|q| q.iter()).map(|item| item.blob.len()).sum();
+    }
+    let woken = push::global().restore(push);
+    (count, woken)
+}
+
+/// The first format: one sealed file holding everything. Still read, so the first start after an update finds
+/// what was waiting; it is written in the new format from then on.
+fn load_whole(store: &Shared, path: &std::path::Path, sealer: &sealed::Sealer) -> (usize, usize) {
+    let Ok(raw) = std::fs::read(path) else { return (0, 0) };
+    if !sealed::Sealer::is_sealed(&raw) {
+        return (0, 0);
+    }
+    let Some(spool) = sealer.open(&raw).and_then(|plain| serde_json::from_slice::<Spool>(&plain).ok()) else {
+        eprintln!("the spool at {} couldn't be opened; starting without it", path.display());
+        return (0, 0);
+    };
+    drop(raw);
+    let now = unix_now();
+    let mut count = 0;
+    {
+        let mut store = store.lock().unwrap();
+        if let Some(seed) = hex::decode(&spool.id_seed).ok().and_then(|raw| <[u8; 32]>::try_from(raw).ok()) {
+            store.id_seed = seed;
+            store.counter = spool.counter;
+        }
+        for queue in spool.queues {
+            count += restore_queue(&mut store, &queue.mailbox, queue.items, now);
+        }
+        store.bytes = store.queues.values().flat_map(|q| q.iter()).map(|item| item.blob.len()).sum();
+    }
+    let woken = push::global().restore(spool.push);
+    (count, woken)
+}
 
 /// Waits for Ctrl-C or the service manager's stop (SIGTERM), either of which ends the relay cleanly.
 async fn stop_signal() {
@@ -945,7 +979,7 @@ fn app(state: AppState) -> Router {
         .route("/v1/health", get(|| async { ([("x-pulshade-boot", BOOT.as_str())], "ok") }))
         // The address this request came from, for the app's anonymity report. Answered, never kept.
         .route("/v1/seen", get(|caller::Caller(ip): caller::Caller| async move { ip.to_string() }))
-        .route("/v1/q/{send_id}", put(deposit_limited))
+        .route("/v1/q/{send_id}", put(deposit))
         .route("/v1/fetch", post(fetch))
         .route("/v1/ack", post(ack))
         .route("/v1/push", get(push_status).put(push_register))
@@ -966,10 +1000,9 @@ fn app(state: AppState) -> Router {
         .route("/v1/eggs", post(eggs))
         .route("/v1/eggs/start", post(egg_start))
         .route("/v1/eggs/hatch", post(egg_hatch))
-        .route("/v1/backup/{key}", put(backup_put))
+        .route("/v1/backup/{key}", put(backup_put).layer(DefaultBodyLimit::max(backup::MAX_BACKUP)))
         .route("/v1/backup/{key}/get", post(backup_get))
         .route("/v1/backup/{key}/delete", post(backup_remove))
-        .route("/v1/backup/{key}/forget", post(backup_forget))
         .route("/v1/call/{room}", get(call))
         .route("/v1/admin", post(admin))
         .route("/v1/report-inbox", get(report_inbox))
@@ -977,7 +1010,6 @@ fn app(state: AppState) -> Router {
         .route("/v1/update/mac", get(update_manifest))
         .route("/v1/update/mac.zip", get(update_archive))
         .layer(DefaultBodyLimit::max(MAX_ENVELOPE + 1024))
-        .layer(axum::middleware::from_fn_with_state(state.clone(), in_flight))
         .with_state(state)
 }
 
@@ -998,7 +1030,7 @@ fn pet_signing_key() -> Option<ed25519_dalek::SigningKey> {
 }
 
 /// Keeps memory off the disk: no core file if the relay crashes, and (on Linux) no other process of this user
-/// may read its memory. The addresses counted for rate limits and the waiting envelopes only ever live there.
+/// may read its memory. Waiting envelopes and the addresses counted for rate limits only ever live there.
 fn no_core_dumps() {
     let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
     // SAFETY: plain system calls with valid arguments.
@@ -1037,8 +1069,13 @@ async fn main() {
     }
     let bind = std::env::var("PULSHADE_BIND").unwrap_or_else(|_| "127.0.0.1:7878".into());
     let store: Shared = Arc::default();
-    // A spool file an older version left behind is destroyed before anyone can ask for anything.
-    forget_old_spool(&PathBuf::from(&directory_path).with_file_name("pulshade-spool.sealed"));
+    // What the last run left waiting, before anyone can ask for it.
+    let spool = spool_path(&directory_path);
+    let spool_sealer = Arc::new(sealed::Sealer::standard(&PathBuf::from(&directory_path)));
+    let (waiting, woken) = load_spool(&store, &spool, &spool_sealer);
+    if waiting > 0 || woken > 0 {
+        eprintln!("brought back {waiting} waiting envelope(s) and {woken} wake-up registration(s)");
+    }
     let state = AppState {
         store: store.clone(),
         calls: Arc::default(),
@@ -1047,7 +1084,6 @@ async fn main() {
         directory: Arc::new(Mutex::new(Directory::load(PathBuf::from(&directory_path), creator_key(),
                                                        sealed::Sealer::standard(&PathBuf::from(&directory_path))))),
         limits: Arc::default(),
-        in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         admin_token: Arc::new(admin_token()),
         started: Instant::now(),
     };
@@ -1061,6 +1097,15 @@ async fn main() {
             purge(&sweeper);
             push::global().sweep();
             backups.sweep(backup::BACKUP_TTL);
+        }
+    });
+    let (spooler, spool_file, sealer) = (store.clone(), spool.clone(), spool_sealer.clone());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(SPOOL_EVERY);
+        loop {
+            tick.tick().await;
+            let (store, file, sealer) = (spooler.clone(), spool_file.clone(), sealer.clone());
+            let _ = tokio::task::spawn_blocking(move || save_spool(&store, &file, &sealer, false)).await;
         }
     });
     // Addresses are only kept while they count towards a limit, checked every minute.
@@ -1091,17 +1136,14 @@ async fn main() {
         .with_graceful_shutdown(stop_signal())
         .await
         .unwrap();
+    // Everything still waiting goes to disk before the process ends, so nothing is lost to a restart.
+    save_spool(&store, &spool, &spool_sealer, true);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::IpAddr;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn unix_now() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-    }
 
     #[tokio::test]
     async fn call_rooms_pass_packets_between_two_devices_only() {
@@ -1116,7 +1158,6 @@ mod tests {
             releases: Arc::new(release::Releases::at(dir.join("release"))),
             directory: Arc::new(Mutex::new(Directory::default())),
             limits: Arc::default(),
-            in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
                 admin_token: Arc::new("t".into()),
             started: Instant::now(),
         };
@@ -1220,6 +1261,161 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_secs(1), "nothing for it: waited out the second");
     }
 
+    /// What's waiting and who to wake survive a restart: written out sealed, read back by the next run with the same
+    /// ids and ages, and nothing past its week comes back.
+    #[tokio::test]
+    async fn waiting_mail_and_wake_ups_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("pulshade-spool-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pulshade-spool.sealed");
+        let sealer = sealed::Sealer::with_key([7; 32]);
+        let store: Shared = Arc::default();
+        let receive = key(31);
+        let send = hex::encode(send_id_for(&receive));
+        assert_eq!(deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), Bytes::from_static(b"first")).await, StatusCode::ACCEPTED);
+        assert_eq!(deposit(State(store.clone()), Path(send), HeaderMap::new(), Bytes::from_static(b"second")).await, StatusCode::ACCEPTED);
+        // One that's been waiting longer than a relay keeps anything.
+        let stale = key(32);
+        store.lock().unwrap().queues.insert(send_id_for(&stale), VecDeque::from([Item {
+            id: 99, at: Instant::now().checked_sub(TTL + Duration::from_secs(60)).unwrap(), blob: Bytes::from_static(b"old"),
+        }]));
+        let token = "ab".repeat(32);
+        assert!(push::global().register(&[send_id_for(&receive)], &token, false, true));
+        let Json(before) = fetch(State(store.clone()), Json(FetchRequest { keys: vec![hex::encode(receive)], wait: 0 })).await.unwrap();
+
+        save_spool(&store, &path, &sealer, true);
+        let raw = std::fs::read(&path).unwrap();
+        assert!(raw.starts_with(SPOOL_MARKER), "written a piece at a time");
+        assert!(!raw.windows(5).any(|w| w == b"first") && !raw.windows(token.len()).any(|w| w == token.as_bytes()), "nothing readable");
+
+        // The next run starts empty, and the spool brings it back.
+        push::global().forget(&token);
+        let next: Shared = Arc::default();
+        let (waiting, woken) = load_spool(&next, &path, &sealer);
+        assert_eq!(waiting, 2, "the stale one stays behind");
+        assert!(woken >= 1);
+        let Json(after) = fetch(State(next.clone()), Json(FetchRequest { keys: vec![hex::encode(receive)], wait: 0 })).await.unwrap();
+        assert_eq!(after.items.iter().map(|i| (i.id, i.blob.clone())).collect::<Vec<_>>(),
+                   before.items.iter().map(|i| (i.id, i.blob.clone())).collect::<Vec<_>>(), "same envelopes, same ids");
+        assert_eq!(next.lock().unwrap().bytes, 5 + 6);
+        assert!(next.lock().unwrap().queues.get(&send_id_for(&stale)).is_none());
+        // New ids carry on from where the last run stopped, so none is ever handed out twice.
+        assert_eq!(next.lock().unwrap().counter, store.lock().unwrap().counter);
+        let (saved, _) = push::global().saved();
+        assert!(saved.iter().any(|s| s.token == token && s.mailbox == hex::encode(send_id_for(&receive))));
+        push::global().forget(&token);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The first format of the spool, as the relay wrote it before: one sealed file of everything.
+    fn save_spool_first_format(store: &Shared, path: &std::path::Path, sealer: &sealed::Sealer) {
+        let now = unix_now();
+        let (push, _) = push::global().saved();
+        let spool = {
+            let store = store.lock().unwrap();
+            Spool {
+                id_seed: hex::encode(store.id_seed),
+                counter: store.counter,
+                queues: store.queues.iter().map(|(id, queue)| SpooledQueue {
+                    mailbox: hex::encode(id),
+                    items: queue.iter().map(|item| SpooledItem {
+                        id: item.id,
+                        deposited: now.saturating_sub(item.at.elapsed().as_secs()),
+                        blob: B64.encode(&item.blob),
+                    }).collect(),
+                }).collect(),
+                push,
+            }
+        };
+        std::fs::write(path, sealer.seal(&serde_json::to_vec(&spool).unwrap())).unwrap();
+    }
+
+    /// An update must find the mail the old format left behind, and write the new one from then on.
+    #[tokio::test]
+    async fn a_spool_in_the_first_format_still_loads() {
+        let dir = std::env::temp_dir().join(format!("pulshade-spool-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pulshade-spool.sealed");
+        let sealer = sealed::Sealer::with_key([8; 32]);
+        let store: Shared = Arc::default();
+        let receive = key(41);
+        let send = hex::encode(send_id_for(&receive));
+        for body in [&b"one"[..], b"two", b"three"] {
+            assert_eq!(deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), Bytes::copy_from_slice(body)).await, StatusCode::ACCEPTED);
+        }
+        save_spool_first_format(&store, &path, &sealer);
+        assert!(sealed::Sealer::is_sealed(&std::fs::read(&path).unwrap()));
+
+        let next: Shared = Arc::default();
+        let (waiting, _) = load_spool(&next, &path, &sealer);
+        assert_eq!(waiting, 3);
+        assert_eq!(next.lock().unwrap().bytes, 3 + 3 + 5);
+        MAIL_CHANGED.store(true, Ordering::SeqCst);
+        save_spool(&next, &path, &sealer, true);
+        assert!(std::fs::read(&path).unwrap().starts_with(SPOOL_MARKER), "written in the new format now");
+        let again: Shared = Arc::default();
+        assert_eq!(load_spool(&again, &path, &sealer).0, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lots of mail comes back whole and in order, from a file written in several pieces, and an unreadable piece costs
+    /// only itself.
+    #[tokio::test]
+    async fn a_large_spool_is_written_in_pieces_and_comes_back_in_order() {
+        let dir = std::env::temp_dir().join(format!("pulshade-spool-big-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pulshade-spool.sealed");
+        let sealer = sealed::Sealer::with_key([9; 32]);
+        let store: Shared = Arc::default();
+        let mailboxes = [key(51), key(52)];
+        for (n, receive) in mailboxes.iter().enumerate() {
+            let items: VecDeque<Item> = (0..7u64).map(|i| Item {
+                id: n as u64 * 100 + i,
+                at: Instant::now(),
+                blob: Bytes::from(vec![(n as u8) * 16 + i as u8; 1_500_000]),
+            }).collect();
+            store.lock().unwrap().queues.insert(send_id_for(receive), items);
+        }
+        store.lock().unwrap().bytes = 2 * 7 * 1_500_000;
+        save_spool(&store, &path, &sealer, true);
+
+        // Several pieces, none of them the size of everything.
+        let raw = std::fs::read(&path).unwrap();
+        assert!(raw.starts_with(SPOOL_MARKER));
+        let (mut at, mut pieces, mut largest) = (4, 0, 0);
+        while at + 4 <= raw.len() {
+            let len = u32::from_be_bytes(raw[at..at + 4].try_into().unwrap()) as usize;
+            at += 4 + len;
+            pieces += 1;
+            largest = largest.max(len);
+        }
+        assert!(pieces >= 5, "{pieces} pieces");
+        assert!(largest < 12 * 1024 * 1024, "the largest piece is {largest} bytes");
+
+        let next: Shared = Arc::default();
+        let (waiting, _) = load_spool(&next, &path, &sealer);
+        assert_eq!(waiting, 14);
+        assert_eq!(next.lock().unwrap().bytes, 2 * 7 * 1_500_000);
+        for (n, receive) in mailboxes.iter().enumerate() {
+            let guard = next.lock().unwrap();
+            let queue = guard.queues.get(&send_id_for(receive)).unwrap();
+            let ids: Vec<u64> = queue.iter().map(|i| i.id).collect();
+            assert_eq!(ids, (0..7u64).map(|i| n as u64 * 100 + i).collect::<Vec<_>>(), "same order");
+            assert!(queue.iter().enumerate().all(|(i, item)| item.blob.iter().all(|b| *b == (n as u8) * 16 + i as u8)), "same bytes");
+        }
+
+        // Damage to one piece loses that piece only.
+        let mut damaged = raw.clone();
+        let first_len = u32::from_be_bytes(damaged[4..8].try_into().unwrap()) as usize;
+        let second = 4 + 4 + first_len;
+        damaged[second + 4 + 30] ^= 0xff;
+        std::fs::write(&path, &damaged).unwrap();
+        let hurt: Shared = Arc::default();
+        let (waiting, _) = load_spool(&hurt, &path, &sealer);
+        assert!(waiting > 0 && waiting < 14, "{waiting} came back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A message sent after a story's pieces is handed over first, and a big piece at the front of one mailbox
     /// doesn't hold up the short mail in the others.
     #[tokio::test]
@@ -1255,44 +1451,15 @@ mod tests {
         assert_eq!(deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), Bytes::from_static(b"12345")).await, StatusCode::ACCEPTED);
         assert_eq!(store.lock().unwrap().bytes, 5);
         store.lock().unwrap().bytes = MAX_TOTAL_BYTES - 3;
-        // Full: the oldest mail makes way and the new deposit is taken, rather than the relay going deaf.
-        assert_eq!(deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), Bytes::from_static(b"abcd")).await, StatusCode::ACCEPTED);
+        assert_eq!(deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), Bytes::from_static(b"abcd")).await, StatusCode::INSUFFICIENT_STORAGE);
         assert_eq!(deposit(State(store.clone()), Path(send), HeaderMap::new(), Bytes::from_static(b"abc")).await, StatusCode::ACCEPTED);
         // Expiry recounts from what's really there.
         purge(&store);
-        assert_eq!(store.lock().unwrap().bytes, 4 + 3);
+        assert_eq!(store.lock().unwrap().bytes, 5 + 3);
         let Json(res) = fetch(State(store.clone()), Json(FetchRequest { keys: vec![hex::encode(receive)], wait: 0 })).await.unwrap();
         let ids: Vec<u64> = res.items.iter().map(|i| i.id).collect();
         ack(State(store.clone()), Json(AckRequest { acks: vec![Ack { key: hex::encode(receive), ids }] })).await;
         assert_eq!(store.lock().unwrap().bytes, 0);
-    }
-
-    /// When the relay is full, the oldest mail anywhere goes first and newer mail stays.
-    #[test]
-    fn making_room_drops_the_oldest_mail_first() {
-        let mut store = Store::default();
-        let boxes = [[1u8; 32], [2u8; 32], [3u8; 32]];
-        for (n, mailbox) in boxes.iter().enumerate() {
-            std::thread::sleep(Duration::from_millis(2));
-            let item = Item { id: n as u64, at: Instant::now(), blob: Bytes::from(vec![0u8; 10]) };
-            store.queues.entry(*mailbox).or_default().push_back(item);
-        }
-        store.bytes = MAX_TOTAL_BYTES - MAX_TOTAL_BYTES / 20 + 5;
-        make_room(&mut store, 1, false);
-        assert!(!store.queues.contains_key(&boxes[0]), "the oldest went");
-        assert!(store.queues.contains_key(&boxes[1]) && store.queues.contains_key(&boxes[2]), "the newer stayed");
-        assert_eq!(store.bytes, MAX_TOTAL_BYTES - MAX_TOTAL_BYTES / 20 - 5);
-    }
-
-    /// Deposits are anonymous, so one caller is held to an allowance of its own.
-    #[test]
-    fn one_caller_cannot_deposit_without_end() {
-        let mut limits = Limiter::default();
-        let who: std::net::IpAddr = "203.0.113.5".parse().unwrap();
-        let other: std::net::IpAddr = "203.0.113.6".parse().unwrap();
-        assert!(limits.allow_n(who, "deposit-size", 100, Duration::from_secs(3600), 60));
-        assert!(!limits.allow_n(who, "deposit-size", 100, Duration::from_secs(3600), 60), "past its size allowance");
-        assert!(limits.allow_n(other, "deposit-size", 100, Duration::from_secs(3600), 60), "someone else is unaffected");
     }
 
     /// A big story must not hold up what's behind it: one fetch stays under the size cap (but always carries at
@@ -1351,7 +1518,6 @@ mod tests {
             releases: Arc::new(release::Releases::at(dir.join("release"))),
             directory: Arc::new(Mutex::new(Directory::default())),
             limits: Arc::default(),
-            in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
                 admin_token: Arc::new("t".into()),
             started: Instant::now(),
         };
@@ -1376,194 +1542,5 @@ mod tests {
         assert_eq!(deposit(State(store.clone()), Path("nothex".into()), HeaderMap::new(), Bytes::from_static(b"x")).await, StatusCode::BAD_REQUEST);
         let send = hex::encode(send_id_for(&key(1)));
         assert_eq!(deposit(State(store), Path(send), HeaderMap::new(), Bytes::new()).await, StatusCode::PAYLOAD_TOO_LARGE);
-    }
-
-    fn state_in(dir: &std::path::Path) -> AppState {
-        AppState {
-            store: Arc::default(),
-            calls: Arc::default(),
-            backups: Arc::new(Backups::at(dir.join("backups"))),
-            releases: Arc::new(release::Releases::at(dir.join("release"))),
-            directory: Arc::new(Mutex::new(Directory::default())),
-            limits: Arc::default(),
-            in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
-            admin_token: Arc::new("t".into()),
-            started: Instant::now(),
-        }
-    }
-
-    async fn served(state: AppState) -> SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app(state).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
-        });
-        addr
-    }
-
-    /// A backup request's signature, as the apps make it.
-    fn backup_sig(owner: &ed25519_dalek::SigningKey, label: &str, ts: u64, body: Option<&[u8]>) -> String {
-        use ed25519_dalek::Signer;
-        let mut message = label.as_bytes().to_vec();
-        message.extend_from_slice(owner.verifying_key().as_bytes());
-        message.extend_from_slice(&ts.to_be_bytes());
-        if let Some(body) = body { message.extend_from_slice(&Sha256::digest(body)); }
-        B64.encode(owner.sign(&message).to_bytes())
-    }
-
-    /// The way the apps leave and collect a backup still works as it did: the same headers, the same answers, and
-    /// the same bytes back, now read from disk a piece at a time.
-    #[tokio::test]
-    async fn a_backup_goes_up_and_comes_back_whole_as_before() {
-        let dir = std::env::temp_dir().join(format!("pulshade-backup-http-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let state = state_in(&dir);
-        let addr = served(state.clone()).await;
-        let owner = ed25519_dalek::SigningKey::from_bytes(&[21; 32]);
-        let url = format!("http://{addr}/v1/backup/{}", hex::encode(owner.verifying_key().as_bytes()));
-        // Larger than one piece, and not a whole number of them.
-        let blob: Vec<u8> = (0..300_001u32).map(|i| (i % 251) as u8).collect();
-        let ts = unix_now();
-        let client = reqwest::Client::new();
-
-        let put = client.put(&url)
-            .header("content-type", "application/octet-stream")
-            .header("x-pulshade-sig", backup_sig(&owner, "pulshade.backup.put.v1", ts, Some(&blob)))
-            .header("x-pulshade-ts", ts.to_string())
-            .body(blob.clone()).send().await.unwrap();
-        assert_eq!(put.status(), StatusCode::NO_CONTENT);
-
-        let proof = serde_json::json!({ "sig": backup_sig(&owner, "pulshade.backup.get.v1", ts, None), "ts": ts }).to_string();
-        let got = client.post(format!("{url}/get")).header("content-type", "application/json").body(proof).send().await.unwrap();
-        assert_eq!(got.status(), StatusCode::OK);
-        assert_eq!(got.headers()["content-length"], "300001");
-        assert_eq!(got.headers()["content-type"], "application/octet-stream");
-        assert_eq!(got.bytes().await.unwrap().as_ref(), &blob[..]);
-
-        let stranger = ed25519_dalek::SigningKey::from_bytes(&[22; 32]);
-        let proof = serde_json::json!({ "sig": backup_sig(&stranger, "pulshade.backup.get.v1", ts, None), "ts": ts }).to_string();
-        let refused = client.post(format!("{url}/get")).header("content-type", "application/json").body(proof).send().await.unwrap();
-        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
-        // Everything counted while it arrived has been given back.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(state.in_flight.available_permits(), MAX_IN_FLIGHT);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// An upload is refused before any of it is read when the request already fails its limit or lacks its headers,
-    /// so a caller who will be turned away can't make the relay hold megabytes first.
-    #[tokio::test]
-    async fn a_backup_is_only_read_once_the_request_has_passed_its_checks() {
-        use axum::body::Body;
-        let dir = std::env::temp_dir().join(format!("pulshade-backup-order-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let state = state_in(&dir);
-        let owner = ed25519_dalek::SigningKey::from_bytes(&[23; 32]);
-        let id = hex::encode(owner.verifying_key().as_bytes());
-        let ip: IpAddr = "203.0.113.40".parse().unwrap();
-        // A body that notes when anything asks for it.
-        let watched = || {
-            let read = Arc::new(AtomicBool::new(false));
-            let flag = read.clone();
-            let body = Body::from_stream(futures_util::stream::once(async move {
-                flag.store(true, Ordering::SeqCst);
-                Ok::<_, std::io::Error>(Bytes::from_static(b"sealed"))
-            }));
-            (body, read)
-        };
-        let signed = |length: Option<&str>| {
-            let mut headers = HeaderMap::new();
-            headers.insert("x-pulshade-sig", B64.encode([0u8; 64]).parse().unwrap());
-            headers.insert("x-pulshade-ts", unix_now().to_string().parse().unwrap());
-            if let Some(length) = length { headers.insert("content-length", length.parse().unwrap()); }
-            headers
-        };
-
-        let (body, read) = watched();
-        assert_eq!(backup_put(State(state.clone()), caller::Caller(ip), Path(id.clone()), HeaderMap::new(), body).await, StatusCode::BAD_REQUEST);
-        assert!(!read.load(Ordering::SeqCst), "no signature: refused unread");
-
-        let (body, read) = watched();
-        let too_long = (backup::MAX_BACKUP + 1).to_string();
-        assert_eq!(backup_put(State(state.clone()), caller::Caller(ip), Path(id.clone()), signed(Some(&too_long)), body).await, StatusCode::PAYLOAD_TOO_LARGE);
-        assert!(!read.load(Ordering::SeqCst), "says it is too large: refused unread");
-
-        // With everything in order it is read, and then judged by its signature.
-        let (body, read) = watched();
-        assert_eq!(backup_put(State(state.clone()), caller::Caller(ip), Path(id.clone()), signed(Some("6")), body).await, StatusCode::UNAUTHORIZED);
-        assert!(read.load(Ordering::SeqCst));
-
-        // One that doesn't say how long it is stops being read at the limit.
-        let endless = Body::from_stream(futures_util::stream::iter((0..40).map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![0u8; 1024 * 1024])))));
-        assert_eq!(backup_put(State(state.clone()), caller::Caller(ip), Path(id.clone()), signed(None), endless).await, StatusCode::PAYLOAD_TOO_LARGE);
-
-        // Past the hourly limit, nothing is read at all.
-        for _ in 0..16 {
-            let (body, _) = watched();
-            backup_put(State(state.clone()), caller::Caller(ip), Path(id.clone()), HeaderMap::new(), body).await;
-        }
-        let (body, read) = watched();
-        assert_eq!(backup_put(State(state.clone()), caller::Caller(ip), Path(id), signed(Some("6")), body).await, StatusCode::TOO_MANY_REQUESTS);
-        assert!(!read.load(Ordering::SeqCst), "over the limit: refused unread");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Uploads being received share one budget of memory. With none left a large upload is refused (503) instead of
-    /// being held, short mail still gets through, and the room comes back when requests end.
-    #[tokio::test]
-    async fn large_uploads_are_refused_when_too_much_is_arriving_at_once() {
-        let dir = std::env::temp_dir().join(format!("pulshade-in-flight-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let state = state_in(&dir);
-        let addr = served(state.clone()).await;
-        let url = format!("http://{addr}/v1/q/{}", hex::encode(send_id_for(&key(71))));
-        let client = reqwest::Client::new();
-        let send = |size: usize| client.put(&url).body(vec![5u8; size]).send();
-
-        // As if other uploads had taken all but a little of the room.
-        let others = state.in_flight.clone().try_acquire_many_owned((MAX_IN_FLIGHT - 10_000) as u32).unwrap();
-        assert_eq!(send(SHORT_MAIL + 16 * 1024).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(state.store.lock().unwrap().queues.is_empty(), "nothing of it was kept");
-        assert_eq!(send(100).await.unwrap().status(), StatusCode::ACCEPTED, "a short message isn't counted");
-        assert_eq!(send(SHORT_MAIL).await.unwrap().status(), StatusCode::ACCEPTED);
-        assert_eq!(send(SHORT_MAIL + 5_000).await.unwrap().status(), StatusCode::ACCEPTED, "what fits in the room left is taken");
-
-        drop(others);
-        assert_eq!(send(SHORT_MAIL + 16 * 1024).await.unwrap().status(), StatusCode::ACCEPTED);
-        assert_eq!(send(2 * 1024 * 1024).await.unwrap().status(), StatusCode::ACCEPTED);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(state.in_flight.available_permits(), MAX_IN_FLIGHT, "all of it given back");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// An acknowledgement costs its own length: ids are looked up in a set, a mailbox named twice is gone through
-    /// once, and a list longer than any app sends is refused whole.
-    #[tokio::test]
-    async fn acknowledgements_are_capped_and_cost_no_more_than_their_length() {
-        let store: Shared = Arc::default();
-        let receive = key(81);
-        let send = hex::encode(send_id_for(&receive));
-        for _ in 0..MAX_QUEUE {
-            assert_eq!(deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), Bytes::from_static(b"x")).await, StatusCode::ACCEPTED);
-        }
-        let ids: Vec<u64> = store.lock().unwrap().queues[&send_id_for(&receive)].iter().map(|item| item.id).collect();
-
-        let too_many = AckRequest { acks: vec![Ack { key: hex::encode(receive), ids: (0..=MAX_ACK_IDS as u64).collect() }] };
-        assert_eq!(ack(State(store.clone()), Json(too_many)).await, StatusCode::BAD_REQUEST);
-        assert_eq!(store.lock().unwrap().bytes, MAX_QUEUE, "and nothing is dropped for it");
-
-        // A full mailbox acknowledged at once, with ids that aren't there mixed in, split over two mentions of it.
-        let started = Instant::now();
-        let mut first = ids[..MAX_QUEUE / 2].to_vec();
-        first.extend(0..(MAX_ACK_IDS - first.len()) as u64);
-        let request = AckRequest { acks: vec![
-            Ack { key: hex::encode(receive), ids: first },
-            Ack { key: "not a key".into(), ids: vec![1] },
-            Ack { key: hex::encode(receive), ids: ids[MAX_QUEUE / 2..].to_vec() },
-        ] };
-        assert_eq!(ack(State(store.clone()), Json(request)).await, StatusCode::NO_CONTENT);
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(store.lock().unwrap().queues.is_empty());
-        assert_eq!(store.lock().unwrap().bytes, 0);
     }
 }
