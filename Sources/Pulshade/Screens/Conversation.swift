@@ -1346,6 +1346,7 @@ private struct ConversationInfo: View {
                         }
                     }
                 }
+                if peer.badge.isModerator { ModeratorTag() }
                 if let bio = peer.bio, !bio.isEmpty {
                     Text(LinkPreviews.linked(bio))
                         .font(.system(size: 15))

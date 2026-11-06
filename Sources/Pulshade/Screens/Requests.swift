@@ -392,6 +392,7 @@ private struct ProfileCard: View {
                         .help("This handle can only belong to PULSHADE's creator")
                 }
             }
+            if profile.badge.isModerator { ModeratorTag() }
             if !profile.bio.isEmpty {
                 Text(LinkPreviews.linked(profile.bio))
                     .font(.system(size: 13))
