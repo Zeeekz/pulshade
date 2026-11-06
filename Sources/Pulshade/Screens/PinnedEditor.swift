@@ -10,6 +10,7 @@ struct PinnedEditor: View {
     @Environment(\.theme) private var theme
     @State private var linkDraft: LinkDraft?
     @State private var noteDraft: NoteDraft?
+    @State private var pending: Pending?
 
     struct NoteDraft: Identifiable {
         var existing: ProfileNote?
@@ -46,6 +47,7 @@ struct PinnedEditor: View {
             RowDivider(inset: 16)
             addMenu
         }
+        .confirms($pending)
         .sheet(item: $linkDraft) { draft in
             AddLinkSheet(draft: draft, choices: free(wallets: draft.wallets)) { link in
                 storeLinks { list in
@@ -89,7 +91,11 @@ struct PinnedEditor: View {
         pinRow(title: link.kind == .custom ? (link.label ?? "Link") : link.kind.title,
                subtitle: link.subtitle, mono: link.kind.isWallet,
                edit: { linkDraft = LinkDraft(wallets: link.kind.isWallet, kind: link.kind, existing: link) },
-               remove: { storeLinks { list in list.removeAll { $0.id == link.id } } }) {
+               remove: {
+                   pending = Pending(title: "Remove this \(link.kind.isWallet ? "wallet" : "link") from your profile?", confirm: "Remove") {
+                       storeLinks { list in list.removeAll { $0.id == link.id } }
+                   }
+               }) {
             BrandTile(kind: link.kind, size: 36)
         }
     }
@@ -97,7 +103,12 @@ struct PinnedEditor: View {
     private func noteRow(_ note: ProfileNote) -> some View {
         pinRow(title: note.title, subtitle: note.subtitle, mono: false,
                edit: { noteDraft = NoteDraft(existing: note) },
-               remove: { storeNotes { list in list.removeAll { $0.id == note.id } } }) {
+               remove: {
+                   pending = Pending(title: "Delete the note “\(note.title)”?", message: "It's removed from your profile and can't be brought back.",
+                                     confirm: "Delete") {
+                       storeNotes { list in list.removeAll { $0.id == note.id } }
+                   }
+               }) {
             Image(systemName: note.isLocked ? "lock.fill" : note.isRestricted ? "person.2.fill" : "doc.text.fill")
                 .font(.system(size: 14, weight: .semibold)).foregroundStyle(theme.accent)
                 .frame(width: 36, height: 36)
@@ -123,7 +134,7 @@ struct PinnedEditor: View {
             }
             .buttonStyle(.plain)
             Button(action: remove) {
-                Image(systemName: "trash").font(.system(size: 14)).foregroundStyle(Ink.faint).frame(width: 30, height: 30).contentShape(.rect)
+                Image(systemName: "trash").font(.system(size: 14)).foregroundStyle(Ink.faint).frame(width: 40, height: 40).contentShape(.rect)
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Remove \(title)")

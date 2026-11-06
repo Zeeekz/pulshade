@@ -4,9 +4,10 @@
 //! them with their receive keys. When an envelope is deposited, the relay sends Apple one push with no
 //! message in it: only "New message". The phone then fetches the real thing over Tor as usual.
 //!
-//! What the relay holds is a token per mailbox, in memory only (a restart forgets them until the phone next
-//! opens Pulshade and registers again, and so does a week without it opening). Apple learns that a device was
-//! woken, and when. Nothing else leaves.
+//! What the relay holds is a token per mailbox. They are kept in memory and written to disk with the waiting
+//! mail, in the sealed spool, so a restart keeps them; a week without the phone opening Pulshade and registering
+//! again forgets one. Whoever has the spool and the storage key can see which token goes with which mailbox.
+//! Apple learns that a device was woken, and when. Nothing else leaves.
 //!
 //! The limits are there so this can't be turned on the relay or on Apple: a token can hold only so many mailboxes,
 //! the table has a ceiling (the oldest registrations make way), a device is woken at most once in a while however

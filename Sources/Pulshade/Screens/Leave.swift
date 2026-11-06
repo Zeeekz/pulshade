@@ -92,7 +92,7 @@ struct BurnSheet: View {
                 }
                 BurnConfirmField(confirm: $confirm)
                 if let problem {
-                    Text(branded: problem).font(.system(size: 13, weight: .medium)).foregroundStyle(.orange)
+                    ProblemText(problem)
                 }
                 BurnButton(working: working, enabled: confirm == "BURN", action: burn)
             }
@@ -143,7 +143,7 @@ struct PersonaBurnSheet: View {
                 }
                 BurnConfirmField(confirm: $confirm)
                 if let problem {
-                    Text(branded: problem).font(.system(size: 13, weight: .medium)).foregroundStyle(.orange)
+                    ProblemText(problem)
                 }
                 BurnButton(working: working, enabled: confirm == "BURN", action: burn)
             }
@@ -193,7 +193,7 @@ struct LockedLeaveSheet: View {
                     BurnConfirmField(confirm: $confirm)
                 }
                 if let problem {
-                    Text(branded: problem).font(.system(size: 13, weight: .medium)).foregroundStyle(.orange)
+                    ProblemText(problem)
                 }
                 if burning {
                     BurnButton(working: working, enabled: confirm == "BURN" && !code.isEmpty, action: leave)

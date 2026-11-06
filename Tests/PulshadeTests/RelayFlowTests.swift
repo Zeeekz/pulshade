@@ -1661,6 +1661,8 @@ struct RelayFlowTests {
         let bobFP = try #require(zee.visibleContacts.first).fingerprint
         let chat = zee.startConversation(kind: .direct, title: "", members: [bobFP])
         zee.send("never in a backup", in: chat.id)
+        // Delivered and receipted first, so nothing about the account changes between the two saves below.
+        await settle(zee, bob)
         let seed = try #require(zee.identity?.seed)
         let identity = try Identity(seed: seed)
 

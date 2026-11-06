@@ -686,7 +686,7 @@ private struct HandleSettings: View {
             HStack {
                 Text("\(used) of \(AppModel.maxHandles) used").font(.system(size: 13)).foregroundStyle(Ink.faint)
                 Spacer()
-                if let problem { Text(problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange) }
+                if let problem { ProblemText(problem) }
             }
             .padding(.horizontal, 14)
         }
@@ -1293,14 +1293,14 @@ private struct UpdateSettings: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(16)
                     RowDivider()
-                    ActionRow(title: "Install and Restart") {
+                    ActionRow(title: "Install and restart") {
                         guard let client = model.client(nil, lane: "update") else { return }
                         Task { await updater.install(client) }
                     }
                 }
             }
             SettingsGroup {
-                ActionRow(title: "Check for Updates") {
+                ActionRow(title: "Check for updates") {
                     guard let client = model.client(nil, lane: "update") else { return }
                     Task { await updater.check(client) }
                 }
@@ -1451,7 +1451,7 @@ private struct DisguiseSetup: View {
                 Image(systemName: kind == .decoy ? "theatermasks" : "flame")
                     .font(.system(size: 52, weight: .light))
                     .foregroundStyle(kind == .decoy ? AnyShapeStyle(theme.gradient) : AnyShapeStyle(Color.orange))
-                    .symbolEffect(.pulse)
+                    .symbolEffect(.pulse, isActive: !Platform.reduceMotion)
                 Text(branded: kind == .decoy
                      ? "Opens an empty PULSHADE with your name and theme. Your real chats stay hidden."
                      : "Silently erases your real identity and chats, then opens an empty PULSHADE. This can't be undone.")
@@ -1469,7 +1469,7 @@ private struct DisguiseSetup: View {
                         .modifier(Shake(trigger: shake))
                 }
                 if let problem {
-                    Text(branded: problem).font(.system(size: 11, weight: .semibold)).foregroundStyle(.orange)
+                    ProblemText(problem)
                 }
                 Button(action: save) {
                     if working { ProgressView().controlSize(.small).tint(Ink.onAccent) } else { Image(systemName: "checkmark") }

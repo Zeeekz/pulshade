@@ -7,7 +7,7 @@ enum StoryPalette {
         [.hex(0xB6FF3D), .hex(0x00494A)], [.hex(0xFF5FD2), .hex(0x2B0B4A)], [.hex(0xFFC93D), .hex(0x6A0F3A)],
     ]
     static func gradient(_ i: Int) -> LinearGradient {
-        LinearGradient(colors: all[i % all.count], startPoint: .topLeading, endPoint: .bottomTrailing)
+        LinearGradient(colors: all[i.wrapped(all.count)], startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 }
 
@@ -16,6 +16,7 @@ struct StoryStrip: View {
     @Environment(AppModel.self) private var model
     @Binding var composing: Bool
     @Binding var viewing: StoryReel?
+    @State private var pending: Pending?
 
     var body: some View {
         ScrollView(.horizontal) {
@@ -47,10 +48,13 @@ struct StoryStrip: View {
                     Button("New story", systemImage: "plus") { composing = true }
                     ForEach(model.myStories) { story in
                         Button("Delete story from \(story.date.formatted(date: .omitted, time: .shortened))",
-                               systemImage: "trash", role: .destructive) { model.deleteStory(story.id) }
+                               systemImage: "trash", role: .destructive) {
+                            pending = Pending(title: "Delete this story?", message: "It disappears for everyone who can see it.", confirm: "Delete") { model.deleteStory(story.id) }
+                        }
                     }
                 }
                 .accessibilityLabel(model.myStories.isEmpty ? "New story" : "Your story")
+                .confirms($pending)
 
                 ForEach(model.friendStories, id: \.author) { entry in
                     let contact = model.contact(entry.author)

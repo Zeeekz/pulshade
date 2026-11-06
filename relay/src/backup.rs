@@ -13,10 +13,16 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
+    sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub const MAX_BACKUP: usize = 64 * 1024 * 1024;
+/// The largest backup taken. The apps pad a backup to a power of two and sealing adds a few bytes, so this is the
+/// 32 MB size and everything under it. (The limit was 64 MB exactly, which the 64 MB size never fitted under.)
+pub const MAX_BACKUP: usize = 32 * 1024 * 1024 + 1024;
+/// All backups on disk together. Past this, new ones are refused (507) instead of filling the disk; one already
+/// here can still be replaced by another no larger.
+pub const MAX_STORED: u64 = 2 * 1024 * 1024 * 1024;
 /// How long a backup waits for its recovery code before it's erased.
 pub const BACKUP_TTL: Duration = Duration::from_secs(180 * 24 * 3600);
 
@@ -30,6 +36,10 @@ pub struct Proof {
 
 pub struct Backups {
     dir: Option<PathBuf>,
+    /// The most the folder may hold: `MAX_STORED`, or less in tests.
+    ceiling: u64,
+    /// Held while a backup is checked against the ceiling and written, so two at once can't both take the last room.
+    writing: Mutex<()>,
 }
 
 fn now() -> u64 {
@@ -51,7 +61,13 @@ impl Backups {
         let _ = std::fs::create_dir_all(&dir);
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-        Backups { dir: Some(dir) }
+        Backups { dir: Some(dir), ceiling: MAX_STORED, writing: Mutex::new(()) }
+    }
+
+    /// The size of everything in the folder.
+    fn stored(&self) -> u64 {
+        let Some(files) = self.dir.as_ref().and_then(|dir| std::fs::read_dir(dir).ok()) else { return 0 };
+        files.flatten().filter_map(|file| file.metadata().ok()).map(|meta| meta.len()).sum()
     }
 
     #[cfg(test)]
@@ -84,16 +100,34 @@ impl Backups {
         }
         let name = Self::verify(key_hex, "pulshade.backup.put.v1", sig, ts, Some(blob))?;
         let path = self.file(&name)?;
+        let _writing = self.writing.lock().unwrap();
+        let replaced = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if self.stored().saturating_sub(replaced) + blob.len() as u64 > self.ceiling {
+            return Err(StatusCode::INSUFFICIENT_STORAGE);
+        }
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, blob).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)?;
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        std::fs::rename(tmp, path).map_err(|_| StatusCode::INSUFFICIENT_STORAGE)
+        let written = crate::sealed::write_private(&tmp, blob).and_then(|()| std::fs::rename(&tmp, path));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written.map_err(|_| StatusCode::INSUFFICIENT_STORAGE)
     }
 
-    pub fn get(&self, key_hex: &str, proof: &Proof) -> Result<Vec<u8>, StatusCode> {
+    /// The backup's file, open for reading, and its size, so it can be sent a piece at a time.
+    pub fn open(&self, key_hex: &str, proof: &Proof) -> Result<(std::fs::File, u64), StatusCode> {
         let name = Self::verify(key_hex, "pulshade.backup.get.v1", &proof.sig, proof.ts, None)?;
-        std::fs::read(self.file(&name)?).map_err(|_| StatusCode::NOT_FOUND)
+        let file = std::fs::File::open(self.file(&name)?).map_err(|_| StatusCode::NOT_FOUND)?;
+        let size = file.metadata().map_err(|_| StatusCode::NOT_FOUND)?.len();
+        Ok((file, size))
+    }
+
+    #[cfg(test)]
+    pub fn get(&self, key_hex: &str, proof: &Proof) -> Result<Vec<u8>, StatusCode> {
+        use std::io::Read;
+        let (mut file, size) = self.open(key_hex, proof)?;
+        let mut blob = Vec::with_capacity(size as usize);
+        file.read_to_end(&mut blob).map_err(|_| StatusCode::NOT_FOUND)?;
+        Ok(blob)
     }
 
     pub fn remove(&self, key_hex: &str, proof: &Proof) -> Result<(), StatusCode> {
@@ -188,5 +222,29 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         backups.sweep(Duration::from_millis(10));
         assert_eq!(get(), Err(StatusCode::NOT_FOUND), "an old one goes");
+    }
+
+    /// The folder has a ceiling, so backups can't fill the disk. One already there can still be saved again.
+    #[test]
+    fn backups_are_refused_once_the_folder_is_full() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut backups = Backups::temporary();
+        backups.ceiling = 250;
+        let t = now();
+        let put = |seed: u8, body: &[u8]| {
+            let owner = SigningKey::from_bytes(&[seed; 32]);
+            let id = hex::encode(owner.verifying_key().as_bytes());
+            backups.put(&id, &signed(&owner, &owner, "pulshade.backup.put.v1", t, Some(body)), t, body).map(|()| id)
+        };
+        let first = put(11, &[1u8; 100]).unwrap();
+        put(12, &[2u8; 100]).unwrap();
+        assert_eq!(put(13, &[3u8; 100]), Err(StatusCode::INSUFFICIENT_STORAGE), "no room for a third");
+        assert_eq!(put(13, &[3u8; 50]).map(|_| ()), Ok(()), "what fits is still taken");
+        assert_eq!(put(11, &[4u8; 100]).map(|_| ()), Ok(()), "one already here is replaced");
+        assert_eq!(put(11, &[5u8; 101]), Err(StatusCode::INSUFFICIENT_STORAGE), "but not by a larger one");
+        assert_eq!(backups.stored(), 250);
+        let mode = std::fs::metadata(backups.file(&first).unwrap()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "only the relay reads it");
+        let _ = std::fs::remove_dir_all(backups.dir.as_ref().unwrap());
     }
 }

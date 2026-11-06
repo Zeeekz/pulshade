@@ -12,6 +12,15 @@ typealias PlatformImage = UIImage
 
 /// The few things that differ between the Mac and iPhone apps, kept in one place.
 enum Platform {
+    /// Whether the person asked the system for less movement. Looping animations stay still when they did.
+    @MainActor static var reduceMotion: Bool {
+        #if os(iOS)
+        UIAccessibility.isReduceMotionEnabled
+        #else
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        #endif
+    }
+
     static var isPhone: Bool {
         #if os(iOS)
         true

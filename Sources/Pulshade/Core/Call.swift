@@ -53,7 +53,8 @@ struct CallCrypto {
         let bytes = Data(packet)
         guard bytes.count >= 9 + 16, let kind = Kind(rawValue: bytes[0]) else { return nil }
         let n = bytes[1..<9].reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
-        guard n + 100 > newest, !seen.contains(n),
+        // Compared without adding to the packet's own number, which could be made large enough to overflow.
+        guard n >= newest || newest - n < 100, !seen.contains(n),
               let box = try? ChaChaPoly.SealedBox(nonce: Self.nonce(n), ciphertext: bytes[9..<(bytes.count - 16)],
                                                    tag: bytes[(bytes.count - 16)...]),
               let padded = try? ChaChaPoly.open(box, using: receiveKey, authenticating: bytes[0..<9]), padded.count >= 2
@@ -63,7 +64,7 @@ struct CallCrypto {
         let body = Data(padded.dropFirst(2).prefix(length))
         seen.insert(n)
         newest = max(newest, n)
-        if seen.count > 400 { seen = seen.filter { $0 + 200 > newest } }
+        if seen.count > 400 { seen = seen.filter { $0 >= newest || newest - $0 < 200 } }
         return (kind, body)
     }
 }
@@ -359,6 +360,8 @@ final class CallAudio: @unchecked Sendable {
     }
 
     private func decode(_ packet: Data) -> AVAudioPCMBuffer? {
+        // An empty packet has no bytes to point at.
+        guard !packet.isEmpty else { return nil }
         let compressed = AVAudioCompressedBuffer(format: opus, packetCapacity: 1, maximumPacketSize: packet.count)
         packet.withUnsafeBytes { compressed.data.copyMemory(from: $0.baseAddress!, byteCount: packet.count) }
         compressed.byteLength = UInt32(packet.count)

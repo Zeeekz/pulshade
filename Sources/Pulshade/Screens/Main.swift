@@ -419,7 +419,7 @@ private struct ChatList: View {
                         .disabled(model.clearableChats.isEmpty)
                 } label: {
                     HStack(spacing: 4) {
-                        Text("Chats").font(.system(size: 18, weight: .bold)).foregroundStyle(Ink.text)
+                        Text("Chats").font(.system(size: 20, weight: .bold)).foregroundStyle(Ink.text)
                         Image(systemName: "chevron.down").font(.system(size: 9, weight: .bold)).foregroundStyle(Ink.faint)
                     }
                     .contentShape(Rectangle())
@@ -757,6 +757,8 @@ private struct PersonaSwitcher: View {
                         .onSubmit(create)
                     Button(action: create) { Image(systemName: "checkmark") }
                         .buttonStyle(GlowButtonStyle(size: 36))
+                        .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                        .accessibilityLabel("Create persona")
                 }
                 .transition(.move(edge: .top).combined(with: .opacity))
             } else if model.canAddPersona {

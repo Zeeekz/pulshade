@@ -150,6 +150,11 @@ chown -R "$user:$user" "$data" "$keys" && chmod 700 "$data" "$keys" && chmod 600
 [[ -f "$data/pet.key" ]] || warn "No pet.key in $data: eggs can't hatch and collectibles can't be gifted until you put it there."
 
 step "The background service"
+# The most memory the relay may take, in MB: all but 320 MB of what the server has (and never less than half of
+# it), which is left for SSH, the web proxy and the system itself. If the relay ever grows past it, the relay alone
+# is stopped and started again, and the server stays reachable.
+memory_max=$(( mem_kb / 1024 - 320 ))
+(( memory_max >= mem_kb / 2048 )) || memory_max=$(( mem_kb / 2048 ))
 cat > "$unit" <<UNIT
 [Unit]
 Description=Pulshade relay
@@ -167,6 +172,9 @@ Environment=PULSHADE_DIRECTORY=$data/pulshade-directory.json
 Environment=PULSHADE_STORAGE_KEY_FILE=$keys/storage.key
 Restart=always
 RestartSec=5
+MemoryMax=${memory_max}M
+# Should the whole server run short of memory all the same, the relay is the first thing stopped, not SSH.
+OOMScoreAdjust=500
 LimitCORE=0
 UMask=0077
 NoNewPrivileges=yes

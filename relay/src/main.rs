@@ -3,8 +3,12 @@
 //! It knows no users, no names and no keys. A mailbox is two random values:
 //! the owner keeps a secret *receive key* and hands out its SHA-256 hash as the
 //! *send id*. Anyone with the send id can drop envelopes in; only the holder of
-//! the receive key can read them out. Envelopes are opaque, kept in memory only,
-//! deleted on acknowledgement or after seven days, and nothing is ever logged.
+//! the receive key can read them out. Envelopes are opaque, deleted on acknowledgement
+//! or after seven days, and nothing is ever logged. They wait in memory, and so that a
+//! restart doesn't lose them they are also written to disk every 30 seconds (the spool,
+//! below), sealed with the relay's storage key. That keeps a copy of the file closed. It
+//! does not hide which mailboxes hold mail from someone who has the key as well, as
+//! anyone who holds the whole disk of a Linux server does, where the key is a file.
 
 mod admin;
 mod backup;
@@ -31,19 +35,27 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, Ordering}},
+    sync::{Arc, LazyLock, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 
 const MAX_ENVELOPE: usize = 4 * 1024 * 1024;
 const MAX_QUEUE: usize = 2_000;
 /// Everything waiting in memory, all mailboxes together. Past this, deposits are refused (507) instead of letting
 /// the process grow until it's killed, which would lose every queued envelope at once.
 const MAX_TOTAL_BYTES: usize = 384 * 1024 * 1024;
+/// Request bodies being received at once, all requests together, apart from the first `SHORT_MAIL` bytes of each. An
+/// upload is held in memory whole until it is stored or refused, so without this a few dozen slow, large uploads
+/// could take all the memory there is. Past it, a large upload is refused (503) and tried again by the app; short
+/// messages never count, so they always get through.
+const MAX_IN_FLIGHT: usize = 96 * 1024 * 1024;
+/// Envelope ids one mailbox's acknowledgement may name: twice what a mailbox can hold, and many times what a fetch
+/// hands over.
+const MAX_ACK_IDS: usize = 2 * MAX_QUEUE;
 /// Mailboxes holding mail at once.
 const MAX_MAILBOXES: usize = 200_000;
 /// Receive keys per push registration, so a phone with more registers in several goes.
@@ -114,6 +126,8 @@ struct AppState {
     releases: Arc<release::Releases>,
     calls: Arc<calls::Rooms>,
     limits: Arc<Mutex<Limiter>>,
+    /// Room for request bodies being received, counted in bytes: `MAX_IN_FLIGHT` in all.
+    in_flight: Arc<Semaphore>,
     /// The operator's token, from `admin.token` beside the relay.
     admin_token: Arc<String>,
     started: Instant,
@@ -255,14 +269,22 @@ struct AckRequest {
 }
 
 async fn ack(State(store): State<Shared>, Json(req): Json<AckRequest>) -> StatusCode {
-    let mut store = store.lock().unwrap();
+    if req.acks.iter().any(|a| a.ids.len() > MAX_ACK_IDS) {
+        return StatusCode::BAD_REQUEST;
+    }
+    // Gathered by mailbox before the lock is taken, so each queue is gone through once and looking an id up costs
+    // the same however many were sent.
+    let mut gone: HashMap<Id, HashSet<u64>> = HashMap::new();
     for a in req.acks {
         let Some(receive_key) = parse_id(&a.key) else { continue };
-        let send_id = send_id_for(&receive_key);
+        gone.entry(send_id_for(&receive_key)).or_default().extend(a.ids);
+    }
+    let mut store = store.lock().unwrap();
+    for (send_id, ids) in gone {
         let mut freed = 0;
         if let Some(queue) = store.queues.get_mut(&send_id) {
             queue.retain(|item| {
-                let keep = !a.ids.contains(&item.id);
+                let keep = !ids.contains(&item.id);
                 if !keep { freed += item.blob.len(); }
                 keep
             });
@@ -617,9 +639,7 @@ fn admin_token() -> String {
     let mut raw = [0u8; 32];
     std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut raw)).expect("no randomness");
     let token = hex::encode(raw);
-    std::fs::write("admin.token", &token).expect("could not write admin.token");
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions("admin.token", std::fs::Permissions::from_mode(0o600));
+    sealed::write_private(std::path::Path::new("admin.token"), token.as_bytes()).expect("could not write admin.token");
     token
 }
 
@@ -635,8 +655,10 @@ async fn backup_put(
     caller::Caller(ip): caller::Caller,
     Path(key): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> StatusCode {
+    // The backup itself is only read once the request has passed everything that can be checked without it, so
+    // one that will be refused anyway never takes up memory.
     let who = pow::rate_key(ip, &headers, &format!("backup|{key}"));
     if !state.limits.lock().unwrap().allow(who, "backup", 20, Duration::from_secs(3600)) {
         return StatusCode::TOO_MANY_REQUESTS;
@@ -645,10 +667,41 @@ async fn backup_put(
     let (Some(sig), Some(ts)) = (header("x-pulshade-sig"), header("x-pulshade-ts").and_then(|t| t.parse().ok())) else {
         return StatusCode::BAD_REQUEST;
     };
-    match state.backups.put(&key, &sig, ts, &body) {
+    let declared = header("content-length").and_then(|n| n.parse::<usize>().ok());
+    if declared.is_some_and(|n| n > backup::MAX_BACKUP) {
+        return StatusCode::PAYLOAD_TOO_LARGE;
+    }
+    use futures_util::StreamExt;
+    // Grown as the pieces come, never set aside ahead on the request's say-so.
+    let mut blob = Vec::new();
+    let mut pieces = body.into_data_stream();
+    while let Some(piece) = pieces.next().await {
+        let Ok(piece) = piece else { return StatusCode::BAD_REQUEST };
+        if blob.len() + piece.len() > backup::MAX_BACKUP {
+            return StatusCode::PAYLOAD_TOO_LARGE;
+        }
+        blob.extend_from_slice(&piece);
+    }
+    match state.backups.put(&key, &sig, ts, &blob) {
         Ok(()) => StatusCode::NO_CONTENT,
         Err(code) => code,
     }
+}
+
+/// A file as the body of an answer, read a piece at a time, so a large one is never in memory whole.
+fn in_pieces(file: std::fs::File) -> axum::body::Body {
+    axum::body::Body::from_stream(futures_util::stream::unfold(Some(file), |file| async move {
+        let mut file = file?;
+        let mut piece = vec![0u8; 64 * 1024];
+        match file.read(&mut piece) {
+            Ok(0) => None,
+            Ok(n) => {
+                piece.truncate(n);
+                Some((Ok(Bytes::from(piece)), Some(file)))
+            }
+            Err(e) => Some((Err(e), None)),
+        }
+    }))
 }
 
 async fn backup_get(
@@ -657,12 +710,15 @@ async fn backup_get(
     Path(key): Path<String>,
     headers: HeaderMap,
     Json(proof): Json<backup::Proof>,
-) -> Result<Vec<u8>, StatusCode> {
+) -> Result<axum::response::Response, StatusCode> {
+    use axum::{http::header, response::IntoResponse};
     let who = pow::rate_key(ip, &headers, &format!("backup-read|{key}"));
     if !state.limits.lock().unwrap().allow(who, "backup-read", 60, Duration::from_secs(3600)) {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
-    state.backups.get(&key, &proof)
+    let (file, size) = state.backups.open(&key, &proof)?;
+    let about = [(header::CONTENT_TYPE, "application/octet-stream".to_string()), (header::CONTENT_LENGTH, size.to_string())];
+    Ok((about, in_pieces(file)).into_response())
 }
 
 async fn backup_remove(State(state): State<AppState>, Path(key): Path<String>, Json(proof): Json<backup::Proof>) -> StatusCode {
@@ -725,6 +781,62 @@ async fn update_archive(
         Some(zip) => ([(axum::http::header::CONTENT_TYPE, "application/zip")], zip).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// What one request has taken of the room for bodies being received, given back when the request is done.
+struct Room {
+    budget: Arc<Semaphore>,
+    taken: AtomicUsize,
+    /// Set when there was no room left for the next piece.
+    full: AtomicBool,
+}
+
+impl Room {
+    fn take(&self, bytes: usize) -> bool {
+        match self.budget.try_acquire_many(bytes as u32) {
+            Ok(room) => {
+                room.forget();
+                self.taken.fetch_add(bytes, Ordering::SeqCst);
+                true
+            }
+            Err(_) => {
+                self.full.store(true, Ordering::SeqCst);
+                false
+            }
+        }
+    }
+}
+
+impl Drop for Room {
+    fn drop(&mut self) {
+        self.budget.add_permits(self.taken.load(Ordering::SeqCst));
+    }
+}
+
+/// Counts every request's body against `MAX_IN_FLIGHT` as it arrives, whatever reads it, and answers 503 when there
+/// is no room. The count is by what has really arrived, not by what the request says it will send, and is given back
+/// once the request has been answered: by then the body is stored, and counted there, or gone.
+async fn in_flight(State(state): State<AppState>, request: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use futures_util::StreamExt;
+    let room = Arc::new(Room { budget: state.in_flight.clone(), taken: AtomicUsize::new(0), full: AtomicBool::new(false) });
+    let (parts, body) = request.into_parts();
+    let (counting, mut seen) = (room.clone(), 0usize);
+    let counted = body.into_data_stream().map(move |piece| {
+        let piece = piece?;
+        // The first bytes of every request are free, so a message or a receipt is never turned away.
+        let before = seen.max(SHORT_MAIL);
+        seen += piece.len();
+        if seen > before && !counting.take(seen - before) {
+            return Err(axum::Error::new(std::io::Error::other("no room for more uploads")));
+        }
+        Ok(piece)
+    });
+    let response = next.run(axum::extract::Request::from_parts(parts, axum::body::Body::from_stream(counted))).await;
+    if room.full.load(Ordering::SeqCst) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    response
 }
 
 fn purge(store: &Shared) {
@@ -1000,7 +1112,7 @@ fn app(state: AppState) -> Router {
         .route("/v1/eggs", post(eggs))
         .route("/v1/eggs/start", post(egg_start))
         .route("/v1/eggs/hatch", post(egg_hatch))
-        .route("/v1/backup/{key}", put(backup_put).layer(DefaultBodyLimit::max(backup::MAX_BACKUP)))
+        .route("/v1/backup/{key}", put(backup_put))
         .route("/v1/backup/{key}/get", post(backup_get))
         .route("/v1/backup/{key}/delete", post(backup_remove))
         .route("/v1/call/{room}", get(call))
@@ -1010,6 +1122,7 @@ fn app(state: AppState) -> Router {
         .route("/v1/update/mac", get(update_manifest))
         .route("/v1/update/mac.zip", get(update_archive))
         .layer(DefaultBodyLimit::max(MAX_ENVELOPE + 1024))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), in_flight))
         .with_state(state)
 }
 
@@ -1030,7 +1143,8 @@ fn pet_signing_key() -> Option<ed25519_dalek::SigningKey> {
 }
 
 /// Keeps memory off the disk: no core file if the relay crashes, and (on Linux) no other process of this user
-/// may read its memory. Waiting envelopes and the addresses counted for rate limits only ever live there.
+/// may read its memory. The addresses counted for rate limits only ever live there, and waiting envelopes reach
+/// the disk only sealed, in the spool.
 fn no_core_dumps() {
     let none = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
     // SAFETY: plain system calls with valid arguments.
@@ -1084,6 +1198,7 @@ async fn main() {
         directory: Arc::new(Mutex::new(Directory::load(PathBuf::from(&directory_path), creator_key(),
                                                        sealed::Sealer::standard(&PathBuf::from(&directory_path))))),
         limits: Arc::default(),
+        in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         admin_token: Arc::new(admin_token()),
         started: Instant::now(),
     };
@@ -1158,6 +1273,7 @@ mod tests {
             releases: Arc::new(release::Releases::at(dir.join("release"))),
             directory: Arc::new(Mutex::new(Directory::default())),
             limits: Arc::default(),
+            in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
                 admin_token: Arc::new("t".into()),
             started: Instant::now(),
         };
@@ -1518,6 +1634,7 @@ mod tests {
             releases: Arc::new(release::Releases::at(dir.join("release"))),
             directory: Arc::new(Mutex::new(Directory::default())),
             limits: Arc::default(),
+            in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
                 admin_token: Arc::new("t".into()),
             started: Instant::now(),
         };
@@ -1542,5 +1659,194 @@ mod tests {
         assert_eq!(deposit(State(store.clone()), Path("nothex".into()), HeaderMap::new(), Bytes::from_static(b"x")).await, StatusCode::BAD_REQUEST);
         let send = hex::encode(send_id_for(&key(1)));
         assert_eq!(deposit(State(store), Path(send), HeaderMap::new(), Bytes::new()).await, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    fn state_in(dir: &std::path::Path) -> AppState {
+        AppState {
+            store: Arc::default(),
+            calls: Arc::default(),
+            backups: Arc::new(Backups::at(dir.join("backups"))),
+            releases: Arc::new(release::Releases::at(dir.join("release"))),
+            directory: Arc::new(Mutex::new(Directory::default())),
+            limits: Arc::default(),
+            in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            admin_token: Arc::new("t".into()),
+            started: Instant::now(),
+        }
+    }
+
+    async fn served(state: AppState) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+        });
+        addr
+    }
+
+    /// A backup request's signature, as the apps make it.
+    fn backup_sig(owner: &ed25519_dalek::SigningKey, label: &str, ts: u64, body: Option<&[u8]>) -> String {
+        use ed25519_dalek::Signer;
+        let mut message = label.as_bytes().to_vec();
+        message.extend_from_slice(owner.verifying_key().as_bytes());
+        message.extend_from_slice(&ts.to_be_bytes());
+        if let Some(body) = body { message.extend_from_slice(&Sha256::digest(body)); }
+        B64.encode(owner.sign(&message).to_bytes())
+    }
+
+    /// The way the apps leave and collect a backup still works as it did: the same headers, the same answers, and
+    /// the same bytes back, now read from disk a piece at a time.
+    #[tokio::test]
+    async fn a_backup_goes_up_and_comes_back_whole_as_before() {
+        let dir = std::env::temp_dir().join(format!("pulshade-backup-http-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = state_in(&dir);
+        let addr = served(state.clone()).await;
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[21; 32]);
+        let url = format!("http://{addr}/v1/backup/{}", hex::encode(owner.verifying_key().as_bytes()));
+        // Larger than one piece, and not a whole number of them.
+        let blob: Vec<u8> = (0..300_001u32).map(|i| (i % 251) as u8).collect();
+        let ts = unix_now();
+        let client = reqwest::Client::new();
+
+        let put = client.put(&url)
+            .header("content-type", "application/octet-stream")
+            .header("x-pulshade-sig", backup_sig(&owner, "pulshade.backup.put.v1", ts, Some(&blob)))
+            .header("x-pulshade-ts", ts.to_string())
+            .body(blob.clone()).send().await.unwrap();
+        assert_eq!(put.status(), StatusCode::NO_CONTENT);
+
+        let proof = serde_json::json!({ "sig": backup_sig(&owner, "pulshade.backup.get.v1", ts, None), "ts": ts }).to_string();
+        let got = client.post(format!("{url}/get")).header("content-type", "application/json").body(proof).send().await.unwrap();
+        assert_eq!(got.status(), StatusCode::OK);
+        assert_eq!(got.headers()["content-length"], "300001");
+        assert_eq!(got.headers()["content-type"], "application/octet-stream");
+        assert_eq!(got.bytes().await.unwrap().as_ref(), &blob[..]);
+
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[22; 32]);
+        let proof = serde_json::json!({ "sig": backup_sig(&stranger, "pulshade.backup.get.v1", ts, None), "ts": ts }).to_string();
+        let refused = client.post(format!("{url}/get")).header("content-type", "application/json").body(proof).send().await.unwrap();
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        // Everything counted while it arrived has been given back.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(state.in_flight.available_permits(), MAX_IN_FLIGHT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An upload is refused before any of it is read when the request already fails its limit or lacks its headers,
+    /// so a caller who will be turned away can't make the relay hold megabytes first.
+    #[tokio::test]
+    async fn a_backup_is_only_read_once_the_request_has_passed_its_checks() {
+        use axum::body::Body;
+        let dir = std::env::temp_dir().join(format!("pulshade-backup-order-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = state_in(&dir);
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[23; 32]);
+        let id = hex::encode(owner.verifying_key().as_bytes());
+        let ip: IpAddr = "203.0.113.40".parse().unwrap();
+        // A body that notes when anything asks for it.
+        let watched = || {
+            let read = Arc::new(AtomicBool::new(false));
+            let flag = read.clone();
+            let body = Body::from_stream(futures_util::stream::once(async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok::<_, std::io::Error>(Bytes::from_static(b"sealed"))
+            }));
+            (body, read)
+        };
+        let signed = |length: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-pulshade-sig", B64.encode([0u8; 64]).parse().unwrap());
+            headers.insert("x-pulshade-ts", unix_now().to_string().parse().unwrap());
+            if let Some(length) = length { headers.insert("content-length", length.parse().unwrap()); }
+            headers
+        };
+
+        let (body, read) = watched();
+        assert_eq!(backup_put(State(state.clone()), caller::Caller(ip), Path(id.clone()), HeaderMap::new(), body).await, StatusCode::BAD_REQUEST);
+        assert!(!read.load(Ordering::SeqCst), "no signature: refused unread");
+
+        let (body, read) = watched();
+        let too_long = (backup::MAX_BACKUP + 1).to_string();
+        assert_eq!(backup_put(State(state.clone()), caller::Caller(ip), Path(id.clone()), signed(Some(&too_long)), body).await, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!read.load(Ordering::SeqCst), "says it is too large: refused unread");
+
+        // With everything in order it is read, and then judged by its signature.
+        let (body, read) = watched();
+        assert_eq!(backup_put(State(state.clone()), caller::Caller(ip), Path(id.clone()), signed(Some("6")), body).await, StatusCode::UNAUTHORIZED);
+        assert!(read.load(Ordering::SeqCst));
+
+        // One that doesn't say how long it is stops being read at the limit.
+        let endless = Body::from_stream(futures_util::stream::iter((0..40).map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![0u8; 1024 * 1024])))));
+        assert_eq!(backup_put(State(state.clone()), caller::Caller(ip), Path(id.clone()), signed(None), endless).await, StatusCode::PAYLOAD_TOO_LARGE);
+
+        // Past the hourly limit, nothing is read at all.
+        for _ in 0..16 {
+            let (body, _) = watched();
+            backup_put(State(state.clone()), caller::Caller(ip), Path(id.clone()), HeaderMap::new(), body).await;
+        }
+        let (body, read) = watched();
+        assert_eq!(backup_put(State(state.clone()), caller::Caller(ip), Path(id), signed(Some("6")), body).await, StatusCode::TOO_MANY_REQUESTS);
+        assert!(!read.load(Ordering::SeqCst), "over the limit: refused unread");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Uploads being received share one budget of memory. With none left a large upload is refused (503) instead of
+    /// being held, short mail still gets through, and the room comes back when requests end.
+    #[tokio::test]
+    async fn large_uploads_are_refused_when_too_much_is_arriving_at_once() {
+        let dir = std::env::temp_dir().join(format!("pulshade-in-flight-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = state_in(&dir);
+        let addr = served(state.clone()).await;
+        let url = format!("http://{addr}/v1/q/{}", hex::encode(send_id_for(&key(71))));
+        let client = reqwest::Client::new();
+        let send = |size: usize| client.put(&url).body(vec![5u8; size]).send();
+
+        // As if other uploads had taken all but a little of the room.
+        let others = state.in_flight.clone().try_acquire_many_owned((MAX_IN_FLIGHT - 10_000) as u32).unwrap();
+        assert_eq!(send(SHORT_MAIL + 16 * 1024).await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(state.store.lock().unwrap().queues.is_empty(), "nothing of it was kept");
+        assert_eq!(send(100).await.unwrap().status(), StatusCode::ACCEPTED, "a short message isn't counted");
+        assert_eq!(send(SHORT_MAIL).await.unwrap().status(), StatusCode::ACCEPTED);
+        assert_eq!(send(SHORT_MAIL + 5_000).await.unwrap().status(), StatusCode::ACCEPTED, "what fits in the room left is taken");
+
+        drop(others);
+        assert_eq!(send(SHORT_MAIL + 16 * 1024).await.unwrap().status(), StatusCode::ACCEPTED);
+        assert_eq!(send(2 * 1024 * 1024).await.unwrap().status(), StatusCode::ACCEPTED);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(state.in_flight.available_permits(), MAX_IN_FLIGHT, "all of it given back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An acknowledgement costs its own length: ids are looked up in a set, a mailbox named twice is gone through
+    /// once, and a list longer than any app sends is refused whole.
+    #[tokio::test]
+    async fn acknowledgements_are_capped_and_cost_no_more_than_their_length() {
+        let store: Shared = Arc::default();
+        let receive = key(81);
+        let send = hex::encode(send_id_for(&receive));
+        for _ in 0..MAX_QUEUE {
+            assert_eq!(deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), Bytes::from_static(b"x")).await, StatusCode::ACCEPTED);
+        }
+        let ids: Vec<u64> = store.lock().unwrap().queues[&send_id_for(&receive)].iter().map(|item| item.id).collect();
+
+        let too_many = AckRequest { acks: vec![Ack { key: hex::encode(receive), ids: (0..=MAX_ACK_IDS as u64).collect() }] };
+        assert_eq!(ack(State(store.clone()), Json(too_many)).await, StatusCode::BAD_REQUEST);
+        assert_eq!(store.lock().unwrap().bytes, MAX_QUEUE, "and nothing is dropped for it");
+
+        // A full mailbox acknowledged at once, with ids that aren't there mixed in, split over two mentions of it.
+        let started = Instant::now();
+        let mut first = ids[..MAX_QUEUE / 2].to_vec();
+        first.extend(0..(MAX_ACK_IDS - first.len()) as u64);
+        let request = AckRequest { acks: vec![
+            Ack { key: hex::encode(receive), ids: first },
+            Ack { key: "not a key".into(), ids: vec![1] },
+            Ack { key: hex::encode(receive), ids: ids[MAX_QUEUE / 2..].to_vec() },
+        ] };
+        assert_eq!(ack(State(store.clone()), Json(request)).await, StatusCode::NO_CONTENT);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(store.lock().unwrap().queues.is_empty());
+        assert_eq!(store.lock().unwrap().bytes, 0);
     }
 }

@@ -72,7 +72,7 @@ private struct EggCard: View {
                 } else if left == 0 {
                     action("Open") { opened(try await model.hatchEgg(egg.id)) }
                 }
-                if let problem { Text(problem).font(.system(size: 11)).foregroundStyle(.orange) }
+                if let problem { ProblemText(problem) }
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 14).padding(.horizontal, 10)
@@ -84,7 +84,7 @@ private struct EggCard: View {
     private func status(_ left: TimeInterval?) -> String {
         guard let left else { return "Takes \(EggNames.minutes(egg.seconds))" }
         if left == 0 { return "Ready to open" }
-        let s = Int(left.rounded(.up))
+        let s = Int(min(left.rounded(.up), 360_000))
         return s >= 3600 ? String(format: "%d:%02d:%02d", s / 3600, s % 3600 / 60, s % 60) : String(format: "%d:%02d", s / 60, s % 60)
     }
 
@@ -265,7 +265,7 @@ struct GiftSheet: View {
                         .disabled(working)
                     }
                 }
-                if let problem { Text(problem).font(.system(size: 12, weight: .medium)).foregroundStyle(.orange) }
+                if let problem { ProblemText(problem) }
             }
         }
         .confirmationDialog("Give it to \(confirming?.displayName ?? "them")?", isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } }),
