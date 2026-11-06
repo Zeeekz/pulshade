@@ -1585,6 +1585,30 @@ struct RelayFlowTests {
         await zee.unpublishProfile()
     }
 
+    /// The panic passcode takes the relay's copy of the real account's backup away, with a token that can do nothing
+    /// else, and the real account's recovery code then finds nothing.
+    @Test func thePanicPasscodeErasesTheRelayBackup() async throws {
+        let model = try await makeUser("Real")
+        let seed = try #require(model.identity?.seed)
+        try await model.setPanic(passcode: "panic-pass-1")
+        #expect(await model.saveBackup(), "A backup is on the relay")
+        let looker = testModel("pulshade-panic-look")
+        defer { looker.lock() }
+        guard case .found = await looker.backup(of: try Identity(seed: seed)) else {
+            Issue.record("No backup to begin with")
+            return
+        }
+        model.lock()
+        #expect(await model.unlock(passcode: "panic-pass-1"), "It looks like an ordinary unlock")
+        await model.forgetPendingBackup()
+        guard case .none = await looker.backup(of: try Identity(seed: seed)) else {
+            Issue.record("The real account's backup is still on the relay")
+            return
+        }
+        #expect(model.data.pendingBackupForget == nil)
+        model.lock()
+    }
+
     @Test func detachingTheOnlyDeviceKeepsEverythingButChats() async throws {
         let zee = try await makeUser("Zee")
         let bob = try await makeUser("Bob")

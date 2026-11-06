@@ -136,7 +136,39 @@ impl Backups {
         if !path.exists() {
             return Err(StatusCode::NOT_FOUND);
         }
+        if let Ok(sidecar) = self.file(&format!("{name}.del")) { let _ = erase(&sidecar); }
         erase(&path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+    }
+
+    /// Remembers a hash of a delete-only token for this backup (the file is a hash, never the token). Whoever holds the
+    /// token can erase the backup with `forget` and can do nothing else with it: the panic passcode keeps one so it can
+    /// take the relay's copy away without holding the account's keys. Called after a signed `put`.
+    pub fn set_forget_hash(&self, key_hex: &str, hash: &[u8; 32]) {
+        let Some(name) = hex::decode(key_hex).ok().filter(|r| r.len() == 32).map(hex::encode) else { return };
+        let Ok(path) = self.file(&format!("{name}.del")) else { return };
+        let tmp = path.with_extension("deltmp");
+        if crate::sealed::write_private(&tmp, hash).and_then(|()| std::fs::rename(&tmp, &path)).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// Erases the backup (and the stored hash) for whoever presents the delete-only token it was filed with.
+    pub fn forget(&self, key_hex: &str, token_hex: &str) -> Result<(), StatusCode> {
+        let name = hex::decode(key_hex).ok().filter(|r| r.len() == 32).map(hex::encode).ok_or(StatusCode::BAD_REQUEST)?;
+        let token = hex::decode(token_hex).ok().filter(|r| r.len() == 32).ok_or(StatusCode::BAD_REQUEST)?;
+        let sidecar = self.file(&format!("{name}.del"))?;
+        // 410, not 404: a relay without this route answers 404, and the app must tell the two apart.
+        let stored = std::fs::read(&sidecar).map_err(|_| StatusCode::GONE)?;
+        let given = Sha256::digest(&token);
+        // Compared without stopping at the first difference.
+        let same = stored.len() == given.len() && stored.iter().zip(given.iter()).fold(0u8, |d, (a, b)| d | (a ^ b)) == 0;
+        if !same {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        let _writing = self.writing.lock().unwrap();
+        let blob = self.file(&name)?;
+        if blob.exists() { erase(&blob).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?; }
+        erase(&sidecar).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
     }
 
     /// Erases every backup written more than `max_age` ago.
@@ -152,10 +184,18 @@ impl Backups {
     }
 }
 
-/// Overwrites first, so the sealed bytes don't linger on disk, then removes.
+/// Overwrites with random bytes and flushes them to the disk, so the sealed bytes don't linger, then removes. On a
+/// solid-state disk, or one with snapshots, an old copy can still survive somewhere the file system can't reach; the
+/// backup is encrypted on the device with a key made from the recovery code, which is what keeps such a copy closed.
 fn erase(path: &Path) -> std::io::Result<()> {
+    use std::io::{Read, Write};
     if let Ok(meta) = std::fs::metadata(path) {
-        let _ = std::fs::write(path, vec![0u8; meta.len() as usize]);
+        let mut noise = vec![0u8; usize::try_from(meta.len()).unwrap_or(0)];
+        if let Ok(mut random) = std::fs::File::open("/dev/urandom") { let _ = random.read_exact(&mut noise); }
+        if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(path) {
+            let _ = file.write_all(&noise);
+            let _ = file.sync_all();
+        }
     }
     std::fs::remove_file(path)
 }
@@ -246,5 +286,24 @@ mod tests {
         let mode = std::fs::metadata(backups.file(&first).unwrap()).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "only the relay reads it");
         let _ = std::fs::remove_dir_all(backups.dir.as_ref().unwrap());
+    }
+
+    #[test]
+    fn a_delete_only_token_erases_the_backup_and_nothing_else() {
+        let backups = Backups::temporary();
+        let owner = SigningKey::from_bytes(&[9u8; 32]);
+        let id = hex::encode(owner.verifying_key().to_bytes());
+        let ts = now();
+        let body: &[u8] = b"sealed";
+        backups.put(&id, &signed(&owner, &owner, "pulshade.backup.put.v1", ts, Some(body)), ts, body).unwrap();
+        let token = [3u8; 32];
+        backups.set_forget_hash(&id, &Sha256::digest(token).into());
+        assert_eq!(backups.forget(&id, &hex::encode([4u8; 32])), Err(StatusCode::UNAUTHORIZED), "a wrong token does nothing");
+        assert_eq!(backups.forget(&id, "zz"), Err(StatusCode::BAD_REQUEST));
+        assert!(backups.file(&id).unwrap().exists());
+        assert_eq!(backups.forget(&id, &hex::encode(token)), Ok(()));
+        assert!(!backups.file(&id).unwrap().exists(), "the backup is gone");
+        assert!(!backups.file(&format!("{id}.del")).unwrap().exists(), "and so is the stored hash");
+        assert_eq!(backups.forget(&id, &hex::encode(token)), Err(StatusCode::GONE), "a second try finds nothing");
     }
 }

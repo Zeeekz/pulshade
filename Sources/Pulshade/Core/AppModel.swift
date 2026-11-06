@@ -369,6 +369,7 @@ final class AppModel {
             }
             failedAttempts = 0
             didUnlock()
+            if data.pendingBackupForget != nil { Task { await forgetPendingBackup() } }
             // A decoy is an empty account: the real one's wake-ups stop until the real one is unlocked again.
             if !isPrimary { withdrawPush() }
             await bindToDevice(passcode: passcode)
@@ -2556,13 +2557,18 @@ final class AppModel {
         landingData.profile.name = data.profile.name
         landingData.theme = data.theme
         landingData.relay = data.relay
+        // What the landing account needs to take the real account's relay backup away after the panic passcode.
+        landingData.pendingBackupForget = backupProof("pulshade.backup.get.v1", main).key
         try await Task.detached { try vault.setSlot(2, identity: landing, passcode: passcode, panic: true) }.value
         try vault.save(landingData, with: landing)
         guard identity?.fingerprint == main.fingerprint else { return }
         data.panicSeed = landing.seed
+        // The next backup carries the token's hash to the relay.
+        data.backupDigest = nil
         vault.disableBiometrics()
         save()
         rebalanceFiles()
+        scheduleBackup(after: 5...30)
     }
 
     func removePanic() {
@@ -4655,7 +4661,7 @@ extension AppModel {
 // MARK: - Detach & burn
 
 extension AppModel {
-    enum LeaveError: Error { case wrongRecoveryCode, offline }
+    enum LeaveError: Error { case wrongRecoveryCode, offline, backupNotRemoved }
 
     /// Whether this account also lives on another device, so detaching only this one loses nothing.
     var hasOtherDevices: Bool { !linkedDevices.isEmpty }
@@ -4693,15 +4699,34 @@ extension AppModel {
     /// every @handle is retired (unclaimable for three months, tied to no key), the relay's backup and waiting
     /// envelopes are gone, every device it's on is
     /// wiped, and this one keeps nothing, not even a Keychain item.
-    func burn(recoveryCode: String? = nil) async throws {
+    ///
+    /// `thisDeviceOnly` is for when the relay can't be reached: it wipes this device at once and nothing else.
+    /// The relay's copy of the backup stays (it opens only with the recovery code and the relay erases it 180 days
+    /// after its last save), handles are not retired and contacts are not told.
+    func burn(recoveryCode: String? = nil, thisDeviceOnly: Bool = false) async throws {
         try open(recoveryCode: recoveryCode)
+        if thisDeviceOnly {
+            data.security.keepBackup = false
+            backupTask?.cancel()
+            backupTask = nil
+            destroyEverything(leavingNoTrace: true)
+            Vault.scrubLeftovers()
+            return
+        }
         guard let client = client(nil), await client.health(), let identity else { throw LeaveError.offline }
         // No upload may land after the delete.
+        let hadBackup = data.security.keepBackup
         data.security.keepBackup = false
         backupTask?.cancel()
         backupTask = nil
+        // The backup goes first, and if it can't be removed nothing else is touched: burning on while it stays on the
+        // relay would break the promise that nothing is left.
+        do { try await deleteBackup(of: identity) } catch {
+            data.security.keepBackup = hadBackup
+            scheduleBackup()
+            throw LeaveError.backupNotRemoved
+        }
         for persona in [nil] + data.personas.map(\.id) { await retireHandles(persona: persona) }
-        try? await deleteBackup(of: identity)
         for id in data.conversations.map(\.id) { delete(id) }
         for c in data.contacts where !c.isSelf {
             // Someone we only sent a request to has no session with us yet, so it goes straight to them.
@@ -4818,7 +4843,7 @@ extension AppModel {
             guard let client = client(nil, lane: "backup") else { throw LeaveError.offline }
             let sealed = try Self.sealedBackup(of: data, with: identity)
             let (key, sig, ts) = backupProof("pulshade.backup.put.v1", identity, body: sealed)
-            try await client.putBackup(sealed, key: key, sig: sig, ts: ts)
+            try await client.putBackup(sealed, key: key, sig: sig, ts: ts, forgetHash: forgetHash)
         } catch {
             startSync()
             throw LeaveError.offline
@@ -4826,6 +4851,11 @@ extension AppModel {
     }
 
     // MARK: Keeping the backup fresh
+
+    /// A hash of the panic passcode's delete-only token, sent with each backup so the relay can honour it.
+    private var forgetHash: Data? {
+        data.panicSeed.map { Data(SHA256.hash(data: Self.forgetToken(landingSeed: $0))) }
+    }
 
     /// What goes in a backup: everything but chats, and not the two fields that track the backup itself.
     static func backupContents(of data: AppData) -> AppData {
@@ -4844,6 +4874,7 @@ extension AppModel {
         kept.clipParts = [:]
         kept.decoySeed = nil
         kept.panicSeed = nil
+        kept.pendingBackupForget = nil
         return kept
     }
 
@@ -4899,7 +4930,7 @@ extension AppModel {
         if digest == data.backupDigest, !week { return true }
         guard let sealed = try? AES.GCM.seal(Self.padded(plain), using: identity.backupKey).combined else { return false }
         let (key, sig, ts) = backupProof("pulshade.backup.put.v1", identity, body: sealed)
-        do { try await client.putBackup(sealed, key: key, sig: sig, ts: ts) } catch {
+        do { try await client.putBackup(sealed, key: key, sig: sig, ts: ts, forgetHash: forgetHash) } catch {
             // Try again in a while.
             scheduleBackup(after: 300...900)
             return false
@@ -4939,6 +4970,26 @@ extension AppModel {
     }
 
     /// `label | backup key | ts`, plus the contents' hash for an upload, signed with the backup key.
+    /// The delete-only token for the relay backup: made from the panic landing account's seed, so the panic passcode
+    /// (which opens that account and nothing real) can work it out without holding any key to the real account. It
+    /// can erase the backup and do nothing else with it.
+    static func forgetToken(landingSeed: Data) -> Data {
+        HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: landingSeed), info: Data("pulshade.backup.forget.v1".utf8),
+                               outputByteCount: 32).bytes
+    }
+
+    /// After the panic passcode: asks the relay to erase the real account's backup, trying again at each unlock
+    /// until it has answered.
+    func forgetPendingBackup() async {
+        guard let key = data.pendingBackupForget, let seed = identity?.seed, let client = client(nil, lane: "backup") else { return }
+        guard let status = try? await client.forgetBackup(key: key, token: Self.forgetToken(landingSeed: seed)) else { return }
+        // 410: nothing to erase. 404 would be a relay that doesn't know this yet, so it is tried again later.
+        if (200..<300).contains(status) || status == 410 || status == 401 {
+            data.pendingBackupForget = nil
+            save()
+        }
+    }
+
     private func backupProof(_ label: String, _ identity: Identity, body: Data? = nil) -> (key: Data, sig: Data, ts: UInt64) {
         let signer = identity.backupSigningKey
         let key = signer.publicKey.rawRepresentation

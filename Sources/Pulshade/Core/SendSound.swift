@@ -1,59 +1,59 @@
 import AudioToolbox
 import Foundation
 
-/// The sound of sending: a short, chunky "tok", like a solid block set down. Made here rather than shipped as a file,
-/// and played as a system sound: on iPhone it follows the ring/silent switch and the ringer volume, and it never takes
-/// over the audio a call or a voice note is using.
+/// The sound of sending: two quiet taps, a hair apart, the second a touch higher, like a soft key pressed twice. Made
+/// here rather than shipped as a file, and played as a system sound: on iPhone it follows the ring/silent switch and
+/// the ringer volume, and it never takes over the audio a call or a voice note is using.
 enum SendSound {
     static let sampleRate = 44_100
-    static let seconds = 0.09
-    /// How loud, as a share of full scale.
-    static let loudness = 0.55
+    static let seconds = 0.12
+    /// How loud, as a share of full scale. Quiet on purpose.
+    static let loudness = 0.30
+    /// When the second tap lands.
+    private static let gap = 0.05
 
-    /// The thump under it: low, starting a little higher and settling.
-    private static let body = 75.0
-    /// Where the grit sits: three bands of noise, the lowest loudest.
-    private static let grit: [(freq: Double, level: Double)] = [(300, 1.0), (650, 0.7), (1_300, 0.35)]
-    /// How clumpy the noise is: near 1 it comes in small chunks, which sounds like something solid landing, not hiss.
-    private static let crunch = 0.9
+    /// A short dull click: noise, softened and with its lowest part taken out, dying in about a millisecond.
+    private static func click(decay: Double, bright: Double, count: Int, seed: UInt32) -> [Double] {
+        var state = seed
+        func next() -> Double {
+            state = state &* 1_664_525 &+ 1_013_904_223
+            return Double(state) / Double(UInt32.max) * 2 - 1
+        }
+        let length = min(count, Int(0.010 * Double(sampleRate)))
+        var soft = [Double](repeating: 0, count: length)
+        var held = 0.0
+        for n in 0..<length {
+            held += bright * (next() * exp(-Double(n) / Double(sampleRate) / decay) - held)
+            soft[n] = held
+        }
+        var low = 0.0
+        return soft.map { v in low += 0.02 * (v - low); return v - low }
+    }
 
-    /// The sound as 16-bit mono PCM samples. The same every time: its noise comes from a fixed seed.
+    /// A small round tone that glides down a little as it fades.
+    private static func tone(seconds: Double, from: Double, to: Double, glide: Double, rise: Double, fall: Double) -> [Double] {
+        var phase = 0.0
+        return (0..<Int(seconds * Double(sampleRate))).map { n in
+            let t = Double(n) / Double(sampleRate)
+            phase += 2 * .pi * (to + (from - to) * exp(-t / glide)) / Double(sampleRate)
+            return (1 - exp(-t / rise)) * exp(-t / fall) * sin(phase)
+        }
+    }
+
+    /// The sound as 16-bit mono PCM samples. The same every time: its noise comes from fixed seeds.
     static func samples() -> [Int16] {
         let count = Int(seconds * Double(sampleRate))
-        var seed: UInt32 = 5
-        func next() -> Double {
-            seed = seed &* 1_664_525 &+ 1_013_904_223
-            return Double(seed) / Double(UInt32.max) * 2 - 1
-        }
-        // Grain: each value held for a few samples, with a little fresh noise over it.
-        var noise = [Double](repeating: 0, count: count)
-        var hold = 0.0
-        for n in 0..<count {
-            if n % 6 == 0 { hold = next() }
-            noise[n] = hold * crunch + next() * (1 - crunch)
-        }
-        var gritty = [Double](repeating: 0, count: count)
-        for band in grit {
-            // A state-variable band-pass around the band's frequency.
-            let k = 2 * sin(.pi * band.freq / Double(sampleRate))
-            var low = 0.0, mid = 0.0
-            for n in 0..<count {
-                low += k * mid
-                let high = noise[n] - low - 0.55 * mid
-                mid += k * high
-                gritty[n] += band.level * mid
-            }
-        }
         var out = [Double](repeating: 0, count: count)
-        for n in 0..<count {
-            let t = Double(n) / Double(sampleRate)
-            // Half a millisecond to arrive, so the front is solid without a click; gone in a few hundredths.
-            let envelope = exp(-t / 0.014) * (1 - exp(-t / 0.0005))
-            let thump = exp(-t / 0.018) * sin(2 * .pi * body * (1 + 0.6 * exp(-t / 0.004)) * t)
-            out[n] = gritty[n] * envelope + 0.9 * thump * (1 - exp(-t / 0.0007))
+        func mix(_ part: [Double], gain: Double, at start: Double) {
+            let offset = Int(start * Double(sampleRate))
+            for (n, v) in part.enumerated() where offset + n < count { out[offset + n] += gain * v }
         }
+        mix(click(decay: 0.0013, bright: 0.4, count: count, seed: 7), gain: 0.9, at: 0)
+        mix(tone(seconds: 0.05, from: 420, to: 300, glide: 0.01, rise: 0.001, fall: 0.014), gain: 0.7, at: 0)
+        mix(click(decay: 0.0011, bright: 0.55, count: count, seed: 11), gain: 0.8, at: gap)
+        mix(tone(seconds: 0.06, from: 520, to: 380, glide: 0.01, rise: 0.001, fall: 0.016), gain: 0.45, at: gap)
         let peak = out.map(abs).max() ?? 1
-        let fade = Double(Int(0.005 * Double(sampleRate)))
+        let fade = Double(Int(0.012 * Double(sampleRate)))
         return out.enumerated().map { n, v in
             let tail = min(1, Double(count - n) / fade)
             return Int16(v / peak * loudness * tail * Double(Int16.max))
@@ -84,7 +84,7 @@ enum SendSound {
             // On the Mac the caches folder is shared by every app, so this one keeps to its own.
             let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
                 .appendingPathComponent(Bundle.main.bundleIdentifier ?? "app.pulshade", isDirectory: true)
-            let url = dir.appendingPathComponent("send-place-v4.wav")
+            let url = dir.appendingPathComponent("send-taps-v6.wav")
             if !FileManager.default.fileExists(atPath: url.path) {
                 try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
                 guard (try? wav().write(to: url, options: .atomic)) != nil else { return }

@@ -18,6 +18,15 @@ import PulshadeShared
         #expect(13.wrapped(10) == 3)
     }
 
+    @Test func theSendSoundIsQuietShortAndTheSameEveryTime() {
+        let first = SendSound.samples()
+        #expect(first == SendSound.samples())
+        #expect(first.count == Int(SendSound.seconds * Double(SendSound.sampleRate)))
+        let peak = first.map { abs(Int($0)) }.max() ?? 0
+        #expect(peak > 5_000 && peak <= Int(0.31 * Double(Int16.max)), "audible but quiet: \(peak)")
+        #expect(first.last == 0, "ends in silence, no click")
+    }
+
     @Test func theWrongPasscodeCountSurvivesAndBurnClearsIt() {
         FileKeys.inMemory = true
         FileKeys.forgetAttempts()

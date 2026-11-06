@@ -219,9 +219,11 @@ async fn deposit_limited(State(state): State<AppState>, caller::Caller(who): cal
         if who.is_loopback() { return deposit(State(state.store), Path(send_id), headers, body).await; }
         let mut limits = state.limits.lock().unwrap();
         let kib = u32::try_from(body.len() / 1024 + 1).unwrap_or(u32::MAX);
-        if !limits.allow(who, "deposit", 3_000, Duration::from_secs(3600))
-            || !limits.allow_n(who, "deposit-size", 256 * 1024, Duration::from_secs(3600), kib)
-            || (new_mailbox && !limits.allow(who, "deposit-new", 200, Duration::from_secs(3600))) {
+        // Generous on purpose: typing signals, receipts and several devices or housemates behind one address all count.
+        // The aim is to stop a flood, not to notice a busy chat.
+        if !limits.allow(who, "deposit", 12_000, Duration::from_secs(3600))
+            || !limits.allow_n(who, "deposit-size", 512 * 1024, Duration::from_secs(3600), kib)
+            || (new_mailbox && !limits.allow(who, "deposit-new", 2_500, Duration::from_secs(3600))) {
             return StatusCode::TOO_MANY_REQUESTS;
         }
     }
@@ -723,6 +725,29 @@ async fn backup_put(
         blob.extend_from_slice(&piece);
     }
     match state.backups.put(&key, &sig, ts, &blob) {
+        Ok(()) => {
+            // A delete-only token's hash, if the app sent one, kept beside the backup.
+            if let Some(hash) = header("x-pulshade-forget").and_then(|h| hex::decode(h).ok()).and_then(|r| <[u8; 32]>::try_from(r).ok()) {
+                state.backups.set_forget_hash(&key, &hash);
+            }
+            StatusCode::NO_CONTENT
+        }
+        Err(code) => code,
+    }
+}
+
+#[derive(Deserialize)]
+struct Forget {
+    token: String,
+}
+
+/// Erases a backup for the holder of its delete-only token (the panic passcode's), with no signature.
+async fn backup_forget(State(state): State<AppState>, caller::Caller(ip): caller::Caller, Path(key): Path<String>,
+                       Json(body): Json<Forget>) -> StatusCode {
+    if !ip.is_loopback() && !state.limits.lock().unwrap().allow(ip, "backup-forget", 20, Duration::from_secs(3600)) {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    match state.backups.forget(&key, &body.token) {
         Ok(()) => StatusCode::NO_CONTENT,
         Err(code) => code,
     }
@@ -944,6 +969,7 @@ fn app(state: AppState) -> Router {
         .route("/v1/backup/{key}", put(backup_put))
         .route("/v1/backup/{key}/get", post(backup_get))
         .route("/v1/backup/{key}/delete", post(backup_remove))
+        .route("/v1/backup/{key}/forget", post(backup_forget))
         .route("/v1/call/{room}", get(call))
         .route("/v1/admin", post(admin))
         .route("/v1/report-inbox", get(report_inbox))
