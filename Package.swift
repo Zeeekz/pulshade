@@ -4,6 +4,10 @@ import PackageDescription
 let package = Package(
     name: "Pulshade",
     platforms: [.macOS("26.0")],
+    products: [
+        // What Pulshade Admin, which lives in its own folder, builds on.
+        .library(name: "PulshadeShared", targets: ["PulshadeShared"]),
+    ],
     targets: [
         .executableTarget(
             name: "Pulshade",
@@ -12,7 +16,8 @@ let package = Package(
             swiftSettings: [.swiftLanguageMode(.v5)],
             linkerSettings: [.linkedFramework("Security"), .linkedFramework("SystemConfiguration"), .linkedLibrary("resolv")]
         ),
-        // What the app and Pulshade Admin both need: collectibles and their art, and sealed reports.
+        // What the app and Pulshade Admin (which lives in its own folder, outside this repository) both need: collectibles
+        // and their art, and sealed reports.
         .target(
             name: "PulshadeShared",
             path: "Sources/PulshadeShared",
