@@ -551,36 +551,44 @@ struct UnlockView: View {
     @State private var shake = 0
     @State private var working = false
     @State private var leaving = false
-    /// The wallpaper covers the keypad until it's slid away: `drag` is how far a finger has pulled it left.
+    /// The wallpaper covers the keypad until it's slid away. `drag` is how far a finger has pulled it: left to open, right to close.
     @State private var opened = false
     @State private var drag: CGFloat = 0
 
     var body: some View {
         GeometryReader { geo in
             let width = max(geo.size.width, 1)
-            let progress = opened ? 1 : min(max(-drag / width, 0), 1)
+            // 0 is the wallpaper, 1 the keypad. A finger moves it either way, so the page follows it both ways.
+            let progress = opened ? 1 - min(max(drag / width, 0), 1) : min(max(-drag / width, 0), 1)
             ZStack {
-                if opened || drag < 0 {
+                if progress > 0 {
                     pad
                         .opacity(0.25 + 0.75 * progress)
                         .scaleEffect(0.96 + 0.04 * progress)
-                        // Swipe right on the keypad to put the wallpaper back.
-                        .simultaneousGesture(DragGesture(minimumDistance: 30)
-                            .onEnded { v in
-                                guard opened, v.translation.width > 80, abs(v.translation.width) > abs(v.translation.height) * 2 else { return }
-                                close()
-                            })
                 }
                 LockWallpaper(onOpen: { open() })
-                    .offset(x: opened ? -width : min(drag, 0))
+                    .offset(x: -width * progress)
                     .allowsHitTesting(!opened)
-                    .gesture(DragGesture(minimumDistance: 8)
-                        .onChanged { drag = min($0.translation.width, 0) }
-                        .onEnded { value in
-                            let pushed = max(-value.translation.width, -value.predictedEndTranslation.width * 0.5)
-                            if pushed > width * 0.3 { open() } else { withAnimation(.snappy) { drag = 0 } }
-                        })
             }
+            .contentShape(.rect)
+            // Slide left to open the keypad, right to put the wallpaper back. Only sideways drags count, so the
+            // keypad's own buttons and the passcode field keep working.
+            .simultaneousGesture(DragGesture(minimumDistance: 12)
+                .onChanged { v in
+                    guard abs(v.translation.width) > abs(v.translation.height) else { return }
+                    drag = opened ? max(v.translation.width, 0) : min(v.translation.width, 0)
+                }
+                .onEnded { v in
+                    let sideways = abs(v.translation.width) > abs(v.translation.height)
+                    let thrown = v.predictedEndTranslation.width * 0.5
+                    if opened {
+                        let pulled = max(v.translation.width, thrown)
+                        if sideways, pulled > width * 0.25 { close() } else { withAnimation(.snappy) { drag = 0 } }
+                    } else {
+                        let pushed = max(-v.translation.width, -thrown)
+                        if sideways, pushed > width * 0.3 { open() } else { withAnimation(.snappy) { drag = 0 } }
+                    }
+                })
         }
         .ignoresSafeArea()
         .task { model.warmUp() }
