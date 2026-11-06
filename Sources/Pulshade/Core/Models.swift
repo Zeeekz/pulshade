@@ -767,6 +767,13 @@ struct StoryChoice: Codable, Equatable {
 
 /// Where sending one of your stories stands, kept on the device that posted it: who has said they have it, and how
 /// many times it's been sent again since. A build that doesn't know this field simply doesn't keep it.
+/// Someone a story is still to be queued for.
+struct StoryTarget: Codable, Equatable {
+    var fingerprint: String
+    var persona: UUID?
+    var withClip: Bool
+}
+
 struct StoryDelivery: Codable, Equatable {
     var confirmed: [String] = []
     var resends = 0
@@ -774,6 +781,9 @@ struct StoryDelivery: Codable, Equatable {
     /// Every copy sealed for the story has been handed to the relay once. Sending it again later, to someone who
     /// hasn't confirmed, isn't the story uploading.
     var uploaded: Bool?
+    /// The people it hasn't been queued for yet (it's queued for a few at a time). Saved, so a story that was still
+    /// going out when Pulshade was closed carries on from here the next time it's open. Nil once everyone is queued.
+    var left: [StoryTarget]?
 }
 
 struct Story: Codable, Identifiable, Equatable {

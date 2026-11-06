@@ -66,7 +66,7 @@ targets:
         NSMicrophoneUsageDescription: Record voice notes, videos and make calls. Audio is encrypted before it leaves your phone.
         # fetch: iOS wakes the app now and then to check for announcements (AnnouncementWatch).
         UIBackgroundModes: [audio, fetch, voip]
-        BGTaskSchedulerPermittedIdentifiers: [app.pulshade.ios.announcements]
+        BGTaskSchedulerPermittedIdentifiers: [app.pulshade.ios.announcements, app.pulshade.ios.upload]
         NSFaceIDUsageDescription: Unlock PULSHADE with Face ID.
         NSLocalNetworkUsageDescription: Reach a PULSHADE relay running on your own network.
         NSAppTransportSecurity:

@@ -11,6 +11,9 @@ import PulshadeShared
 #if os(macOS)
 import AppKit
 #endif
+#if os(iOS)
+import UIKit
+#endif
 
 @MainActor
 @Observable
@@ -236,9 +239,11 @@ final class AppModel {
         refreshDisguises()
         #if os(iOS)
         AnnouncementWatch.schedule()
+        tendStoryUpload()
         // Requests left open would only time out while the app is suspended, and look like the relay failing on
-        // the way back. Anything unsent waits in the outbox.
-        RelayClient.closeAll()
+        // the way back. Anything unsent waits in the outbox. Not while a story is going out with iOS's leave to
+        // carry on (see `BackgroundUpload`): then the app keeps running, and its connections with it.
+        if !BackgroundUpload.isWanted { RelayClient.closeAll() }
         #endif
     }
 
@@ -516,11 +521,15 @@ final class AppModel {
         slot = 0
         identity = nil
         data = AppData()
+        // Who each story is still to go to is saved with it, and picked up again on unlocking.
+        storyBacklog = [:]
+        storyUploadTotal = [:]
         forgetSession()
         link = .offline
         openConversation = nil
         Platform.setBadge(0)
         withAnimation(.smooth(duration: 0.5)) { phase = .locked }
+        tendStoryUpload()
     }
 
     /// Wipes this device. `leavingNoTrace` (Burn) also deletes the Keychain items, the folder, Tor's saved state
@@ -1576,13 +1585,11 @@ final class AppModel {
     /// How many copies of a story were waiting to go out when it was posted or last changed.
     private var storyUploadTotal: [Story.ID: Int] = [:]
 
-    /// Someone a story is still to be queued for.
-    private struct StoryTarget { var fingerprint: String; var persona: UUID?; var withClip: Bool }
     /// The people a story hasn't been queued for yet, and about how many copies each takes.
     private struct StoryBacklog { var targets: [StoryTarget]; var perContact = 1 }
     /// Sealing a story for everyone at once piles hundreds of megabytes into the outbox, and every save then wrote all
     /// of it out again, which starved the rest of the app. So it is queued for a few people at a time, as the earlier
-    /// copies go. Memory only: if the app is closed, the quiet re-send later covers whoever was left.
+    /// copies go. Who is left is saved with the story (`StoryDelivery.left`), so closing the app part-way loses nobody.
     @ObservationIgnored private var storyBacklog: [Story.ID: StoryBacklog] = [:]
     /// Copies of one story to hold in the outbox before queueing it for more people.
     private static let storyOutboxLimit = 12
@@ -1593,6 +1600,72 @@ final class AppModel {
         })
         let queued = drainStoryBacklog(story.id)
         if queued > 0 { storyBacklog[story.id]?.perContact = max(1, unsentCopies(of: story.id) / queued) }
+        noteBacklog(story.id)
+    }
+
+    /// Writes who a story is still to be queued for into the story itself, where it's saved.
+    private func noteBacklog(_ id: Story.ID) {
+        guard let i = data.stories.firstIndex(where: { $0.id == id }), data.stories[i].delivery != nil else { return }
+        let left = storyBacklog[id].map(\.targets)
+        if data.stories[i].delivery?.left != left { data.stories[i].delivery?.left = left }
+    }
+
+    /// Stories that were still going out when Pulshade was last closed carry on from where they stopped.
+    private func resumeStoryUploads() {
+        for story in data.stories where story.author == "me" && storyBacklog[story.id] == nil {
+            guard let left = story.delivery?.left, !left.isEmpty else { continue }
+            guard story.isLive else { noteBacklog(story.id); continue }
+            storyBacklog[story.id] = StoryBacklog(targets: left)
+            let queued = drainStoryBacklog(story.id)
+            if queued > 0 { storyBacklog[story.id]?.perContact = max(1, unsentCopies(of: story.id) / queued) }
+            noteBacklog(story.id)
+            trackUpload(of: story.id)
+        }
+        // And those with nobody left to queue for, whose last copies were still waiting to be sent.
+        for story in data.stories where story.author == "me" && storyUploadTotal[story.id] == nil && isUploading(story.id) {
+            trackUpload(of: story.id)
+        }
+    }
+
+    /// How far the stories going out now have got, all of them together, 0...1. Nil when none is.
+    private var storyUploadProgress: Double? {
+        var (total, left) = (0, 0)
+        for (id, n) in storyUploadTotal where isUploading(id) {
+            let waiting = unsentCopies(of: id) + backlogCopies(of: id)
+            total += max(n, waiting)
+            left += waiting
+        }
+        return total > 0 && left > 0 ? 1 - Double(left) / Double(total) : nil
+    }
+
+    /// While a story is going out, an iPhone doesn't sleep with Pulshade in front, and iOS is asked to let the upload
+    /// carry on if you leave. Called whenever an upload starts, and on every beat after.
+    private func tendStoryUpload() {
+        #if os(iOS)
+        let progress = phase == .unlocked ? storyUploadProgress : nil
+        let inFront = backgroundedAt == nil
+        let awake = progress != nil && inFront
+        if UIApplication.shared.isIdleTimerDisabled != awake { UIApplication.shared.isIdleTimerDisabled = awake }
+        guard let progress else {
+            if BackgroundUpload.isWanted {
+                BackgroundUpload.finish()
+                // Nothing more to send, and nobody looking: as when the app leaves the screen with nothing going out.
+                if !inFront { RelayClient.closeAll() }
+            }
+            return
+        }
+        if inFront, !BackgroundUpload.isWanted {
+            BackgroundUpload.onEnded = { [weak self] in
+                guard let self, self.backgroundedAt != nil else { return }
+                self.save()
+                RelayClient.closeAll()
+            }
+            // What iOS shows outside the app says no more than a notification would.
+            let hidden = data.security.notificationContent == .hidden
+            BackgroundUpload.begin(title: hidden ? "Uploading" : "Posting your story", subtitle: hidden ? "In progress" : "Sending it to your friends")
+        }
+        BackgroundUpload.report(progress)
+        #endif
     }
 
     /// Queues stories for more people while there's room. Returns how many people it queued for.
@@ -1611,6 +1684,7 @@ final class AppModel {
                 queued += 1
             }
             storyBacklog[id] = entry.targets.isEmpty ? nil : entry
+            noteBacklog(id)
         }
         return queued
     }
@@ -1634,6 +1708,7 @@ final class AppModel {
     /// finishes; whoever gets it drops it as expired or removed.
     private func dropUnsent(story id: Story.ID) {
         storyBacklog[id] = nil
+        noteBacklog(id)
         storyUploadTotal[id] = nil
         if data.outbox.contains(where: { $0.story == id && !sendingIDs.contains($0.id) }) {
             data.outbox.removeAll { $0.story == id && !sendingIDs.contains($0.id) }
@@ -1649,6 +1724,7 @@ final class AppModel {
         let n = unsentCopies(of: id) + backlogCopies(of: id)
         if n > 0 { storyUploadTotal[id] = n } else { storyUploadTotal[id] = nil }
         markUploadedIfDone(id)
+        tendStoryUpload()
     }
 
     /// Copies of a story sealed and waiting in the outbox. Not those still waiting for a session with someone: they
@@ -2696,6 +2772,8 @@ final class AppModel {
         let minutes = data.security.autoLockMinutes
         // Locking hangs up, and nobody touches the screen with the phone at their ear.
         if call != nil { lastActivity = Date(); return }
+        // Locking stops a story part-way out to its audience, and nobody touches the screen while waiting for one.
+        if storyUploadProgress != nil { lastActivity = Date(); return }
         guard minutes > 0, Date().timeIntervalSince(lastActivity) > Double(minutes) * 60 else { return }
         lock()
     }
@@ -3029,6 +3107,7 @@ final class AppModel {
 
     private func startSync() {
         syncTask?.cancel()
+        resumeStoryUploads()
         if trafficShaping { watchNetwork() }
         guard trafficShaping else {
             // Tests: one round at a time, at a steady pace.
@@ -3151,6 +3230,7 @@ final class AppModel {
     /// Sending, retries and receipts, every couple of seconds. Also keeps the sending lane's circuit warm, so
     /// pressing send doesn't wait for Tor to build one.
     private func housekeep() async {
+        tendStoryUpload()
         refreshPush()
         watchTor()
         watchStall()

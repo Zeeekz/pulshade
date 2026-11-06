@@ -27,6 +27,7 @@ struct PulshadeApp: App {
         Notifier.shared.attach()
         #if os(iOS)
         AnnouncementWatch.register()
+        BackgroundUpload.register()
         #endif
     }
 
