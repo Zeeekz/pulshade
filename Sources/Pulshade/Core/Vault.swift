@@ -464,28 +464,58 @@ struct Vault {
         }
     }
 
-    /// Overwrites and deletes whatever Pulshade left in the temporary and cache folders (clips, pictures, sounds), and
-    /// forgets anything the system kept of its web requests. The overwriting runs in the background, since it can
-    /// take a moment.
+    /// Overwrites and deletes whatever Pulshade left in its temporary and cache folders, and forgets anything the system
+    /// kept of its web requests. On iPhone those folders belong to Pulshade alone, so they're emptied. On the Mac they
+    /// are shared with every other app, so only Pulshade's own cache folder and its own temporary files go, never
+    /// anything of anyone else's. The overwriting runs in the background, since it can take a moment.
     static func scrubLeftovers() {
         URLCache.shared.removeAllCachedResponses()
         HTTPCookieStorage.shared.removeCookies(since: .distantPast)
         let files = FileManager.default
-        let roots = [files.temporaryDirectory, files.urls(for: .cachesDirectory, in: .userDomainMask).first].compactMap { $0 }
-        Task.detached(priority: .userInitiated) {
-            for root in roots {
-                let walker = files.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey])
-                for case let url as URL in walker ?? NSEnumerator() {
-                    guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
-                          values.isRegularFile == true else { continue }
-                    // Very large files are only deleted: overwriting them would hold the wipe up for long.
-                    if let size = values.fileSize, size > 0, size <= 64_000_000 { try? Data.random(size).write(to: url) }
-                    try? files.removeItem(at: url)
-                }
-                for url in (try? files.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [] {
-                    try? files.removeItem(at: url)
-                }
+        func contents(of folder: URL) -> [URL] { (try? files.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [] }
+        let caches = files.urls(for: .cachesDirectory, in: .userDomainMask).first
+        var items: [URL] = []
+        #if os(iOS)
+        items = contents(of: files.temporaryDirectory) + (caches.map(contents(of:)) ?? [])
+        #else
+        // Under a test runner the bundle is Apple's, not ours: leave its folder alone.
+        if let caches, let id = Bundle.main.bundleIdentifier, !id.hasPrefix("com.apple.") {
+            items.append(caches.appendingPathComponent(id, isDirectory: true))
+        }
+        items += contents(of: files.temporaryDirectory).filter { TempFiles.isOurs($0.lastPathComponent) }
+        #endif
+        Task.detached(priority: .userInitiated) { for item in items { scrub(item: item) } }
+    }
+
+    /// Overwrites a file or everything under a folder, then deletes it.
+    nonisolated static func scrub(item: URL) {
+        var isFolder: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: item.path, isDirectory: &isFolder) else { return }
+        if isFolder.boolValue {
+            scrub(folder: item)
+            try? FileManager.default.removeItem(at: item)
+        } else {
+            if let size = (try? item.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size > 0, size <= 64_000_000 {
+                try? Data.random(size).write(to: item)
             }
+            try? FileManager.default.removeItem(at: item)
+        }
+    }
+
+    /// Overwrites every file under `root` (up to 64 MB each; larger ones are only deleted, so the wipe isn't held
+    /// up) and deletes everything in it.
+    private nonisolated static func scrub(folder root: URL) {
+        let files = FileManager.default
+        if let walker = files.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey]) {
+            for case let url as URL in walker {
+                guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                      values.isRegularFile == true else { continue }
+                if let size = values.fileSize, size > 0, size <= 64_000_000 { try? Data.random(size).write(to: url) }
+                try? files.removeItem(at: url)
+            }
+        }
+        for url in (try? files.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [] {
+            try? files.removeItem(at: url)
         }
     }
 

@@ -218,8 +218,8 @@ struct StoryComposer: View {
     @State private var text = ""
     @State private var palette = 0
     @State private var image: Data?
-    /// A recorded or picked clip, not yet compressed. The composer deletes the file when it goes away.
-    @State private var clip: URL?
+    /// A recorded or picked clip, not yet compressed. Held in memory only.
+    @State private var clip: MemoryClip?
     /// Zoom recorded with the clip, for cameras that couldn't zoom for real.
     @State private var clipZoom = ZoomTrack.none
     @State private var clipPreview: ClipPreview?
@@ -243,7 +243,7 @@ struct StoryComposer: View {
     /// After posting, so the camera behind closes too.
     var posted: () -> Void = {}
 
-    init(image: Data? = nil, clip: URL? = nil, zoom: ZoomTrack = .none, filter: StoryFilter = .none, posted: @escaping () -> Void = {}) {
+    init(image: Data? = nil, clip: MemoryClip? = nil, zoom: ZoomTrack = .none, filter: StoryFilter = .none, posted: @escaping () -> Void = {}) {
         _image = State(initialValue: image)
         _clip = State(initialValue: clip)
         _clipZoom = State(initialValue: zoom)
@@ -289,12 +289,12 @@ struct StoryComposer: View {
             startTyping()
         }
         .onChange(of: image == nil && clip == nil) { _, plain in if plain { startTyping() } }
-        .task(id: clip) { openClip() }
+        .task(id: clip?.id) { openClip() }
         .task(id: [filter.rawValue, String(image?.count ?? 0)]) { await look() }
         .onChange(of: filter) { _, new in clipPreview?.set(new) }
         .onDisappear {
             clipPreview?.close()
-            if let clip { try? FileManager.default.removeItem(at: clip) }
+            clip = nil
         }
     }
 
@@ -366,7 +366,7 @@ struct StoryComposer: View {
                                 withAnimation {
                                     switch kind {
                                     case let .photo(data): image = data
-                                    case let .clip(url, zoom): clip = url; clipZoom = zoom
+                                    case let .clip(picked, zoom): clip = picked; clipZoom = zoom
                                     }
                                 }
                             }) {
@@ -492,7 +492,7 @@ struct StoryComposer: View {
                         withAnimation {
                             switch kind {
                             case let .photo(data): image = data
-                            case let .clip(url, zoom): clip = url; clipZoom = zoom
+                            case let .clip(picked, zoom): clip = picked; clipZoom = zoom
                             }
                         }
                     }) {
@@ -611,7 +611,7 @@ struct StoryComposer: View {
         clipPreview?.close()
         clipPreview = nil
         guard let clip else { return }
-        clipPreview = ClipPreview(url: clip, filter: filter, zoom: clipZoom)
+        clipPreview = ClipPreview(clip: clip, filter: filter, zoom: clipZoom)
     }
 
     /// Colours the photo for the preview.
@@ -1182,8 +1182,8 @@ struct StoryCamera: View {
         guard !holdRecording, !camera.recording else { return }
         holdRecording = true
         Haptics.tick()
-        camera.record { url, track in
-            if let url { cover = .framed(StoryPick(kind: .clip(url, track), filter: filter)) }
+        camera.record { made, track in
+            if let made { cover = .framed(StoryPick(kind: .clip(made, track), filter: filter)) }
         }
     }
 
