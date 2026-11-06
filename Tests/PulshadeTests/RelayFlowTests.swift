@@ -683,6 +683,39 @@ struct RelayFlowTests {
         #expect(bob.data.stories.isEmpty)
     }
 
+    /// A story is queued for a few people at a time. Who is left is saved with it, so a story still going out when
+    /// Pulshade is locked or closed carries on from there, and reaches everyone, the next time it's open.
+    @Test func aStoryInterruptedPartWayStillReachesEveryone() async throws {
+        let alice = try await makeUser("Alice")
+        var friends: [AppModel] = []
+        for n in 0..<6 { friends.append(try await makeUser("Friend \(n)")) }
+        defer { for m in friends + [alice] { m.lock() } }
+        for friend in friends {
+            _ = try #require(friend.addContact(code: alice.makeInviteCode(), nickname: ""))
+            await settle(alice, friend)
+        }
+        let clip = Data((0..<3_000_000).map { _ in UInt8.random(in: 0...255) })
+        alice.postStory(.video(clip, caption: "for all six"))
+        let id = try #require(alice.myStories.first?.id)
+        let left = try #require(alice.data.stories.first { $0.id == id }?.delivery?.left, "some are still to be queued, and that is saved")
+        #expect(!left.isEmpty && left.count < friends.count)
+
+        alice.lock()
+        #expect(await alice.unlock(passcode: "test-passcode"))
+        #expect(alice.isUploading(id), "it carries on")
+        for _ in 0..<8 {
+            await settle(alice, rounds: 2)
+            for friend in friends { await settle(friend, rounds: 1) }
+        }
+        for friend in friends {
+            let got = friend.data.stories.first { $0.id == id }
+            #expect(got?.isReady == true, "\(friend.data.profile.name) has the whole story")
+        }
+        let mine = try #require(alice.data.stories.first { $0.id == id }?.delivery)
+        #expect(mine.left == nil && mine.uploaded == true)
+        #expect(!alice.isUploading(id))
+    }
+
     @Test func likingOrReplyingToAStoryMessagesItsAuthor() async throws {
         let alice = try await makeUser("Alice")
         let bob = try await makeUser("Bob")

@@ -45,6 +45,18 @@ const MAX_QUEUE: usize = 2_000;
 /// Everything waiting in memory, all mailboxes together. Past this, deposits are refused (507) instead of letting
 /// the process grow until it's killed, which would lose every queued envelope at once.
 const MAX_TOTAL_BYTES: usize = 384 * 1024 * 1024;
+/// The same budget as this relay runs with: `PULSHADE_MAIL_MIB` (in MiB) on a server with more memory, or
+/// `MAX_TOTAL_BYTES` when it isn't set. A video story is 4 MiB for every person it goes to who hasn't collected it
+/// yet (12 MiB to an older app), so this is what decides how many stories can wait for people who are away.
+static BUDGET: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("PULSHADE_MAIL_MIB").ok().and_then(|v| v.trim().parse::<usize>().ok())
+        .map_or(MAX_TOTAL_BYTES, |mib| mib.clamp(64, 64 * 1024) * 1024 * 1024)
+});
+/// Big mail on its way out in answers to fetches, all of them together. An answer is held in memory until the phone
+/// has taken it, and a phone on a slow line takes a while, so without this a few hundred phones collecting a story
+/// at the same moment could take all the memory there is. Past it, a fetch hands over short mail only and the big
+/// piece goes on the phone's next fetch; messages are never held back.
+const MAX_LEAVING: usize = 128 * 1024 * 1024;
 /// Request bodies being received at once, all requests together, apart from the first `SHORT_MAIL` bytes of each. An
 /// upload is held in memory whole until it is stored or refused, so without this a few dozen slow, large uploads
 /// could take all the memory there is. Past it, a large upload is refused (503) and tried again by the app; short
@@ -82,6 +94,20 @@ struct Item {
     id: u64,
     at: Instant,
     blob: Bytes,
+    /// Deposited without asking to wake a phone: not a message. Big mail like that is a piece of a story or a video,
+    /// which the app can ask its sender for again, so it's the first to make way when the relay is full.
+    quiet: bool,
+}
+
+impl Item {
+    /// What makes way first when the relay is full: 0 before 1 before 2.
+    fn rank(&self) -> u8 {
+        match (self.blob.len() > SHORT_MAIL, self.quiet) {
+            (true, true) => 0,
+            (true, false) => 1,
+            (false, _) => 2,
+        }
+    }
 }
 
 struct Store {
@@ -122,6 +148,8 @@ struct AppState {
     limits: Arc<Mutex<Limiter>>,
     /// Room for request bodies being received, counted in bytes: `MAX_IN_FLIGHT` in all.
     in_flight: Arc<Semaphore>,
+    /// Room for big mail on its way out in answers, counted in KiB: `MAX_LEAVING` in all.
+    leaving: Arc<Semaphore>,
     /// The operator's token, from `admin.token` beside the relay.
     admin_token: Arc<String>,
     started: Instant,
@@ -160,16 +188,16 @@ async fn deposit(State(store): State<Shared>, Path(send_id): Path<String>, heade
         return StatusCode::PAYLOAD_TOO_LARGE;
     }
     let mut store = store.lock().unwrap();
-    // Full: the oldest waiting mail makes way, so the relay never stops taking new messages. (Refusing instead let
-    // anyone who filled it with junk silence everybody until the junk expired.)
+    // Full: waiting mail makes way, so the relay never stops taking new messages. (Refusing instead let anyone who
+    // filled it with junk silence everybody until the junk expired.)
     let new_mailbox = !store.queues.contains_key(&id);
-    if store.bytes + body.len() > MAX_TOTAL_BYTES || (new_mailbox && store.queues.len() >= MAX_MAILBOXES) {
+    if store.bytes + body.len() > *BUDGET || (new_mailbox && store.queues.len() >= MAX_MAILBOXES) {
         make_room(&mut store, body.len(), new_mailbox);
     }
-    if store.bytes + body.len() > MAX_TOTAL_BYTES {
+    if store.bytes + body.len() > *BUDGET {
         return StatusCode::INSUFFICIENT_STORAGE;
     }
-    let item = Item { id: store.next_id(), at: Instant::now(), blob: body };
+    let item = Item { id: store.next_id(), at: Instant::now(), blob: body, quiet: !wakes(&headers) };
     let size = item.blob.len();
     let queue = store.queues.entry(id).or_default();
     if queue.len() >= MAX_QUEUE {
@@ -186,13 +214,38 @@ async fn deposit(State(store): State<Shared>, Path(send_id): Path<String>, heade
     StatusCode::ACCEPTED
 }
 
-/// Drops the oldest waiting mail, whoever it is for, until there is room for `need` bytes (and a new mailbox, if
-/// `slot`) with a twentieth of the budget to spare, so this runs once in a long while, not on every deposit.
+/// Drops waiting mail, whoever it is for, until there is room for `need` bytes (and a new mailbox, if `slot`) with a
+/// twentieth of the budget to spare, so this runs once in a long while, not on every deposit.
+///
+/// Messages are the last to go. The oldest pieces of stories and videos make way first: they are nearly all of what
+/// fills a relay, and an app that is missing one asks its sender for it again. Then the oldest of the other big mail
+/// (photos). Short mail, which is what people write to each other, only once nothing big is left.
 fn make_room(store: &mut Store, need: usize, slot: bool) {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
-    let bytes_goal = MAX_TOTAL_BYTES - MAX_TOTAL_BYTES / 20;
+    let bytes_goal = *BUDGET - *BUDGET / 20;
     let slots_goal = MAX_MAILBOXES - MAX_MAILBOXES / 20;
+    for rank in [0, 1] {
+        if store.bytes + need <= bytes_goal { break }
+        let mut big: Vec<(Instant, Id, u64, usize)> = store.queues.iter()
+            .flat_map(|(mailbox, queue)| queue.iter().filter(|item| item.rank() == rank)
+                .map(|item| (item.at, *mailbox, item.id, item.blob.len())))
+            .collect();
+        big.sort_unstable_by_key(|(at, ..)| *at);
+        let mut going: HashMap<Id, HashSet<u64>> = HashMap::new();
+        let mut freed = 0;
+        for (_, mailbox, id, size) in big {
+            if store.bytes + need - freed <= bytes_goal { break }
+            going.entry(mailbox).or_default().insert(id);
+            freed += size;
+        }
+        for (mailbox, ids) in going {
+            let Some(queue) = store.queues.get_mut(&mailbox) else { continue };
+            queue.retain(|item| !ids.contains(&item.id));
+            if queue.is_empty() { store.queues.remove(&mailbox); }
+        }
+        store.bytes = store.bytes.saturating_sub(freed);
+    }
     let mut fronts: BinaryHeap<Reverse<(Instant, Id)>> = store.queues.iter()
         .filter_map(|(mailbox, queue)| queue.front().map(|item| Reverse((item.at, *mailbox))))
         .collect();
@@ -219,10 +272,12 @@ async fn deposit_limited(State(state): State<AppState>, caller::Caller(who): cal
         if who.is_loopback() { return deposit(State(state.store), Path(send_id), headers, body).await; }
         let mut limits = state.limits.lock().unwrap();
         let kib = u32::try_from(body.len() / 1024 + 1).unwrap_or(u32::MAX);
-        // Generous on purpose: typing signals, receipts and several devices or housemates behind one address all count.
-        // The aim is to stop a flood, not to notice a busy chat.
+        // Generous on purpose: typing signals, receipts and several devices or housemates behind one address all count,
+        // and a phone network puts many people behind one address. One video story to twenty people is 80 MiB (240 to
+        // older apps). The aim is to stop a flood, not to notice a busy chat; what a flood can do is bounded anyway,
+        // since a full relay lets go of big mail before it touches a message.
         if !limits.allow(who, "deposit", 12_000, Duration::from_secs(3600))
-            || !limits.allow_n(who, "deposit-size", 512 * 1024, Duration::from_secs(3600), kib)
+            || !limits.allow_n(who, "deposit-size", 2 * 1024 * 1024, Duration::from_secs(3600), kib)
             || (new_mailbox && !limits.allow(who, "deposit-new", 2_500, Duration::from_secs(3600))) {
             return StatusCode::TOO_MANY_REQUESTS;
         }
@@ -254,7 +309,40 @@ struct FetchResponse {
     items: Vec<Envelope>,
 }
 
+/// A fetch with nothing counted, as the tests ask for one.
+#[cfg(test)]
 async fn fetch(State(store): State<Shared>, Json(req): Json<FetchRequest>) -> Result<Json<FetchResponse>, StatusCode> {
+    fetch_within(&store, req, None).await.map(|(answer, _)| Json(answer))
+}
+
+/// What the route runs: the same fetch, with the big mail it hands over counted against `MAX_LEAVING` until the
+/// phone has taken the answer (or gone away).
+async fn fetch_limited(State(state): State<AppState>, Json(req): Json<FetchRequest>) -> Result<axum::response::Response, StatusCode> {
+    use axum::response::IntoResponse;
+    let (answer, room) = fetch_within(&state.store, req, Some(&state.leaving)).await?;
+    let body = Bytes::from(serde_json::to_vec(&answer).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+    drop(answer);
+    let body = axum::body::Body::from_stream(Leaving { body: Some(body), _room: room });
+    Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response())
+}
+
+/// An answer on its way out, with the room it takes. The room is given back when this is let go of, which is once
+/// the answer has been written out or the connection has gone.
+struct Leaving {
+    body: Option<Bytes>,
+    _room: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl futures_util::Stream for Leaving {
+    type Item = Result<Bytes, std::convert::Infallible>;
+
+    fn poll_next(mut self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        std::task::Poll::Ready(self.body.take().map(Ok))
+    }
+}
+
+async fn fetch_within(store: &Shared, req: FetchRequest, leaving: Option<&Arc<Semaphore>>)
+    -> Result<(FetchResponse, Option<tokio::sync::OwnedSemaphorePermit>), StatusCode> {
     if req.keys.len() > MAX_KEYS_PER_FETCH {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -265,13 +353,39 @@ async fn fetch(State(store): State<Shared>, Json(req): Json<FetchRequest>) -> Re
         let arrived = ARRIVALS.notified();
         tokio::pin!(arrived);
         arrived.as_mut().enable();
-        let items = collect(&store, &mailboxes);
-        let now = Instant::now();
-        if !items.is_empty() || now >= deadline {
-            return Ok(Json(FetchResponse { items }));
+        let mut picked = collect(store, &mailboxes);
+        // Room for the big mail in this answer, in KiB. With none to be had, the short mail goes alone.
+        let big: usize = picked.iter().map(|p| p.blob.len()).filter(|size| *size > SHORT_MAIL).sum();
+        let mut room = None;
+        let mut crowded = false;
+        if let (Some(leaving), true) = (leaving, big > 0) {
+            match leaving.clone().try_acquire_many_owned((big / 1024 + 1) as u32) {
+                Ok(taken) => room = Some(taken),
+                Err(_) => {
+                    picked.retain(|p| p.blob.len() <= SHORT_MAIL);
+                    crowded = true;
+                }
+            }
         }
-        let _ = tokio::time::timeout(deadline - now, arrived).await;
+        let now = Instant::now();
+        if !picked.is_empty() || now >= deadline {
+            // Made into text out here, not while holding the store: it's the slow part, and everyone waits on the store.
+            let items = picked.into_iter()
+                .map(|p| Envelope { k: p.k, id: p.id, blob: B64.encode(&p.blob), age: p.at.elapsed().as_secs() }).collect();
+            return Ok((FetchResponse { items }, room));
+        }
+        // Big mail is waiting but too much is on its way out already: look again in a moment, not only on a deposit.
+        let pause = if crowded { Duration::from_millis(250).min(deadline - now) } else { deadline - now };
+        let _ = tokio::time::timeout(pause, arrived).await;
     }
+}
+
+/// An envelope picked for an answer. The bytes are shared with the store, not copied.
+struct Picked {
+    k: usize,
+    id: u64,
+    at: Instant,
+    blob: Bytes,
 }
 
 /// Mail up to this size is a message or a receipt; above it, a photo or a piece of a story.
@@ -281,7 +395,7 @@ const SHORT_MAIL: usize = 64 * 1024;
 /// pieces used to wait behind them, fetched a piece at a time over a slow circuit, and a big piece at the front of
 /// one mailbox held up the others in the same answer. Mail is read in either order, and each is acknowledged by its
 /// id, so taking the short ones first changes nothing for the apps.
-fn collect(store: &Shared, mailboxes: &[Option<Id>]) -> Vec<Envelope> {
+fn collect(store: &Shared, mailboxes: &[Option<Id>]) -> Vec<Picked> {
     let store = store.lock().unwrap();
     let mut items = Vec::new();
     let mut bytes = 0;
@@ -293,7 +407,7 @@ fn collect(store: &Shared, mailboxes: &[Option<Id>]) -> Vec<Envelope> {
                 // comes on the next fetch, once this has been acknowledged. The first envelope always goes, however big.
                 if !items.is_empty() && bytes + item.blob.len() > MAX_FETCH_BYTES { break 'passes; }
                 bytes += item.blob.len();
-                items.push(Envelope { k, id: item.id, blob: B64.encode(&item.blob), age: item.at.elapsed().as_secs() });
+                items.push(Picked { k, id: item.id, at: item.at, blob: item.blob.clone() });
             }
         }
     }
@@ -976,7 +1090,7 @@ fn app(state: AppState) -> Router {
         // The address this request came from, for the app's anonymity report. Answered, never kept.
         .route("/v1/seen", get(|caller::Caller(ip): caller::Caller| async move { ip.to_string() }))
         .route("/v1/q/{send_id}", put(deposit_limited))
-        .route("/v1/fetch", post(fetch))
+        .route("/v1/fetch", post(fetch_limited))
         .route("/v1/ack", post(ack))
         .route("/v1/push", get(push_status).put(push_register))
         .route("/v1/push/off", post(push_off))
@@ -1078,6 +1192,7 @@ async fn main() {
                                                        sealed::Sealer::standard(&PathBuf::from(&directory_path))))),
         limits: Arc::default(),
         in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            leaving: Arc::new(Semaphore::new(MAX_LEAVING / 1024)),
         admin_token: Arc::new(admin_token()),
         started: Instant::now(),
     };
@@ -1147,6 +1262,7 @@ mod tests {
             directory: Arc::new(Mutex::new(Directory::default())),
             limits: Arc::default(),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            leaving: Arc::new(Semaphore::new(MAX_LEAVING / 1024)),
                 admin_token: Arc::new("t".into()),
             started: Instant::now(),
         };
@@ -1256,8 +1372,8 @@ mod tests {
     async fn short_mail_is_fetched_before_big_pieces_ahead_of_it() {
         let store: Shared = Arc::default();
         let (a, b) = (key(61), key(62));
-        let big = |id: u64| Item { id, at: Instant::now(), blob: Bytes::from(vec![1u8; 2_000_000]) };
-        let short = |id: u64, body: &'static [u8]| Item { id, at: Instant::now(), blob: Bytes::from_static(body) };
+        let big = |id: u64| Item { id, at: Instant::now(), blob: Bytes::from(vec![1u8; 2_000_000]), quiet: true };
+        let short = |id: u64, body: &'static [u8]| Item { id, at: Instant::now(), blob: Bytes::from_static(body), quiet: false };
         store.lock().unwrap().queues.insert(send_id_for(&a), VecDeque::from([big(1), big(2), short(3, b"hello")]));
         store.lock().unwrap().queues.insert(send_id_for(&b), VecDeque::from([big(4), short(5, b"hi"), short(6, b"there")]));
 
@@ -1306,9 +1422,9 @@ mod tests {
         let past = Instant::now().checked_sub(Duration::from_secs(3 * 3600)).unwrap_or_else(Instant::now);
         {
             let mut s = store.lock().unwrap();
-            let old_text = Item { id: 1, at: past, blob: Bytes::from(vec![0u8; 100]) };
-            let old_piece = Item { id: 2, at: past, blob: Bytes::from(vec![0u8; SHORT_MAIL + 1]) };
-            let new_piece = Item { id: 3, at: Instant::now(), blob: Bytes::from(vec![0u8; SHORT_MAIL + 1]) };
+            let old_text = Item { id: 1, at: past, blob: Bytes::from(vec![0u8; 100]), quiet: false };
+            let old_piece = Item { id: 2, at: past, blob: Bytes::from(vec![0u8; SHORT_MAIL + 1]), quiet: true };
+            let new_piece = Item { id: 3, at: Instant::now(), blob: Bytes::from(vec![0u8; SHORT_MAIL + 1]), quiet: true };
             s.queues.entry(stale).or_default().extend([old_text, old_piece]);
             s.queues.entry(fresh).or_default().push_back(new_piece);
             s.bytes = 100 + 2 * (SHORT_MAIL + 1);
@@ -1330,7 +1446,7 @@ mod tests {
         let boxes = [[1u8; 32], [2u8; 32], [3u8; 32]];
         for (n, mailbox) in boxes.iter().enumerate() {
             std::thread::sleep(Duration::from_millis(2));
-            let item = Item { id: n as u64, at: Instant::now(), blob: Bytes::from(vec![0u8; 10]) };
+            let item = Item { id: n as u64, at: Instant::now(), blob: Bytes::from(vec![0u8; 10]), quiet: false };
             store.queues.entry(*mailbox).or_default().push_back(item);
         }
         store.bytes = MAX_TOTAL_BYTES - MAX_TOTAL_BYTES / 20 + 5;
@@ -1338,6 +1454,65 @@ mod tests {
         assert!(!store.queues.contains_key(&boxes[0]), "the oldest went");
         assert!(store.queues.contains_key(&boxes[1]) && store.queues.contains_key(&boxes[2]), "the newer stayed");
         assert_eq!(store.bytes, MAX_TOTAL_BYTES - MAX_TOTAL_BYTES / 20 - 5);
+    }
+
+    /// A full relay lets go of pieces of stories first, then other big mail, and of messages last of all: someone
+    /// who is away finds what people wrote to them, even after stories have filled the relay many times over.
+    #[test]
+    fn messages_are_the_last_to_make_way() {
+        let mut store = Store::default();
+        let (texts, photos, stories) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let piece = MAX_TOTAL_BYTES / 8;
+        let mut id = 0;
+        let mut put = |store: &mut Store, mailbox: Id, size: usize, quiet: bool| {
+            id += 1;
+            std::thread::sleep(Duration::from_millis(2));
+            store.queues.entry(mailbox).or_default().push_back(Item { id, at: Instant::now(), blob: Bytes::from(vec![0u8; size]), quiet });
+            store.bytes += size;
+            id
+        };
+        // The messages are the oldest mail there is, then a photo, then pieces of stories.
+        let text = put(&mut store, texts, 500, false);
+        let photo = put(&mut store, photos, piece, false);
+        let old_piece = put(&mut store, stories, piece, true);
+        let pieces: Vec<u64> = (0..5).map(|_| put(&mut store, stories, piece, true)).collect();
+        let waiting = |store: &Store, mailbox: Id| store.queues.get(&mailbox).map_or(vec![], |q| q.iter().map(|i| i.id).collect::<Vec<_>>());
+        make_room(&mut store, piece, false);
+        assert_eq!(waiting(&store, texts), vec![text], "the message stays, old as it is");
+        assert_eq!(waiting(&store, photos), vec![photo], "and the photo, while a story's piece can go instead");
+        assert!(!waiting(&store, stories).contains(&old_piece), "the oldest piece went");
+        assert_eq!(waiting(&store, stories), pieces, "and no more than was needed");
+        // With no pieces left to drop, the photo goes before the message does.
+        store.queues.remove(&stories);
+        store.bytes = 500 + piece;
+        make_room(&mut store, *BUDGET / 10 * 9, false);
+        assert_eq!(waiting(&store, texts), vec![text]);
+        assert!(waiting(&store, photos).is_empty(), "the photo made way");
+        assert_eq!(store.bytes, 500);
+    }
+
+    /// Big mail on its way out is counted, so many phones collecting at once can't take all the memory: with no room,
+    /// a fetch hands over the messages and leaves the big piece for the next one.
+    #[tokio::test]
+    async fn a_fetch_leaves_big_mail_for_later_when_too_much_is_leaving() {
+        let store: Shared = Arc::default();
+        let receive = key(33);
+        let send = hex::encode(send_id_for(&receive));
+        let mut quiet = HeaderMap::new();
+        quiet.insert("x-pulshade-wake", "0".parse().unwrap());
+        deposit(State(store.clone()), Path(send.clone()), quiet, Bytes::from(vec![7u8; SHORT_MAIL + 1])).await;
+        deposit(State(store.clone()), Path(send), HeaderMap::new(), Bytes::from_static(b"hello")).await;
+        let ask = || FetchRequest { keys: vec![hex::encode(receive)], wait: 0 };
+        let leaving = Arc::new(Semaphore::new(10));
+        let (crowded, room) = fetch_within(&store, ask(), Some(&leaving)).await.unwrap();
+        assert_eq!(crowded.items.iter().map(|i| B64.decode(&i.blob).unwrap().len()).collect::<Vec<_>>(), vec![5], "only the message");
+        assert!(room.is_none());
+        let leaving = Arc::new(Semaphore::new(1024));
+        let (all, room) = fetch_within(&store, ask(), Some(&leaving)).await.unwrap();
+        assert_eq!(all.items.len(), 2);
+        assert_eq!(leaving.available_permits(), 1024 - (SHORT_MAIL + 1) / 1024 - 1, "the piece is counted while it leaves");
+        drop(room);
+        assert_eq!(leaving.available_permits(), 1024, "and the room comes back");
     }
 
     /// Deposits are anonymous, so one caller is held to an allowance of its own.
@@ -1408,6 +1583,7 @@ mod tests {
             directory: Arc::new(Mutex::new(Directory::default())),
             limits: Arc::default(),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            leaving: Arc::new(Semaphore::new(MAX_LEAVING / 1024)),
                 admin_token: Arc::new("t".into()),
             started: Instant::now(),
         };
@@ -1443,6 +1619,7 @@ mod tests {
             directory: Arc::new(Mutex::new(Directory::default())),
             limits: Arc::default(),
             in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            leaving: Arc::new(Semaphore::new(MAX_LEAVING / 1024)),
             admin_token: Arc::new("t".into()),
             started: Instant::now(),
         }
