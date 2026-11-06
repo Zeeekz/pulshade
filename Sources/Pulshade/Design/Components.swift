@@ -42,7 +42,7 @@ struct Banner: View {
 
     var body: some View {
         ZStack {
-            if let image, let picture = PlatformImage(data: image) {
+            if let image, let picture = DecodedImages.image(image) {
                 Image(platformImage: picture).resizable().scaledToFill()
             } else {
                 let tint = Signature.tint(for: seed, model: model)

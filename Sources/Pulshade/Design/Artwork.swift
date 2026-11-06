@@ -240,7 +240,7 @@ struct Avatar: View {
 
     var body: some View {
         ZStack {
-            if let image, let ns = PlatformImage(data: image) {
+            if let image, let ns = DecodedImages.image(image) {
                 Image(platformImage: ns).resizable().scaledToFill()
             } else {
                 PulseArt(tint: Signature.tint(for: seed, model: model), size: size, symbol: symbol)

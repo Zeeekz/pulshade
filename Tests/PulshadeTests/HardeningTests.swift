@@ -18,6 +18,19 @@ import PulshadeShared
         #expect(13.wrapped(10) == 3)
     }
 
+    @Test func theWrongPasscodeCountSurvivesAndBurnClearsIt() {
+        FileKeys.inMemory = true
+        FileKeys.forgetAttempts()
+        #expect(FileKeys.savedAttempts() == 0)
+        FileKeys.saveAttempts(7)
+        #expect(FileKeys.savedAttempts() == 7, "A relaunch starts from the same count")
+        FileKeys.saveAttempts(0)
+        #expect(FileKeys.savedAttempts() == 0)
+        FileKeys.saveAttempts(3)
+        FileKeys.forgetAttempts()
+        #expect(FileKeys.savedAttempts() == 0)
+    }
+
     @Test func aDataFileThatCannotBeReadIsAnErrorNotAnEmptyAccount() throws {
         let dir = testDirectory("pulshade-hardening")
         let vault = Vault(directory: dir)
