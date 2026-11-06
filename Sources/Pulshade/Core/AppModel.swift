@@ -39,7 +39,9 @@ final class AppModel {
     /// When a video was last sent again on someone's asking, as "fingerprint|id", so one asking can't make it
     /// go over and over.
     @ObservationIgnored private var clipResent: [String: Date] = [:]
-    var failedAttempts = 0
+    var failedAttempts = FileKeys.savedAttempts() {
+        didSet { if failedAttempts != oldValue { FileKeys.saveAttempts(failedAttempts) } }
+    }
     /// The passcode was right but the account's data wouldn't open, so nothing was opened (or touched).
     private(set) var dataUnreadable = false
     /// Another of your devices has a newer profile than this version can read. Set until PULSHADE is updated.
@@ -541,6 +543,7 @@ final class AppModel {
         backupTask = nil
         discardSaves()
         vault.destroy(leavingNoTrace: leavingNoTrace)
+        failedAttempts = 0
         AnnouncementWatch.forget()
         // The few display settings kept outside the vault, so the lock screen can look right.
         for key in ["pulshade.theme", "pulshade.menuBar", "pulshade.blockCapture", "pulshade.blur"] {
@@ -564,6 +567,7 @@ final class AppModel {
     /// next, a decoy included, must not find them.
     private func forgetSession() {
         identityCache = [:]
+        DecodedImages.forget()
         eggs = []
     }
 
@@ -2711,6 +2715,8 @@ final class AppModel {
             data.contacts[i].devices[d].sendID = sendID
             return d
         }
+        // More than anyone owns: the oldest makes way, so a contact can't grow the list without end.
+        if data.contacts[i].devices.count >= Self.maxDevicesPerContact { data.contacts[i].devices.removeFirst() }
         data.contacts[i].devices.append(DeviceLink(id: id, sendID: sendID))
         return data.contacts[i].devices.count - 1
     }
@@ -3525,6 +3531,10 @@ final class AppModel {
         }
     }
 
+    static let maxAvatarBytes = 512 * 1024
+    static let maxBannerBytes = 2 * 1024 * 1024
+    static let maxDevicesPerContact = 16
+
     /// Longer than the relay keeps anything (seven days).
     static let replayWindow: TimeInterval = 8 * 24 * 3600
 
@@ -3569,8 +3579,9 @@ final class AppModel {
             let claimed = handle.flatMap(DirectoryProfile.validHandle)
             if claimed != sender.handle { sender.handle = nil }
             if let claimed, claimed != sender.handle { confirmHandle(claimed, of: sender) }
-            sender.avatar = avatar
-            sender.banner = banner
+            // A picture bigger than any this app makes is not kept, so one contact can't fill the vault.
+            sender.avatar = avatar.flatMap { $0.count <= Self.maxAvatarBytes ? $0 : nil }
+            sender.banner = banner.flatMap { $0.count <= Self.maxBannerBytes ? $0 : nil }
             sender.color = color.map { $0.wrapped(Signature.colors.count) }
             upsert(sender)
             refreshDirectTitle(fp)
@@ -4774,7 +4785,9 @@ extension AppModel {
         return kept
     }
 
-    enum BackupLookup { case found(AppData), none, unreachable }
+    /// `unreadable`: a copy is on the relay but this version can't open it (it may come from a newer one). It must
+    /// not be taken for no backup, or starting over would later save across it.
+    enum BackupLookup { case found(AppData), none, unreachable, unreadable }
 
     /// The account a log out left on the relay, opened with the recovery code's key.
     func backup(of identity: Identity) async -> BackupLookup {
@@ -4785,7 +4798,7 @@ extension AppModel {
         guard let sealed else { return .none }
         guard let box = try? AES.GCM.SealedBox(combined: sealed),
               let plain = try? AES.GCM.open(box, using: identity.backupKey),
-              let restored = try? JSONDecoder.pulshade.decode(AppData.self, from: Self.unpadded(plain)) else { return .none }
+              let restored = try? JSONDecoder.pulshade.decode(AppData.self, from: Self.unpadded(plain)) else { return .unreadable }
         return .found(restored)
     }
 

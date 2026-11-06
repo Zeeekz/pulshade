@@ -1429,6 +1429,11 @@ impl Limiter {
     }
 
     pub fn allow(&mut self, ip: IpAddr, kind: &'static str, max: u32, window: Duration) -> bool {
+        self.allow_n(ip, kind, max, window, 1)
+    }
+
+    /// As `allow`, but the request counts as `weight` (a deposit by its size in KiB, say).
+    pub fn allow_n(&mut self, ip: IpAddr, kind: &'static str, max: u32, window: Duration, weight: u32) -> bool {
         let now = Instant::now();
         if now.duration_since(self.salted_at) >= Self::SALT_LIFETIME {
             // A new salt makes every old entry meaningless, so they go with it.
@@ -1441,7 +1446,7 @@ impl Limiter {
         if now.duration_since(entry.0) >= entry.1 {
             *entry = (now, window, 0);
         }
-        entry.2 += 1;
+        entry.2 = entry.2.saturating_add(weight);
         entry.2 <= max
     }
 

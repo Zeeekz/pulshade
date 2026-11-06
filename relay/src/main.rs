@@ -166,7 +166,13 @@ async fn deposit(State(store): State<Shared>, Path(send_id): Path<String>, heade
         return StatusCode::PAYLOAD_TOO_LARGE;
     }
     let mut store = store.lock().unwrap();
-    if store.bytes + body.len() > MAX_TOTAL_BYTES || (!store.queues.contains_key(&id) && store.queues.len() >= MAX_MAILBOXES) {
+    // Full: the oldest waiting mail makes way, so the relay never stops taking new messages. (Refusing instead let
+    // anyone who filled it with junk silence everybody until the junk expired.)
+    let new_mailbox = !store.queues.contains_key(&id);
+    if store.bytes + body.len() > MAX_TOTAL_BYTES || (new_mailbox && store.queues.len() >= MAX_MAILBOXES) {
+        make_room(&mut store, body.len(), new_mailbox);
+    }
+    if store.bytes + body.len() > MAX_TOTAL_BYTES {
         return StatusCode::INSUFFICIENT_STORAGE;
     }
     let item = Item { id: store.next_id(), at: Instant::now(), blob: body };
@@ -185,6 +191,49 @@ async fn deposit(State(store): State<Shared>, Path(send_id): Path<String>, heade
         push::global().notify_as(id, if rings(&headers) { push::Wake::Call } else { push::Wake::Message });
     }
     StatusCode::ACCEPTED
+}
+
+/// Drops the oldest waiting mail, whoever it is for, until there is room for `need` bytes (and a new mailbox, if
+/// `slot`) with a twentieth of the budget to spare, so this runs once in a long while, not on every deposit.
+fn make_room(store: &mut Store, need: usize, slot: bool) {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let bytes_goal = MAX_TOTAL_BYTES - MAX_TOTAL_BYTES / 20;
+    let slots_goal = MAX_MAILBOXES - MAX_MAILBOXES / 20;
+    let mut fronts: BinaryHeap<Reverse<(Instant, Id)>> = store.queues.iter()
+        .filter_map(|(mailbox, queue)| queue.front().map(|item| Reverse((item.at, *mailbox))))
+        .collect();
+    while store.bytes + need > bytes_goal || (slot && store.queues.len() >= slots_goal) {
+        let Some(Reverse((_, mailbox))) = fronts.pop() else { break };
+        let Some(queue) = store.queues.get_mut(&mailbox) else { continue };
+        if let Some(item) = queue.pop_front() {
+            let size = item.blob.len();
+            let next = queue.front().map(|next| next.at);
+            if queue.is_empty() { store.queues.remove(&mailbox); }
+            store.bytes = store.bytes.saturating_sub(size);
+            if let Some(at) = next { fronts.push(Reverse((at, mailbox))); }
+        }
+    }
+    MAIL_CHANGED.store(true, Ordering::SeqCst);
+}
+
+/// What the route runs: the same deposit, after checking how much this caller has been sending. Deposits are
+/// anonymous, so without it one client could fill the relay with junk. Each Tor circuit counts on its own address.
+async fn deposit_limited(State(state): State<AppState>, caller::Caller(who): caller::Caller, Path(send_id): Path<String>,
+                         headers: HeaderMap, body: Bytes) -> StatusCode {
+    let new_mailbox = parse_id(&send_id).is_some_and(|id| !state.store.lock().unwrap().queues.contains_key(&id));
+    {
+        // Straight from this machine (the proxy always names the real client): the operator, or a test.
+        if who.is_loopback() { return deposit(State(state.store), Path(send_id), headers, body).await; }
+        let mut limits = state.limits.lock().unwrap();
+        let kib = u32::try_from(body.len() / 1024 + 1).unwrap_or(u32::MAX);
+        if !limits.allow(who, "deposit", 3_000, Duration::from_secs(3600))
+            || !limits.allow_n(who, "deposit-size", 256 * 1024, Duration::from_secs(3600), kib)
+            || (new_mailbox && !limits.allow(who, "deposit-new", 200, Duration::from_secs(3600))) {
+            return StatusCode::TOO_MANY_REQUESTS;
+        }
+    }
+    deposit(State(state.store), Path(send_id), headers, body).await
 }
 
 #[derive(Deserialize)]
@@ -1091,7 +1140,7 @@ fn app(state: AppState) -> Router {
         .route("/v1/health", get(|| async { ([("x-pulshade-boot", BOOT.as_str())], "ok") }))
         // The address this request came from, for the app's anonymity report. Answered, never kept.
         .route("/v1/seen", get(|caller::Caller(ip): caller::Caller| async move { ip.to_string() }))
-        .route("/v1/q/{send_id}", put(deposit))
+        .route("/v1/q/{send_id}", put(deposit_limited))
         .route("/v1/fetch", post(fetch))
         .route("/v1/ack", post(ack))
         .route("/v1/push", get(push_status).put(push_register))
@@ -1567,15 +1616,44 @@ mod tests {
         assert_eq!(deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), Bytes::from_static(b"12345")).await, StatusCode::ACCEPTED);
         assert_eq!(store.lock().unwrap().bytes, 5);
         store.lock().unwrap().bytes = MAX_TOTAL_BYTES - 3;
-        assert_eq!(deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), Bytes::from_static(b"abcd")).await, StatusCode::INSUFFICIENT_STORAGE);
+        // Full: the oldest mail makes way and the new deposit is taken, rather than the relay going deaf.
+        assert_eq!(deposit(State(store.clone()), Path(send.clone()), HeaderMap::new(), Bytes::from_static(b"abcd")).await, StatusCode::ACCEPTED);
         assert_eq!(deposit(State(store.clone()), Path(send), HeaderMap::new(), Bytes::from_static(b"abc")).await, StatusCode::ACCEPTED);
         // Expiry recounts from what's really there.
         purge(&store);
-        assert_eq!(store.lock().unwrap().bytes, 5 + 3);
+        assert_eq!(store.lock().unwrap().bytes, 4 + 3);
         let Json(res) = fetch(State(store.clone()), Json(FetchRequest { keys: vec![hex::encode(receive)], wait: 0 })).await.unwrap();
         let ids: Vec<u64> = res.items.iter().map(|i| i.id).collect();
         ack(State(store.clone()), Json(AckRequest { acks: vec![Ack { key: hex::encode(receive), ids }] })).await;
         assert_eq!(store.lock().unwrap().bytes, 0);
+    }
+
+    /// When the relay is full, the oldest mail anywhere goes first and newer mail stays.
+    #[test]
+    fn making_room_drops_the_oldest_mail_first() {
+        let mut store = Store::default();
+        let boxes = [[1u8; 32], [2u8; 32], [3u8; 32]];
+        for (n, mailbox) in boxes.iter().enumerate() {
+            std::thread::sleep(Duration::from_millis(2));
+            let item = Item { id: n as u64, at: Instant::now(), blob: Bytes::from(vec![0u8; 10]) };
+            store.queues.entry(*mailbox).or_default().push_back(item);
+        }
+        store.bytes = MAX_TOTAL_BYTES - MAX_TOTAL_BYTES / 20 + 5;
+        make_room(&mut store, 1, false);
+        assert!(!store.queues.contains_key(&boxes[0]), "the oldest went");
+        assert!(store.queues.contains_key(&boxes[1]) && store.queues.contains_key(&boxes[2]), "the newer stayed");
+        assert_eq!(store.bytes, MAX_TOTAL_BYTES - MAX_TOTAL_BYTES / 20 - 5);
+    }
+
+    /// Deposits are anonymous, so one caller is held to an allowance of its own.
+    #[test]
+    fn one_caller_cannot_deposit_without_end() {
+        let mut limits = Limiter::default();
+        let who: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        let other: std::net::IpAddr = "203.0.113.6".parse().unwrap();
+        assert!(limits.allow_n(who, "deposit-size", 100, Duration::from_secs(3600), 60));
+        assert!(!limits.allow_n(who, "deposit-size", 100, Duration::from_secs(3600), 60), "past its size allowance");
+        assert!(limits.allow_n(other, "deposit-size", 100, Duration::from_secs(3600), 60), "someone else is unaffected");
     }
 
     /// A big story must not hold up what's behind it: one fetch stays under the size cap (but always carries at

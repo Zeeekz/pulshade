@@ -476,6 +476,12 @@ struct RestoreFlow: View {
                 working = false
                 withAnimation(.snappy) { problem = "Can't reach the relay. Check your connection and try again." }
                 return
+            case .unreadable:
+                // Carrying on would start the account over, and the next backup would replace this one.
+                lookup = nil
+                working = false
+                withAnimation(.snappy) { problem = "A backup is saved for this code, but this version of Pulshade can't open it. Update Pulshade and try again." }
+                return
             case .none:
                 break
             }
