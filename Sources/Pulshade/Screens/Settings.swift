@@ -14,6 +14,8 @@ struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     @State private var path: [SettingsPage] = []
+    /// The @handle at the top says "Copied" for a moment after it's tapped.
+    @State private var copiedHandle = false
     #if DEBUG
     @State private var demoCrop: PendingCrop?
     @State private var demoFrame = CropFrame.avatar
@@ -142,9 +144,26 @@ struct SettingsView: View {
                     .foregroundStyle(Ink.text)
                 BadgeMark(badge: model.activeProfile.badge, size: 22)
             }
-            Text(model.activeProfile.handle.map { "@\($0)" } ?? "Private profile")
-                .font(.system(size: 14))
-                .foregroundStyle(model.activeProfile.handle == nil ? Ink.dim : theme.accent)
+            // Tap the @handle to copy it.
+            Button {
+                guard let handle = model.activeProfile.handle else { return }
+                copyToClipboard("@\(handle)")
+                Haptics.tick()
+                withAnimation(.snappy) { copiedHandle = true }
+                Task {
+                    try? await Task.sleep(for: .seconds(1.5))
+                    withAnimation(.snappy) { copiedHandle = false }
+                }
+            } label: {
+                Text(copiedHandle ? "Copied" : (model.activeProfile.handle.map { "@\($0)" } ?? "Private profile"))
+                    .font(.system(size: 14))
+                    .foregroundStyle(model.activeProfile.handle == nil ? Ink.dim : theme.accent)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(model.activeProfile.handle == nil)
+            .accessibilityLabel(model.activeProfile.handle.map { "@\($0)" } ?? "Private profile")
+            .accessibilityHint(model.activeProfile.handle == nil ? "" : "Copies your username")
         }
         .frame(maxWidth: .infinity)
         .padding(.top, 8)
