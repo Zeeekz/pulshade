@@ -28,9 +28,12 @@ banner and the key it belongs to are stored on our server so anyone can look it 
 A handle you let go of is held for a while so nobody else can take it straight away; a burned account's handles are
 retired and no longer tied to anyone.
 
-**Sealed backups (only if you detach an account).** Detaching can leave an encrypted copy of your profile, contacts,
-groups, personas and settings on the server so your recovery code can restore it. We can't open it. It is deleted
-after 180 days if nobody restores it. Chats are never included.
+**Sealed backup (on by default, switch in Settings).** So that Detaching a device can be instant, the app keeps an
+encrypted copy of your profile, contacts, groups, personas and settings on the server, saved again a few minutes
+after they change, so your recovery code can restore it. We can't open it, and it isn't tied to your account on the
+server. It is deleted when you switch the backup off or Burn, and 180 days after it was last saved if the app never
+saves it again (for instance after a Detach). Chats are never included. The server sees when it was saved and its
+rough size, and, if you connect without Tor, your IP address during the upload, as with any connection.
 
 **Collectibles.** If you are given a collectible, the server keeps what it needs to show it and let its owner claim it
 again with a backup code: the item, its number and a hash of the code.

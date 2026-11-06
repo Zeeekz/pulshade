@@ -126,6 +126,10 @@ final class AppModel {
     let vault: Vault
     private var syncTask: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
+    /// The sealed backup upload waiting its turn, and how long it waits (seconds, picked at random each time so the
+    /// relay can't line an upload up with an edit). Tests shorten the wait.
+    @ObservationIgnored private var backupTask: Task<Void, Never>?
+    @ObservationIgnored static var backupWait: ClosedRange<Int> = 90...600
     private var activityMonitor: Any?
     private var lastActivity = Date()
     private var profileTask: Task<Void, Never>?
@@ -331,8 +335,8 @@ final class AppModel {
         }
         adoptConnectionChoice()
         didUnlock()
-        // It's on this device now. An old copy left behind could only fall out of step.
-        if backup != nil { Task { try? await deleteBackup(of: identity) } }
+        // It's on this device now. It stays on the relay and is saved over as things change, unless backups are off.
+        if backup != nil, !data.security.keepBackup { Task { try? await deleteBackup(of: identity) } }
     }
 
     func unlock(passcode: String) async -> Bool {
@@ -429,6 +433,7 @@ final class AppModel {
         }
         connecting = true
         withAnimation(.smooth(duration: 0.6)) { phase = .unlocked }
+        scheduleBackup()
         // Ask straight away, and again until it answers, so the wait is only as long as Tor needs.
         Task { [weak self] in
             while let self, self.connecting, self.phase == .unlocked, let client = self.client(nil) {
@@ -530,6 +535,9 @@ final class AppModel {
         if hadPush { withdrawPush() }
         syncTask?.cancel()
         tickTask?.cancel()
+        // Nothing more goes to the relay from here. The backup already there is what a recovery code brings back.
+        backupTask?.cancel()
+        backupTask = nil
         discardSaves()
         vault.destroy(leavingNoTrace: leavingNoTrace)
         AnnouncementWatch.forget()
@@ -586,6 +594,7 @@ final class AppModel {
             }
         }
         updateBadge()
+        scheduleBackup()
         AnnouncementWatch.mirror(.init(notifications: data.security.notifications, content: data.security.notificationContent,
                                        sound: data.security.notificationSound,
                                        muted: conversation(Conversation.announcementsID)?.muted ?? false))
@@ -4641,6 +4650,10 @@ extension AppModel {
     func burn(recoveryCode: String? = nil) async throws {
         try open(recoveryCode: recoveryCode)
         guard let client = client(nil), await client.health(), let identity else { throw LeaveError.offline }
+        // No upload may land after the delete.
+        data.security.keepBackup = false
+        backupTask?.cancel()
+        backupTask = nil
         for persona in [nil] + data.personas.map(\.id) { await retireHandles(persona: persona) }
         try? await deleteBackup(of: identity)
         for id in data.conversations.map(\.id) { delete(id) }
@@ -4737,7 +4750,7 @@ extension AppModel {
         guard let sealed else { return .none }
         guard let box = try? AES.GCM.SealedBox(combined: sealed),
               let plain = try? AES.GCM.open(box, using: identity.backupKey),
-              let restored = try? JSONDecoder.pulshade.decode(AppData.self, from: plain) else { return .none }
+              let restored = try? JSONDecoder.pulshade.decode(AppData.self, from: Self.unpadded(plain)) else { return .none }
         return .found(restored)
     }
 
@@ -4755,14 +4768,109 @@ extension AppModel {
         await flush()
         do {
             guard let client = client(nil) else { throw LeaveError.offline }
-            let plain = try JSONEncoder.pulshade.encode(Self.withoutChats(data, keepingDevices: false))
-            let sealed = try AES.GCM.seal(plain, using: identity.backupKey).combined!
+            let sealed = try Self.sealedBackup(of: data, with: identity)
             let (key, sig, ts) = backupProof("pulshade.backup.put.v1", identity, body: sealed)
             try await client.putBackup(sealed, key: key, sig: sig, ts: ts)
         } catch {
             startSync()
             throw LeaveError.offline
         }
+    }
+
+    // MARK: Keeping the backup fresh
+
+    /// What goes in a backup: everything but chats, and not the two fields that track the backup itself.
+    private static func backupContents(of data: AppData) -> AppData {
+        var kept = withoutChats(data, keepingDevices: false)
+        kept.backupSavedAt = nil
+        kept.backupDigest = nil
+        return kept
+    }
+
+    /// Pads to a power of two (at least 64 KB) behind a marker and the real length, so the relay learns a rough size
+    /// class and not how many contacts there are. The old, unpadded form starts with `{`, never with the marker.
+    static func padded(_ plain: Data) -> Data {
+        var size = 64 * 1024
+        while size < plain.count + 5 { size *= 2 }
+        var out = Data([0x01])
+        withUnsafeBytes(of: UInt32(plain.count).bigEndian) { out.append(contentsOf: $0) }
+        out.append(plain)
+        out.append(Data(count: size - out.count))
+        return out
+    }
+
+    static func unpadded(_ data: Data) -> Data {
+        guard data.first == 0x01, data.count >= 5 else { return data }
+        let length = data.dropFirst().prefix(4).reduce(0) { $0 << 8 | Int($1) }
+        guard 5 + length <= data.count else { return data }
+        return data.subdata(in: 5..<(5 + length))
+    }
+
+    static func sealedBackup(of data: AppData, with identity: Identity) throws -> Data {
+        let plain = try JSONEncoder.pulshade.encode(backupContents(of: data))
+        return try AES.GCM.seal(padded(plain), using: identity.backupKey).combined!
+    }
+
+    /// Called after every save: waits a random few minutes, then saves the backup if anything in it changed.
+    /// Only the main identity does it, never a decoy.
+    func scheduleBackup(after wait: ClosedRange<Int>? = nil) {
+        guard backupTask == nil, data.security.keepBackup, isPrimary, phase == .unlocked else { return }
+        let range = wait ?? Self.backupWait
+        backupTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Int.random(in: range)))
+            guard !Task.isCancelled, let self else { return }
+            self.backupTask = nil
+            await self.saveBackup()
+        }
+    }
+
+    /// Seals and uploads the backup if it changed (or is a week old). Quiet on failure: it tries again later.
+    @discardableResult
+    func saveBackup() async -> Bool {
+        guard data.security.keepBackup, isPrimary, phase == .unlocked, let identity, let client = client(nil) else { return false }
+        guard let plain = try? JSONEncoder.pulshade.encode(Self.backupContents(of: data)) else { return false }
+        let digest = Data(SHA256.hash(data: plain))
+        let week = data.backupSavedAt.map { Date().timeIntervalSince($0) > 7 * 24 * 3600 } ?? true
+        if digest == data.backupDigest, !week { return true }
+        guard let sealed = try? AES.GCM.seal(Self.padded(plain), using: identity.backupKey).combined else { return false }
+        let (key, sig, ts) = backupProof("pulshade.backup.put.v1", identity, body: sealed)
+        do { try await client.putBackup(sealed, key: key, sig: sig, ts: ts) } catch {
+            // Try again in a while.
+            scheduleBackup(after: 300...900)
+            return false
+        }
+        // Nothing of the account changed, so this save doesn't ask for another upload.
+        guard self.identity?.fingerprint == identity.fingerprint, data.security.keepBackup else { return true }
+        data.backupDigest = digest
+        data.backupSavedAt = Date()
+        save()
+        return true
+    }
+
+    /// One line for Settings and the Detach screen: how fresh the relay's copy is.
+    var backupStatus: String {
+        guard data.security.keepBackup else { return "Backups are off" }
+        guard let saved = data.backupSavedAt else { return "Not saved yet" }
+        let seconds = Int(Date().timeIntervalSince(saved))
+        if seconds < 60 { return "Saved just now" }
+        if seconds < 3600 { return "Saved \(seconds / 60) min ago" }
+        if seconds < 86400 { return "Saved \(seconds / 3600) h ago" }
+        return "Saved \(seconds / 86400) d ago"
+    }
+
+    /// The switch in Settings. Off also takes the copy off the relay.
+    func setKeepBackup(_ on: Bool) {
+        data.security.keepBackup = on
+        if on {
+            scheduleBackup(after: 0...5)
+        } else {
+            backupTask?.cancel()
+            backupTask = nil
+            data.backupSavedAt = nil
+            data.backupDigest = nil
+            if let identity { Task { try? await deleteBackup(of: identity) } }
+        }
+        save()
     }
 
     /// `label | backup key | ts`, plus the contents' hash for an upload, signed with the backup key.

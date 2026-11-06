@@ -781,6 +781,19 @@ private struct PrivacySettings: View {
                 RowDivider()
                 disguiseRow(.panic, title: "Panic passcode", isSet: model.hasPanic)
             }
+            SettingsGroup("Backup", footer: "A sealed copy of your profile, contacts, groups, @handles and settings (never chats) is kept on the relay and saved again a few minutes after something changes. Only your recovery code can open it, so the relay can't. Detach wipes this device at once, and your recovery code brings the copy back. Off erases it from the relay.") {
+                SettingRow("Keep a sealed backup") {
+                    Toggle("", isOn: Binding(get: { model.data.security.keepBackup },
+                                             set: { v in withAnimation(.snappy) { model.setKeepBackup(v) } }))
+                        .toggleStyle(GlowToggleStyle())
+                }
+                if model.data.security.keepBackup {
+                    RowDivider()
+                    SettingRow("Last saved") {
+                        Text(model.backupStatus).font(.system(size: 14)).foregroundStyle(Ink.faint)
+                    }
+                }
+            }
             SettingsGroup {
                 MenuRow(page: .anonymity, symbol: "eye.slash.fill", color: .hex(0x64D2FF), title: "Anonymity Report")
                 RowDivider(inset: 54)
