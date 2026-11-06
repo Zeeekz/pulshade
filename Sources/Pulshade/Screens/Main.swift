@@ -536,6 +536,8 @@ private struct ChatList: View {
             .scrollIndicators(.never)
             .scrollDismissesKeyboard(.immediately)
             .scrollTargetBehavior(StoriesSnap(height: storiesHeight))
+            // Pull down to check for new messages now.
+            .refreshable { await model.refresh() }
             .coordinateSpace(.named("chatlist"))
             #if os(iOS)
             // Swipe right on the chats, as "back" from the first page, and the story camera opens, as on Instagram.
