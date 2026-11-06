@@ -229,18 +229,14 @@ a contact once said. Every code you scan or open asks before it does anything, a
 app can never link a device; that only works from the camera. The code is open, so anyone can check what the app and
 the server do; a build someone makes themselves uses its own server, and isn't Pulshade.
 
-**The server (relay).** A small Rust program. No accounts, no logs. Envelopes are held in memory and deleted on
-pickup or after 7 days; their ids are random, so they don't reveal how busy it is. So that a restart doesn't lose
-the ones still waiting, they are also written to the server's disk: every 30 seconds while anything has changed, and
-when the server stops, into one file (`pulshade-spool.sealed`) together with wake-up registrations (which device
-token to wake for which mailbox), sealed with the server's storage key. Each write replaces the file, leaving out
-what has been collected; the old copy is deleted, not overwritten. The handle directory, held handles, moderation
+**The server (relay).** A small Rust program. No accounts and no request logs (it prints only start-up and error lines, none naming an address or a mailbox). Envelopes are held in memory only and deleted on
+pickup or after 7 days; their ids are random, so they don't reveal how busy it is. Waiting envelopes and wake-up
+registrations (which device token to wake for which mailbox) are never written to the server's disk, so a restart or crash
+empties them: a message not yet collected is lost and must be sent again. The handle directory, held handles, moderation
 lists and accounts' sealed backups (no chats) are saved to disk too, the first three sealed with the same storage
 key. On a Mac that key is in the Keychain; on a Linux server it is a file outside the data folder but on the same
 disk. So the seal keeps these files closed to anyone who gets a copy of the data folder or of its backups, and does
-not protect them from someone who holds the whole disk or controls the server, who can read the key as well. What
-they would learn from the spool is which mailboxes have mail waiting, how much and since when, and which device
-tokens are woken for which mailboxes; the envelopes inside stay end-to-end encrypted, and they can't open those. A
+not protect them from someone who holds the whole disk or controls the server, who can read the key as well. A
 backup that hasn't been saved again for 180 days (a detached account's, once its device is gone) is erased. The server turns off core dumps, so a crash never writes its memory to disk. Rate
 limits never keep an IP address, only a hash with a salt that's replaced every hour. Admin actions need the token in
 `admin.token`, which only the server can read; the Pulshade app has no admin in it at all. Abuse reports are sealed to

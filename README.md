@@ -40,10 +40,8 @@ possible:
 - **Not where you are.** Over Tor the server sees a made-up address for each connection, never your IP address.
   Each persona and inbox uses its own Tor circuit, so they can't be linked by address.
 - **Nothing for long.** Envelopes are deleted once collected, or after 7 days. While they wait they are held in
-  memory and, so a restart doesn't lose them, written every 30 seconds to one file on the server's disk, sealed with
-  a key the server keeps outside its data folder. That seal keeps a copy of the file closed; it doesn't stop someone
-  who takes the whole server, who would find which mailboxes have mail waiting but still couldn't read an envelope.
-  Nothing is logged. Your sealed backup (profile, contacts, groups; never chats) is saved again as things change and erased 180
+  memory only and never written to the server's disk, so a restart or crash empties them (a message not yet collected is lost and has to be sent again).
+  The relay and the web server in front of it keep no request log. Your sealed backup (profile, contacts, groups; never chats) is saved again as things change and erased 180
   days after its last save, so a detached account's waits at most that long for its recovery code. Turn it off in
   Settings and it's erased at once.
 

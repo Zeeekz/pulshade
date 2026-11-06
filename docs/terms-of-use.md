@@ -47,7 +47,7 @@ envelopes. Public handles, names and pictures you choose to publish are visible 
 
 - Pulshade is provided "as is". It has **not yet had an independent security audit**, as the README says. Don't rely
   on it where your safety depends on it.
-- Messages may be delayed or lost if the server restarts, because waiting envelopes are kept in the server's memory and only a sealed copy reaches its disk.
+- Messages may be delayed or lost if the server restarts, because waiting envelopes are kept in the server's memory only, never on its disk.
 - We may change, pause or end the service. We'll try to give notice in the app's announcements.
 - To the extent the law allows, we are not liable for loss or damage from using Pulshade, other than what the law
   doesn't allow us to exclude. [Lawyer: adapt for your country and for consumer-protection rules.]
