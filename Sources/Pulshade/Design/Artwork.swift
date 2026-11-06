@@ -131,7 +131,7 @@ struct LockWallpaper: View {
         .overlay(Grain().opacity(0.02).allowsHitTesting(false))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Pulshade is locked")
-        .accessibilityHint("Slide right to enter your passcode")
+        .accessibilityHint("Slide left to enter your passcode")
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { onOpen() }
     }
@@ -144,8 +144,8 @@ struct LockWallpaper: View {
                     .font(.system(size: 15, weight: .medium))
                 HStack(spacing: -2) {
                     ForEach(0..<3, id: \.self) { i in
-                        let glow = 0.35 + 0.65 * max(0, sin(t * 3 - Double(i) * 0.7))
-                        Image(systemName: "chevron.right")
+                        let glow = 0.35 + 0.65 * max(0, sin(t * 3 - Double(2 - i) * 0.7))
+                        Image(systemName: "chevron.left")
                             .font(.system(size: 13, weight: .bold))
                             .opacity(glow)
                     }
