@@ -865,6 +865,70 @@ struct RelayFlowTests {
         #expect(try await bob.findProfile(handle) == nil)
     }
 
+    /// A relay restart empties waiting mail. A friend request nobody answered is sent again from what the sender
+    /// already holds, and the copy opens a real chat when accepted, without a second banner while the first is there.
+    @Test func aLostFriendRequestIsSentAgainAndStillWorks() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        let handle = "alice_\(Int.random(in: 10000...99999))"
+        try await alice.publishProfile(handle: handle)
+        let found = try #require(try await bob.findProfile(handle))
+        _ = try #require(bob.sendRequest(to: found, note: "it's me"))
+        await settle(alice, bob)
+        #expect(alice.requests.count == 1)
+        let first = try #require(alice.requests.first)
+
+        // Sent again while the first is still there: nothing changes.
+        bob.resendPendingRequests()
+        await settle(alice, bob)
+        #expect(alice.requests.count == 1 && alice.requests.first?.id == first.id, "no second banner for the same request")
+
+        // The first was lost in a restart: the copy arrives, with the note.
+        alice.data.requests.removeAll()
+        bob.resendPendingRequests()
+        await settle(alice, bob)
+        let again = try #require(alice.requests.first)
+        #expect(again.note == "it's me" && again.handshake == first.handshake)
+        let chat = try #require(alice.acceptRequest(again.id))
+        await settle(alice, bob)
+        #expect(bob.sentRequests.isEmpty, "Bob's wait is over")
+        alice.send("welcome", in: chat.id)
+        await settle(alice, bob)
+        #expect(bob.data.conversations.first { $0.kind == .direct }?.messages.last?.text == "welcome")
+    }
+
+    /// Messages the relay took but nobody confirmed are sent again after a restart, once, and a copy that wasn't
+    /// needed is ignored while its receipt is sent again.
+    @Test func anUnconfirmedMessageIsSentAgainOnce() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, bob)
+        let chat = try #require(alice.data.conversations.first { $0.kind == .direct })
+        alice.send("hello", in: chat.id)
+        await settle(alice, bob)
+        let theirs = try #require(bob.data.conversations.first { $0.kind == .direct })
+        #expect(theirs.messages.count == 1)
+        let id = try #require(alice.conversation(chat.id)?.messages.last?.id)
+
+        // Not needed: Bob has it. The copy is ignored, and the tick stays where it is.
+        alice.resendUnconfirmedMessages()
+        await settle(alice, bob)
+        #expect(bob.data.conversations.first { $0.kind == .direct }?.messages.count == 1)
+
+        // Lost: Bob never got it, and Alice's tick only says the relay took it.
+        bob.data.conversations[bob.data.conversations.firstIndex { $0.kind == .direct }!].messages.removeAll()
+        let at = try #require(alice.data.conversations.firstIndex { $0.id == chat.id })
+        let mi = try #require(alice.data.conversations[at].messages.firstIndex { $0.id == id })
+        alice.data.conversations[at].messages[mi].status = .sent
+        alice.resendUnconfirmedMessages()
+        await settle(alice, bob)
+        #expect(bob.data.conversations.first { $0.kind == .direct }?.messages.map(\.text) == ["hello"])
+        #expect(alice.conversation(chat.id)?.messages.first { $0.id == id }?.status == .delivered)
+    }
+
     /// A request you sent can be taken back before it is accepted: it leaves your waiting list, and accepting it
     /// afterwards doesn't make a chat appear for either side.
     @Test func aSentRequestCanBeCancelled() async throws {
@@ -2428,6 +2492,22 @@ struct RelayFlowTests {
         #expect(!alice.data.contacts.contains { $0.persona == persona.id })
         #expect(bob.data.contacts.filter { !$0.isSelf && !$0.hidden }.map(\.name) == ["Alice"], "Bob forgets only Mask")
         #expect(alice.visibleContacts.map(\.name) == ["Bob"], "the main identity keeps its contact")
+    }
+
+    /// Double-tapping the Account tab goes to the next persona, round through the main account and back.
+    @Test func switchingToTheNextPersonaGoesRound() async throws {
+        let me = try await makeUser("Me")
+        defer { me.lock() }
+        me.switchToNextPersona()
+        #expect(me.activePersona == nil, "with only one account there is nowhere to go")
+        let a = try #require(me.createPersona(name: "A"))
+        let b = try #require(me.createPersona(name: "B"))
+        me.switchToNextPersona()
+        #expect(me.activePersona == a.id)
+        me.switchToNextPersona()
+        #expect(me.activePersona == b.id)
+        me.switchToNextPersona()
+        #expect(me.activePersona == nil, "back to the main account")
     }
 
     @Test func personasStopAtTheLimit() async throws {
