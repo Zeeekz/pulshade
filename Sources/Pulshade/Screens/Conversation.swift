@@ -668,6 +668,8 @@ private struct Bubble: View {
     @State private var hovering = false
     @State private var picking = false
     @State private var viewingImage = false
+    /// Counts double-tap hearts, so each one plays the burst again.
+    @State private var hearts = 0
 
     static let quick = ["❤️", "😂", "🔥", "😮", "😢", "👍"]
 
@@ -683,6 +685,10 @@ private struct Bubble: View {
             if mine && !Platform.isPhone { actions }
             VStack(alignment: mine ? .trailing : .leading, spacing: -5) {
                 bubble
+                    .overlay { if canReact { HeartBurst(trigger: hearts) } }
+                    // A double tap loves the message, at once. It only adds: taking it back is the reaction itself.
+                    .simultaneousGesture(TapGesture(count: 2).onEnded { loveIt() })
+                    .accessibilityAction(named: "Love") { loveIt() }
                 if !message.reactions.isEmpty {
                     ReactionChips(reactions: message.reactions, mine: mine) { react($0) }
                         .padding(.horizontal, 8)
@@ -728,6 +734,13 @@ private struct Bubble: View {
                 Button("Unsend for everyone", role: .destructive, action: unsend)
             }
         }
+    }
+
+    private func loveIt() {
+        guard canReact, !message.isSystem else { return }
+        if message.reactions["me"] != "❤️" { react("❤️") }
+        hearts += 1
+        Haptics.tick()
     }
 
     private var bubble: some View {
@@ -783,10 +796,20 @@ private struct Bubble: View {
             if let voice = message.voice {
                 VoiceBubble(note: voice, id: message.id, mine: mine)
             }
-            if !message.text.isEmpty {
+            if let collectible = message.collectible, collectible.kind != nil {
+                CollectibleCard(collectible: collectible, mine: mine)
+            }
+            if let card = message.note {
+                NoteCardView(card: card, message: message, mine: mine)
+            }
+            if message.collectible?.kind != nil || message.note != nil {
+                // The card says it all; the words are only for apps that don't know cards.
+            } else if bare {
+                BigEmoji(text: message.text, fresh: Date().timeIntervalSince(message.date) < 6)
+            } else if !message.text.isEmpty {
                 Text(LinkPreviews.linked(message.text))
-                    .font(.system(size: bare ? 40 : 14))
-                    .foregroundStyle(mine && !bare ? Ink.onAccent.opacity(0.88) : Ink.text)
+                    .font(.system(size: 14))
+                    .foregroundStyle(mine ? Ink.onAccent.opacity(0.88) : Ink.text)
                     .tint(mine ? Ink.onAccent.opacity(0.85) : theme.accent)
                     .textSelection(.enabled)
             }
@@ -855,7 +878,7 @@ private struct Bubble: View {
                                 Button {
                                     react(e)
                                     picking = false
-                                } label: { Text(e).font(.system(size: 20)) }
+                                } label: { if e == "❤️" { PulseHeart(size: 22) } else { Text(e).font(.system(size: 20)) } }
                                     .buttonStyle(EmojiButtonStyle(selected: message.reactions["me"] == e))
                             }
                         }
@@ -865,6 +888,146 @@ private struct Bubble: View {
         }
         .opacity((hovering || picking) && swipe == 0 ? 1 : 0)
         .padding(.bottom, 4)
+    }
+}
+
+/// A few emoji on their own float without a bubble. One is big, like WhatsApp's, and pops in when it arrives and
+/// bounces when it's tapped, like Telegram's. With Reduce Motion on it just sits there, big.
+private struct BigEmoji: View {
+    var text: String
+    @State private var popped: Bool
+    @State private var taps = 0
+
+    init(text: String, fresh: Bool) {
+        self.text = text
+        // Old messages are simply there: only one that has just arrived pops in.
+        _popped = State(initialValue: !fresh || Platform.reduceMotion)
+    }
+
+    /// One emoji is the biggest; each one more makes them smaller, so three still fit a line.
+    private var size: CGFloat {
+        switch text.filter({ !$0.isWhitespace }).count {
+        case 1: 96
+        case 2: 68
+        default: 52
+        }
+    }
+
+    private struct Bounce {
+        var scale = 1.0
+        var angle = 0.0
+    }
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: size))
+            .scaleEffect(popped ? 1 : 0.2)
+            .rotationEffect(.degrees(popped ? 0 : -16))
+            .keyframeAnimator(initialValue: Bounce(), trigger: taps) { view, bounce in
+                view.scaleEffect(bounce.scale).rotationEffect(.degrees(bounce.angle))
+            } keyframes: { _ in
+                KeyframeTrack(\.scale) {
+                    SpringKeyframe(1.3, duration: 0.16, spring: .snappy)
+                    SpringKeyframe(0.92, duration: 0.14)
+                    SpringKeyframe(1.0, duration: 0.3, spring: .bouncy)
+                }
+                KeyframeTrack(\.angle) {
+                    LinearKeyframe(-12, duration: 0.09)
+                    LinearKeyframe(12, duration: 0.11)
+                    LinearKeyframe(-7, duration: 0.1)
+                    SpringKeyframe(0, duration: 0.3, spring: .bouncy)
+                }
+            }
+            .onAppear {
+                guard !popped else { return }
+                withAnimation(.spring(response: 0.55, dampingFraction: 0.42)) { popped = true }
+            }
+            .onTapGesture {
+                guard !Platform.reduceMotion else { return }
+                taps += 1
+                Haptics.tick()
+            }
+            .accessibilityLabel(text)
+    }
+}
+
+/// A collectible someone showed in the chat, drawn at a good size with its name and number.
+private struct CollectibleCard: View {
+    @Environment(\.theme) private var theme
+    var collectible: Collectible
+    var mine: Bool
+
+    var body: some View {
+        if let kind = collectible.kind {
+            VStack(spacing: 4) {
+                CollectibleIcon(item: kind, size: 132)
+                Text(kind.name).font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(mine ? Ink.onAccent : Ink.text).lineLimit(1)
+                Text("#\(collectible.serial)").font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(mine ? Ink.onAccent.opacity(0.7) : Ink.dim)
+            }
+            .padding(.vertical, 6).padding(.horizontal, 10)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(kind.name), number \(collectible.serial)")
+        }
+    }
+}
+
+/// A note sent as a card. Only its title travelled: tapping reads it from the sender's profile, so a locked one asks
+/// for its password, one made for you says "Access Granted", and one that isn't yours to read says so.
+private struct NoteCardView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.theme) private var theme
+    var card: NoteCard
+    var message: Message
+    var mine: Bool
+    @State private var reading: ProfileNote?
+    @State private var unavailable = false
+
+    private var symbol: String { card.locked ? "lock.fill" : card.restricted ? "person.fill.checkmark" : "doc.text.fill" }
+
+    private var subtitle: String {
+        card.locked ? "Locked with a password" : card.restricted ? "Only for chosen people" : "Note"
+    }
+
+    /// The note itself: yours, or what the sender's profile has given you.
+    private func note() -> ProfileNote? {
+        if message.isMine { return model.activeProfile.notes?.first { $0.id == card.id } }
+        return model.contact(message.sender, in: model.activePersona)?.notes?.first { $0.id == card.id }
+    }
+
+    var body: some View {
+        Button {
+            if let found = note() { reading = found } else { unavailable = true }
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: symbol)
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(mine ? Ink.onAccent : theme.accent)
+                    .frame(width: 40, height: 40)
+                    .background((mine ? Ink.onAccent : theme.accent).opacity(0.16), in: .rect(cornerRadius: 10, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(card.title).font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(mine ? Ink.onAccent : Ink.text).lineLimit(2).multilineTextAlignment(.leading)
+                    Text(subtitle).font(.system(size: 12))
+                        .foregroundStyle(mine ? Ink.onAccent.opacity(0.7) : Ink.dim)
+                }
+                Spacer(minLength: 4)
+                Image(systemName: "chevron.right").font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(mine ? Ink.onAccent.opacity(0.6) : Ink.faint)
+            }
+            .frame(minWidth: 210, maxWidth: 270, alignment: .leading)
+            .padding(.vertical, 4)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(card.title), \(subtitle). Opens the note.")
+        .sheet(item: $reading) { found in NoteReaderSheet(note: found, tint: theme.accent) }
+        .alert("You can't read this note", isPresented: $unavailable) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("It isn't shared with you, or it hasn't reached your phone yet. Ask \(message.isMine ? "yourself" : "them") to check who can read it.")
+        }
     }
 }
 
@@ -930,7 +1093,7 @@ private struct ReactionChips: View {
             ForEach(counts, id: \.key) { emoji, count in
                 Button { tap(emoji) } label: {
                     HStack(spacing: 3) {
-                        Text(emoji).font(.system(size: 13))
+                        if emoji == "❤️" { PulseHeart(size: 15) } else { Text(emoji).font(.system(size: 13)) }
                         if count > 1 { Text("\(count)").font(.system(size: 10, weight: .bold)).foregroundStyle(Ink.dim) }
                     }
                     .padding(.horizontal, 7).frame(height: 24)

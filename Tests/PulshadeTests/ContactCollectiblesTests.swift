@@ -51,9 +51,10 @@ struct ContactCollectiblesDeliveryTests {
 
     @Test func aContactSeesOnlyWhatIsGenuine() async throws {
         let admin = Curve25519.Signing.PrivateKey()
+        await AdminKeyGate.shared.acquire()
         let saved = AppModel.adminKey
         AppModel.adminKey = admin.publicKey.rawRepresentation
-        defer { AppModel.adminKey = saved }
+        defer { AppModel.adminKey = saved; Task { await AdminKeyGate.shared.release() } }
         let alice = try await makeUser("Alice")
         let bob = try await makeUser("Bob")
         defer { for m in [alice, bob] { m.lock() } }

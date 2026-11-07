@@ -26,9 +26,10 @@ struct RelayFlowTests {
     /// never does, and one taken back goes away.
     @Test func announcementsReachEveryoneAndOnlyGenuineOnes() async throws {
         let admin = Curve25519.Signing.PrivateKey()
+        await AdminKeyGate.shared.acquire()
         let previous = AppModel.adminKey
         AppModel.adminKey = admin.publicKey.rawRepresentation
-        defer { AppModel.adminKey = previous }
+        defer { AppModel.adminKey = previous; Task { await AdminKeyGate.shared.release() } }
         let alice = try await makeUser("Alice")
         let bob = try await makeUser("Bob")
         defer { for m in [alice, bob] { m.lock() } }
@@ -75,9 +76,10 @@ struct RelayFlowTests {
     /// notification it raised goes with it.
     @Test func aTakenBackAnnouncementLeavesEveryDevice() async throws {
         let admin = Curve25519.Signing.PrivateKey()
+        await AdminKeyGate.shared.acquire()
         let previous = AppModel.adminKey
         AppModel.adminKey = admin.publicKey.rawRepresentation
-        defer { AppModel.adminKey = previous }
+        defer { AppModel.adminKey = previous; Task { await AdminKeyGate.shared.release() } }
         let alice = try await makeUser("Alice")
         let bob = try await makeUser("Bob")
         defer { for m in [alice, bob] { m.lock() } }
@@ -863,6 +865,32 @@ struct RelayFlowTests {
         // Going private removes the listing.
         await alice.unpublishProfile()
         #expect(try await bob.findProfile(handle) == nil)
+    }
+
+    /// A collectible shown in a chat is kept only if it is really the sender's: one for someone else's key is dropped.
+    @Test func aCollectibleInTheChatMustBeTheSenders() async throws {
+        let admin = Curve25519.Signing.PrivateKey()
+        await AdminKeyGate.shared.acquire()
+        let saved = AppModel.adminKey
+        AppModel.adminKey = admin.publicKey.rawRepresentation
+        defer { AppModel.adminKey = saved; Task { await AdminKeyGate.shared.release() } }
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        let carol = try await makeUser("Carol")
+        defer { for m in [alice, bob, carol] { m.lock() } }
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, bob)
+        let chat = try #require(alice.data.conversations.first { $0.kind == .direct })
+        let hers = try Collectible.make(.partyHat, serial: 1, owner: try #require(alice.identity).card.signing, signedBy: admin)
+        let carols = try Collectible.make(.partyHat, serial: 2, owner: try #require(carol.identity).card.signing, signedBy: admin)
+        #expect(hers.isGenuine(for: hers.owner), "set up right")
+        alice.send("Party Hat #1", collectible: hers, in: chat.id)
+        alice.send("Party Hat #2", collectible: carols, in: chat.id)
+        await settle(alice, bob)
+        let received = try #require(bob.data.conversations.first { $0.kind == .direct }).messages
+        #expect(received.count == 2)
+        #expect(received.first { $0.text == "Party Hat #1" }?.collectible == hers, "hers is shown")
+        #expect(received.first { $0.text == "Party Hat #2" }?.collectible == nil, "someone else's isn't, only the words")
     }
 
     /// A relay restart empties waiting mail. A friend request nobody answered is sent again from what the sender
@@ -2234,8 +2262,10 @@ struct RelayFlowTests {
         defer { for m in [bob, carol] { m.lock() } }
         // The admin app's keys, and the app built to trust them.
         let admin = Curve25519.Signing.PrivateKey(), reportsKey = Curve25519.KeyAgreement.PrivateKey(), mailbox = Mailbox.make()
+        await AdminKeyGate.shared.acquire()
+        let before = AppModel.adminKey
         AppModel.adminKey = admin.publicKey.rawRepresentation
-        defer { AppModel.adminKey = nil }
+        defer { AppModel.adminKey = before; Task { await AdminKeyGate.shared.release() } }
 
         // No app account can run operator actions: only the admin token works.
         #expect(try await operate("stats", token: "a guess").status == 401)
@@ -2315,9 +2345,10 @@ struct RelayFlowTests {
     /// get a place in line, the admin app signs each in order, and it shows up in their app as a genuine collectible.
     @Test func aGiveawayGivesEachCollectibleToTheFirstPeopleToEnterTheCode() async throws {
         let admin = Curve25519.Signing.PrivateKey()
+        await AdminKeyGate.shared.acquire()
         let previous = AppModel.adminKey
         AppModel.adminKey = admin.publicKey.rawRepresentation
-        defer { AppModel.adminKey = previous }
+        defer { AppModel.adminKey = previous; Task { await AdminKeyGate.shared.release() } }
         let alice = try await makeUser("Alice")
         let bob = try await makeUser("Bob")
         let carol = try await makeUser("Carol")
@@ -2373,9 +2404,10 @@ struct RelayFlowTests {
     /// and only for the account that signs the claim.
     @Test func oneBackupCodeBringsEveryCollectibleBackAfterABurn() async throws {
         let admin = Curve25519.Signing.PrivateKey()
+        await AdminKeyGate.shared.acquire()
         let previous = AppModel.adminKey
         AppModel.adminKey = admin.publicKey.rawRepresentation
-        defer { AppModel.adminKey = previous }
+        defer { AppModel.adminKey = previous; Task { await AdminKeyGate.shared.release() } }
         let old = try await makeUser("Old")
         let reborn = try await makeUser("Reborn")
         let thief = try await makeUser("Thief")
@@ -2438,9 +2470,10 @@ struct RelayFlowTests {
     /// of each is #1 again.
     @Test func resettingCollectiblesClearsEveryoneAndStartsAtOne() async throws {
         let admin = Curve25519.Signing.PrivateKey()
+        await AdminKeyGate.shared.acquire()
         let previous = AppModel.adminKey
         AppModel.adminKey = admin.publicKey.rawRepresentation
-        defer { AppModel.adminKey = previous }
+        defer { AppModel.adminKey = previous; Task { await AdminKeyGate.shared.release() } }
         let ann = try await makeUser("Ann")
         defer { ann.lock() }
         let key = try #require(ann.me(nil)).card.signing
@@ -2464,9 +2497,10 @@ struct RelayFlowTests {
     /// what's been given out, and tells the app the size of the run so the last number can be marked.
     @Test func theOperatorCanChangeHowManyOfACollectibleThereAre() async throws {
         let admin = Curve25519.Signing.PrivateKey()
+        await AdminKeyGate.shared.acquire()
         let previous = AppModel.adminKey
         AppModel.adminKey = admin.publicKey.rawRepresentation
-        defer { AppModel.adminKey = previous }
+        defer { AppModel.adminKey = previous; Task { await AdminKeyGate.shared.release() } }
         let ann = try await makeUser("Ann")
         defer { ann.lock() }
         let key = try #require(ann.me(nil)).card.signing

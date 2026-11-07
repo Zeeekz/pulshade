@@ -473,6 +473,11 @@ struct Message: Codable, Identifiable, Equatable {
     var video: Data?
     /// How long the video runs.
     var clipSeconds: Double?
+    /// A collectible the sender showed in the chat: checked against their key before it's kept, so it's theirs.
+    var collectible: Collectible?
+    /// A note of the sender's profile, shown as a card: only its title travels. Opening it reads the note from their
+    /// profile, behind its password or the access they gave.
+    var note: NoteCard?
 
     var isVideo: Bool { video != nil }
     var isMine: Bool { sender == "me" }
@@ -507,7 +512,48 @@ struct Message: Codable, Identifiable, Equatable {
         preview = try? c.decodeIfPresent(LinkPreview.self, forKey: .preview)
         video = try? c.decodeIfPresent(Data.self, forKey: .video)
         clipSeconds = try? c.decodeIfPresent(Double.self, forKey: .clipSeconds)
+        collectible = try? c.decodeIfPresent(Collectible.self, forKey: .collectible)
+        note = try? c.decodeIfPresent(NoteCard.self, forKey: .note)
     }
+}
+
+/// A note sent into a chat as a card. It carries no words: those stay on the sender's profile.
+struct NoteCard: Codable, Equatable {
+    var id: String
+    var title: String
+    /// Whether the note has a password, so the card can say so before it's opened.
+    var locked: Bool
+    /// Whether the note is only for chosen contacts, so the card can say so.
+    var restricted: Bool
+
+    init(id: String, title: String, locked: Bool, restricted: Bool) {
+        self.id = id
+        self.title = title
+        self.locked = locked
+        self.restricted = restricted
+    }
+
+    /// Never fails on one odd entry, so a newer app's card still opens in an older one.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try? c.decode(String.self, forKey: .id)) ?? ""
+        title = (try? c.decode(String.self, forKey: .title)) ?? ""
+        locked = (try? c.decode(Bool.self, forKey: .locked)) ?? false
+        restricted = (try? c.decode(Bool.self, forKey: .restricted)) ?? false
+    }
+
+    init(_ note: ProfileNote) {
+        self.init(id: note.id, title: note.title, locked: note.isLocked, restricted: note.isRestricted)
+    }
+
+    /// What someone sent as a card, checked: a short plain title and an id, or nothing.
+    static func cleaned(_ card: NoteCard) -> NoteCard? {
+        guard !card.id.isEmpty, card.id.count <= 32, let title = ProfileNote.cleanTitle(card.title) else { return nil }
+        return NoteCard(id: card.id, title: title, locked: card.locked, restricted: card.restricted)
+    }
+
+    /// The words an app from before cards shows instead.
+    var fallbackText: String { "📄 \(title)" }
 }
 
 /// Disappearing-message timers on offer.
@@ -978,7 +1024,8 @@ struct AppData: Codable {
     /// 4: a profile note can list the contacts it is for.
     /// 5: a sealed backup is kept on the relay, and when it was last saved.
     /// 7: a profile can have more than one @handle in use; messages can be videos; a device says if it reads frames.
-    static let currentFormat = 7
+    /// 8: a message can show a collectible or carry a note as a card.
+    static let currentFormat = 8
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []

@@ -86,6 +86,10 @@ struct NoteReaderSheet: View {
                 Spacer()
                 Button("Done") { dismiss() }.buttonStyle(.plain).font(.system(size: 15, weight: .semibold)).foregroundStyle(theme.accent)
             }
+            if note.restricted == true {
+                Label("Access Granted", systemImage: "checkmark.seal.fill")
+                    .font(.system(size: 13, weight: .semibold)).foregroundStyle(.green)
+            }
             if let text {
                 ScrollView {
                     Text(text)
