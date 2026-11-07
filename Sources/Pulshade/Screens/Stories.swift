@@ -60,7 +60,7 @@ struct StoryStrip: View {
                     let contact = model.contact(entry.author)
                     Button {
                         viewing = StoryReel(stories: entry.stories, start: entry.stories.firstIndex { !$0.seen } ?? 0,
-                                            following: unseenReels(after: entry.author))
+                                            following: unseenReels(after: entry.author), preceding: reels(before: entry.author))
                     } label: {
                         StoryBubble(image: contact?.avatar, seed: entry.author, name: model.displayName(entry.author),
                                     active: entry.stories.contains { !$0.seen }, adding: false)
@@ -77,6 +77,13 @@ struct StoryStrip: View {
 
     }
 
+    /// Everyone in the row before `author`, seen or not, your own story first: where a swipe back goes.
+    private func reels(before author: String) -> [[Story]] {
+        let all = model.friendStories
+        let earlier = all.firstIndex { $0.author == author }.map { Array(all[..<$0]) } ?? []
+        return (model.myStories.isEmpty ? [] : [model.myStories]) + earlier.map(\.stories)
+    }
+
     /// The row's stories that haven't all been seen, after `author`'s (or all of them, from your own).
     private func unseenReels(after author: String?) -> [[Story]] {
         let all = model.friendStories
@@ -91,6 +98,8 @@ struct StoryReel: Identifiable {
     var start = 0
     /// Whose stories play next when these run out: the people after them in the row who have something unseen.
     var following: [[Story]] = []
+    /// The people before them in the row, so a swipe right goes back to them.
+    var preceding: [[Story]] = []
 }
 
 private struct StoryBubble: View {
@@ -158,8 +167,31 @@ struct StoryFace: View {
 
     /// A video still arriving says how far it has got, once its first piece is in.
     private var loadingLabel: String {
-        guard let got = model?.clipProgress(of: story.id), got.have > 0, got.of > 1 else { return "Loading video" }
+        guard let got = model?.clipProgress(of: story.id, persona: story.persona), got.have > 0, got.of > 1 else { return "Loading video" }
         return "Loading video · \(got.have) of \(got.of)"
+    }
+
+    /// A video still on its way: how far it has got, and once it has been asked for, who it is waiting on, with a
+    /// way to ask again. Read again every few seconds, since the asking happens out of sight.
+    private var waiting: some View {
+        TimelineView(.periodic(from: .now, by: 4)) { _ in
+            let got = model?.clipProgress(of: story.id, persona: story.persona)
+            let started = (got?.have ?? 0) > 0
+            let wait = model?.clipWait(of: story)
+            VStack(spacing: 8) {
+                Text(loadingLabel).font(.system(size: 13, weight: .semibold)).monospacedDigit()
+                if !started, let wait, wait.asked {
+                    Text("Waiting for \(wait.name) to send it. Pulshade needs to be open on their phone.")
+                        .font(.system(size: 12)).multilineTextAlignment(.center).padding(.horizontal, 28)
+                    Button("Ask again") { model?.askAgain(for: story) }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 13, weight: .semibold))
+                        .padding(.horizontal, 16).padding(.vertical, 8)
+                        .background(.white.opacity(0.18), in: .capsule)
+                }
+            }
+            .foregroundStyle(.white.opacity(0.85))
+        }
     }
 
     var body: some View {
@@ -186,7 +218,7 @@ struct StoryFace: View {
                     // Still arriving: it plays as soon as the last piece is in.
                     VStack(spacing: 10) {
                         ProgressView().tint(.white)
-                        if !compact { Text(loadingLabel).font(.system(size: 13, weight: .semibold)).foregroundStyle(.white.opacity(0.8)).monospacedDigit() }
+                        if !compact { waiting }
                     }
                     .accessibilityElement(children: .combine)
                     .accessibilityLabel(loadingLabel)
@@ -880,9 +912,15 @@ struct StoryViewers: View {
                         .frame(minHeight: 52)
                     }
                 }
-                SettingsGroup {
+                SettingsGroup(footer: model.storyReceipt(of: story) == nil ? nil : "Counts only people who have delivery receipts on, so it can be lower than the number who really have it.") {
                     SettingRow("Shared with", symbol: "person.2") {
                         Text(model.summary(of: story.shownTo)).font(.system(size: 14)).foregroundStyle(Ink.faint)
+                    }
+                    if let got = model.storyReceipt(of: story) {
+                        RowDivider(inset: 52)
+                        SettingRow("Has it", symbol: "checkmark.circle") {
+                            Text("\(got.have) of \(got.of)").font(.system(size: 14)).foregroundStyle(Ink.faint)
+                        }
                     }
                     RowDivider(inset: 52)
                     SettingRow("Disappears", symbol: "clock") {
@@ -962,6 +1000,10 @@ struct StoryCamera: View {
             Color.black.ignoresSafeArea()
             if ready == true {
                 GeometryReader { geo in
+                    // The preview is the story's own 9:16 frame, centred, so what is on screen is what is posted: a
+                    // preview that filled the whole (taller) screen showed a narrower slice than the story keeps.
+                    let frame = CGSize(width: max(min(geo.size.width, geo.size.height * 9 / 16), 1),
+                                       height: max(min(geo.size.width, geo.size.height * 9 / 16), 1) * 16 / 9)
                     ZStack {
                         LayerView(layer: camera.preview)
                             .blur(radius: flipBlur)
@@ -974,14 +1016,17 @@ struct StoryCamera: View {
                                 .allowsHitTesting(false)
                         }
                     }
+                    .frame(width: frame.width, height: frame.height)
+                    .clipped()
                     .contentShape(Rectangle())
                     .simultaneousGesture(ExclusiveGesture(SpatialTapGesture(count: 2), SpatialTapGesture(count: 1))
                         .onEnded { result in
                             switch result {
                             case .first: flipCamera()
-                            case let .second(tap): focus(at: tap.location, in: geo.size)
+                            case let .second(tap): focus(at: tap.location, in: frame)
                             }
                         })
+                    .position(x: geo.size.width / 2, y: geo.size.height / 2)
                 }
                 .ignoresSafeArea()
                     .filterSwipe($filter, enabled: !pinching && pressStart == nil, swipes: false)
@@ -1301,6 +1346,11 @@ struct StoryViewer: View {
     /// The stories on screen now, and the people queued after them.
     @State private var reel: [Story]
     @State private var upcoming: [[Story]]
+    /// The people already passed, nearest last, so a swipe right comes back to them.
+    @State private var previousReels: [[Story]]
+    /// Which way the page turns when the person changes. Set a moment before the change, since a page going away
+    /// turns the way it was last drawn.
+    @State private var turnsForward = true
     @State private var index = 0
     /// How far through the story on screen. Kept out of the view's own state so the 30 ticks a second redraw only
     /// the bars, not the picture, the header and the buttons.
@@ -1325,10 +1375,11 @@ struct StoryViewer: View {
     @State private var sentNote: String?
     private let duration: Double = 5
 
-    init(stories: [Story], start: Int = 0, following: [[Story]] = []) {
+    init(stories: [Story], start: Int = 0, following: [[Story]] = [], preceding: [[Story]] = []) {
         self.start = start
         _reel = State(initialValue: stories)
         _upcoming = State(initialValue: following)
+        _previousReels = State(initialValue: preceding)
     }
     private let tick = Timer.publish(every: 1 / 30, on: .main, in: .common).autoconnect()
 
@@ -1347,8 +1398,8 @@ struct StoryViewer: View {
 
     private var currentID: Story.ID? { current.indices.contains(index) ? current[index].id : nil }
 
-    var body: some View {
-        let stories = current
+    /// One person's stories as a page: the picture, bars, header and buttons. Changing person turns the whole page.
+    private func page(_ stories: [Story]) -> some View {
         ZStack(alignment: .top) {
             if stories.indices.contains(index) {
                 // The picture goes under the status bar and home bar; everything written over it stays inside them.
@@ -1410,6 +1461,21 @@ struct StoryViewer: View {
                 }
             }
         }
+    }
+
+    /// Identifies the person on screen: a new one is a new page.
+    private var pageKey: String {
+        reel.first.map { "\($0.author)|\($0.persona?.uuidString ?? "")" } ?? "none"
+    }
+
+    var body: some View {
+        let stories = current
+        ZStack {
+            page(stories)
+                .id(pageKey)
+                .transition(reduceMotion ? .opacity : .turning(forward: turnsForward))
+        }
+        .clipped()
         .scaleEffect(1 - min(dragY, 400) / 2000, anchor: .top)
         .offset(y: dragY)
         // A video has no size of its own, so on the Mac the window is given the story's shape outright.
@@ -1462,7 +1528,7 @@ struct StoryViewer: View {
     }
 
     private func markSeenIfReady() {
-        if current.indices.contains(index), current[index].isReady { model.markSeen(current[index].id) }
+        if current.indices.contains(index), current[index].isReady { model.markSeen(current[index].id, persona: current[index].persona) }
     }
 
     /// Plays the video of the story now on screen, and lets go of the last one.
@@ -1506,6 +1572,12 @@ struct StoryViewer: View {
         if drag.translation.height < -70, abs(drag.translation.height) > abs(drag.translation.width) * 1.5,
            current.indices.contains(index), current[index].author == "me" {
             showingViewers = current[index]
+            return
+        }
+        // A swipe sideways goes to the next person (left) or the one before (right).
+        let across = drag.translation.width
+        if abs(across) > abs(drag.translation.height) * 1.5, abs(across) > 60 || abs(drag.predictedEndTranslation.width) > 220 {
+            goPerson(across < 0 ? 1 : -1)
             return
         }
         guard !wasHolding, abs(drag.translation.width) < 24, abs(drag.translation.height) < 24 else { return }
@@ -1638,23 +1710,42 @@ struct StoryViewer: View {
     }
 
     /// Past the last story of this person: on to the next person with something new, or close.
-    private func nextReel() {
-        guard !upcoming.isEmpty else { dismiss(); return }
+    private func nextReel() { goPerson(1, closeAtEnd: true) }
+
+    /// To the next person (1) or the one before (-1), the page turning like a cube. Past either end it closes (if
+    /// asked to, going forward) or does nothing.
+    private func goPerson(_ d: Int, closeAtEnd: Bool = false) {
+        guard d > 0 ? !upcoming.isEmpty : !previousReels.isEmpty else {
+            if d > 0, closeAtEnd { dismiss() }
+            return
+        }
+        // The story on screen stops now, so a late tick can't step twice while the page turns.
         clip?.close()
         clip = nil
-        let next = upcoming.removeFirst()
-        withAnimation(reduceMotion ? .easeInOut(duration: 0.2) : .smooth(duration: 0.35)) {
-            reel = next
-            gone = []
-            index = next.firstIndex { !$0.seen } ?? 0
-        }
         clock.progress = 0
+        turnsForward = d > 0
+        Task { @MainActor in
+            // A moment for the direction to be drawn, then the change itself.
+            try? await Task.sleep(for: .milliseconds(30))
+            withAnimation(reduceMotion ? .easeInOut(duration: 0.2) : .smooth(duration: 0.45)) {
+                if d > 0 {
+                    previousReels.append(reel)
+                    reel = upcoming.removeFirst()
+                } else {
+                    upcoming.insert(reel, at: 0)
+                    reel = previousReels.removeLast()
+                }
+                gone = []
+                index = reel.firstIndex { !$0.seen } ?? 0
+            }
+            clock.progress = 0
+        }
     }
 
     private func step(_ d: Int) {
         let next = index + d
         guard current.indices.contains(next) else {
-            if d > 0 { nextReel() } else { clock.progress = 0; clip?.restart() }
+            if d > 0 { nextReel() } else if !previousReels.isEmpty { goPerson(-1) } else { clock.progress = 0; clip?.restart() }
             return
         }
         // Let go of this clip now, so a late tick can't step twice.
@@ -1663,5 +1754,32 @@ struct StoryViewer: View {
         withAnimation(.easeOut(duration: 0.18)) { index = next }
         clock.progress = 0
         prefetchAround(next)
+    }
+}
+
+
+// MARK: - Turning between people
+
+/// A page swinging round a vertical edge as another comes in beside it, like a cube turning.
+private struct PageTurn: ViewModifier {
+    /// 0 in place; +1 waiting off the right, -1 gone off the left.
+    var turn: Double
+
+    func body(content: Content) -> some View {
+        content.visualEffect { view, proxy in
+            view
+                .offset(x: proxy.size.width * turn)
+                .rotation3DEffect(.degrees(-turn * 60), axis: (x: 0, y: 1, z: 0),
+                                  anchor: turn > 0 ? .leading : .trailing, perspective: 0.45)
+        }
+    }
+}
+
+extension AnyTransition {
+    /// The page in view leaves one way as the next arrives from the other; `forward` is towards the next person.
+    fileprivate static func turning(forward: Bool) -> AnyTransition {
+        let way = forward ? 1.0 : -1.0
+        return .asymmetric(insertion: .modifier(active: PageTurn(turn: way), identity: PageTurn(turn: 0)),
+                           removal: .modifier(active: PageTurn(turn: -way), identity: PageTurn(turn: 0)))
     }
 }

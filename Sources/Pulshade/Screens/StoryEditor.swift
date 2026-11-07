@@ -273,6 +273,8 @@ struct StoryTypingOverlay: View {
             let ink = StoryInk.colors[item.color % StoryInk.colors.count]
             ZStack {
                 Color.black.opacity(0.6).ignoresSafeArea().onTapGesture { finish() }
+                // Scrolls when the words outgrow the room above the keyboard, so they can't run off the screen.
+                ScrollView {
                 TextField("", text: binding(\.text, fallback: ""),
                           prompt: Text("Type here").foregroundStyle(.white.opacity(0.45)), axis: .vertical)
                     .textFieldStyle(.plain)
@@ -290,6 +292,13 @@ struct StoryTypingOverlay: View {
                     .frame(maxWidth: canvasWidth * 0.86)
                     .animation(.snappy(duration: 0.15), value: item.backed)
                     .animation(.snappy(duration: 0.15), value: item.face)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                }
+                .scrollBounceBehavior(.basedOnSize)
+                .scrollIndicators(.never)
+                // Clear of the Done button; the sides are left alone so words wrap exactly as they will in the story.
+                .padding(.top, 52)
             }
             .overlay(alignment: .topTrailing) {
                 Button("Done") { finish() }

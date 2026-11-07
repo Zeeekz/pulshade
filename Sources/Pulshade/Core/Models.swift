@@ -869,8 +869,25 @@ struct Story: Codable, Identifiable, Equatable {
     }
 }
 
+/// A clip being received: its story or message id, and the persona it came in on. One friend can send the same
+/// story to two of your personas, so the id alone isn't enough to tell the two copies apart.
+struct ClipKey: Hashable {
+    var id: UUID
+    var persona: UUID?
+    init(_ id: UUID, _ persona: UUID?) { self.id = id; self.persona = persona }
+    /// The key it is saved under: the id itself without a persona, else the id mixed with the persona's.
+    var stored: UUID {
+        guard let persona else { return id }
+        var a = id.uuid, b = persona.uuid
+        withUnsafeMutableBytes(of: &a) { x in withUnsafeBytes(of: &b) { y in for i in 0..<16 { x[i] ^= y[i] } } }
+        return UUID(uuid: a)
+    }
+}
+
 /// The pieces of a clip that have arrived so far, waiting for the rest.
 struct ClipParts: Codable {
+    /// The story or message the pieces belong to. Nil in pieces saved by older builds, which are asked for again.
+    var id: UUID?
     var author: String
     var persona: UUID?
     var date = Date()

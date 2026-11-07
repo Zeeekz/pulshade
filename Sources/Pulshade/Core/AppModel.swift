@@ -36,9 +36,9 @@ final class AppModel {
     /// don't know the change would refuse the data.
     @ObservationIgnored var removedStories: [String: Date] = [:]
     /// A friend's video still arriving: when its last piece (or the story itself) came in. In memory only.
-    @ObservationIgnored private var clipActivity: [UUID: Date] = [:]
+    @ObservationIgnored private var clipActivity: [ClipKey: Date] = [:]
     /// How often a stalled video has been asked for again, and when last.
-    @ObservationIgnored private var clipAsks: [UUID: (count: Int, at: Date)] = [:]
+    @ObservationIgnored private var clipAsks: [ClipKey: (count: Int, at: Date)] = [:]
     /// When a video was last sent again on someone's asking, as "fingerprint|id", so one asking can't make it
     /// go over and over.
     @ObservationIgnored private var clipResent: [String: Date] = [:]
@@ -1150,7 +1150,7 @@ final class AppModel {
         let convo = startConversation(kind: .direct, title: "", members: [story.author], persona: .some(story.persona))
         let quote = ReplyRef(id: story.id, author: story.author, snippet: Self.snippet(of: story), picture: picture)
         send(like ? "❤️ Liked your story" : words, quote: quote, in: convo.id)
-        if like, let i = data.stories.firstIndex(where: { $0.id == story.id }) {
+        if like, let i = data.stories.firstIndex(where: { $0.id == story.id && $0.persona == story.persona }) {
             data.stories[i].liked = true
             save()
         }
@@ -1514,27 +1514,47 @@ final class AppModel {
         }
     }
 
+    /// Pieces saved by an older build carry no id and sit under the bare story id, where two personas' copies of one
+    /// story collided. Each is filed under its own persona now, and any clip that is already whole is put together
+    /// (its last piece came before there was a story to join it to, or went to the wrong copy).
+    private func refileOldClipParts() {
+        for (key, old) in data.clipParts where old.id == nil {
+            var entry = old
+            entry.id = key
+            data.clipParts[key] = nil
+            let home = ClipKey(key, entry.persona).stored
+            if data.clipParts[home] == nil { data.clipParts[home] = entry }
+        }
+        for entry in data.clipParts.values where entry.isComplete {
+            if let id = entry.id { assembleClip(id, persona: entry.persona) }
+        }
+    }
+
     /// A video that has stopped arriving part-way: with nothing new for a while, whoever posted it is asked for
     /// what's missing. A few times at most, further apart each time, while the story is still up.
     private func askForStalledClips() {
         let now = Date()
-        var stalled = Set(data.clipParts.keys)
-        for story in data.stories where story.author != "me" && story.isLive && !story.isReady { stalled.insert(story.id) }
+        // Keyed by story and persona: two of your personas can be sent the same story by one friend.
+        var stalled = Set(data.clipParts.values.compactMap { p in p.id.map { ClipKey($0, p.persona) } })
+        for story in data.stories where story.author != "me" && story.isLive && !story.isReady {
+            stalled.insert(ClipKey(story.id, story.persona))
+        }
         // Chat videos whose message has come but whose pieces haven't all.
         stalled.formUnion(clipActivity.keys)
-        for id in stalled {
-            let story = data.stories.first { $0.id == id }
-            let parts = data.clipParts[id]
-            if story == nil, let at = videoMessage(id) {
+        for key in stalled {
+            let id = key.id
+            let story = data.stories.first { $0.id == id && $0.persona == key.persona && $0.author != "me" }
+            let parts = data.clipParts[key.stored]
+            if story == nil, let at = videoMessage(id), data.conversations[at.convo].persona == key.persona {
                 // A chat video: asked of whoever sent it, in that chat's persona, while it's still unfinished.
                 let message = data.conversations[at.convo].messages[at.message]
-                guard message.video?.isEmpty == true, !message.isMine else { clipActivity[id] = nil; continue }
-                guard let last = clipActivity[id] else { clipActivity[id] = now; continue }
-                let asked = clipAsks[id], tries = asked?.count ?? 0
+                guard message.video?.isEmpty == true, !message.isMine else { clipActivity[key] = nil; continue }
+                guard let last = clipActivity[key] else { clipActivity[key] = now; continue }
+                let asked = clipAsks[key], tries = asked?.count ?? 0
                 guard tries < Self.clipAskLimit, now.timeIntervalSince(last) >= clipQuiet,
                       now.timeIntervalSince(asked?.at ?? .distantPast) >= clipQuiet * Double(1 << tries),
                       let contact = contact(message.sender, in: data.conversations[at.convo].persona) else { continue }
-                clipAsks[id] = (tries + 1, now)
+                clipAsks[key] = (tries + 1, now)
                 enqueue(.storyWant(id: id, parts: parts.map { p in (0..<p.of).filter { p.parts[$0] == nil } }), to: contact)
                 continue
             }
@@ -1542,14 +1562,14 @@ final class AppModel {
                   removedStories["\(author)|\(id)"] == nil else { continue }
             if story.map({ $0.isLive && !$0.isReady }) == false { continue }
             // Seen for the first time since launch: the wait starts now.
-            guard let last = clipActivity[id] else { clipActivity[id] = now; continue }
-            let asked = clipAsks[id]
+            guard let last = clipActivity[key] else { clipActivity[key] = now; continue }
+            let asked = clipAsks[key]
             let tries = asked?.count ?? 0
             guard tries < Self.clipAskLimit, now.timeIntervalSince(last) >= clipQuiet,
                   now.timeIntervalSince(asked?.at ?? .distantPast) >= clipQuiet * Double(1 << tries),
                   let contact = contact(author, in: story?.persona ?? parts?.persona) else { continue }
             let missing = parts.map { p in (0..<p.of).filter { p.parts[$0] == nil } }
-            clipAsks[id] = (tries + 1, now)
+            clipAsks[key] = (tries + 1, now)
             enqueue(.storyWant(id: id, parts: missing), to: contact)
         }
     }
@@ -1560,12 +1580,38 @@ final class AppModel {
 
     /// Joins a clip's pieces into its story once the story and every piece are here.
     /// How much of a video that's still arriving is here: pieces in, out of how many. Nil before the first lands.
-    func clipProgress(of id: Story.ID) -> (have: Int, of: Int)? {
-        data.clipParts[id].map { ($0.parts.count, $0.of) }
+    func clipProgress(of id: Story.ID, persona: UUID?) -> (have: Int, of: Int)? {
+        data.clipParts[ClipKey(id, persona).stored].map { ($0.parts.count, $0.of) }
     }
 
-    private func assembleClip(_ id: UUID) {
-        guard let pending = data.clipParts[id], pending.isComplete else { return }
+    /// For a friend's video story that hasn't arrived: who it's from, and whether it has been asked for yet.
+    func clipWait(of story: Story) -> (name: String, asked: Bool)? {
+        guard story.author != "me", let from = contact(story.author, in: story.persona) else { return nil }
+        return (from.displayName, clipAsks[ClipKey(story.id, story.persona)] != nil)
+    }
+
+    /// Asks the author for a video again now, instead of waiting for the next automatic ask. Not more than once
+    /// every few seconds, and it doesn't use up the automatic asks.
+    func askAgain(for story: Story) {
+        let key = ClipKey(story.id, story.persona)
+        guard story.author != "me", !story.isReady, let author = contact(story.author, in: story.persona),
+              removedStories["\(story.author)|\(story.id)"] == nil else { return }
+        if let at = clipAsks[key]?.at, Date().timeIntervalSince(at) < 15 { return }
+        clipAsks[key] = (clipAsks[key]?.count ?? 0, Date())
+        clipActivity[key] = Date()
+        let parts = data.clipParts[key.stored]
+        enqueue(.storyWant(id: story.id, parts: parts.map { p in (0..<p.of).filter { p.parts[$0] == nil } }), to: author)
+    }
+
+    /// The same for a video in a chat: it is in the persona that chat belongs to.
+    func clipProgress(ofMessage id: UUID) -> (have: Int, of: Int)? {
+        guard let at = videoMessage(id) else { return nil }
+        return clipProgress(of: id, persona: data.conversations[at.convo].persona)
+    }
+
+    private func assembleClip(_ id: UUID, persona: UUID?) {
+        let key = ClipKey(id, persona)
+        guard let pending = data.clipParts[key.stored], pending.isComplete else { return }
         // A video in a chat: from whoever wrote the message (or, for one of your own, from another of your devices).
         if let at = videoMessage(id) {
             let message = data.conversations[at.convo].messages[at.message]
@@ -1573,9 +1619,9 @@ final class AppModel {
             let mine = message.isMine && contact(pending.author, in: pending.persona)?.isSelf == true
             guard message.video?.isEmpty == true, theirs || mine, data.conversations[at.convo].persona == pending.persona else { return }
             let joined = (0..<pending.of).reduce(into: Data()) { $0.append(pending.parts[$1] ?? Data()) }
-            data.clipParts[id] = nil
-            clipActivity[id] = nil
-            clipAsks[id] = nil
+            data.clipParts[key.stored] = nil
+            clipActivity[key] = nil
+            clipAsks[key] = nil
             guard !joined.isEmpty, joined.count <= ChatVideo.maxBytes + 500_000 else { return }
             withAnimation(.snappy) { data.conversations[at.convo].messages[at.message].video = joined }
             return
@@ -1583,9 +1629,9 @@ final class AppModel {
         guard let i = data.stories.firstIndex(where: { $0.id == id && $0.author == pending.author && $0.persona == pending.persona }),
               case let .video(have, caption) = data.stories[i].style, have.isEmpty else { return }
         let joined = (0..<pending.of).reduce(into: Data()) { $0.append(pending.parts[$1] ?? Data()) }
-        data.clipParts[id] = nil
-        clipActivity[id] = nil
-        clipAsks[id] = nil
+        data.clipParts[key.stored] = nil
+        clipActivity[key] = nil
+        clipAsks[key] = nil
         guard !joined.isEmpty else { return }
         withAnimation(.snappy) { data.stories[i].style = .video(joined, caption: caption) }
         acknowledgeStory(id, author: pending.author, persona: pending.persona)
@@ -1696,8 +1742,8 @@ final class AppModel {
     }
 
     /// The first time you see someone's story, they're told (with story views on, and never from a one-time chat).
-    func markSeen(_ id: Story.ID) {
-        guard let i = data.stories.firstIndex(where: { $0.id == id }), !data.stories[i].seen else { return }
+    func markSeen(_ id: Story.ID, persona: UUID?) {
+        guard let i = data.stories.firstIndex(where: { $0.id == id && $0.persona == persona }), !data.stories[i].seen else { return }
         data.stories[i].seen = true
         let story = data.stories[i]
         if story.author != "me", data.security.storyViews,
@@ -1903,6 +1949,15 @@ final class AppModel {
     }
 
     /// Who viewed one of your stories, most recent first. Empty with story views off.
+    /// How many of the people a story of yours is for have said it reached them (with its video, for a video). Only
+    /// people with delivery receipts on can say so, so this can be lower than the truth.
+    func storyReceipt(of story: Story) -> (have: Int, of: Int)? {
+        guard story.author == "me", let delivery = story.delivery else { return nil }
+        let people = audience(of: story)
+        guard !people.isEmpty else { return nil }
+        return (people.filter { delivery.confirmed.contains($0.fingerprint) }.count, people.count)
+    }
+
     func viewers(of id: Story.ID) -> [(fingerprint: String, at: Date)] {
         guard data.security.storyViews, let story = data.stories.first(where: { $0.id == id && $0.author == "me" }) else { return [] }
         return (story.viewers ?? [:]).map { ($0.key, $0.value) }.sorted { $0.at > $1.at }
@@ -3496,6 +3551,7 @@ final class AppModel {
         if data.clipParts.contains(where: { $0.value.date <= clipCutoff }) {
             data.clipParts = data.clipParts.filter { $0.value.date > clipCutoff }
         }
+        refileOldClipParts()
         askForStalledClips()
         sendDueReceipts()
         drainStoryBacklog()
@@ -4207,9 +4263,11 @@ final class AppModel {
             // Already taken back: a late or repeated copy mustn't bring it back.
             guard removedStories["\(fp)|\(id)"] == nil else { break }
             let lifetime = lasts.map { min(max($0, 3600), StoryLifetime.twoDays.rawValue) }
-            if let i = data.stories.firstIndex(where: { $0.id == id }) {
+            // The same story can reach two of your personas (one friend in both): each keeps its own copy, so
+            // only the copy for this persona counts as "sent before". The id is never taken from someone else.
+            guard !data.stories.contains(where: { $0.id == id && $0.author != fp }) else { break }
+            if let i = data.stories.firstIndex(where: { $0.id == id && $0.author == fp && $0.persona == persona }) {
                 // A new version of one they sent before.
-                guard data.stories[i].author == fp, data.stories[i].persona == persona else { break }
                 var style = style
                 // A new caption on a clip they already sent comes without the clip.
                 if case let .video(bytes, caption) = style, bytes.isEmpty, case let .video(have, _) = data.stories[i].style, !have.isEmpty {
@@ -4219,33 +4277,37 @@ final class AppModel {
                 data.stories[i].lifetime = lifetime
                 if !data.stories[i].isLive { data.stories.remove(at: i); break }
                 acknowledgeStory(id, author: fp, persona: persona)
-                // Sent again because pieces went missing: what's here now may complete it.
-                clipActivity[id] = Date()
-                assembleClip(id)
+                // Sent again because pieces went missing: what's here now may complete it. The story arriving again
+                // is not progress (only a piece is), or a sender that keeps repeating it would keep this from
+                // ever asking for the clip.
+                if clipActivity[ClipKey(id, persona)] == nil { clipActivity[ClipKey(id, persona)] = Date() }
+                assembleClip(id, persona: persona)
                 break
             }
-            if case let .video(bytes, _) = style, bytes.isEmpty { clipActivity[id] = Date() }
+            if case let .video(bytes, _) = style, bytes.isEmpty { clipActivity[ClipKey(id, persona)] = Date() }
             var story = Story(id: id, author: fp, style: style, date: dated(date))
             story.persona = persona
             story.lifetime = lifetime
             if story.isLive { withAnimation(.snappy) { data.stories.append(story) } }
-            assembleClip(id)
+            assembleClip(id, persona: persona)
             acknowledgeStory(id, author: fp, persona: persona)
         case let .storyPart(id, index, of, bytes):
+            let key = ClipKey(id, persona)
             guard removedStories["\(fp)|\(id)"] == nil else { break }
             // A piece sent again after the clip came together: nothing to do with it.
-            if data.stories.contains(where: { $0.id == id && $0.author == fp && $0.isReady }) { break }
-            if let at = videoMessage(id), data.conversations[at.convo].messages[at.message].video?.isEmpty == false { break }
+            if data.stories.contains(where: { $0.id == id && $0.author == fp && $0.persona == persona && $0.isReady }) { break }
+            if let at = videoMessage(id), data.conversations[at.convo].persona == persona,
+               data.conversations[at.convo].messages[at.message].video?.isEmpty == false { break }
             guard (1...StoryClipPieces.maxPieces).contains(of), (0..<of).contains(index), bytes.count <= StoryClipPieces.framedSize,
-                  data.clipParts[id] != nil || data.clipParts.count < 32 else { break }
-            var pending = data.clipParts[id] ?? ClipParts(author: fp, persona: persona, of: of)
+                  data.clipParts[key.stored] != nil || data.clipParts.count < 32 else { break }
+            var pending = data.clipParts[key.stored] ?? ClipParts(id: id, author: fp, persona: persona, of: of)
             guard pending.author == fp, pending.persona == persona else { break }
             // Cut differently from the pieces already here (their app or mine updated part-way): start over with these.
-            if pending.of != of { pending = ClipParts(author: fp, persona: persona, of: of) }
+            if pending.of != of { pending = ClipParts(id: id, author: fp, persona: persona, of: of) }
             pending.parts[index] = bytes
-            data.clipParts[id] = pending
-            clipActivity[id] = Date()
-            assembleClip(id)
+            data.clipParts[key.stored] = pending
+            clipActivity[key] = Date()
+            assembleClip(id, persona: persona)
         case let .storyReceived(id):
             // One of my contacts has the story: it's no longer sent to them again.
             guard let i = data.stories.firstIndex(where: { $0.id == id && $0.author == "me" && $0.persona == persona }),
@@ -4278,13 +4340,13 @@ final class AppModel {
                   data.stories[i].shownTo.includes(fp), data.stories[i].viewers?[fp] == nil else { break }
             data.stories[i].viewers = (data.stories[i].viewers ?? [:]).merging([fp: min(deposited ?? Date(), Date())]) { old, _ in old }
         case let .storyRemoved(id):
-            if data.clipParts[id]?.author == fp { data.clipParts[id] = nil }
+            if data.clipParts[ClipKey(id, persona).stored]?.author == fp { data.clipParts[ClipKey(id, persona).stored] = nil }
             noteRemoved("\(fp)|\(id)")
             withAnimation { data.stories.removeAll { $0.id == id && $0.author == fp && $0.persona == persona } }
         case .storiesCleared:
             // Only theirs: whoever sends this can take back their own stories and nobody else's.
             for story in data.stories where story.author == fp && story.persona == persona { noteRemoved("\(fp)|\(story.id)") }
-            data.clipParts = data.clipParts.filter { $0.value.author != fp }
+            data.clipParts = data.clipParts.filter { !($0.value.author == fp && $0.value.persona == persona) }
             withAnimation { data.stories.removeAll { $0.author == fp && $0.persona == persona } }
         case let .unsend(ids):
             applyUnsend(ids, from: sender)
@@ -4449,11 +4511,11 @@ final class AppModel {
             // A video: its clip comes in pieces after this (some may be here already).
             message.video = Data()
             message.clipSeconds = min(max(clip.seconds, 0), ChatVideo.maxSeconds)
-            clipActivity[wire.id] = Date()
+            clipActivity[ClipKey(wire.id, data.conversations[i].persona)] = Date()
         }
         typing[data.conversations[i].id]?[sender.fingerprint] = nil
         withAnimation(.snappy(duration: 0.4)) { data.conversations[i].messages.append(message) }
-        if wire.clip != nil { assembleClip(wire.id) }
+        if wire.clip != nil { assembleClip(wire.id, persona: data.conversations[i].persona) }
         if openConversation != data.conversations[i].id || !appActive { data.conversations[i].unread += 1 }
         notify(message, at: i)
         if wire.conversation == nil {
@@ -5001,7 +5063,7 @@ extension AppModel {
                 message.clipSeconds = min(max(clip.seconds, 0), ChatVideo.maxSeconds)
             }
             withAnimation(.snappy) { data.conversations[i].messages.append(message) }
-            if wire.clip != nil { assembleClip(wire.id) }
+            if wire.clip != nil { assembleClip(wire.id, persona: data.conversations[i].persona) }
         case let .reaction(id, emoji):
             for i in data.conversations.indices {
                 if let m = data.conversations[i].messages.firstIndex(where: { $0.id == id }) {
