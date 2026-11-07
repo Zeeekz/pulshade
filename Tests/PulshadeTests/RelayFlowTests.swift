@@ -2260,6 +2260,84 @@ struct RelayFlowTests {
         #expect(bobSees.contains("alice after"), "and Bob reads Alice")
     }
 
+    /// The whole of it as it happens on a phone: two accounts chat, one does a real Detach, waits, logs back in with the
+    /// recovery code, opens the chat with the other, and they talk both ways. No removing and adding again.
+    @Test func afterARealDetachAndLoginTheChatWorksAgain() async throws {
+        let phone = try await makeUser("Phone")
+        let laptop = try await makeUser("Laptop")
+        defer { for m in [phone, laptop] { m.lock() } }
+        // Real profiles carry a picture, a banner and words, so the first thing sent after pairing is not tiny.
+        func photo(_ bytes: Int) -> Data { Data((0..<bytes).map { _ in UInt8.random(in: 0...255) }) }
+        let handle = "laptop_\(Int.random(in: 10000...99999))"
+        try await laptop.publishProfile(handle: handle)
+        phone.updateProfile { $0.avatar = photo(300_000); $0.banner = photo(1_500_000); $0.bio = String(repeating: "about me ", count: 40) }
+        laptop.updateProfile { $0.avatar = photo(300_000); $0.banner = photo(1_500_000); $0.bio = String(repeating: "about me ", count: 40) }
+        let found = try #require(try await phone.findProfile(handle))
+        _ = try #require(phone.sendRequest(to: found, note: "hi"))
+        await settle(phone, laptop, rounds: 8)
+        let waitingRequest = try #require(laptop.requests.first)
+        _ = try #require(laptop.acceptRequest(waitingRequest.id))
+        await settle(phone, laptop, rounds: 12)
+        let laptopFP = try #require(phone.visibleContacts.first).fingerprint
+        let chat = phone.startConversation(kind: .direct, title: "", members: [laptopFP])
+        phone.send("hello laptop", in: chat.id)
+        await settle(phone, laptop, rounds: 10)
+        let theirs = try #require(laptop.data.conversations.first { $0.kind == .direct })
+        laptop.send("hello phone", in: theirs.id)
+        await settle(phone, laptop, rounds: 10)
+        #expect(phone.data.conversations.first { $0.id == chat.id }?.messages.map(\.text).contains("hello phone") == true)
+        let seed = try #require(phone.identity?.seed)
+        let identity = try Identity(seed: seed)
+        #expect(await phone.saveBackup())
+
+        // The real Detach, on the only device and online, then a wait.
+        await phone.detachNow()
+        #expect(phone.identity == nil)
+        await settle(laptop, rounds: 6)
+        // The laptop's chat was cleared by the Detach; its owner keeps typing to the phone that has gone.
+        let clearedChat = laptop.startConversation(kind: .direct, title: "", members: [phone.visibleContacts.first?.fingerprint ?? laptopFP].filter { _ in false } + [try #require(laptop.visibleContacts.first).fingerprint])
+        laptop.send("are you there", in: clearedChat.id)
+        laptop.send("hello??", in: clearedChat.id)
+        await settle(laptop, rounds: 6)
+        try await Task.sleep(for: .seconds(3))
+
+        let again = testModel("pulshade-real-detach")
+        defer { again.lock() }
+        guard case let .found(backup) = await again.backup(of: identity) else {
+            Issue.record("Detaching left nothing to restore")
+            return
+        }
+        try await again.restore(seed: seed, passcode: "new-device", from: backup)
+        await settle(again, laptop, rounds: 12)
+        #expect(again.visibleContacts.map(\.fingerprint) == [laptopFP], "the contact is back")
+
+        let reopened = again.startConversation(kind: .direct, title: "", members: [laptopFP])
+        again.send("I'm back", in: reopened.id)
+        await settle(again, laptop, rounds: 20)
+        let onLaptop = laptop.data.conversations.first { $0.kind == .direct }?.messages.map(\.text) ?? []
+        #expect(onLaptop.contains("I'm back"), "the laptop gets what the recovered phone writes")
+        let laptopsChat = try #require(laptop.data.conversations.first { $0.kind == .direct })
+        laptop.send("welcome back", in: laptopsChat.id)
+        await settle(again, laptop, rounds: 20)
+        let onPhone = again.data.conversations.first { $0.kind == .direct }?.messages.map(\.text) ?? []
+        #expect(onPhone.contains("welcome back"), "and the phone gets the laptop's")
+    }
+
+    /// While new keys are being set up with a contact the chat can say so, and it stops saying so once they've answered.
+    @Test func theChatSaysWhileNewKeysAreBeingSetUp() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, bob, rounds: 10)
+        let bobFP = try #require(alice.visibleContacts.first).fingerprint
+        #expect(alice.keysPending(with: bobFP) == false, "nothing to wait for")
+        alice.renewChatKeys()
+        #expect(alice.keysPending(with: bobFP), "waiting for Bob's app to answer")
+        await settle(alice, bob, rounds: 14)
+        #expect(alice.keysPending(with: bobFP) == false, "he answered")
+    }
+
     @Test func aBackupIsPaddedAndOldOnesStillOpen() throws {
         let small = AppModel.padded(Data(repeating: 7, count: 100))
         #expect(small.count == 64 * 1024)

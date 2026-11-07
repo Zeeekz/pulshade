@@ -384,6 +384,14 @@ final class AppModel {
         if backup != nil, !data.security.keepBackup { Task { try? await deleteBackup(of: identity) } }
     }
 
+    /// Whether new keys are being set up with this contact and aren't ready yet: nothing can be sent to them until their
+    /// app answers, which it does when it's running. For the chat to say so, instead of showing a clock and nothing else.
+    func keysPending(with fingerprint: String) -> Bool {
+        guard let c = contact(fingerprint, in: activePersona), !c.awaitingAcceptance, !c.devices.isEmpty else { return false }
+        let ready = c.devices.contains { $0.session?.canSend == true }
+        return !ready && c.devices.contains { $0.handshake != nil || $0.session != nil }
+    }
+
     /// Opens fresh sessions with every contact, on request (Settings > Chats), for messages that stopped getting through.
     func renewChatKeys() {
         guard phase == .unlocked else { return }
