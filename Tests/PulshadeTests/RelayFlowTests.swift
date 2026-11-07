@@ -865,6 +865,27 @@ struct RelayFlowTests {
         #expect(try await bob.findProfile(handle) == nil)
     }
 
+    /// A request you sent can be taken back before it is accepted: it leaves your waiting list, and accepting it
+    /// afterwards doesn't make a chat appear for either side.
+    @Test func aSentRequestCanBeCancelled() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        let handle = "alice_\(Int.random(in: 10000...99999))"
+        try await alice.publishProfile(handle: handle)
+        let found = try #require(try await bob.findProfile(handle))
+        _ = try #require(bob.sendRequest(to: found, note: "hi"))
+        #expect(bob.sentRequests.count == 1)
+        bob.cancelRequest(to: found.fingerprint)
+        #expect(bob.sentRequests.isEmpty)
+        #expect(bob.data.contacts.allSatisfy { $0.fingerprint != found.fingerprint })
+        await settle(alice, bob)
+        if let request = alice.requests.first { _ = alice.acceptRequest(request.id) }
+        await settle(alice, bob)
+        #expect(bob.data.conversations.isEmpty, "Bob no longer waits for her, so nothing opens on his side")
+        #expect(bob.sentRequests.isEmpty)
+    }
+
     /// One side still has the other as a friend; the other lost them and asks again. They reconnect by
     /// themselves, instead of the request vanishing and each side waiting on the other.
     @Test func aFriendWhoLostYouReconnectsByAskingAgain() async throws {

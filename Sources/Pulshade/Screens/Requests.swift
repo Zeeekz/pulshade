@@ -153,11 +153,20 @@ struct ContactsView: View {
                         .foregroundStyle(theme.accent)
                     // A request can go missing (a relay restart), or they may still think you're friends:
                     // sending it again gets it there, and an existing friend reconnects straight away.
-                    if !sent {
-                        Button("Send again", action: request)
-                            .buttonStyle(.plain)
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(Ink.dim)
+                    HStack(spacing: 18) {
+                        if !sent {
+                            Button("Send again", action: request)
+                                .buttonStyle(.plain)
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(Ink.dim)
+                        }
+                        Button("Cancel request") {
+                            model.cancelRequest(to: found.fingerprint)
+                            withAnimation(.snappy) { sent = false }
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Ink.dim)
                     }
                 } else {
                     TextField("", text: $note, prompt: Text("Add a note (optional)").foregroundStyle(Ink.faint))
@@ -266,8 +275,16 @@ struct ContactsView: View {
         SettingsGroup("Waiting for them to accept") {
             ForEach(Array(model.sentRequests.enumerated()), id: \.element.id) { i, c in
                 if i > 0 { RowDivider(inset: 66) }
-                ContactRow(contact: c, detail: "Request sent")
-                    .opacity(0.75)
+                HStack(spacing: 0) {
+                    ContactRow(contact: c, detail: "Request sent")
+                        .opacity(0.75)
+                    Button("Cancel") { withAnimation(.snappy) { model.cancelRequest(to: c.fingerprint) } }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Ink.dim)
+                        .padding(.trailing, 14)
+                        .accessibilityLabel("Cancel request to \(c.displayName)")
+                }
             }
         }
     }
