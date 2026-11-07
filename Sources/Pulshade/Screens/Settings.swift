@@ -5,7 +5,7 @@ import PulshadeShared
 
 /// The pages Settings opens, each from a row on the main list.
 enum SettingsPage: String, Hashable {
-    case profile, handles, collectibles, pets, privacy, privacyLock, privacyMessages, privacyPasscodes, privacyBackup, blocked, notifications, appearance, devices, network, anonymity, account, updates
+    case profile, handles, pinned, collectibles, pets, privacy, privacyLock, privacyMessages, privacyPasscodes, privacyBackup, blocked, notifications, appearance, devices, network, anonymity, account, updates
 }
 
 /// Settings, laid out like a phone's own: your profile on top, then a short list of rows,
@@ -85,6 +85,7 @@ struct SettingsView: View {
                     switch page {
                     case .profile: ProfileSettings()
                     case .handles: HandleSettings()
+                    case .pinned: PinnedSettings()
                     case .collectibles: CollectiblesView(inSettings: true, pets: false)
                     case .pets: CollectiblesView(inSettings: true, pets: true)
                     case .privacy: PrivacySettings()
@@ -427,7 +428,7 @@ struct SettingsScreen<Content: View>: View {
             .frame(height: 44)
             .padding(.top, Platform.isPhone ? 0 : 30)
             ScrollView {
-                VStack(spacing: 26) { content }
+                VStack(spacing: 20) { content }
                     .padding(.horizontal, 16)
                     .padding(.top, 12)
                     .padding(.bottom, 30)
@@ -452,7 +453,7 @@ private struct ProfileSettings: View {
     @State private var bio = ""
     @State private var burningPersona = false
 
-    private var listed: Bool { model.activeProfile.handle != nil }
+    private var pinnedCount: Int { (model.activeProfile.links ?? []).count + (model.activeProfile.notes ?? []).count }
     private static let bioLimit = 120
 
     private func hint(_ text: String, color: Color) -> some View {
@@ -483,7 +484,7 @@ private struct ProfileSettings: View {
     /// Your profile as people you chat with see it, changing as you edit, with the colour picker built in.
     private var hero: some View {
         let tint = model.signature("me")
-        return VStack(spacing: 12) {
+        return VStack(spacing: 8) {
             VStack(spacing: -48) {
                 BannerPicker(image: Binding(get: { model.activeProfile.banner },
                                             set: { v in model.updateProfile { $0.banner = v } }),
@@ -492,22 +493,6 @@ private struct ProfileSettings: View {
                                             set: { v in model.updateProfile { $0.avatar = v } }),
                              seed: model.fingerprint, size: 96, ring: tint, ringGap: Ink.base)
             }
-            VStack(spacing: 4) {
-                Text(name.isEmpty ? "Your name" : name)
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(name.isEmpty ? Ink.faint : Ink.text)
-                if let h = model.activeProfile.handle {
-                    Text("@\(h)").font(.system(size: 13, weight: .bold)).foregroundStyle(tint)
-                }
-                if !bio.isEmpty {
-                    Text(bio)
-                        .font(.system(size: 13)).foregroundStyle(Ink.dim)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: 300)
-                        .padding(.top, 2)
-                }
-            }
-            .padding(.horizontal, 12)
             VStack(spacing: 6) {
                 HStack(spacing: 0) {
                     ForEach(Signature.colors.indices, id: \.self) { i in
@@ -523,13 +508,9 @@ private struct ProfileSettings: View {
                         .accessibilityLabel("Signature colour \(i + 1)")
                     }
                 }
-                Text("Your colour: it rings your picture and makes your messages glow on other people's screens.")
-                    .font(.system(size: 11)).foregroundStyle(Ink.faint)
-                    .multilineTextAlignment(.center)
             }
-            .padding(.top, 4)
         }
-        .padding(14)
+        .padding(12)
         .frame(maxWidth: .infinity)
         .glass(14)
     }
@@ -577,20 +558,14 @@ private struct ProfileSettings: View {
 
     var body: some View {
         SettingsScreen(title: "Profile") {
-            // 1. Who you're editing.
             if !model.personas.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    sectionNote("Editing")
-                    personaBar
-                }
+                personaBar
             }
-            // 2. How it looks to others, changing as you edit. Tap the picture or banner to change it.
-            VStack(spacing: 8) {
+            VStack(spacing: 6) {
                 hero
-                sectionNote("This is how people you chat with see you. Tap your picture or banner to change it.")
+                sectionNote("Tap your picture or banner to change it. Your colour rings your picture and tints your messages.")
             }
-            // 3. About you.
-            SettingsGroup("About you", footer: "Only people you chat with see your name, picture and banner.") {
+            SettingsGroup("About you", footer: "Only people you chat with see these.") {
                 fieldRow("Name") {
                     TextField("", text: $name, prompt: Text("Your name").foregroundStyle(Ink.faint))
                         .textFieldStyle(.plain)
@@ -616,30 +591,18 @@ private struct ProfileSettings: View {
                     }
                 }
             }
-            // 4. Handles: how strangers find this persona.
-            HandlesEditor()
-            if listed {
-                SettingsGroup {
-                    ActionRow(title: "Stop being discoverable", destructive: true) { Task { await model.unpublishProfile() } }
-                }
-            }
-            // 5. What's pinned: links, wallets and notes.
-            PinnedEditor()
-            // 6. What you own.
-            if Platform.isPhone {
-                SettingsGroup("Collectibles") {
-                    NavigationLink(value: SettingsPage.collectibles) {
-                        SettingRow("Collectibles & Pets", symbol: "crown") {
-                            HStack(spacing: 6) {
-                                if let worn = model.activeProfile.badge?.kind?.name {
-                                    Text(worn).font(.system(size: 13)).foregroundStyle(Ink.faint)
-                                }
-                                Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Ink.faint)
-                            }
-                        }
-                        .contentShape(.rect)
-                    }
-                    .buttonStyle(.plain)
+            SettingsGroup {
+                MenuRow(page: .handles, symbol: "at", color: .hex(0x3D8BFF), title: "Handles",
+                        value: model.activeProfile.handle.map { "@\($0)" } ?? "Private")
+                RowDivider(inset: 54)
+                MenuRow(page: .pinned, symbol: "pin.fill", color: .hex(0xFF9F0A), title: "Pinned",
+                        value: pinnedCount == 0 ? nil : "\(pinnedCount)")
+                if Platform.isPhone {
+                    RowDivider(inset: 54)
+                    MenuRow(page: .collectibles, symbol: "crown.fill", color: .hex(0xE5383B), title: "Collectibles",
+                            value: model.activeProfile.badge?.kind?.name)
+                    RowDivider(inset: 54)
+                    MenuRow(page: .pets, symbol: "pawprint.fill", color: .hex(0xBF5AF2), title: "Pets")
                 }
             }
             if let id = model.activePersona {
@@ -661,8 +624,23 @@ private struct ProfileSettings: View {
 
 /// The page for a persona's handles on its own (the same editor is on the Profile page).
 private struct HandleSettings: View {
+    @Environment(AppModel.self) private var model
+
     var body: some View {
-        SettingsScreen(title: "Your handles", back: "Profile") { HandlesEditor() }
+        SettingsScreen(title: "Handles", back: "Profile") {
+            HandlesEditor()
+            if model.activeProfile.handle != nil {
+                SettingsGroup {
+                    ActionRow(title: "Stop being discoverable", destructive: true) { Task { await model.unpublishProfile() } }
+                }
+            }
+        }
+    }
+}
+
+private struct PinnedSettings: View {
+    var body: some View {
+        SettingsScreen(title: "Pinned", back: "Profile") { PinnedEditor() }
     }
 }
 

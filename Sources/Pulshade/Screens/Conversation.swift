@@ -1519,7 +1519,7 @@ private struct ConversationInfo: View {
     private func personProfile(_ peer: Contact, in c: Conversation) -> some View {
         let tint = Signature.color(peer.color, seed: peer.fingerprint)
         let theirName = peer.name.isEmpty ? "Anonymous" : peer.name
-        let bannerHeight: CGFloat = 196
+        let bannerHeight: CGFloat = 150
         return VStack(spacing: 0) {
             Banner(image: peer.banner, seed: peer.fingerprint, height: bannerHeight)
                 .overlay {
@@ -1535,19 +1535,19 @@ private struct ConversationInfo: View {
                     return content.scaleEffect(1 + pull / bannerHeight, anchor: .bottom)
                 }
                 .accessibilityHidden(true)
-            VStack(spacing: 14) {
-                Avatar(image: c.avatar ?? peer.avatar, seed: peer.fingerprint, size: 112)
+            VStack(spacing: 10) {
+                Avatar(image: c.avatar ?? peer.avatar, seed: peer.fingerprint, size: 96)
                     .padding(5)
                     .background(Ink.base, in: .circle)
                     .overlay {
                         Circle().strokeBorder(AngularGradient(colors: [tint, tint.opacity(0.35), tint], center: .center), lineWidth: 3)
                     }
-                    .shadow(color: tint.opacity(0.55), radius: 28, y: 6)
+                    .shadow(color: tint.opacity(0.45), radius: 20, y: 4)
                     .scaleEffect(arrived ? 1 : 0.8)
                 VStack(spacing: 5) {
                     HStack(spacing: 7) {
                         Text(peer.nickname.isEmpty ? theirName : peer.nickname)
-                            .font(.system(size: 26, weight: .bold))
+                            .font(.system(size: 24, weight: .bold))
                             .foregroundStyle(Ink.text)
                             .lineLimit(2).multilineTextAlignment(.center).minimumScaleFactor(0.7)
                         BadgeMark(badge: peer.badge, size: 24)
@@ -1601,22 +1601,22 @@ private struct ConversationInfo: View {
                         model.toggleMute(c.id)
                     }
                 }
-                .padding(.top, 4)
+                .padding(.top, 2)
                 HStack(spacing: 5) {
                     Image(systemName: "lock.fill").font(.system(size: 9))
                     Text(summary(c)).font(.system(size: 12))
                 }
                 .foregroundStyle(Ink.faint)
-                VStack(spacing: 14) {
+                VStack(spacing: 10) {
                     ContactCollectibles(items: peer.collectibles ?? [], tint: tint)
                     ProfileLinkList(links: peer.links ?? [], tint: tint, walletChangedAt: peer.walletChangedAt, isMine: peer.isSelf)
                     ProfileNoteList(notes: peer.notes ?? [], tint: tint)
                 }
-                .padding(.top, 6)
+                .padding(.top, 2)
             }
-            .padding(.horizontal, 20)
-            .offset(y: -62)
-            .padding(.bottom, -62)
+            .padding(.horizontal, 16)
+            .offset(y: -52)
+            .padding(.bottom, -52)
         }
         .frame(maxWidth: .infinity)
     }
