@@ -207,6 +207,28 @@ impl Push {
         self.last_call.lock().unwrap().retain(|_, at| now.duration_since(*at) < CALL_COOLDOWN);
     }
 
+    /// Every registration, with how old it is, for the next relay to take over when this one is replaced.
+    pub fn carry(&self) -> Vec<crate::handover::Registration> {
+        let now = Instant::now();
+        self.targets.lock().unwrap().iter().map(|(id, t)| crate::handover::Registration {
+            mailbox: *id, token: t.token.clone(), sandbox: t.sandbox, sound: t.sound, tone: t.tone.clone(), voip: t.voip.clone(),
+            age: now.duration_since(t.at),
+        }).collect()
+    }
+
+    /// Takes over registrations from the relay this one replaces, keeping how old each already was.
+    pub fn take_over(&self, carried: Vec<crate::handover::Registration>) {
+        let now = Instant::now();
+        let mut targets = self.targets.lock().unwrap();
+        for r in carried {
+            if r.age >= TTL || !valid_token(&r.token) || targets.len() >= MAX_TARGETS { continue; }
+            let tone = r.tone.filter(|t| TONES.contains(&t.as_str()));
+            let voip = r.voip.filter(|v| valid_token(v));
+            targets.insert(r.mailbox, Target { token: r.token, sandbox: r.sandbox, sound: r.sound, tone, voip,
+                                               at: now.checked_sub(r.age).unwrap_or(now) });
+        }
+    }
+
     pub fn registered(&self) -> usize {
         self.targets.lock().unwrap().len()
     }

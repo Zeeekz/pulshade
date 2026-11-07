@@ -12,6 +12,7 @@ mod backup;
 mod caller;
 mod calls;
 mod directory;
+mod handover;
 mod onion;
 mod pow;
 mod push;
@@ -81,7 +82,12 @@ const MAX_WAIT: u64 = 25;
 static ARRIVALS: LazyLock<Notify> = LazyLock::new(Notify::new);
 /// Different every time the relay starts. The health check carries it, so an app can tell the relay restarted and
 /// register for wake-ups again straight away.
+/// The boot mark of the relay this one replaced, when it took over its mail: phones then see no restart, because
+/// nothing was lost.
+static CARRIED_BOOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 static BOOT: LazyLock<String> = LazyLock::new(|| {
+    if let Some(carried) = CARRIED_BOOT.get() { return carried.clone(); }
     let mut raw = [0u8; 8];
     std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut raw)).expect("no randomness");
     hex::encode(raw)
@@ -117,17 +123,49 @@ struct Store {
     /// Envelope ids are unpredictable, so they say nothing about how busy the relay is.
     id_seed: [u8; 32],
     counter: u64,
+    /// Set when the relay has been told to stop: it takes no more mail, so what it hands to the next relay is all
+    /// there is. A sender that is turned away keeps the message and tries again.
+    frozen: bool,
 }
 
 impl Default for Store {
     fn default() -> Self {
         let mut id_seed = [0u8; 32];
         std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut id_seed)).expect("no randomness");
-        Store { queues: HashMap::new(), bytes: 0, id_seed, counter: 0 }
+        Store { queues: HashMap::new(), bytes: 0, id_seed, counter: 0, frozen: false }
     }
 }
 
 impl Store {
+    /// Writes everything waiting, for the relay that replaces this one, one message at a time straight from where it
+    /// is held: no second copy of the mail is made.
+    fn write_handover(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        let now = Instant::now();
+        handover::write_head(w, &BOOT, &self.id_seed, self.counter, self.queues.len())?;
+        for (id, queue) in &self.queues {
+            handover::write_mailbox(w, id, queue.len())?;
+            for item in queue {
+                handover::write_mail(w, item.id, now.duration_since(item.at), item.quiet, &item.blob)?;
+            }
+        }
+        handover::write_registrations(w, &push::global().carry())
+    }
+
+    /// Takes over what the relay before this one was holding. Mail that has waited past its time is let go.
+    fn take_over(&mut self, snapshot: handover::Snapshot) {
+        let now = Instant::now();
+        self.id_seed = snapshot.id_seed;
+        self.counter = snapshot.counter;
+        for (id, mail) in snapshot.mailboxes {
+            let queue: VecDeque<Item> = mail.into_iter().filter(|m| m.waited < TTL).map(|m| Item {
+                id: m.id, at: now.checked_sub(m.waited).unwrap_or(now), blob: Bytes::from(m.blob), quiet: m.quiet,
+            }).collect();
+            if !queue.is_empty() { self.queues.insert(id, queue); }
+        }
+        self.bytes = self.queues.values().flat_map(|q| q.iter()).map(|item| item.blob.len()).sum();
+        push::global().take_over(snapshot.registrations);
+    }
+
     /// A fresh id below 2^53, so it survives any JSON reader.
     fn next_id(&mut self) -> u64 {
         self.counter += 1;
@@ -188,6 +226,7 @@ async fn deposit(State(store): State<Shared>, Path(send_id): Path<String>, heade
         return StatusCode::PAYLOAD_TOO_LARGE;
     }
     let mut store = store.lock().unwrap();
+    if store.frozen { return StatusCode::SERVICE_UNAVAILABLE; }
     // Full: waiting mail makes way, so the relay never stops taking new messages. (Refusing instead let anyone who
     // filled it with junk silence everybody until the junk expired.)
     let new_mailbox = !store.queues.contains_key(&id);
@@ -1005,6 +1044,16 @@ impl Drop for Room {
     }
 }
 
+/// Puts the boot mark on every answer, not only the health check's, so a phone that is only fetching and sending
+/// still notices the relay has restarted and can send again what the restart may have emptied.
+async fn stamp_boot(request: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    if let Ok(mark) = axum::http::HeaderValue::from_str(BOOT.as_str()) {
+        response.headers_mut().insert("x-pulshade-boot", mark);
+    }
+    response
+}
+
 /// Counts every request's body against `MAX_IN_FLIGHT` as it arrives, whatever reads it, and answers 503 when there
 /// is no room. The count is by what has really arrived, not by what the request says it will send, and is given back
 /// once the request has been answered: by then the body is stored, and counted there, or gone.
@@ -1124,6 +1173,7 @@ fn app(state: AppState) -> Router {
         .route("/v1/update/mac.zip", get(update_archive))
         .layer(DefaultBodyLimit::max(MAX_ENVELOPE + 1024))
         .layer(axum::middleware::from_fn_with_state(state.clone(), in_flight))
+        .layer(axum::middleware::from_fn(stamp_boot))
         .with_state(state)
 }
 
@@ -1183,6 +1233,16 @@ async fn main() {
     }
     let bind = std::env::var("PULSHADE_BIND").unwrap_or_else(|_| "127.0.0.1:7878".into());
     let store: Shared = Arc::default();
+    // Started by a service manager that kept what the relay before it was holding: take it over, so a restart doesn't
+    // empty the mail waiting or forget which phones to wake. Anything wrong with it and this starts empty, as ever.
+    let kept = handover::take_from_service();
+    if kept.is_some() { handover::forget_in_service(); }
+    if let Some(snapshot) = kept.and_then(|file| handover::read(&mut std::io::BufReader::with_capacity(1 << 20, file))) {
+        let (boxes, registered) = (snapshot.mailboxes.len(), snapshot.registrations.len());
+        let _ = CARRIED_BOOT.set(snapshot.boot.clone());
+        store.lock().unwrap().take_over(snapshot);
+        eprintln!("took over {boxes} mailboxes and {registered} wake-up registrations from the relay before this one");
+    }
     // A spool file an older version left behind is destroyed before anyone can ask for anything.
     forget_old_spool(&PathBuf::from(&directory_path).with_file_name("pulshade-spool.sealed"));
     let state = AppState {
@@ -1234,10 +1294,22 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&bind).await.expect("could not bind");
     eprintln!("pulshade relay listening on {bind}");
+    let closing = store.clone();
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(stop_signal())
+        .with_graceful_shutdown(async move {
+            stop_signal().await;
+            // Told to stop: no more mail from here, so what is handed on below is all there is.
+            closing.lock().unwrap().frozen = true;
+        })
         .await
         .unwrap();
+    // Stopped by a service manager that can keep it: hand over what is waiting, in memory and nowhere else.
+    if std::env::var_os("NOTIFY_SOCKET").is_some() {
+        match handover::give_to_service(|out| store.lock().unwrap().write_handover(out)) {
+            Ok(()) => eprintln!("handed what was waiting to the service manager for the next relay"),
+            Err(e) => eprintln!("what was waiting was not kept: {e}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1325,6 +1397,52 @@ mod tests {
         assert!(wakes(&headers));
         headers.insert("x-pulshade-wake", "0".parse().unwrap());
         assert!(!wakes(&headers), "a typing signal or receipt doesn't");
+    }
+
+    #[tokio::test]
+    async fn waiting_mail_is_taken_over_by_the_next_relay() {
+        let old: Shared = Arc::default();
+        let (a, b) = (key(7), key(8));
+        for (receive, text) in [(a, &b"first"[..]), (a, b"second"), (b, b"other")] {
+            let send = hex::encode(send_id_for(&receive));
+            assert_eq!(deposit(State(old.clone()), Path(send), HeaderMap::new(), Bytes::copy_from_slice(text)).await, StatusCode::ACCEPTED);
+        }
+        // Told to stop: it takes no more, and what it holds goes through the carrier format unchanged.
+        old.lock().unwrap().frozen = true;
+        let send = hex::encode(send_id_for(&a));
+        assert_eq!(deposit(State(old.clone()), Path(send), HeaderMap::new(), Bytes::from_static(b"late")).await, StatusCode::SERVICE_UNAVAILABLE,
+                   "a sender turned away keeps its message and tries again");
+        let mut bytes = Vec::new();
+        old.lock().unwrap().write_handover(&mut bytes).unwrap();
+        let snapshot = handover::read(&mut std::io::Cursor::new(bytes)).expect("what was packed unpacks");
+
+        let new: Shared = Arc::default();
+        new.lock().unwrap().take_over(snapshot);
+        assert!(!new.lock().unwrap().frozen, "the new relay takes mail");
+        let Json(res) = fetch(State(new.clone()), Json(FetchRequest { keys: vec![hex::encode(a)], wait: 0 })).await.unwrap();
+        let texts: Vec<Vec<u8>> = res.items.iter().map(|i| B64.decode(&i.blob).unwrap()).collect();
+        assert_eq!(texts, vec![b"first".to_vec(), b"second".to_vec()], "in the order they came");
+        let Json(res) = fetch(State(new.clone()), Json(FetchRequest { keys: vec![hex::encode(b)], wait: 0 })).await.unwrap();
+        assert_eq!(res.items.len(), 1);
+        assert_eq!(new.lock().unwrap().bytes, "firstsecondother".len(), "the running total is right");
+        // Ids it hands out next don't repeat the ones already given.
+        let first = old.lock().unwrap().counter;
+        assert_eq!(new.lock().unwrap().counter, first);
+    }
+
+    #[test]
+    fn mail_that_waited_too_long_is_not_carried_on() {
+        let snapshot = handover::Snapshot {
+            boot: "0011223344556677".into(), id_seed: [1; 32], counter: 0, registrations: vec![],
+            mailboxes: vec![([3; 32], vec![
+                handover::Mail { id: 1, waited: TTL + Duration::from_secs(1), quiet: false, blob: vec![1] },
+                handover::Mail { id: 2, waited: Duration::from_secs(5), quiet: false, blob: vec![2, 2] },
+            ])],
+        };
+        let mut new = Store::default();
+        new.take_over(snapshot);
+        assert_eq!(new.queues.get(&[3; 32]).map(|q| q.len()), Some(1));
+        assert_eq!(new.bytes, 2);
     }
 
     #[tokio::test]

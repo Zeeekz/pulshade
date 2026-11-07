@@ -172,6 +172,11 @@ Environment=PULSHADE_DIRECTORY=$data/pulshade-directory.json
 Environment=PULSHADE_STORAGE_KEY_FILE=$keys/storage.key
 Restart=always
 RestartSec=5
+# A restart keeps what the relay is holding: it gives it to systemd in a memory-backed file as it stops, and the next
+# relay is started with it. Nothing is written to disk, and a plain stop, a crash or a reboot hands nothing on.
+NotifyAccess=main
+FileDescriptorStoreMax=1
+FileDescriptorStorePreserve=restart
 MemoryMax=${memory_max}M
 # Should the whole server run short of memory all the same, the relay is the first thing stopped, not SSH.
 OOMScoreAdjust=500
