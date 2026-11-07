@@ -608,7 +608,7 @@ private struct ChatList: View {
         .background { Color.clear.storyCamera(isPresented: $composingStory) }
         .background {
             Color.clear.viewerCover(item: $viewingStory) { reel in
-                StoryViewer(stories: reel.stories, start: reel.start, following: reel.following)
+                StoryViewer(stories: reel.stories, start: reel.start, following: reel.following, preceding: reel.preceding)
             }
         }
     }

@@ -571,7 +571,7 @@ struct RelayFlowTests {
         // Lost on the way: Bob has the story and the first piece only.
         let i = try #require(bob.data.stories.firstIndex { $0.id == id })
         bob.data.stories[i].style = .video(Data(), caption: "clip")
-        bob.data.clipParts[id] = ClipParts(author: bob.data.stories[i].author, persona: nil, of: pieces.count, parts: [0: pieces[0]])
+        bob.data.clipParts[id] = ClipParts(id: id, author: bob.data.stories[i].author, persona: nil, of: pieces.count, parts: [0: pieces[0]])
         #expect(bob.friendStories.first?.stories.first?.isReady == false, "listed, as loading")
         await settle(alice, bob, rounds: 2)
         #expect(bob.data.stories[i].isReady == false, "nothing is asked for while pieces might still be on their way")
@@ -586,10 +586,56 @@ struct RelayFlowTests {
         // The story itself lost, with some pieces in: asking brings the story back with the rest.
         let author = bob.data.stories[i].author
         bob.data.stories.removeAll { $0.id == id }
-        bob.data.clipParts[id] = ClipParts(author: author, persona: nil, of: pieces.count, parts: [1: pieces[1]])
+        bob.data.clipParts[id] = ClipParts(id: id, author: author, persona: nil, of: pieces.count, parts: [1: pieces[1]])
         await settle(bob, alice)
         await settle(bob, alice)
         #expect(bob.data.stories.first { $0.id == id }?.style == .video(clip, caption: "clip"))
+    }
+
+    /// One friend who is in two of your personas sends each the same story. Each keeps its own copy and assembles
+    /// its own clip: neither is dropped, and neither is left stuck part-way.
+    @Test func aVideoStoryReachesEveryPersonaThatFriendIsIn() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        let ghost = try #require(bob.createPersona(name: "Ghost"))
+        bob.switchPersona(ghost.id)
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, bob)
+
+        let clip = Data((0..<StoryVideo.maxBytes).map { _ in UInt8.random(in: 0...255) })
+        alice.postStory(.video(clip, caption: "clip"))
+        await settle(alice, bob)
+        await settle(alice, bob)
+        let id = try #require(alice.myStories.first?.id)
+        let copies = bob.data.stories.filter { $0.id == id }
+        #expect(Set(copies.map(\.persona)).count == 2, "one copy for each persona")
+        #expect(copies.allSatisfy { $0.style == .video(clip, caption: "clip") })
+        #expect(bob.data.clipParts.isEmpty)
+    }
+
+    /// Pieces an older build saved (no id, all of them in, but never joined) are filed under their persona and
+    /// joined on the next tick instead of spinning forever.
+    @Test func aWholeClipSavedByAnOlderBuildIsJoined() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, bob)
+        let clip = Data((0..<StoryVideo.maxBytes).map { _ in UInt8.random(in: 0...255) })
+        alice.postStory(.video(clip, caption: "clip"))
+        await settle(alice, bob)
+        let id = try #require(alice.myStories.first?.id)
+        let pieces = StoryClipPieces.split(clip)
+        let i = try #require(bob.data.stories.firstIndex { $0.id == id })
+        bob.data.stories[i].style = .video(Data(), caption: "clip")
+        var old = ClipParts(id: nil, author: bob.data.stories[i].author, persona: nil, of: pieces.count)
+        for (n, piece) in pieces.enumerated() { old.parts[n] = piece }
+        bob.data.clipParts[id] = old
+        await settle(alice, bob, rounds: 3)
+        #expect(bob.data.stories.first { $0.id == id }?.style == .video(clip, caption: "clip"))
+        #expect(bob.data.clipParts.isEmpty)
     }
 
     /// A video goes to an updated app in two pieces that each fill one 2 MiB message, and to an app from before
@@ -849,7 +895,7 @@ struct RelayFlowTests {
                 "the next story offers the same choice")
 
         // Bob views it; the receipt travels through the ratchet back to Alice.
-        bob.markSeen(story.id)
+        bob.markSeen(story.id, persona: story.persona)
         await settle(alice, bob)
         #expect(alice.viewers(of: story.id).map(\.fingerprint) == [bobFP])
 
@@ -862,7 +908,7 @@ struct RelayFlowTests {
 
         // Cara with story views off: she sees it, but Alice isn't told.
         cara.updateSecurity { $0.storyViews = false }
-        cara.markSeen(story.id)
+        cara.markSeen(story.id, persona: story.persona)
         await settle(alice, cara)
         #expect(alice.viewers(of: story.id).map(\.fingerprint) == [bobFP])
 

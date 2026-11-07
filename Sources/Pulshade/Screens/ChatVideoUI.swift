@@ -70,7 +70,7 @@ struct VideoBubble: View {
     private var ready: Bool { message.video?.isEmpty == false }
 
     private var loadingLabel: String {
-        guard let got = model.clipProgress(of: message.id), got.have > 0, got.of > 1 else { return "Loading video" }
+        guard let got = model.clipProgress(ofMessage: message.id), got.have > 0, got.of > 1 else { return "Loading video" }
         return "Loading video · \(got.have) of \(got.of)"
     }
 
