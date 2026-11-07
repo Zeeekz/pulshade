@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import Pulshade
 
-/// Wake-up pushes, against a throwaway relay. That relay has no Apple key beside it, so
+/// Wake-up pushes, against the throwaway relay `scripts/test.sh` starts. That relay has no Apple key beside it, so
 /// it says it can't send pushes, and refuses to take a registration instead of pretending.
 @Suite(.enabled(if: ProcessInfo.processInfo.environment["PULSHADE_RELAY_TEST"] == "1"), .serialized)
 struct PushTests {

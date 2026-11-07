@@ -24,6 +24,8 @@ struct ConversationView: View {
     @State private var recorder = VoiceRecorder()
     @State private var replyingTo: Message?
     @State private var draftPreview: LinkPreview?
+    /// People picked from the "@" list for the message being written.
+    @State private var picks: [(fingerprint: String, name: String)] = []
     @State private var dismissedPreview: String?
     @State private var previewTask: Task<Void, Never>?
     @State private var flash: UUID?
@@ -359,8 +361,55 @@ struct ConversationView: View {
 
     // MARK: Composer
 
+    /// What's typed after the last "@" when it starts a word, for picking someone to mention. Nil when not typing one.
+    private var mentionQuery: String? {
+        guard let at = draft.lastIndex(of: "@") else { return nil }
+        if at > draft.startIndex, !draft[draft.index(before: at)].isWhitespace { return nil }
+        let query = String(draft[draft.index(after: at)...])
+        return query.count > 30 || query.contains(where: \.isNewline) ? nil : query
+    }
+
+    private func mentionSuggestions(_ c: Conversation) -> [Contact] {
+        guard let query = mentionQuery else { return [] }
+        let all = model.mentionable(in: c)
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return Array(all.prefix(5)) }
+        let starts = all.filter { $0.displayName.localizedCaseInsensitiveContains(q) && $0.displayName.lowercased().hasPrefix(q.lowercased()) }
+        let rest = all.filter { c in c.displayName.localizedCaseInsensitiveContains(q) && !starts.contains { $0.fingerprint == c.fingerprint } }
+        return Array((starts + rest).prefix(5))
+    }
+
+    private func pick(_ contact: Contact) {
+        guard let at = draft.lastIndex(of: "@") else { return }
+        draft = String(draft[..<at]) + "@" + contact.displayName + " "
+        picks.removeAll { $0.fingerprint == contact.fingerprint }
+        picks.append((contact.fingerprint, contact.displayName))
+    }
+
     private func composer(_ c: Conversation) -> some View {
         VStack(spacing: 8) {
+            let suggestions = mentionSuggestions(c)
+            if !suggestions.isEmpty {
+                VStack(spacing: 0) {
+                    ForEach(suggestions, id: \.fingerprint) { person in
+                        Button { pick(person) } label: {
+                            HStack(spacing: 10) {
+                                Text("@").foregroundStyle(theme.accent)
+                                Text(person.displayName).foregroundStyle(Ink.text).lineLimit(1)
+                                Spacer(minLength: 0)
+                            }
+                            .font(.system(size: 14))
+                            .padding(.horizontal, 12).padding(.vertical, 9)
+                            .contentShape(.rect)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Mention \(person.displayName)")
+                    }
+                }
+                .background(Ink.raised, in: .rect(cornerRadius: 10))
+                .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(Ink.line) }
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
             if let replyingTo {
                 ComposerContext(symbol: "arrowshape.turn.up.left.fill",
                                 title: replyingTo.isMine ? "Replying to yourself" : "Replying to \(model.displayName(replyingTo.sender))",
@@ -551,15 +600,16 @@ struct ConversationView: View {
             videoDraft = nil
             return
         } else if attachments.isEmpty {
-            model.send(draft, replyTo: replyingTo, preview: preview, in: id)
+            model.send(draft, replyTo: replyingTo, preview: preview, mentioning: picks, in: id)
         } else {
             for (i, photo) in attachments.enumerated() {
                 model.send(i == 0 ? draft : "", image: photo, replyTo: i == 0 ? replyingTo : nil,
-                           preview: i == 0 ? preview : nil, in: id)
+                           preview: i == 0 ? preview : nil, mentioning: i == 0 ? picks : [], in: id)
             }
         }
         model.playSendSound()
         draft = ""
+        picks = []
         attachments = []
         videoDraft = nil
         replyingTo = nil
@@ -675,6 +725,21 @@ private struct Bubble: View {
     static let quick = ["❤️", "😂", "🔥", "😮", "😢", "👍"]
 
     private var showsSender: Bool { !message.isMine && kind == .group }
+
+    /// The "@Name" parts of the words in bold, and in the accent colour when they name you (on your own
+    /// messages the bubble already is the accent colour, so there it is bold only).
+    private func mentioned(_ text: AttributedString) -> AttributedString {
+        var out = text
+        let plain = message.text
+        for m in message.mentions {
+            guard let r = Range(NSRange(location: m.start, length: m.length), in: plain),
+                  let lower = AttributedString.Index(r.lowerBound, within: out),
+                  let upper = AttributedString.Index(r.upperBound, within: out) else { continue }
+            out[lower..<upper].font = .system(size: 14, weight: .bold)
+            if !message.isMine { out[lower..<upper].foregroundColor = m.fingerprint == "me" ? theme.accent : Ink.text }
+        }
+        return out
+    }
 
     var body: some View {
         let mine = message.isMine
@@ -808,7 +873,7 @@ private struct Bubble: View {
             } else if bare {
                 BigEmoji(text: message.text, fresh: Date().timeIntervalSince(message.date) < 6)
             } else if !message.text.isEmpty {
-                Text(LinkPreviews.linked(message.text))
+                Text(mentioned(LinkPreviews.linked(message.text)))
                     .font(.system(size: 14))
                     .foregroundStyle(mine ? Ink.onAccent.opacity(0.88) : Ink.text)
                     .tint(mine ? Ink.onAccent.opacity(0.85) : theme.accent)

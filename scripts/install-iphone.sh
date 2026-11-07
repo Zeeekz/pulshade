@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Builds Pulshade for your connected iPhone and installs it.
 # The phone is pointed at the relay on this Mac: its onion address once it has one,
-# otherwise its Wi-Fi address.
+# otherwise its Wi-Fi address (start that with: PULSHADE_BIND=0.0.0.0:7878 ./scripts/run-relay.sh).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

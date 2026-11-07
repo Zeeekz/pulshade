@@ -4,7 +4,7 @@ import Foundation
 
 /// The message tones, and the call flag that makes a phone ring instead of showing a banner.
 struct MessageToneTests {
-    /// The names the relay accepts: the app has to offer exactly these and no others.
+    /// The names the relay accepts (relay/src/push.rs, `TONES`): the app has to offer exactly these and no others.
     private let relayTones = ["pulse", "chime", "bubble", "drop", "knock", "tick"]
 
     @Test func everyToneTheAppOffersIsOneTheRelayAccepts() {

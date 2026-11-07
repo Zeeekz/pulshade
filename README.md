@@ -81,7 +81,8 @@ macOS 26 or later, or iOS 26 or later.
 ## Building from source
 
 The code is open so anyone can check what the app and the server do. A build you make yourself is for reading,
-testing and auditing: the official app only ever talks to Pulshade's servers.
+testing and auditing: development builds can talk to a relay on your own Mac, while the official app only ever
+talks to Pulshade's servers.
 
 You'll need Xcode, Rust (`rustup`), Go and, for the iPhone, [XcodeGen](https://github.com/yonaskolb/XcodeGen). The first
 build compiles Tor ([Arti](https://gitlab.torproject.org/tpo/core/arti)) and its bridge transports (Snowflake and
@@ -89,16 +90,17 @@ webtunnel, from Tor Project's [lyrebird](https://gitlab.torproject.org/tpo/anti-
 which takes a few minutes.
 
 ```bash
+./scripts/run-relay.sh            # a relay on this Mac, at 127.0.0.1:7878
 ./scripts/build-app.sh debug      # builds build/Pulshade.app, a development build
 open build/Pulshade.app
 ```
 
 ```bash
-swift test                        # the tests that run on their own, no server needed
+./scripts/test.sh                 # every test, against a throwaway relay
 ```
 
-The apps are in `Sources/Pulshade` (the Mac and iPhone share all their code) and the Tor
-bridge in `tor/`. The server is not published.
+The apps are in `Sources/Pulshade` (the Mac and iPhone share all their code), the server in `relay/`, and the Tor
+bridge in `tor/`.
 
 ## Security
 
@@ -106,7 +108,7 @@ Found a vulnerability? Please report it privately, not in a public issue: see [S
 
 ## License
 
-Pulshade (the apps and the Tor bridge) is open source under the [MIT License](LICENSE). You can use,
+Pulshade (the apps, the relay and the Tor bridge) is open source under the [MIT License](LICENSE). You can use,
 study, change and share it, as long as you keep the copyright and license notice.
 Bundled third-party code keeps its own license (`tor/vendor/sysinfo` is MIT).
 

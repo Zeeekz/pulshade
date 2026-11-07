@@ -30,7 +30,7 @@ import PulshadeShared
 }
 
 /// A relay that's gone covers the app with the offline screen within half a minute, and coming back lifts it.
-@MainActor @Suite(.enabled(if: ProcessInfo.processInfo.environment["PULSHADE_RELAY_TEST"] == "1")) struct RelayOfflineTests {
+@MainActor @Suite struct RelayOfflineTests {
     @Test func aDeadRelayShowsAsOffline() async throws {
         let model = testModel("pulshade-offline")
         model.trafficShaping = true
@@ -49,7 +49,7 @@ import PulshadeShared
 }
 
 /// Goes out over the real Tor network, so it's off by default and runs on its own (it switches Tor on for the
-/// whole process): PULSHADE_TOR_TEST=1 swift test --filter TorNetworkTests
+/// whole process): PULSHADE_TOR_TEST=1 ./scripts/test.sh --filter TorNetworkTests
 @Suite(.enabled(if: ProcessInfo.processInfo.environment["PULSHADE_TOR_TEST"] == "1"), .serialized)
 struct TorNetworkTests {
     init() { Tor.enabled = true }
@@ -107,7 +107,7 @@ struct TorNetworkTests {
         #expect(heard.contains("pulse"))
     }
 
-    /// A relay's own onion service, end to end: PULSHADE_TEST_ONION=http://….onion.
+    /// A relay's own onion service, end to end: PULSHADE_TEST_ONION=http://….onion (see relay/pulshade-onion/hostname).
     @Test(.enabled(if: ProcessInfo.processInfo.environment["PULSHADE_TEST_ONION"] != nil))
     func reachesARelayOverItsOnion() async throws {
         let relay = try #require(Invite.validRelay(ProcessInfo.processInfo.environment["PULSHADE_TEST_ONION"]).flatMap(URL.init))
@@ -162,7 +162,7 @@ struct TorNetworkTests {
 }
 
 /// Connects through the built-in bridges over the real network, so it's off by default and runs on its own (Tor
-/// starts once per process): PULSHADE_BRIDGE_TEST=snowflake swift test --filter BridgeNetworkTests
+/// starts once per process): PULSHADE_BRIDGE_TEST=snowflake ./scripts/test.sh --filter BridgeNetworkTests
 @Suite(.enabled(if: ProcessInfo.processInfo.environment["PULSHADE_BRIDGE_TEST"] != nil), .serialized)
 struct BridgeNetworkTests {
     @Test func reachesTorThroughABridge() async throws {

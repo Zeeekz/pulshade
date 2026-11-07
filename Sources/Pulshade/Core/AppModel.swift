@@ -836,7 +836,8 @@ final class AppModel {
 
     private func notify(_ message: Message, at i: Int) {
         let convo = data.conversations[i]
-        guard data.security.notifications, !convo.muted else { return }
+        // Being @-mentioned gets through a muted chat: that's someone asking for you in particular.
+        guard data.security.notifications, !convo.muted || message.mentionsMe else { return }
         if appActive && openConversation == convo.id { return }
         let content = Notifier.content(for: message, in: convo, sender: displayName(message.sender),
                                        style: data.security.notificationContent)
@@ -1063,7 +1064,7 @@ final class AppModel {
 
     func send(_ text: String, image: Data? = nil, voice: VoiceNote? = nil, replyTo: Message? = nil,
               quote: ReplyRef? = nil, preview: LinkPreview? = nil, collectible: Collectible? = nil, note: NoteCard? = nil,
-              in id: Conversation.ID) {
+              mentioning picks: [(fingerprint: String, name: String)] = [], in id: Conversation.ID) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || image != nil || voice != nil || collectible != nil || note != nil, let i = index(of: id) else { return }
         let convo = data.conversations[i]
@@ -1077,13 +1078,17 @@ final class AppModel {
                               preview: preview)
         message.collectible = collectible
         message.note = note
+        // Only people of this group that are your contacts can be mentioned.
+        let allowed = Set(mentionable(in: convo).map(\.fingerprint))
+        message.mentions = Mention.locate(picks.filter { allowed.contains($0.fingerprint) }, in: trimmed)
         withAnimation(.snappy(duration: 0.4)) { data.conversations[i].messages.append(message) }
 
         let wire = WireMessage(id: message.id, conversation: sharedID(convo), kind: convo.kind == .broadcast ? .direct : convo.kind,
                                text: trimmed, image: image, voice: voice, date: RelayClock.relay(now), expiresIn: convo.disappearAfter,
                                reply: reply.map { ReplyRef(id: $0.id, author: $0.author == "me" ? (me(convo.persona)?.fingerprint ?? "") : $0.author,
                                                            snippet: $0.snippet, picture: $0.picture) },
-                               preview: preview, collectible: collectible, note: note)
+                               preview: preview, collectible: collectible, note: note,
+                               mentions: message.mentions.isEmpty ? nil : message.mentions)
         let recipients = audience(convo)
         for member in recipients { enqueue(.message(wire), to: member, message: message.id) }
         sync(.sent(ref(convo), wire))
@@ -1225,6 +1230,15 @@ final class AppModel {
     /// Who receives conversation-level signals (reactions, unsends, timers). Broadcasts fan out privately.
     private func audience(_ convo: Conversation) -> [Contact] {
         convo.members.compactMap { contact($0, in: convo.persona) }
+    }
+
+    /// Who you can @-mention in a chat: members of a group that are your own contacts, by name. Someone in the
+    /// group you haven't added isn't offered, so a group can't be used to reach people you don't know.
+    func mentionable(in convo: Conversation) -> [Contact] {
+        guard convo.kind == .group else { return [] }
+        return convo.members.compactMap { contact($0, in: convo.persona) }
+            .filter { !$0.hidden && !$0.awaitingAcceptance && !$0.isSelf }
+            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
     }
 
     // MARK: Unsend, reactions, typing, timers
@@ -3304,7 +3318,8 @@ final class AppModel {
                 let wire = WireMessage(id: message.id, conversation: sharedID(convo), kind: convo.kind, text: message.text,
                                        image: message.image, voice: message.voice, date: RelayClock.relay(message.date),
                                        expiresIn: message.expiresAt == nil ? nil : convo.disappearAfter, reply: reply, preview: message.preview,
-                                       collectible: message.collectible, note: message.note)
+                                       collectible: message.collectible, note: message.note,
+                                       mentions: message.mentions.isEmpty ? nil : message.mentions)
                 // Not marked queued: it stays "sent" until the receipt comes, which is what makes it worth sending again.
                 for member in recipients { enqueue(.message(wire), to: member) }
             }
@@ -4507,6 +4522,12 @@ final class AppModel {
         // Shown only if it's really theirs: a collectible is checked against their key, a note card is just a title.
         message.collectible = wire.collectible.flatMap { $0.isGenuine(for: sender.signingKey) ? $0 : nil }
         message.note = wire.note.flatMap(NoteCard.cleaned)
+        // A mention counts only in a group, and only as far as it fits the words; yours is stored as "me".
+        if data.conversations[i].kind == .group {
+            message.mentions = Mention.cleaned(wire.mentions, in: message.text).map {
+                Mention(fingerprint: $0.fingerprint == mine ? "me" : $0.fingerprint, start: $0.start, length: $0.length)
+            }
+        }
         if let clip = wire.clip {
             // A video: its clip comes in pieces after this (some may be here already).
             message.video = Data()

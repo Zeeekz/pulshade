@@ -55,8 +55,8 @@ enum RelayClock {
     }
 }
 
-/// Proof of work for onion requests, so that building fresh Tor circuits doesn't buy fresh rate-limit allowances.
-/// A fraction of a second's hashing, tied to one request and used once.
+/// Proof of work for onion requests, so that building fresh Tor circuits doesn't buy fresh rate-limit allowances
+/// (relay/src/pow.rs). A fraction of a second's hashing, tied to one request and used once.
 enum Work {
     static let bits = 18
 

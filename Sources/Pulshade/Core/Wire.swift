@@ -54,6 +54,8 @@ struct WireMessage: Codable, Equatable {
     var collectible: Collectible?
     /// A note of the sender's profile, as a card (no words in it). Older apps see only `text`.
     var note: NoteCard?
+    /// People @-mentioned in a group message. Older apps ignore it and just show the "@Name" text.
+    var mentions: [Mention]?
 }
 
 /// What a message says about the video that follows it.

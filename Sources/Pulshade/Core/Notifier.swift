@@ -71,7 +71,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         case .hidden:
             return ("PULSHADE", "New message")
         case .name:
-            return (title(conversation, sender: sender), "New message")
+            return (title(conversation, sender: sender), message.mentionsMe ? "Mentioned you" : "New message")
         case .full:
             let body: String
             if message.voice != nil { body = "🎤 Voice note" }
@@ -79,7 +79,7 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
             else if message.isVideo { body = "🎥 Video" }
             else if message.image != nil { body = "📷 Photo" }
             else { body = "New message" }
-            let prefix = conversation.kind == .group ? "\(sender): " : ""
+            let prefix = message.mentionsMe ? "\(sender) mentioned you: " : conversation.kind == .group ? "\(sender): " : ""
             return (title(conversation, sender: sender), prefix + body)
         }
     }

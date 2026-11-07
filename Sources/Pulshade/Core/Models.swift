@@ -478,8 +478,12 @@ struct Message: Codable, Identifiable, Equatable {
     /// A note of the sender's profile, shown as a card: only its title travels. Opening it reads the note from their
     /// profile, behind its password or the access they gave.
     var note: NoteCard?
+    /// People @-mentioned in a group message. On a received message your own mention names "me".
+    var mentions: [Mention] = []
 
     var isVideo: Bool { video != nil }
+    /// Whether this message @-mentions you.
+    var mentionsMe: Bool { mentions.contains { $0.fingerprint == "me" } }
     var isMine: Bool { sender == "me" }
     var isSystem: Bool { sender == "system" }
 
@@ -514,6 +518,55 @@ struct Message: Codable, Identifiable, Equatable {
         clipSeconds = try? c.decodeIfPresent(Double.self, forKey: .clipSeconds)
         collectible = try? c.decodeIfPresent(Collectible.self, forKey: .collectible)
         note = try? c.decodeIfPresent(NoteCard.self, forKey: .note)
+        mentions = (try? c.decodeIfPresent([Mention].self, forKey: .mentions)) ?? []
+    }
+}
+
+/// Someone @-mentioned in a message: which part of its text (UTF-16 offsets, so it maps onto `NSRange`) names them.
+/// It travels inside the encrypted message, so only the people in the chat learn who was mentioned.
+struct Mention: Codable, Equatable {
+    var fingerprint: String
+    var start: Int
+    var length: Int
+
+    static let maxPerMessage = 20
+
+    /// The pieces of `text` that read "@Name" for each person picked, in the order they appear. A pick whose
+    /// "@Name" was edited away since is simply left out.
+    static func locate(_ picks: [(fingerprint: String, name: String)], in text: String) -> [Mention] {
+        let ns = text as NSString
+        var found: [Mention] = []
+        for pick in picks where !pick.name.isEmpty {
+            let token = "@" + pick.name
+            var from = 0
+            while from < ns.length {
+                let r = ns.range(of: token, options: [.literal], range: NSRange(location: from, length: ns.length - from))
+                if r.location == NSNotFound { break }
+                from = r.location + r.length
+                // Not the front of a longer word ("@Nova" inside "@Novak"), and not inside an email address.
+                let after = from < ns.length ? ns.substring(with: NSRange(location: from, length: 1)) : ""
+                let before = r.location > 0 ? ns.substring(with: NSRange(location: r.location - 1, length: 1)) : " "
+                if after.first.map({ $0.isLetter || $0.isNumber }) == true { continue }
+                if before.first.map({ $0.isLetter || $0.isNumber }) == true { continue }
+                found.append(Mention(fingerprint: pick.fingerprint, start: r.location, length: r.length))
+            }
+        }
+        return Array(found.sorted { $0.start < $1.start }.prefix(maxPerMessage))
+    }
+
+    /// What arrived, kept only where it fits the text: inside it, starting on an "@", not overlapping another.
+    static func cleaned(_ mentions: [Mention]?, in text: String) -> [Mention] {
+        let ns = text as NSString
+        var out: [Mention] = []
+        var end = 0
+        for m in (mentions ?? []).sorted(by: { $0.start < $1.start }) {
+            guard out.count < maxPerMessage, !m.fingerprint.isEmpty, m.fingerprint.count <= 128,
+                  m.start >= end, m.length >= 2, m.length <= 200, m.start + m.length <= ns.length,
+                  ns.substring(with: NSRange(location: m.start, length: 1)) == "@" else { continue }
+            out.append(m)
+            end = m.start + m.length
+        }
+        return out
     }
 }
 

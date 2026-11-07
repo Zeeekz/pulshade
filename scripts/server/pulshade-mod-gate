@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# pulshade-mod-gate NAME "REQUEST": all a moderator's SSH key can do on this server. A moderator's line in
+# authorized_keys forces this to run, through sudo, for whatever they ask: they never get a shell. Anything not listed
+# here is refused, so a moderator can read reports and take down or ban handles, and nothing else: no collectibles,
+# announcements, backups, restarts or other mailboxes. The admin token stays with root.
+#
+# Every request is logged to $data/mod/log with the moderator's name, so the operator can see who did what. The log
+# holds handles and counts, never a report or anything a person wrote.
+set -euo pipefail
+umask 077
+export LC_ALL=C
+
+data="${PULSHADE_DATA:-/var/lib/pulshade}"
+keys="${PULSHADE_KEYS:-/etc/pulshade}"
+relay_url="${PULSHADE_RELAY_URL:-http://127.0.0.1:7878}"
+state="$data/mod"
+max_cases=4000000
+# Admin calls one moderator may make an hour. The relay counts every admin call from this machine together, so one
+# moderator can't be allowed to use it all up.
+max_admin_per_hour=100
+
+name="${1:-}"
+request="${2:-}"
+[[ "$name" =~ ^[a-z0-9][a-z0-9-]{0,23}$ ]] || { echo "Who is this?" >&2; exit 1; }
+install -d -m 700 "$state"
+
+log()    { printf '%s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" "$*" >> "$state/log"; }
+refuse() { log "refused: $*"; echo "$*" >&2; exit 1; }
+
+# The Pulshade Admin app calls `pulshade-server ...`; only what follows matters here.
+request="${request#pulshade-server }"
+read -r -a words <<<"$request"
+cmd="${words[0]:-}"
+
+# One relay admin action with the token only root can read. Prints the relay's JSON answer.
+relay_admin() {
+  local action="$1" arg="$2" body out code
+  [[ -f "$data/admin.token" ]] || refuse "The relay has no admin token yet"
+  body=$(python3 -c 'import json,sys; print(json.dumps({"action": sys.argv[1], "arg": sys.argv[2]}))' "$action" "$arg")
+  out=$(curl -s -m 10 -w '\n%{http_code}' -X POST "$relay_url/v1/admin" \
+        -H 'Content-Type: application/json' -H @<(printf 'x-pulshade-admin-token: %s\n' "$(<"$data/admin.token")") -d "$body") \
+    || refuse "Can't reach the relay"
+  code="${out##*$'\n'}"; out="${out%$'\n'*}"
+  [[ "$code" == 2* ]] || { echo "${out:-Refused ($code)}" >&2; exit 1; }
+  printf '%s\n' "$out"
+}
+
+# The reports mailbox's receive key, which the operator stored here. Moderators never hold it. It goes to curl on
+# standard input, not as an argument, so it never shows in the list of running programs.
+reports_key() {
+  local k
+  [[ -s "$keys/mod-reports.key" ]] || refuse "Reports aren't set up for moderators yet"
+  k=$(<"$keys/mod-reports.key")
+  [[ "$k" =~ ^[0-9a-f]{64}$ ]] || refuse "The reports key on this server is damaged"
+  printf '%s' "$k"
+}
+
+etag() { [[ -f "$state/cases.b64" ]] && sha256sum "$state/cases.b64" | cut -d' ' -f1 || printf 'none'; }
+
+case "$cmd" in
+  json)
+    # `json ACTION [BASE64 ARGUMENT]`, only for actions that take down or ban, or look something up.
+    action="${words[1]:-}"
+    case "$action" in
+      stats|lookup|lists|handles|remove|ban-handle|unban-handle|ban-account|unban-account) ;;
+      *) refuse "Moderators can't do that" ;;
+    esac
+    arg=""
+    if [[ -n "${words[2]:-}" ]]; then
+      arg=$(printf '%s' "${words[2]}" | base64 -d 2>/dev/null) || refuse "The argument isn't base64"
+    fi
+    # A handle or an account key, nothing else: no spaces, quotes or control characters.
+    [[ -z "$arg" || "$arg" =~ ^@?[A-Za-z0-9_+/=]{1,64}$ ]] || refuse "That isn't a handle or an account"
+    [[ "$action" == stats || "$action" == lists || "$action" == handles || -n "$arg" ]] || refuse "Which handle?"
+    since=$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-1H +%Y-%m-%dT%H:%M:%SZ)
+    used=$([[ -f "$state/log" ]] && awk -v n="$name" -v s="$since" '$2==n && $1>=s && $3!="refused:" && $3!="updated"' "$state/log" | wc -l || echo 0)
+    [[ "${used// /}" -lt $max_admin_per_hour ]] || refuse "Slow down: that's $max_admin_per_hour requests this hour"
+    log "$action $arg"
+    relay_admin "$action" "$arg"
+    ;;
+  reports-fetch)
+    key=$(reports_key)
+    out=$(printf '{"keys":["%s"],"wait":0}' "$key" \
+          | curl -sf -m 10 -X POST "$relay_url/v1/fetch" -H 'Content-Type: application/json' -d @-) \
+      || refuse "Can't reach the relay"
+    printf '%s\n' "$out"
+    ;;
+  reports-ack)
+    key=$(reports_key)
+    ids=("${words[@]:1}")
+    [[ ${#ids[@]} -gt 0 && ${#ids[@]} -le 200 ]] || refuse "Which reports?"
+    for id in "${ids[@]}"; do [[ "$id" =~ ^[0-9]{1,20}$ ]] || refuse "That isn't a report id"; done
+    list=$(IFS=,; printf '%s' "${ids[*]}")
+    printf '{"acks":[{"key":"%s","ids":[%s]}]}' "$key" "$list" \
+      | curl -sf -m 10 -X POST "$relay_url/v1/ack" -H 'Content-Type: application/json' -d @- >/dev/null \
+      || refuse "Can't reach the relay"
+    printf '{"ok":true}\n'
+    ;;
+  cases-get)
+    # The team's shared report list, sealed by the apps with a key this server never has.
+    exec 9>"$state/.lock"; flock 9
+    if [[ -f "$state/cases.b64" ]]; then
+      printf '{"etag":"%s","blob":"%s"}\n' "$(etag)" "$(<"$state/cases.b64")"
+    else
+      printf '{"etag":"none","blob":""}\n'
+    fi
+    ;;
+  cases-put)
+    # Replaces it only if nobody else has since the version this moderator read (its etag).
+    expected="${words[1]:-}"
+    [[ "$expected" =~ ^([0-9a-f]{64}|none)$ ]] || refuse "Which version?"
+    blob=$(head -c $((max_cases + 1)))
+    [[ ${#blob} -gt 0 && ${#blob} -le $max_cases ]] || refuse "That list is empty or too big"
+    [[ -z "$(printf '%s' "$blob" | tr -d 'A-Za-z0-9+/=\n')" ]] || refuse "That isn't sealed data"
+    exec 9>"$state/.lock"; flock 9
+    if [[ "$(etag)" != "$expected" ]]; then
+      printf '{"ok":false,"conflict":true,"etag":"%s"}\n' "$(etag)"
+      exit 0
+    fi
+    printf '%s' "${blob//$'\n'/}" > "$state/cases.b64.new"
+    # The version before this one is kept, so a bad write can be put back by hand.
+    [[ -f "$state/cases.b64" ]] && cp "$state/cases.b64" "$state/cases.b64.prev"
+    mv "$state/cases.b64.new" "$state/cases.b64"
+    log "updated the report list"
+    printf '{"ok":true,"etag":"%s"}\n' "$(etag)"
+    ;;
+  cases-reset)
+    # Only the operator: starts the shared list again, keeping the old one beside it.
+    [[ "$name" == owner ]] || refuse "Moderators can't do that"
+    exec 9>"$state/.lock"; flock 9
+    [[ -f "$state/cases.b64" ]] && mv "$state/cases.b64" "$state/cases.b64.reset"
+    log "reset the report list"
+    printf '{"ok":true}\n'
+    ;;
+  *) refuse "Moderators can't do that" ;;
+esac
