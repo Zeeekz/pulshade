@@ -720,6 +720,11 @@ private struct ChatRow: View {
     /// Opens their story when the picture is tapped and they have one.
     var openStory: (StoryReel) -> Void = { _ in }
     @State private var hover = false
+    /// Rows are roomier on the phone, like Telegram's and WhatsApp's; the Mac's sidebar is narrower.
+    private var avatarSize: CGFloat { Platform.isPhone ? 56 : 46 }
+    private var titleSize: CGFloat { Platform.isPhone ? 16.5 : 14.5 }
+    private var lineSize: CGFloat { Platform.isPhone ? 15 : 13.5 }
+    private var stampSize: CGFloat { Platform.isPhone ? 12.5 : 11.5 }
 
     /// Their live stories, when this is a one-to-one chat with someone who has posted.
     private var stories: [Story] {
@@ -734,7 +739,7 @@ private struct ChatRow: View {
             ZStack(alignment: .bottomTrailing) {
                 Avatar(image: c.avatar ?? (c.kind == .direct ? model.contact(c.members.first ?? "")?.avatar : nil),
                        seed: c.kind == .direct ? (c.members.first ?? c.id.uuidString) : c.id.uuidString,
-                       size: 42, symbol: c.kind == .direct ? nil : c.kind.symbol, showsStory: false)
+                       size: avatarSize, symbol: c.kind == .direct ? nil : c.kind.symbol, showsStory: false)
                     .overlay {
                         if c.kind == .direct, let fp = c.members.first {
                             Circle().strokeBorder(model.signature(fp).opacity(0.8), lineWidth: 1.5).padding(-2.5)
@@ -758,27 +763,27 @@ private struct ChatRow: View {
                     Image(systemName: "flame.fill")
                         .font(.system(size: 9, weight: .bold))
                         .foregroundStyle(.white)
-                        .frame(width: 18, height: 18)
+                        .frame(width: 20, height: 20)
                         .background(Burn.gradient, in: .circle)
                         .overlay(Circle().strokeBorder(Ink.base, lineWidth: 2))
                         .offset(x: 3, y: 3)
                         .help("Burns \(burner.burnsAt!.formatted(.relative(presentation: .named)))")
                 } else if c.kind != .direct {
-                    SymbolBadge(symbol: c.kind.symbol, size: 18).offset(x: 3, y: 3)
+                    SymbolBadge(symbol: c.kind.symbol, size: 20).offset(x: 3, y: 3)
                 } else if let fp = c.members.first, model.isOnline(fp) {
-                    OnlineDot(size: 12).offset(x: 2, y: 2)
+                    OnlineDot(size: 14).offset(x: 2, y: 2)
                 }
             }
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
                     Text(c.title)
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(.system(size: titleSize, weight: .semibold))
                         .foregroundStyle(Ink.text)
                         .lineLimit(1)
-                    if c.kind == .direct { BadgeMark(badge: model.contact(c.members.first ?? "")?.badge, size: 14) }
+                    if c.kind == .direct { BadgeMark(badge: model.contact(c.members.first ?? "")?.badge, size: titleSize) }
                     if stories.contains(where: { !$0.seen }) {
                         Text("New story")
-                            .font(.system(size: 10, weight: .semibold))
+                            .font(.system(size: stampSize - 1.5, weight: .semibold))
                             .foregroundStyle(Ink.onAccent.opacity(0.9))
                             .padding(.horizontal, 6).padding(.vertical, 2)
                             .background(theme.accent, in: .capsule)
@@ -786,7 +791,7 @@ private struct ChatRow: View {
                     if c.muted { Image(systemName: "bell.slash.fill").font(.system(size: 10)).foregroundStyle(Ink.faint) }
                     Spacer(minLength: 4)
                     Text(c.lastActivity.chatStamp)
-                        .font(.system(size: 11))
+                        .font(.system(size: stampSize))
                         .foregroundStyle(Ink.faint)
                 }
                 HStack(spacing: 6) {
@@ -794,32 +799,32 @@ private struct ChatRow: View {
                         if last.isMine {
                             StatusTicks(status: last.status).foregroundStyle(Ink.faint)
                         }
-                        if last.image != nil { Image(systemName: "photo").font(.system(size: 11)).foregroundStyle(Ink.dim) }
-                        if last.voice != nil { Image(systemName: "waveform").font(.system(size: 11)).foregroundStyle(Ink.dim) }
+                        if last.image != nil { Image(systemName: "photo").font(.system(size: lineSize - 2)).foregroundStyle(Ink.dim) }
+                        if last.voice != nil { Image(systemName: "waveform").font(.system(size: lineSize - 2)).foregroundStyle(Ink.dim) }
                         if last.expiresAt != nil || c.disappearAfter != nil {
                             Image(systemName: "timer").font(.system(size: 10)).foregroundStyle(Ink.faint)
                         }
                         Text(last.text.isEmpty ? (last.voice != nil ? "Voice message" : last.image != nil ? "Photo" : "") : last.text)
-                            .font(.system(size: 13))
+                            .font(.system(size: lineSize))
                             .foregroundStyle(Ink.dim)
                             .lineLimit(1)
                     } else {
-                        Text("No messages yet").font(.system(size: 13)).foregroundStyle(Ink.faint)
+                        Text("No messages yet").font(.system(size: lineSize)).foregroundStyle(Ink.faint)
                     }
                     Spacer(minLength: 4)
                     if c.pinned { Image(systemName: "pin.fill").font(.system(size: 10)).foregroundStyle(Ink.faint) }
                     if c.unread > 0 {
                         Text("\(c.unread)")
-                            .font(.system(size: 11, weight: .semibold))
+                            .font(.system(size: stampSize, weight: .semibold))
                             .foregroundStyle(Ink.onAccent.opacity(0.85))
-                            .padding(.horizontal, 6).frame(minWidth: 18, minHeight: 18)
+                            .padding(.horizontal, 7).frame(minWidth: 21, minHeight: 21)
                             .background(c.muted ? Ink.faint : theme.accent, in: .capsule)
                     }
                 }
             }
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 9)
+        .padding(.vertical, Platform.isPhone ? 11 : 9)
         .background {
             RoundedRectangle(cornerRadius: 10)
                 .fill(selected ? Ink.raised : (hover ? Ink.surface : .clear))
