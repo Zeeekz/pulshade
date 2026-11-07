@@ -89,6 +89,8 @@ final class CallMedia: @unchecked Sendable {
     private var watchdog: Task<Void, Never>?
     private var greeter: Task<Void, Never>?
     private var audio: CallAudio?
+    /// Playing the ringing sound to the caller, until the other side answers.
+    private var ringing = false
     /// Packets that arrived, for tests without a microphone.
     private(set) var received: [Data] = []
 
@@ -135,10 +137,11 @@ final class CallMedia: @unchecked Sendable {
                 }
             }
             let audio = CallAudio { [weak self] packet in self?.send(.audio, packet) }
-            let speaker = lock.withLock {
+            let (speaker, ringing) = lock.withLock {
                 self.audio = audio
-                return self.speaker
+                return (self.speaker, self.ringing)
             }
+            audio?.setRingback(ringing)
             audio?.start()
             audio?.setSpeaker(speaker)
         }
@@ -163,6 +166,15 @@ final class CallMedia: @unchecked Sendable {
             return self.audio
         }
         audio?.setSpeaker(on)
+    }
+
+    /// The ringing sound the caller hears while waiting. Remembered, so it starts with the audio if that isn't up yet.
+    func setRinging(_ on: Bool) {
+        let audio: CallAudio? = lock.withLock {
+            ringing = on
+            return self.audio
+        }
+        audio?.setRingback(on)
     }
 
     /// Sends a raw packet as audio. Tests use it in place of a microphone.
@@ -216,6 +228,9 @@ final class CallAudio: @unchecked Sendable {
 
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
+    /// Plays the ringing sound while calling, on its own node so it never mixes into what's sent.
+    private let ringer = AVAudioPlayerNode()
+    private var ringbackWanted = false
     private let lock = NSLock()
     private let onPacket: (Data) -> Void
     private let opus: AVAudioFormat
@@ -255,6 +270,8 @@ final class CallAudio: @unchecked Sendable {
         // with no channels and the engine won't start.
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: pcm)
+        engine.attach(ringer)
+        engine.connect(ringer, to: engine.mainMixerNode, format: pcm)
         _ = engine.outputNode
         try? engine.inputNode.setVoiceProcessingEnabled(true)
         let input = engine.inputNode.outputFormat(forBus: 0)
@@ -292,6 +309,23 @@ final class CallAudio: @unchecked Sendable {
         }
         player.play()
         applyRoute()
+        applyRingback()
+    }
+
+    func setRingback(_ on: Bool) {
+        lock.withLock { ringbackWanted = on }
+        applyRingback()
+    }
+
+    /// Starts or stops the ringing loop to match what's wanted. Safe to call at any time; does nothing while the
+    /// engine isn't running (it's called again when it starts).
+    private func applyRingback() {
+        let wanted = lock.withLock { ringbackWanted }
+        guard engine.isRunning else { return }
+        ringer.stop()
+        guard wanted, let buffer = Ringback.buffer(in: pcm) else { return }
+        ringer.scheduleBuffer(buffer, at: nil, options: .loops)
+        ringer.play()
     }
 
     func stop() {
@@ -301,6 +335,7 @@ final class CallAudio: @unchecked Sendable {
         routeWatcher = nil
         engine.inputNode.removeTap(onBus: 0)
         player.stop()
+        ringer.stop()
         engine.stop()
         #if os(iOS)
         if !CallRinger.answeredOnScreen { try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation) }

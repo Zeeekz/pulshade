@@ -5868,6 +5868,8 @@ extension AppModel {
         kick()
         // Wait in the room so the audio can start the moment they answer.
         connectCall()
+        // The caller hears Pulshade's ringing until they pick up.
+        callMedia?.setRinging(true)
         // Long enough for a locked phone to be answered, unlocked and to fetch the call over Tor.
         ringFor(seconds: 90, else: "No answer")
     }
@@ -5973,6 +5975,7 @@ extension AppModel {
             endCall(note: "Declined", tell: false)
             return
         }
+        callMedia?.setRinging(false)
         current.phase = .connecting
         call = current
     }
@@ -5987,6 +5990,7 @@ extension AppModel {
             case .peerHeard:
                 guard var live = self.call, live.phase != .ringing || live.outgoing else { return }
                 if case .live = live.phase { return }
+                self.callMedia?.setRinging(false)
                 live.phase = .live(since: Date())
                 self.call = live
             case .closed:

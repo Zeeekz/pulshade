@@ -130,3 +130,24 @@ struct MentionFlowTests {
         #expect(model.unwatchedReel(of: "k") == nil)
     }
 }
+
+/// The ringing a caller hears while waiting.
+@Suite struct RingbackTests {
+    @Test func isQuietLoopsCleanlyAndIsTheSameEveryTime() {
+        let a = Ringback.samples()
+        #expect(a.count == Int(Ringback.cycle * Ringback.sampleRate))
+        #expect(a == Ringback.samples(), "made the same way every time")
+        let peak = a.map(abs).max() ?? 0
+        #expect(abs(Double(peak) - Ringback.level) < 0.001 && Ringback.level <= 0.3, "quiet")
+        // Round to round, the loop's two ends sit close together, so it doesn't click.
+        #expect(abs(a[0] - a[a.count - 1]) < 0.02)
+        let loudest = stride(from: 0, to: a.count, by: 4_800).map { start in a[start..<min(start + 4_800, a.count)].map(abs).max() ?? 0 }
+        #expect(loudest.max()! > 0.2 && loudest.min()! < 0.12, "swells, then fades before the next round")
+    }
+
+    @Test func wavHasTheRightHeader() {
+        let wav = Ringback.wav()
+        #expect(wav.prefix(4) == Data("RIFF".utf8) && wav.count == 44 + Int(Ringback.cycle * Ringback.sampleRate) * 2)
+        if let path = ProcessInfo.processInfo.environment["PULSHADE_RINGBACK_WAV"] { try? wav.write(to: URL(fileURLWithPath: path)) }
+    }
+}
