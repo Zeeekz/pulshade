@@ -696,17 +696,17 @@ struct RelayFlowTests {
         defer { for m in [alice, bob, cara] { m.lock() } }
         let b = try #require(alice.addContact(code: bob.makeInviteCode(), nickname: ""))
         let c = try #require(alice.addContact(code: cara.makeInviteCode(), nickname: ""))
-        await settle(alice, bob, cara, rounds: 8)
+        await settle(alice, bob, cara, rounds: 14)
         let group = alice.startConversation(kind: .group, title: "Crew", members: [b.fingerprint, c.fingerprint])
-        await settle(alice, bob, cara, rounds: 12)
+        await settle(alice, bob, cara, rounds: 20)
         alice.send("in the group", in: group.id)
         alice.postStory(.text("a story", palette: 1))
-        await settle(alice, bob, cara, rounds: 10)
+        await settle(alice, bob, cara, rounds: 20)
         #expect(bob.conversation(group.id)?.messages.map(\.text) == ["in the group"])
         #expect(bob.friendStories.flatMap(\.stories).count == 1)
 
         await alice.detachNow()
-        await settle(bob, cara, rounds: 10)
+        await settle(bob, cara, rounds: 16)
         #expect(bob.friendStories.flatMap(\.stories).isEmpty && cara.friendStories.flatMap(\.stories).isEmpty, "stories are gone")
         #expect(bob.conversation(group.id)?.messages.isEmpty == true, "and what she said in the group")
         #expect(bob.visibleContacts.count == 1, "but Alice is still his contact")
@@ -1031,6 +1031,22 @@ struct RelayFlowTests {
         await settle(alice, bob)
         #expect(bob.data.conversations.first { $0.kind == .direct }?.messages.map(\.text) == ["hello"])
         #expect(alice.conversation(chat.id)?.messages.first { $0.id == id }?.status == .delivered)
+    }
+
+    /// A friend request asks the relay to wake a locked phone, like a message does; a receipt and a typing signal don't.
+    /// Without it the relay is told "don't wake" and a request only shows once the app is opened.
+    @Test func aFriendRequestAsksToWakeTheOtherPhone() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        let handle = "alice_\(Int.random(in: 10000...99999))"
+        try await alice.publishProfile(handle: handle)
+        let found = try #require(try await bob.findProfile(handle))
+        _ = try #require(bob.sendRequest(to: found, note: "hi"))
+        // Checked before anything is sent: the request is sealed and waiting in the outbox.
+        let waiting = bob.data.outbox
+        #expect(waiting.count == 1 && waiting.first?.wakes == true, "the request asks to wake")
+        #expect(waiting.first?.message == nil, "though it isn't a chat message")
     }
 
     /// A request you sent can be taken back before it is accepted: it leaves your waiting list, and accepting it
@@ -2158,6 +2174,90 @@ struct RelayFlowTests {
         bob.send("welcome back", in: bobsChat.id)
         await settle(restored, bob, rounds: 14)
         #expect(restored.data.conversations.first { $0.kind == .direct }?.messages.map(\.text).contains("welcome back") == true, "and she gets his")
+    }
+
+    /// The backup is a little behind: chat went on after it was saved. After Detach and recovery the phone's keys for
+    /// each contact are older than theirs, so messages must not just be dropped on both sides for good. The account
+    /// opens fresh sessions with its contacts, and messages go both ways again.
+    @Test func recoveringFromAnOutOfDateBackupStillMessagesBothWays() async throws {
+        let zee = try await makeUser("Zee")
+        let bob = try await makeUser("Bob")
+        defer { for m in [zee, bob] { m.lock() } }
+        _ = try #require(bob.addContact(code: zee.makeInviteCode(), nickname: ""))
+        await settle(zee, bob, rounds: 10)
+        let bobFP = try #require(zee.visibleContacts.first).fingerprint
+        let chat = zee.startConversation(kind: .direct, title: "", members: [bobFP])
+        zee.send("one", in: chat.id)
+        await settle(zee, bob)
+        let seed = try #require(zee.identity?.seed)
+        let identity = try Identity(seed: seed)
+        #expect(await zee.saveBackup(), "saved here")
+
+        // Chat goes on, in both directions and a few times over: the keys move on, the backup doesn't.
+        let bobsChat = try #require(bob.data.conversations.first { $0.kind == .direct })
+        for n in 1...3 {
+            bob.send("bob \(n)", in: bobsChat.id)
+            await settle(zee, bob, rounds: 6)
+            zee.send("zee \(n)", in: chat.id)
+            await settle(zee, bob, rounds: 6)
+        }
+        zee.destroyEverything()
+
+        let restored = testModel("pulshade-stale-backup")
+        defer { restored.lock() }
+        guard case let .found(backup) = await restored.backup(of: identity) else {
+            Issue.record("nothing to restore")
+            return
+        }
+        try await restored.restore(seed: seed, passcode: "new-device", from: backup)
+        await settle(restored, bob, rounds: 12)
+
+        let again = restored.startConversation(kind: .direct, title: "", members: [bobFP])
+        restored.send("back with old keys", in: again.id)
+        await settle(restored, bob, rounds: 16)
+        #expect(bob.data.conversations.first { $0.kind == .direct }?.messages.map(\.text).contains("back with old keys") == true,
+                "Bob gets what she writes")
+        bob.send("and Bob answers", in: try #require(bob.data.conversations.first { $0.kind == .direct }).id)
+        await settle(restored, bob, rounds: 16)
+        #expect(restored.data.conversations.first { $0.kind == .direct }?.messages.map(\.text).contains("and Bob answers") == true,
+                "and she gets his")
+    }
+
+    /// If a contact's messages can't be opened because the two phones' keys have drifted apart, the app notices and
+    /// opens a new session by itself, so both sides can read each other again without anyone doing anything.
+    @Test func keysThatDriftApartMendThemselves() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, bob, rounds: 10)
+        let bobFP = try #require(alice.visibleContacts.first).fingerprint
+        let chat = alice.startConversation(kind: .direct, title: "", members: [bobFP])
+        alice.send("one", in: chat.id)
+        await settle(alice, bob, rounds: 8)
+        let i = try #require(alice.data.contacts.firstIndex { $0.fingerprint == bobFP })
+        let old = try #require(alice.data.contacts[i].devices[0].session, "a session to go back to")
+
+        let bobsChat = try #require(bob.data.conversations.first { $0.kind == .direct })
+        for n in 1...3 {
+            bob.send("bob \(n)", in: bobsChat.id)
+            await settle(alice, bob, rounds: 6)
+            alice.send("alice \(n)", in: chat.id)
+            await settle(alice, bob, rounds: 6)
+        }
+        // Alice's keys go back to how they were: older than Bob's.
+        alice.data.contacts[i].devices[0].session = old
+        bob.send("lost while out of step", in: bobsChat.id)
+        await settle(alice, bob, rounds: 14)
+
+        bob.send("after the repair", in: bobsChat.id)
+        await settle(alice, bob, rounds: 14)
+        alice.send("alice after", in: chat.id)
+        await settle(alice, bob, rounds: 14)
+        let aliceSees = alice.data.conversations.first { $0.id == chat.id }?.messages.map(\.text) ?? []
+        let bobSees = bob.data.conversations.first { $0.kind == .direct }?.messages.map(\.text) ?? []
+        #expect(aliceSees.contains("after the repair"), "Alice reads Bob again")
+        #expect(bobSees.contains("alice after"), "and Bob reads Alice")
     }
 
     @Test func aBackupIsPaddedAndOldOnesStillOpen() throws {

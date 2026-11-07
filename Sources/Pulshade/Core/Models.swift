@@ -902,6 +902,8 @@ struct Outgoing: Codable, Identifiable {
     var lane: String?
     /// This starts a call, so the relay rings the other phone instead of showing a banner. Nil for anything else.
     var rings: Bool?
+    /// This is worth waking a locked phone for although it isn't a chat message: a friend request. Nil for anything else.
+    var wakes: Bool?
     /// When it was queued, for the Network page. Nil for those queued by builds from before.
     var queued: Date? = Date()
 
