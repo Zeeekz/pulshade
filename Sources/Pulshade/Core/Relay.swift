@@ -179,6 +179,8 @@ struct RelayClient {
         do {
             let answer = if let body { try await session.upload(for: request, from: body) } else { try await session.data(for: request) }
             Self.lock.withLock { _ = Self.established.insert(name) }
+            // Every answer carries the relay's boot mark, so a restart is noticed whatever the app was doing.
+            if let boot = (answer.1 as? HTTPURLResponse)?.value(forHTTPHeaderField: "X-Pulshade-Boot") { Self.note(boot: boot, of: base) }
             return answer
         } catch {
             // A request cancelled because another one already got through says nothing about the circuit.
@@ -240,13 +242,25 @@ struct RelayClient {
     /// Each relay's boot mark, from its health check: different every time it starts. Relays from before it say nothing.
     nonisolated(unsafe) private static var boots: [String: String] = [:]
     nonisolated(unsafe) private static var restarted: Set<String> = []
+    /// How many restarts have been seen of each relay since this launch: a counter, so each part of the app can keep
+    /// its own place in it.
+    nonisolated(unsafe) private static var restartCounts: [String: Int] = [:]
 
     static func note(boot: String, of base: URL) {
         let host = base.host() ?? ""
         lock.withLock {
-            if let known = boots[host], known != boot { restarted.insert(host) }
+            if let known = boots[host], known != boot {
+                restarted.insert(host)
+                restartCounts[host, default: 0] += 1
+            }
             boots[host] = boot
         }
+    }
+
+    /// How many times this relay has been seen to restart since the app launched.
+    static func restartCount(of base: URL) -> Int {
+        let host = base.host() ?? ""
+        return lock.withLock { restartCounts[host] ?? 0 }
     }
 
     /// Whether this relay has restarted since this was last asked. A restart forgets wake-up registrations on relays

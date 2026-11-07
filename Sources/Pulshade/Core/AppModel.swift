@@ -483,6 +483,9 @@ final class AppModel {
         }
         startSync()
         startTicking()
+        // The relay may have restarted while the app was closed: a request that hasn't been answered goes again.
+        restartsHandled = relayRestartTotal()
+        resendPendingRequests()
         nextAnnouncementCheck = Date().addingTimeInterval(trafficShaping ? 5 : 0)
         nextCollectibleCheck = Date().addingTimeInterval(trafficShaping ? 40 : 3600)
         announcementsVersion = nil
@@ -1906,6 +1909,14 @@ final class AppModel {
         save()
     }
 
+    /// Moves to the next everyday persona, going round through your main account. Does nothing with only one account.
+    func switchToNextPersona() {
+        let order: [UUID?] = [nil] + personas.map { $0.id }
+        guard order.count > 1 else { return }
+        let here = order.firstIndex { $0 == data.activePersona } ?? -1
+        switchPersona(order[(here + 1) % order.count])
+    }
+
     @discardableResult
     func createPersona(name: String) -> Persona? {
         guard canAddPersona else { return nil }
@@ -2510,6 +2521,7 @@ final class AppModel {
         contact.awaitingAcceptance = true
         contact.devices[0].handshake = handshake
         upsert(contact)
+        requestNotes["\(persona?.uuidString ?? "main")|\(profile.fingerprint)"] = String(note.prefix(280))
         seal(.request(card(sendID: mailbox.sendID, persona: persona), request, note: String(note.prefix(280))),
              to: profile.fingerprint, persona: persona)
         syncContact(contact.fingerprint, persona)
@@ -3057,6 +3069,71 @@ final class AppModel {
         seal(payload, contact: i, device: 0, message: message)
     }
 
+    // MARK: Sending again what a relay restart may have emptied
+
+    /// Waiting mail lives in the relay's memory only, so a restart empties it. What the relay took but the other side
+    /// hasn't confirmed is sent again, with nothing kept anywhere new: a friend request that hasn't been accepted, and
+    /// your messages still marked "sent". The other side ignores a message it already has, and answers it with a
+    /// receipt again, so a copy that wasn't needed does no harm.
+    private var restartsHandled = 0
+    /// A request's note, so sending it again carries the words too. Kept while the app is open.
+    private var requestNotes: [String: String] = [:]
+    /// The longest a message is sent again for after being sent: well inside what the relay keeps mail.
+    private static let resendWindow: TimeInterval = 24 * 3600
+
+    /// How many restarts have been seen across the relays this account uses.
+    private func relayRestartTotal() -> Int {
+        var hosts = Set<String>()
+        if let main = reachable(nil) { hosts.insert(main) }
+        for c in data.contacts { if let r = c.relay, let reach = reachable(r) { hosts.insert(reach) } }
+        return hosts.compactMap { URL(string: $0) }.reduce(0) { $0 + RelayClient.restartCount(of: $1) }
+    }
+
+    /// Housekeeping: notices a restart and sends again what it may have lost.
+    private func resendAfterRestart() {
+        let total = relayRestartTotal()
+        guard total > restartsHandled else { return }
+        restartsHandled = total
+        resendPendingRequests()
+        resendUnconfirmedMessages()
+    }
+
+    /// Friend requests still waiting for an answer, sealed again from what the contact already holds: the handshake's
+    /// public half comes from its saved secrets, and its mailbox from the key kept for it.
+    func resendPendingRequests() {
+        for c in data.contacts where c.awaitingAcceptance && !c.isSelf && c.addedAt > Date().addingTimeInterval(-7 * 24 * 3600) {
+            guard let handshake = c.devices.first?.handshake, let public_ = handshake.publicEphemeral, let key = c.receiveKey,
+                  let kem = try? MLKEM768.PrivateKey(seedRepresentation: handshake.kemSeed, publicKey: nil), me(c.persona) != nil else { continue }
+            let request = SessionInit(ephemeral: public_, kem: kem.publicKey.rawRepresentation)
+            let note = requestNotes["\(c.persona?.uuidString ?? "main")|\(c.fingerprint)"] ?? ""
+            seal(.request(card(sendID: Mailbox.sendID(for: key), persona: c.persona), request, note: note),
+                 to: c.fingerprint, persona: c.persona)
+        }
+    }
+
+    /// Your own recent messages the relay took but nobody has confirmed. Videos and stories have their own ways of
+    /// asking again, so only text, photos and voice notes go here.
+    func resendUnconfirmedMessages() {
+        let cutoff = Date().addingTimeInterval(-Self.resendWindow)
+        for i in data.conversations.indices {
+            let convo = data.conversations[i]
+            guard convo.kind == .direct || convo.kind == .group else { continue }
+            let lost = convo.messages.filter { $0.isMine && $0.status == .sent && $0.date > cutoff && !$0.isVideo
+                && ($0.expiresAt.map { $0 > Date() } ?? true) }
+            guard !lost.isEmpty else { continue }
+            let recipients = audience(convo)
+            for message in lost {
+                let reply = message.reply.map { ReplyRef(id: $0.id, author: $0.author == "me" ? (me(convo.persona)?.fingerprint ?? "") : $0.author,
+                                                         snippet: $0.snippet, picture: $0.picture) }
+                let wire = WireMessage(id: message.id, conversation: sharedID(convo), kind: convo.kind, text: message.text,
+                                       image: message.image, voice: message.voice, date: RelayClock.relay(message.date),
+                                       expiresIn: message.expiresAt == nil ? nil : convo.disappearAfter, reply: reply, preview: message.preview)
+                // Not marked queued: it stays "sent" until the receipt comes, which is what makes it worth sending again.
+                for member in recipients { enqueue(.message(wire), to: member) }
+            }
+        }
+    }
+
     /// Handshakes that got no answer (the other side didn't know us yet, say) are tried again. Not a request's: it
     /// went with the request and is answered when they accept, which can be days later. Starting it again would
     /// leave their answer to the first one with nothing to open it.
@@ -3289,6 +3366,7 @@ final class AppModel {
         watchTor()
         watchStall()
         retryStaleHandshakes()
+        resendAfterRestart()
         if introsStale { refileIntros() }
         resendUnconfirmedStories()
         // Only written when something is stale: assigning redraws every view that reads the data.
@@ -3849,6 +3927,8 @@ final class AppModel {
                 if !data.contacts[known].awaitingAcceptance { reconnect(incoming, keeping: data.contacts[known]) }
                 return
             }
+            // The same request sent again (the relay may have lost the first): already here, so no second banner.
+            if data.requests.contains(where: { $0.fingerprint == fp && $0.persona == invite.persona && $0.handshake == request }) { return }
             withAnimation(.snappy) {
                 data.requests.removeAll { $0.fingerprint == fp && $0.persona == invite.persona }
                 data.requests.insert(incoming, at: 0)
@@ -4195,7 +4275,11 @@ final class AppModel {
     private func deliver(_ wire: WireMessage, from sender: Contact) {
         guard let i = conversationIndex(wire.conversation, from: sender, create: true) else { return }
         if wire.conversation != nil, !data.conversations[i].canPost(sender.fingerprint) { return }
-        guard !data.conversations[i].messages.contains(where: { $0.id == wire.id }) else { return }
+        guard !data.conversations[i].messages.contains(where: { $0.id == wire.id }) else {
+            // Sent again because the relay may have lost it: say again that it's here, so their tick catches up.
+            if wire.conversation == nil { queueReceipt(wire.id, to: sender) }
+            return
+        }
         let date = dated(wire.date)
         let expires = wire.expiresIn.map { date.addingTimeInterval(min($0, Disappear.week.rawValue)) }
         if let expires, expires <= Date() { return }

@@ -91,7 +91,7 @@ private struct PhoneMainView: View {
             Tab("Invite", systemImage: "qrcode", value: Section.people) {
                 PeopleView(openChat: open).background(Ink.base)
             }
-            // Your account: its picture is the tab. A tap opens settings; holding it switches or adds a persona.
+            // Your account: its picture is the tab. A tap opens settings; double-tapping it switches to your next persona, and holding it picks one or adds one.
             Tab(value: Section.settings) {
                 SettingsView().background(Ink.base)
             } label: {
@@ -133,7 +133,7 @@ private struct PhoneMainView: View {
             model.onChatsTab = section == .chats
             if section == .chats { model.dismissBanner() }
         }
-        .background(TabHold(tab: 4) { switchingPersona = true })
+        .background(TabHold(tab: 4, action: { switchingPersona = true }, doubleTap: { model.switchToNextPersona() }))
         .sheet(isPresented: $switchingPersona) {
             PersonaSwitcher(done: { switchingPersona = false })
                 .presentationDetents([.medium, .large])
@@ -200,6 +200,8 @@ private struct TabHold: UIViewRepresentable {
     /// Which tab, counting from the first.
     var tab: Int
     var action: () -> Void
+    /// A quick double tap on the same tab, if it should do something.
+    var doubleTap: (() -> Void)?
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -212,6 +214,7 @@ private struct TabHold: UIViewRepresentable {
     func updateUIView(_ probe: Probe, context: Context) {
         context.coordinator.tab = tab
         context.coordinator.action = action
+        context.coordinator.doubleTap = doubleTap
         probe.attachSoon()
     }
 
@@ -237,7 +240,9 @@ private struct TabHold: UIViewRepresentable {
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         var tab = 0
         var action: () -> Void = {}
+        var doubleTap: (() -> Void)?
         static let name = "pulshade.tabhold"
+        static let doubleName = "pulshade.tabdouble"
 
         /// Gives the tab's button (and the copy iOS draws for the selection) the long press, once each.
         func attach(in window: UIWindow) {
@@ -262,10 +267,24 @@ private struct TabHold: UIViewRepresentable {
                 press.delegate = self
                 b.view.addGestureRecognizer(press)
             }
+            // The tap still selects the tab; this only notices the second one.
+            for b in buttons where b.frame == target && !(b.view.gestureRecognizers ?? []).contains(where: { $0.name == Self.doubleName }) {
+                let tap = UITapGestureRecognizer(target: self, action: #selector(doubleTapped(_:)))
+                tap.name = Self.doubleName
+                tap.numberOfTapsRequired = 2
+                tap.cancelsTouchesInView = false
+                tap.delegate = self
+                b.view.addGestureRecognizer(tap)
+            }
         }
 
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                                shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+
+        @objc func doubleTapped(_ tap: UITapGestureRecognizer) {
+            guard tap.state == .ended else { return }
+            doubleTap?()
+        }
 
         @objc func pressed(_ press: UILongPressGestureRecognizer) {
             guard press.state == .began else { return }
