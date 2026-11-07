@@ -5,7 +5,7 @@ import PulshadeShared
 
 /// The pages Settings opens, each from a row on the main list.
 enum SettingsPage: String, Hashable {
-    case profile, handles, collectibles, privacy, blocked, notifications, appearance, devices, network, anonymity, account, updates
+    case profile, handles, collectibles, pets, privacy, privacyLock, privacyMessages, privacyPasscodes, privacyBackup, blocked, notifications, appearance, devices, network, anonymity, account, updates
 }
 
 /// Settings, laid out like a phone's own: your profile on top, then a short list of rows,
@@ -31,8 +31,10 @@ struct SettingsView: View {
                                 value: model.activeProfile.handle.map { "@\($0)" } ?? "Private")
                         if Platform.isPhone {
                             RowDivider(inset: 54)
-                            MenuRow(page: .collectibles, symbol: "crown.fill", color: .hex(0xE5383B), title: "Collectibles & Pets",
+                            MenuRow(page: .collectibles, symbol: "crown.fill", color: .hex(0xE5383B), title: "Collectibles",
                                     value: model.activeProfile.badge?.kind?.name)
+                            RowDivider(inset: 54)
+                            MenuRow(page: .pets, symbol: "pawprint.fill", color: .hex(0xFF9F0A), title: "Pets")
                         }
                     }
                     SettingsGroup {
@@ -83,8 +85,13 @@ struct SettingsView: View {
                     switch page {
                     case .profile: ProfileSettings()
                     case .handles: HandleSettings()
-                    case .collectibles: CollectiblesView(inSettings: true)
+                    case .collectibles: CollectiblesView(inSettings: true, pets: false)
+                    case .pets: CollectiblesView(inSettings: true, pets: true)
                     case .privacy: PrivacySettings()
+                    case .privacyLock: LockSettings()
+                    case .privacyMessages: MessagePrivacySettings()
+                    case .privacyPasscodes: PasscodeSettings()
+                    case .privacyBackup: BackupSettings()
                     case .blocked: BlockedSettings()
                     case .notifications: NotificationSettings()
                     case .appearance: AppearanceSettings()
@@ -483,10 +490,7 @@ private struct ProfileSettings: View {
                              seed: model.fingerprint)
                 AvatarPicker(image: Binding(get: { model.activeProfile.avatar },
                                             set: { v in model.updateProfile { $0.avatar = v } }),
-                             seed: model.fingerprint, size: 96)
-                    .background(Circle().fill(Ink.base).padding(-5))
-                    .overlay(Circle().strokeBorder(tint, lineWidth: 3).padding(-5))
-                    .shadow(color: tint.opacity(0.5), radius: 22)
+                             seed: model.fingerprint, size: 96, ring: tint, ringGap: Ink.base)
             }
             VStack(spacing: 4) {
                 Text(name.isEmpty ? "Your name" : name)
@@ -682,7 +686,7 @@ struct HandlesEditor: View {
     private var used: Int { active.count + off.count }
 
     var body: some View {
-        SettingsGroup("Handles", footer: "Each handle that's on leads to this profile and takes chat requests, all at the same time. You can have \(AppModel.maxHandles) per persona, counting ones that are off. A handle you turn off stays yours for 3 months. Handles belong to the persona that claimed them and can't be moved to another.") {
+        SettingsGroup("Handles", footer: "Every handle that's on takes chat requests for this profile. Up to \(AppModel.maxHandles) per persona; one you turn off stays yours for 3 months. Handles can't move between personas.") {
             if active.isEmpty && off.isEmpty && !loading {
                 SettingRow("No public handle", symbol: "at") { Text("Private").font(.system(size: 13)).foregroundStyle(Ink.faint) }
                 RowDivider()
@@ -870,16 +874,42 @@ struct HandlesEditor: View {
 
 private struct PrivacySettings: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.theme) private var theme
-    @State private var biometrics = false
-    @State private var settingUp: DisguiseKind?
-    @State private var confirmRemove: DisguiseKind?
 
     var body: some View {
         SettingsScreen(title: "Privacy & Security") {
+            SettingsGroup {
+                MenuRow(page: .privacyLock, symbol: "lock.fill", color: .hex(0x8E8E93), title: "Lock & screen",
+                        value: model.data.security.autoLockMinutes == 0 ? "No auto-lock" : "\(model.data.security.autoLockMinutes) min")
+                RowDivider(inset: 54)
+                MenuRow(page: .privacyMessages, symbol: "bubble.left.and.bubble.right.fill", color: .hex(0x3D8BFF), title: "What others see")
+                RowDivider(inset: 54)
+                MenuRow(page: .privacyPasscodes, symbol: "theatermasks.fill", color: .hex(0xFF9F0A), title: "Decoy & panic passcodes",
+                        value: model.hasDecoy || model.hasPanic ? "On" : "Off")
+                RowDivider(inset: 54)
+                MenuRow(page: .blocked, symbol: "hand.raised.fill", color: .hex(0xFF453A), title: "Blocked",
+                        value: model.data.blocked.isEmpty ? "Nobody" : "\(model.data.blocked.count)")
+            }
+            SettingsGroup {
+                MenuRow(page: .privacyBackup, symbol: "externaldrive.fill.badge.checkmark", color: .hex(0x30D158), title: "Backup & keys",
+                        value: model.data.security.keepBackup ? "On" : "Off")
+                RowDivider(inset: 54)
+                MenuRow(page: .anonymity, symbol: "eye.slash.fill", color: .hex(0x64D2FF), title: "Anonymity Report")
+                RowDivider(inset: 54)
+                MenuRow(page: .network, symbol: "antenna.radiowaves.left.and.right", color: .hex(0x30D158), title: "Network & Tor")
+            }
+        }
+    }
+}
+
+private struct LockSettings: View {
+    @Environment(AppModel.self) private var model
+    @State private var biometrics = false
+
+    var body: some View {
+        SettingsScreen(title: "Lock & screen", back: "Privacy") {
             SettingsGroup("Lock", footer: model.biometricsBlocked
                           ? "\(Vault.biometryName) is off while a decoy or panic passcode is set."
-                          : nil) {
+                          : "Locks PULSHADE when you leave it, so a borrowed or stolen phone shows nothing.") {
                 if Vault.biometricsAvailable {
                     SettingRow("Unlock with \(Vault.biometryName)") {
                         Toggle("Unlock with \(Vault.biometryName)", isOn: Binding(get: { biometrics }, set: { on in
@@ -895,12 +925,21 @@ private struct PrivacySettings: View {
                               label: { $0 == 0 ? "Never" : $0 == 1 ? "1 minute" : "\($0) minutes" }) { m in
                     model.updateSecurity { $0.autoLockMinutes = m }
                 }
-                RowDivider()
+            }
+            SettingsGroup("Screen", footer: "Keeps chats out of screenshots, screen recordings and the app switcher.") {
                 SecurityToggle(title: Platform.isPhone ? "Hide in app switcher" : "Blur when in background", key: \.blurWhenInactive)
                 RowDivider()
                 SecurityToggle(title: "Block screenshots & recording", key: \.blockCapture)
             }
-            SettingsGroup("Messages") {
+        }
+        .onAppear { biometrics = model.biometricsOn }
+    }
+}
+
+private struct MessagePrivacySettings: View {
+    var body: some View {
+        SettingsScreen(title: "What others see", back: "Privacy") {
+            SettingsGroup("Messages", footer: "Receipts go out in batches, so their timing gives nothing away. Turn one off and you stop seeing theirs too.") {
                 SecurityToggle(title: "Link previews", key: \.linkPreviews)
                 RowDivider()
                 SecurityToggle(title: "Delivery receipts", key: \.deliveryReceipts)
@@ -909,55 +948,31 @@ private struct PrivacySettings: View {
                 RowDivider()
                 SecurityToggle(title: "Typing indicators", key: \.typingIndicators)
                 RowDivider()
-                SecurityToggle(title: "Online status", key: \.onlineStatus)
-                RowDivider()
                 SecurityToggle(title: "Story views", key: \.storyViews)
             }
-            LearnMore(title: "What these do",
-                      text: "Link previews are made on your device over Tor, on a circuit of their own, so the website never sees your IP address (with Tor off, it does). People receiving the message never contact the website. Receipts are sent a little later, together, so their timing gives nothing away. With read receipts or story views off you won't see other people's either, and one-time chats never send them. Online status shows a green dot while you have PULSHADE open. It goes only to accepted contacts who have it on too, never from a burner, and you see theirs only if you show yours. The relay can't read it, but it can see when it goes out and to whom, and switching persona shows it that two personas share a device, so it's off until you turn it on.")
-            SettingsGroup("People & disguise", footer: "A decoy passcode opens an empty PULSHADE. A panic passcode erases everything, then does the same.") {
-                NavigationLink(value: SettingsPage.blocked) {
-                    SettingRow("Blocked") {
-                        Text(model.data.blocked.isEmpty ? "Nobody" : "\(model.data.blocked.count)")
-                            .font(.system(size: 14)).foregroundStyle(Ink.faint)
-                        Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Ink.faint)
-                    }
-                    .contentShape(.rect)
-                }
-                .buttonStyle(.plain)
-                RowDivider()
+            SettingsGroup("Presence", footer: "Off by default. Only accepted contacts who show theirs can see yours. The relay can tell when it's sent and to whom.") {
+                SecurityToggle(title: "Online status", key: \.onlineStatus)
+            }
+            LearnMore(title: "Link previews",
+                      text: "Made on your device over Tor, so the site never sees your IP (with Tor off, it does). The people you send to never contact the site.")
+        }
+    }
+}
+
+private struct PasscodeSettings: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.theme) private var theme
+    @State private var settingUp: DisguiseKind?
+    @State private var confirmRemove: DisguiseKind?
+
+    var body: some View {
+        SettingsScreen(title: "Decoy & panic", back: "Privacy") {
+            SettingsGroup("Passcodes", footer: "Decoy opens an empty PULSHADE. Panic erases everything, then does the same. \(Vault.biometryName) is off while either is set.") {
                 disguiseRow(.decoy, title: "Decoy passcode", isSet: model.hasDecoy)
                 RowDivider()
                 disguiseRow(.panic, title: "Panic passcode", isSet: model.hasPanic)
             }
-            SettingsGroup("Backup", footer: "A sealed copy of your profile, contacts, groups, @handles and settings (never chats) is kept on the relay and saved again a few minutes after something changes. Only your recovery code can open it, so the relay can't. Detach wipes this device at once, and your recovery code brings the copy back. Off erases it from the relay.") {
-                SettingRow("Keep a sealed backup") {
-                    Toggle("Keep a sealed backup", isOn: Binding(get: { model.data.security.keepBackup },
-                                             set: { v in withAnimation(.snappy) { model.setKeepBackup(v) } }))
-                        .toggleStyle(GlowToggleStyle())
-                }
-                if model.data.security.keepBackup {
-                    RowDivider()
-                    SettingRow("Last saved") {
-                        Text(model.backupStatus).font(.system(size: 14)).foregroundStyle(Ink.faint)
-                    }
-                }
-            }
-            SettingsGroup("Chats", footer: "If messages stop getting through in both directions (after a Detach, say), this opens fresh encrypted sessions with all your contacts, and they accept them by themselves. Nothing is lost that was already delivered.") {
-                SettingRow("Renew keys with contacts") {
-                    Button("Renew") { model.renewChatKeys() }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(model.theme.accent)
-                }
-            }
-            SettingsGroup {
-                MenuRow(page: .anonymity, symbol: "eye.slash.fill", color: .hex(0x64D2FF), title: "Anonymity Report")
-                RowDivider(inset: 54)
-                MenuRow(page: .network, symbol: "antenna.radiowaves.left.and.right", color: .hex(0x30D158), title: "Network & Tor")
-            }
         }
-        .onAppear { biometrics = model.biometricsOn }
         .sheet(item: $settingUp) { kind in DisguiseSetup(kind: kind) }
         .confirmationDialog(confirmRemove == .decoy ? "Remove the decoy?" : "Remove the panic passcode?",
                             isPresented: Binding(get: { confirmRemove != nil }, set: { if !$0 { confirmRemove = nil } })) {
@@ -976,6 +991,36 @@ private struct PrivacySettings: View {
             .font(.system(size: 14, weight: .semibold))
             .buttonStyle(.plain)
             .foregroundStyle(isSet ? Ink.dim : theme.accent)
+        }
+    }
+}
+
+private struct BackupSettings: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        SettingsScreen(title: "Backup & keys", back: "Privacy") {
+            SettingsGroup("Backup", footer: "A sealed copy of your profile, contacts, groups and settings (never chats) sits on the relay. Only your recovery code opens it, so the relay can't. Off erases it.") {
+                SettingRow("Keep a sealed backup") {
+                    Toggle("Keep a sealed backup", isOn: Binding(get: { model.data.security.keepBackup },
+                                             set: { v in withAnimation(.snappy) { model.setKeepBackup(v) } }))
+                        .toggleStyle(GlowToggleStyle())
+                }
+                if model.data.security.keepBackup {
+                    RowDivider()
+                    SettingRow("Last saved") {
+                        Text(model.backupStatus).font(.system(size: 14)).foregroundStyle(Ink.faint)
+                    }
+                }
+            }
+            SettingsGroup("Chat keys", footer: "Use if messages stop arriving both ways, after a Detach say. Opens fresh encrypted sessions with every contact. Nothing already delivered is lost.") {
+                SettingRow("Renew keys with contacts") {
+                    Button("Renew") { model.renewChatKeys() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(model.theme.accent)
+                }
+            }
         }
     }
 }
@@ -1055,8 +1100,8 @@ private struct NotificationSettings: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             if on {
-                LearnMore(title: "About waking a locked iPhone",
-                          text: "Lets the relay wake this iPhone through Apple when mail arrives, so you hear about it while the phone is locked. The wake-up only says \"New message\". Apple learns that your iPhone was woken, and when, and the relay keeps its push token. Turned off, you only hear about messages while PULSHADE is open. Only your main identity is covered. Friend request alerts need one more step: requests arrive at your @handle's own mailbox, and waking the phone for it lets the relay see that this iPhone owns that mailbox as well as your contacts', which it can't tie together otherwise. Off unless you turn it on.")
+                LearnMore(title: "Waking a locked iPhone",
+                          text: "Apple wakes your iPhone with a note that only says \"New message\". Apple learns when it woke, and the relay keeps your push token. Off, you only hear about messages while PULSHADE is open. Friend request alerts also let the relay see that this iPhone owns your @handle's mailbox. Off by default.")
             }
             #endif
             #if os(macOS)
@@ -1086,7 +1131,7 @@ private struct AppearanceSettings: View {
 
     var body: some View {
         SettingsScreen(title: "Appearance") {
-            SettingsGroup("Theme", footer: "Light, Sand, Dark and Midnight are clean and quiet. Pulse is deep violet glass with a slow glow behind it.") {
+            SettingsGroup("Theme", footer: "Graphite is a softer, grayer dark with a lime accent.") {
                 let columns = [GridItem(.adaptive(minimum: 96), spacing: 12)]
                 LazyVGrid(columns: columns, spacing: 12) {
                     ForEach(Theme.all) { t in
@@ -1242,11 +1287,11 @@ private struct NetworkSettings: View {
     private var bridgesFooter: String {
         let what: String
         switch bridges {
-        case .auto: what = "Connects to Tor directly. If that doesn't get through within about 40 seconds, PULSHADE switches to Snowflake by itself and remembers it for next time."
+        case .auto: what = "Tries Tor directly, then switches to Snowflake by itself if it can't connect in about 40 seconds."
             + (Bridges.autoUsesSnowflake ? " Using Snowflake now." : "")
-        case .off: what = "For networks that block Tor or watch for it. PULSHADE connects to Tor directly when they're off."
-        case .snowflake: what = "Snowflake disguises Tor as a video call, through volunteers. Works on most networks."
-        case .custom: what = "Your own bridges, for example from bridges.torproject.org. Private bridges are the hardest for a network to block."
+        case .off: what = "Bridges help on networks that block Tor. Off connects to Tor directly."
+        case .snowflake: what = "Disguises Tor as a video call. Works on most networks."
+        case .custom: what = "Your own bridges, such as from bridges.torproject.org. Hardest for a network to block."
         }
         return bridgesPending ? what + " PULSHADE will use them from the next time it opens." : what
     }
@@ -1264,7 +1309,7 @@ private struct NetworkSettings: View {
     private var connectionFooter: String {
         if model.link == .online { return "Everything is reaching the relay." }
         if !(torLocked || model.data.security.tor) { return "The relay isn't answering. Messages wait on this device and go out when it does." }
-        return "Tor can take a minute or two to connect on a slow or restricted network, longer through a bridge. Messages wait on this device and go out as soon as it does."
+        return "Tor can take a minute or two to connect. Messages wait on this device until it does."
     }
 
     private var waitingText: String {
@@ -1295,7 +1340,7 @@ private struct NetworkSettings: View {
         if !model.data.security.tor {
             return "Off: faster, but the server sees your IP address (or your VPN's) and can tie your personas together by it."
         }
-        return "Hides your IP address from PULSHADE's server. Each persona, inbox and call goes over its own Tor circuit, so they can't be linked by address. Slower than a direct connection."
+        return "Hides your IP from the server, and each persona uses its own circuit so none can be linked by address. Slower."
     }
 }
 
@@ -1496,10 +1541,6 @@ private struct ThemeCard: View {
         let ink = theme.ink
         return ZStack {
             ink.void
-            if theme.glow > 0 {
-                Circle().fill(theme.colors[0].opacity(0.55)).frame(width: 90).blur(radius: 30).offset(x: -34, y: -40)
-                Circle().fill(theme.colors[1].opacity(0.4)).frame(width: 80).blur(radius: 30).offset(x: 40, y: 44)
-            }
             VStack(alignment: .leading, spacing: 6) {
                 Capsule().fill(ink.text.opacity(0.7)).frame(width: 34, height: 5)
                 RoundedRectangle(cornerRadius: 7).fill(ink.raised)

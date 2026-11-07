@@ -11,6 +11,10 @@ struct AvatarPicker: View {
     @Binding var image: Data?
     var seed: String
     var size: CGFloat = 120
+    /// A coloured ring and glow around the picture. They sit under the camera badge so it stays on top.
+    var ring: Color?
+    /// Fills the gap between the picture and its ring, so a banner behind doesn't show through.
+    var ringGap: Color?
     @State private var hover = false
 
     var body: some View {
@@ -18,6 +22,9 @@ struct AvatarPicker: View {
                         onRemove: { withAnimation { image = nil } }, picked: { data in withAnimation(.snappy) { image = data } }) {
             ZStack(alignment: .bottomTrailing) {
                 Avatar(image: image, seed: seed, size: size)
+                    .background { if let ringGap { Circle().fill(ringGap).padding(-5) } }
+                    .overlay { if let ring { Circle().strokeBorder(ring, lineWidth: 3).padding(-5) } }
+                    .shadow(color: (ring ?? .clear).opacity(0.5), radius: ring == nil ? 0 : 22)
                     .scaleEffect(hover ? 1.02 : 1)
                 Image(systemName: image == nil ? "camera.fill" : "arrow.triangle.2.circlepath.camera.fill")
                     .font(.system(size: size * 0.12, weight: .bold))
@@ -248,7 +255,7 @@ struct SheetBody<Content: View>: View {
         content
             .padding(24)
             .frame(width: width)
-            .background(Backdrop(intensity: 0.5))
+            .background(Backdrop())
             .preferredColorScheme(Ink.scheme)
         #endif
     }

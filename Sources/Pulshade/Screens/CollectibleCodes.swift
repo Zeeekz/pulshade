@@ -85,7 +85,7 @@ struct BackupCodeSheet: View {
         if let alert, !alert.newCode {
             return "\(names) is now covered by your backup code, the same one as before. Nothing new to write down."
         }
-        return "One code for all your collectibles: \(names), and any you get later. Write it down and keep it somewhere safe. If this account is ever burned or lost, enter the code in a new account to get them all back, with the same numbers. Anyone with the code can take them, so keep it to yourself."
+        return "One code covers \(names) and any you get later. Enter it in a new account to get them back. Anyone with the code can take them, so keep it safe."
     }
 
     private func replace() {

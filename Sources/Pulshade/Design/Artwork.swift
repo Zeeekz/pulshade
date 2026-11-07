@@ -1,44 +1,10 @@
 import SwiftUI
 import CryptoKit
 
-/// Slowly drifting glow orbs behind every screen.
+/// The flat background behind every screen: nothing animates or blurs behind the chats and the keyboard.
 struct Backdrop: View {
-    @Environment(\.theme) private var theme
-    var intensity: Double = 1
-
     var body: some View {
-        // Themes without a glow get a flat fill: nothing animates or blurs behind the chats and the keyboard.
-        if theme.glow == 0 {
-            Ink.void.ignoresSafeArea().allowsHitTesting(false)
-        } else {
-            glowing
-        }
-    }
-
-    /// The slow moving glow. The orbs drift a few pixels a second, so 12 frames a second looks the same as 30
-    /// while costing far less to blur.
-    private var glowing: some View {
-        TimelineView(.animation(minimumInterval: 1 / 12)) { context in
-            let t = context.date.timeIntervalSinceReferenceDate
-            Canvas { ctx, size in
-                ctx.fill(Path(CGRect(origin: .zero, size: size)), with: .color(Ink.void))
-                let orbs: [(Double, Double, Double, Int)] = [
-                    (0.13, 0.0, 0.62, 0), (0.09, 2.1, 0.5, 1), (0.11, 4.2, 0.55, 2), (0.07, 1.3, 0.4, 0),
-                ]
-                ctx.addFilter(.blur(radius: min(size.width, size.height) * 0.12))
-                for (speed, phase, scale, color) in orbs {
-                    let x = size.width * (0.5 + 0.38 * cos(t * speed + phase))
-                    let y = size.height * (0.5 + 0.34 * sin(t * speed * 1.3 + phase * 0.7))
-                    let r = max(size.width, size.height) * scale * 0.5
-                    ctx.opacity = 0.2 * intensity
-                    ctx.fill(Path(ellipseIn: CGRect(x: x - r, y: y - r, width: r * 2, height: r * 2)),
-                             with: .color(theme.colors[color % theme.colors.count]))
-                }
-            }
-        }
-        .overlay(Grain().drawingGroup().opacity(0.025))
-        .ignoresSafeArea()
-        .allowsHitTesting(false)
+        Ink.void.ignoresSafeArea().allowsHitTesting(false)
     }
 }
 

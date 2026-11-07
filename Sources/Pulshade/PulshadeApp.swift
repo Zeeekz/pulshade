@@ -262,7 +262,7 @@ struct RootView: View {
 
     private var content: some View {
         ZStack {
-            if model.phase == .unlocked { Backdrop(intensity: 0.35 + 1.6 * model.theme.glow) } else { Aurora() }
+            if model.phase == .unlocked { Backdrop() } else { Aurora() }
             switch model.phase {
             case .welcome:
                 WelcomeView().transition(.blurReplace)

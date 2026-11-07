@@ -7,8 +7,6 @@ struct Theme: Identifiable, Equatable {
     let scheme: ColorScheme
     let colors: [Color]
     let ink: Palette
-    /// How strongly the drifting glow behind the app shows through. Zero keeps the background flat.
-    var glow: Double = 0
 
     var accent: Color { colors[0] }
     /// A restrained two-tone version of the accent, for primary buttons and your own bubbles.
@@ -38,34 +36,24 @@ struct Theme: Identifiable, Equatable {
                                          raised: .hex(0x1C1C20), hover: .hex(0x232328), line: .white.opacity(0.065),
                                          text: .white.opacity(0.93), dim: .white.opacity(0.58), faint: .white.opacity(0.34),
                                          onAccent: .black))
-    /// Deep midnight violet with a slow glow moving behind glass-like panels, and a violet-to-rose accent.
-    static let pulse = Theme(id: "pulse", name: "Pulse", scheme: .dark,
-                             colors: [.hex(0x9D7BFF), .hex(0xF06BC4), .hex(0x5FD3E8)],
-                             ink: Palette(void: .hex(0x070515), base: .hex(0x0A0818).opacity(0.58), surface: .hex(0x17132E).opacity(0.74),
-                                          raised: .hex(0x221D40).opacity(0.85), hover: .hex(0x2D2654), line: .hex(0xCBB8FF).opacity(0.11),
-                                          text: .hex(0xF4F0FF).opacity(0.95), dim: .hex(0xD9CFFF).opacity(0.62),
-                                          faint: .hex(0xC9BCF5).opacity(0.38), onAccent: .white),
-                             glow: 1)
+    /// Soft charcoal grays, a step lighter than Dark, with a chartreuse accent that pops against them.
+    static let graphite = Theme(id: "graphite", name: "Graphite", scheme: .dark,
+                                colors: [.hex(0xC8F560), .hex(0x7FE3C4), .hex(0xF2C66E)],
+                                ink: Palette(void: .hex(0x17181B), base: .hex(0x1E2024), surface: .hex(0x282A2F),
+                                             raised: .hex(0x32353B), hover: .hex(0x3C4047), line: .white.opacity(0.09),
+                                             text: .white.opacity(0.92), dim: .white.opacity(0.6), faint: .white.opacity(0.38),
+                                             onAccent: .hex(0x14170A)))
 
-    /// A warm, paper-like light theme: cream surfaces with a terracotta accent.
-    static let sand = Theme(id: "sand", name: "Sand", scheme: .light,
-                            colors: [.hex(0xC4552F), .hex(0xE08A3C), .hex(0x8A5A44)],
-                            ink: Palette(void: .hex(0xEAE3D6), base: .hex(0xF6F1E7), surface: .hex(0xFCF9F3),
-                                         raised: .hex(0xEFE8DA), hover: .hex(0xE4DCCB), line: .hex(0x4A3A22).opacity(0.12),
-                                         text: .hex(0x2A2118).opacity(0.92), dim: .hex(0x2A2118).opacity(0.6),
-                                         faint: .hex(0x2A2118).opacity(0.4), onAccent: .white))
-    /// A flat deep-navy dark theme with a clear blue accent.
-    static let midnight = Theme(id: "midnight", name: "Midnight", scheme: .dark,
-                                colors: [.hex(0x6FA8FF), .hex(0x4E6BFF), .hex(0x4FC3F7)],
-                                ink: Palette(void: .hex(0x050A14), base: .hex(0x0A101C), surface: .hex(0x111A2B),
-                                             raised: .hex(0x182339), hover: .hex(0x1F2C47), line: .hex(0x9DB8FF).opacity(0.09),
-                                             text: .hex(0xF0F4FF).opacity(0.93), dim: .hex(0xDCE5FF).opacity(0.58),
-                                             faint: .hex(0xC6D3F5).opacity(0.36), onAccent: .hex(0x06101F)))
+    static let all: [Theme] = [light, dark, graphite]
 
-    static let all: [Theme] = [light, sand, dark, midnight, pulse]
-
-    /// Ids from before there were three themes were all dark, so they open as Dark.
-    static func named(_ id: String) -> Theme { all.first { $0.id == id } ?? dark }
+    /// Themes that were removed open as the closest one left; unknown ids open as Dark.
+    static func named(_ id: String) -> Theme {
+        switch id {
+        case "sand": light
+        case "midnight", "pulse": dark
+        default: all.first { $0.id == id } ?? dark
+        }
+    }
 }
 
 /// The colours of one theme's surfaces and text.

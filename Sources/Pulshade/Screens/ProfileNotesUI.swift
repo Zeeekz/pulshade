@@ -327,7 +327,7 @@ struct NoteEditSheet: View {
                 Text("Save it somewhere safe, and give it to whoever should read the note. Pulshade can't recover it.")
                     .font(.system(size: 12)).foregroundStyle(Ink.faint)
             }
-            Text("Anyone who opens your profile can copy a locked note and try passwords on their own computer, which is why a strong password is required. The title is not locked.")
+            Text("Anyone can copy a locked note and guess passwords offline, so use a strong one. The title isn't locked.")
                 .font(.system(size: 12)).foregroundStyle(Ink.faint)
         }
     }
@@ -364,7 +364,7 @@ struct NoteEditSheet: View {
                 Text(chosen.isEmpty ? "Pick at least one contact." : chosen.count == 1 ? "1 contact will be able to read this." : "\(chosen.count) contacts will be able to read this.")
                     .font(.system(size: 12, weight: .medium)).foregroundStyle(chosen.isEmpty ? Color.orange : Ink.dim)
             }
-            Text("Only the contacts you pick are sent this note, inside their own encrypted chat with you, so they need no password. It is never in your public listing and other contacts never see it. If you take someone off later, it disappears for them, but they keep anything they already read or copied.")
+            Text("Only the contacts you pick get this note, inside your encrypted chat with them. It's never public. Removing someone hides it, but they keep anything already read or copied.")
                 .font(.system(size: 12)).foregroundStyle(Ink.faint)
         }
     }

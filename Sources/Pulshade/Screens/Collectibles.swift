@@ -9,6 +9,8 @@ struct CollectiblesView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     var inSettings = false
+    /// Which half to show. Nil shows both with a switch on top, as on the Mac's tab.
+    var pets: Bool?
     @State private var loading = true
     @State private var problem: String?
     @State private var showingCode = false
@@ -22,7 +24,7 @@ struct CollectiblesView: View {
     var body: some View {
         Group {
             if inSettings {
-                SettingsScreen(title: "Collectibles & Pets") { content }
+                SettingsScreen(title: pets == true ? "Pets" : pets == false ? "Collectibles" : "Collectibles & Pets") { content }
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 22) {
@@ -49,23 +51,26 @@ struct CollectiblesView: View {
 
     private enum Tab: String, CaseIterable { case collectibles = "Collectibles", pets = "Pets" }
     @State private var tab = Tab.collectibles
+    private var showPets: Bool { pets ?? (tab == .pets) }
 
     private func isPet(_ item: Collectible) -> Bool { item.kind?.category == .pets }
     private var collectibleCount: Int { owned.filter { !isPet($0) }.count }
     private var petCount: Int { owned.filter(isPet).count }
 
     private var content: some View {
-        let pets = tab == .pets
+        let pets = showPets
         let mine = owned.filter { isPet($0) == pets }
         let notYet = missing.filter { ($0.category == .pets) == pets }
         return VStack(alignment: .leading, spacing: 20) {
             preview
-            Picker("", selection: $tab.animation(.snappy)) {
-                Text("Collectibles · \(collectibleCount)").tag(Tab.collectibles)
-                Text("Pets · \(petCount)").tag(Tab.pets)
+            if self.pets == nil {
+                Picker("", selection: $tab.animation(.snappy)) {
+                    Text("Collectibles · \(collectibleCount)").tag(Tab.collectibles)
+                    Text("Pets · \(petCount)").tag(Tab.pets)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
             if pets { EggsSection() }
             if !pets && collectibleCount > 0 { codeRow }
             if !mine.isEmpty {
@@ -89,7 +94,9 @@ struct CollectiblesView: View {
                 .tint(Ink.dim)
             }
             ClaimCodeCard()
-            Text(branded: "Each one is numbered and belongs to this persona only. The collectible you choose shows after your name. One backup code brings them all back if this account is ever burned or lost.")
+            Text(branded: pets
+                 ? "Each pet is numbered and belongs to this persona only. A backup code restores them if the account is lost."
+                 : "Each one is numbered and belongs to this persona only. The one you pick shows after your name. A backup code restores them if the account is lost.")
                 .font(.system(size: 12)).foregroundStyle(Ink.faint)
                 .fixedSize(horizontal: false, vertical: true)
             if let problem {
