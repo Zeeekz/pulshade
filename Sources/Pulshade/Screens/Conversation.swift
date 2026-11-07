@@ -476,7 +476,7 @@ struct ConversationView: View {
 
                     TextField("", text: $draft, prompt: Text(placeholder(c)).foregroundStyle(Ink.faint), axis: .vertical)
                         .textFieldStyle(.plain)
-                        .font(.system(size: 14))
+                        .font(.system(size: Bubble.textSize))
                         .lineLimit(1...6)
                         // Autocorrect learns what you type and keeps it outside Pulshade's encryption.
                         .autocorrectionDisabled()
@@ -696,7 +696,7 @@ private struct ReadOnlyBar: View {
     }
 }
 
-private struct Bubble: View {
+fileprivate struct Bubble: View {
     @Environment(\.theme) private var theme
     var message: Message
     var kind: ConversationKind
@@ -722,6 +722,9 @@ private struct Bubble: View {
     /// Counts double-tap hearts, so each one plays the burst again.
     @State private var hearts = 0
 
+    /// Message text: a size up from before, so chats read easily at a glance.
+    static let textSize: CGFloat = Platform.isPhone ? 17 : 15.5
+
     static let quick = ["❤️", "😂", "🔥", "😮", "😢", "👍"]
 
     private var showsSender: Bool { !message.isMine && kind == .group }
@@ -735,7 +738,7 @@ private struct Bubble: View {
             guard let r = Range(NSRange(location: m.start, length: m.length), in: plain),
                   let lower = AttributedString.Index(r.lowerBound, within: out),
                   let upper = AttributedString.Index(r.upperBound, within: out) else { continue }
-            out[lower..<upper].font = .system(size: 14, weight: .bold)
+            out[lower..<upper].font = .system(size: Self.textSize, weight: .bold)
             if !message.isMine { out[lower..<upper].foregroundColor = m.fingerprint == "me" ? theme.accent : Ink.text }
         }
         return out
@@ -814,7 +817,7 @@ private struct Bubble: View {
         return VStack(alignment: mine ? .trailing : .leading, spacing: 6) {
             if showsSender, first, let senderName {
                 Text(senderName)
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(tint)
             }
             if let quote = message.reply {
@@ -831,10 +834,10 @@ private struct Bubble: View {
                         }
                         VStack(alignment: .leading, spacing: 1) {
                             Text(quoteAuthor ?? "")
-                                .font(.system(size: 11, weight: .semibold))
+                                .font(.system(size: 12, weight: .semibold))
                                 .foregroundStyle(mine ? Ink.onAccent.opacity(0.7) : tint)
                             Text(quote.snippet)
-                                .font(.system(size: 12))
+                                .font(.system(size: 13))
                                 .foregroundStyle(mine ? Ink.onAccent.opacity(0.6) : Ink.dim)
                                 .lineLimit(2)
                         }
@@ -874,7 +877,7 @@ private struct Bubble: View {
                 BigEmoji(text: message.text, fresh: Date().timeIntervalSince(message.date) < 6)
             } else if !message.text.isEmpty {
                 Text(mentioned(LinkPreviews.linked(message.text)))
-                    .font(.system(size: 14))
+                    .font(.system(size: Self.textSize))
                     .foregroundStyle(mine ? Ink.onAccent.opacity(0.88) : Ink.text)
                     .tint(mine ? Ink.onAccent.opacity(0.85) : theme.accent)
                     .textSelection(.enabled)
@@ -890,14 +893,14 @@ private struct Bubble: View {
                         StatusTicks(status: message.status).animation(.snappy(duration: 0.2), value: message.status)
                     }
                 }
-                .font(.system(size: 10, weight: .medium))
+                .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(mine && !bare ? Ink.onAccent.opacity(0.5) : Ink.faint)
                 .transition(.opacity)
             }
         }
         .fixedSize(horizontal: false, vertical: true)
-        .padding(.horizontal, bare ? 2 : 12)
-        .padding(.vertical, bare ? 2 : 8)
+        .padding(.horizontal, bare ? 2 : 14)
+        .padding(.vertical, bare ? 2 : 10)
         .background {
             if !bare { shape }
         }
@@ -911,7 +914,7 @@ private struct Bubble: View {
 
     private var shape: some View {
         let mine = message.isMine
-        let r: CGFloat = 16, tight: CGFloat = 5
+        let r: CGFloat = 18, tight: CGFloat = 6
         return UnevenRoundedRectangle(cornerRadii: .init(
             topLeading: !mine && !first ? tight : r, bottomLeading: !mine && !last ? tight : r,
             bottomTrailing: mine && !last ? tight : r, topTrailing: mine && !first ? tight : r))
