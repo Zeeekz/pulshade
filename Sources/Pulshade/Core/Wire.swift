@@ -169,6 +169,9 @@ enum Payload: Codable, Equatable {
     /// older apps leave it out, meaning a day.
     case story(id: UUID, style: StoryStyle, date: Date, lasts: TimeInterval? = nil)
     case storyRemoved(id: UUID)
+    /// Every story the sender had up is taken back, when their device was wiped (Detach) and doesn't remember which
+    /// they were. Builds from before can't read it and leave it, so their copies run out with the day.
+    case storiesCleared
     /// The sender viewed this story of yours.
     case storyViewed(id: UUID)
     /// The sender has this story of yours, whole (a video: with its clip), so you needn't send it again. Sent only

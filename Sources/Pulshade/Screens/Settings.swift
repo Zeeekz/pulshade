@@ -1030,13 +1030,17 @@ private struct NotificationSettings: View {
                     #if os(iOS)
                     RowDivider()
                     SecurityToggle(title: "Wake when locked", key: \.pushWake)
+                    if security.pushWake {
+                        RowDivider()
+                        SecurityToggle(title: "Friend request alerts when locked", key: \.pushRequests)
+                    }
                     #endif
                 }
             }
             #if os(iOS)
             if on {
                 LearnMore(title: "About waking a locked iPhone",
-                          text: "Lets the relay wake this iPhone through Apple when mail arrives, so you hear about it while the phone is locked. The wake-up only says \"New message\". Apple learns that your iPhone was woken, and when, and the relay keeps its push token. Turned off, you only hear about messages while PULSHADE is open. Only your main identity is covered.")
+                          text: "Lets the relay wake this iPhone through Apple when mail arrives, so you hear about it while the phone is locked. The wake-up only says \"New message\". Apple learns that your iPhone was woken, and when, and the relay keeps its push token. Turned off, you only hear about messages while PULSHADE is open. Only your main identity is covered. Friend request alerts need one more step: requests arrive at your @handle's own mailbox, and waking the phone for it lets the relay see that this iPhone owns that mailbox as well as your contacts', which it can't tie together otherwise. Off unless you turn it on.")
             }
             #endif
             #if os(macOS)
