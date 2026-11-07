@@ -103,9 +103,10 @@ struct ConversationView: View {
                         }
                     }
                     let here = c.kind == .direct && c.members.first.map(model.isOnline) == true
-                    Text(here ? "Online" : subtitle(c))
+                    let settingUp = c.kind == .direct && c.members.first.map(model.keysPending) == true
+                    Text(settingUp ? "Setting up new keys. Done when they open Pulshade" : here ? "Online" : subtitle(c))
                         .font(.system(size: 11))
-                        .foregroundStyle(here ? OnlineDot.color : Ink.faint)
+                        .foregroundStyle(settingUp ? Color.orange : here ? OnlineDot.color : Ink.faint)
                         .lineLimit(1)
                 }
                 .frame(maxWidth: .infinity)
