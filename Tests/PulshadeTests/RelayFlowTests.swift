@@ -687,6 +687,63 @@ struct RelayFlowTests {
         #expect(bob.visibleContacts.count == 1, "Alice is still a contact")
     }
 
+    /// Detach takes back everything of yours from your contacts except the contact: the chat, the stories, and what
+    /// you said in a group. And when the device was wiped before it could, logging back in sweeps up the stories.
+    @Test func detachTakesEverythingBackExceptTheContact() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        let cara = try await makeUser("Cara")
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let b = try #require(alice.addContact(code: bob.makeInviteCode(), nickname: ""))
+        let c = try #require(alice.addContact(code: cara.makeInviteCode(), nickname: ""))
+        await settle(alice, bob, cara, rounds: 8)
+        let group = alice.startConversation(kind: .group, title: "Crew", members: [b.fingerprint, c.fingerprint])
+        await settle(alice, bob, cara, rounds: 12)
+        alice.send("in the group", in: group.id)
+        alice.postStory(.text("a story", palette: 1))
+        await settle(alice, bob, cara, rounds: 10)
+        #expect(bob.conversation(group.id)?.messages.map(\.text) == ["in the group"])
+        #expect(bob.friendStories.flatMap(\.stories).count == 1)
+
+        await alice.detachNow()
+        await settle(bob, cara, rounds: 10)
+        #expect(bob.friendStories.flatMap(\.stories).isEmpty && cara.friendStories.flatMap(\.stories).isEmpty, "stories are gone")
+        #expect(bob.conversation(group.id)?.messages.isEmpty == true, "and what she said in the group")
+        #expect(bob.visibleContacts.count == 1, "but Alice is still his contact")
+    }
+
+    /// A device wiped before it could say anything (no network, say) still takes its stories back from everyone the
+    /// next time the account is recovered: the signal is a sweep, because the stories' names are gone with the device.
+    @Test func recoveringAnAccountSweepsUpItsOldStories() async throws {
+        let zee = try await makeUser("Zee")
+        let bob = try await makeUser("Bob")
+        defer { for m in [zee, bob] { m.lock() } }
+        _ = try #require(bob.addContact(code: zee.makeInviteCode(), nickname: ""))
+        await settle(zee, bob)
+        zee.postStory(.text("left behind", palette: 2))
+        await settle(zee, bob, rounds: 8)
+        #expect(bob.friendStories.flatMap(\.stories).count == 1)
+        let seed = try #require(zee.identity?.seed)
+        let identity = try Identity(seed: seed)
+        #expect(await zee.saveBackup())
+
+        // The instant wipe: nothing is sent, so Bob still has the story.
+        zee.destroyEverything()
+        await settle(bob, rounds: 4)
+        #expect(bob.friendStories.flatMap(\.stories).count == 1)
+
+        let restored = testModel("pulshade-sweep")
+        defer { restored.lock() }
+        guard case let .found(backup) = await restored.backup(of: identity) else {
+            Issue.record("nothing to restore")
+            return
+        }
+        try await restored.restore(seed: seed, passcode: "new-device", from: backup)
+        await settle(restored, bob, rounds: 10)
+        #expect(bob.friendStories.flatMap(\.stories).isEmpty, "recovering sweeps up the story it can no longer name")
+        #expect(bob.visibleContacts.count == 1)
+    }
+
     /// A story that's over stops going out: what was still waiting to be sent is dropped.
     @Test func aDeletedStoryStopsUploading() async throws {
         let alice = try await makeUser("Alice")

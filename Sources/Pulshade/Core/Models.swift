@@ -944,6 +944,10 @@ struct SecuritySettings: Codable, Equatable {
     /// Whether `pushWake` was set by hand. It used to be off by default, so everyone from then saved "off"
     /// without choosing it: only a choice made by hand is kept.
     var pushWakeChosen = false
+    /// Also wake a locked iPhone for friend requests. Off unless chosen: a request arrives at the public mailbox of
+    /// your @handle, and waking the phone for it means telling the relay that this device owns that mailbox as well as
+    /// the ones for your contacts, which it otherwise has no way to tie together.
+    var pushRequests = false
     /// Build a preview when you send a link. Off by default: building one visits the website from your own
     /// connection. Received previews never contact the website.
     var linkPreviews = false
@@ -993,6 +997,7 @@ struct SecuritySettings: Codable, Equatable {
         notificationSound = try c.decodeIfPresent(Bool.self, forKey: .notificationSound) ?? d.notificationSound
         messageTone = (try? c.decodeIfPresent(MessageTone.self, forKey: .messageTone)) ?? d.messageTone
         pushWakeChosen = try c.decodeIfPresent(Bool.self, forKey: .pushWakeChosen) ?? false
+        pushRequests = try c.decodeIfPresent(Bool.self, forKey: .pushRequests) ?? false
         pushWake = pushWakeChosen ? (try c.decodeIfPresent(Bool.self, forKey: .pushWake) ?? d.pushWake) : d.pushWake
         linkPreviews = try c.decodeIfPresent(Bool.self, forKey: .linkPreviews) ?? d.linkPreviews
         menuBarIcon = try c.decodeIfPresent(Bool.self, forKey: .menuBarIcon) ?? d.menuBarIcon

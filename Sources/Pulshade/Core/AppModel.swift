@@ -652,16 +652,28 @@ final class AppModel {
         detaching = false
     }
 
-    /// Tells every contact, in every persona, to delete their one-to-one chat with you, and takes back the stories you
-    /// still have up, the way deleting one does: they were on this device, and a Detach doesn't keep them, so they
-    /// shouldn't go on showing on everyone else's. They keep the contact.
+    /// Takes everything of yours back from your contacts, except the contact itself: their one-to-one chat with you,
+    /// every story you have up (by name, and as a sweep for any this device no longer remembers), and what you said in
+    /// groups and channels. They keep you as a contact. Detach does this before it wipes, and recovering an account does
+    /// it again in case the device was wiped before it could.
     private func clearChatsForContacts() {
         for c in data.contacts where !c.isSelf && !c.hidden && !c.awaitingAcceptance {
             enqueue(.chatDeleted(conversation: nil), to: c)
+            enqueue(.storiesCleared, to: c)
         }
         for story in data.stories where story.author == "me" && story.isLive {
             dropUnsent(story: story.id)
             for c in audience(of: story) { enqueue(.storyRemoved(id: story.id), to: c) }
+        }
+        // What you wrote in groups and channels is theirs to keep only if you stay; you've gone.
+        for convo in data.conversations where convo.kind == .group || convo.kind == .channel {
+            let mine = convo.messages.filter(\.isMine).map(\.id)
+            guard !mine.isEmpty else { continue }
+            for member in audience(convo) where !member.isSelf {
+                for start in stride(from: 0, to: mine.count, by: 200) {
+                    enqueue(.unsend(ids: Array(mine[start..<min(start + 200, mine.count)])), to: member)
+                }
+            }
         }
     }
 
@@ -3614,6 +3626,10 @@ final class AppModel {
     /// muted. Anyone who knows a mailbox can write to it, so a banner for it would otherwise be theirs to ring.
     private func pushKeys() -> Set<Data> {
         var keys = currentLanes()[Lane(relay: nil, name: "main")] ?? []
+        // Friend requests arrive at the public mailbox of your @handle, which has a lane of its own so the relay can't
+        // tell it belongs to the same person. Waking the phone for one puts it under the same push token as the rest,
+        // so it's only done when chosen.
+        if data.security.pushRequests { keys.formUnion(currentLanes()[Lane(relay: nil, name: "public-main")] ?? []) }
         for c in data.contacts where c.persona == nil {
             guard let key = c.receiveKey else { continue }
             let muted = data.conversations.contains { $0.kind == .direct && $0.persona == nil && $0.members == [c.fingerprint] && $0.muted }
@@ -4187,6 +4203,11 @@ final class AppModel {
             if data.clipParts[id]?.author == fp { data.clipParts[id] = nil }
             noteRemoved("\(fp)|\(id)")
             withAnimation { data.stories.removeAll { $0.id == id && $0.author == fp && $0.persona == persona } }
+        case .storiesCleared:
+            // Only theirs: whoever sends this can take back their own stories and nobody else's.
+            for story in data.stories where story.author == fp && story.persona == persona { noteRemoved("\(fp)|\(story.id)") }
+            data.clipParts = data.clipParts.filter { $0.value.author != fp }
+            withAnimation { data.stories.removeAll { $0.author == fp && $0.persona == persona } }
         case let .unsend(ids):
             applyUnsend(ids, from: sender)
         case let .reaction(message, emoji):
