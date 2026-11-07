@@ -3096,6 +3096,25 @@ final class AppModel {
         restartsHandled = total
         resendPendingRequests()
         resendUnconfirmedMessages()
+        resendStoriesAfterRestart()
+    }
+
+    /// Your live stories go again to anyone who hasn't said they have them, now rather than at the next timed try:
+    /// what the relay was holding for them, the story and its clip, went with the restart. Not the ones still going
+    /// out for the first time, which are on their way anyway.
+    func resendStoriesAfterRestart() {
+        for i in data.stories.indices {
+            let story = data.stories[i]
+            guard story.author == "me", story.isLive, var delivery = story.delivery,
+                  outboxCopies(of: story.id) == 0, storyBacklog[story.id] == nil else { continue }
+            let waiting = audience(of: story).filter { !delivery.confirmed.contains($0.fingerprint) }
+            guard !waiting.isEmpty else { continue }
+            delivery.last = Date()
+            // A restart is a fresh reason to try: it leaves the timed tries that were left, and the clip goes too.
+            delivery.resends = min(delivery.resends, 1)
+            data.stories[i].delivery = delivery
+            fanOut(story, to: waiting.map { ($0, true) })
+        }
     }
 
     /// Friend requests still waiting for an answer, sealed again from what the contact already holds: the handshake's
