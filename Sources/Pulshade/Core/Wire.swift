@@ -50,6 +50,10 @@ struct WireMessage: Codable, Equatable {
     /// Set on a video: its clip follows in pieces (`storyPart`, under this message's id), and `image` is a still
     /// from it. Apps from before chat videos leave this out and show the still as a photo.
     var clip: ClipInfo?
+    /// A collectible the sender shows. Older apps see only `text`, which says what it is.
+    var collectible: Collectible?
+    /// A note of the sender's profile, as a card (no words in it). Older apps see only `text`.
+    var note: NoteCard?
 }
 
 /// What a message says about the video that follows it.

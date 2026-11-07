@@ -72,6 +72,32 @@ struct ProfileDeliveryTests {
         #expect(bob.contact(aliceFP)?.notes == nil)
     }
 
+    /// A note goes into a chat as a card with no words in it. The other side finds the note on the sender's profile,
+    /// where the password or the access they were given decides if it opens.
+    @Test func aNoteCardCarriesOnlyItsTitleAndOpensFromTheProfile() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, bob)
+        let bobFP = try #require(alice.visibleContacts.first).fingerprint
+        let open = try #require(ProfileNote.publicNote(title: "Wifi", text: "the password is swordfish"))
+        let mine = try #require(ProfileNote.contactsNote(title: "Just for Bob", text: "a secret plan", contacts: [bobFP]))
+        alice.updateProfile { $0.notes = [open, mine] }
+        await settle(alice, bob, seconds: 6)
+        let chat = try #require(alice.data.conversations.first { $0.kind == .direct })
+        alice.send(NoteCard(mine).fallbackText, note: NoteCard(mine), in: chat.id)
+        await settle(alice, bob)
+
+        let theirs = try #require(bob.data.conversations.first { $0.kind == .direct }?.messages.last)
+        let card = try #require(theirs.note, "it arrives as a card")
+        #expect(card.title == "Just for Bob" && card.restricted && !card.locked)
+        #expect(!theirs.text.contains("secret plan"), "the words never travel in the chat")
+        let found = try #require(bob.contact(alice.fingerprint)?.notes?.first { $0.id == card.id }, "his copy of the note comes with her profile")
+        #expect(found.restricted == true && found.text == "a secret plan", "made for him: access granted")
+        #expect(NoteCard.cleaned(NoteCard(id: "", title: "x", locked: false, restricted: false)) == nil, "a card with no id is dropped")
+    }
+
     @Test func aNoteForChosenContactsReachesOnlyThemWithNoPassword() async throws {
         let alice = try await makeUser("Alice")
         let bob = try await makeUser("Bob")

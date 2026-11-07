@@ -989,25 +989,28 @@ final class AppModel {
     }
 
     func send(_ text: String, image: Data? = nil, voice: VoiceNote? = nil, replyTo: Message? = nil,
-              quote: ReplyRef? = nil, preview: LinkPreview? = nil, in id: Conversation.ID) {
+              quote: ReplyRef? = nil, preview: LinkPreview? = nil, collectible: Collectible? = nil, note: NoteCard? = nil,
+              in id: Conversation.ID) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty || image != nil || voice != nil, let i = index(of: id) else { return }
+        guard !trimmed.isEmpty || image != nil || voice != nil || collectible != nil || note != nil, let i = index(of: id) else { return }
         let convo = data.conversations[i]
         guard canPost(in: convo) else { return }
 
         let now = Date()
         // Replying to a photo carries a small copy of it, so the quote shows what was answered.
         let reply = replyTo.map { ReplyRef(id: $0.id, author: $0.sender, snippet: Self.snippet(of: $0), picture: Self.quotePicture($0.image)) } ?? quote
-        let message = Message(sender: "me", text: trimmed, image: image, voice: voice, date: now,
+        var message = Message(sender: "me", text: trimmed, image: image, voice: voice, date: now,
                               expiresAt: convo.disappearAfter.map { now.addingTimeInterval($0) }, reply: reply,
                               preview: preview)
+        message.collectible = collectible
+        message.note = note
         withAnimation(.snappy(duration: 0.4)) { data.conversations[i].messages.append(message) }
 
         let wire = WireMessage(id: message.id, conversation: sharedID(convo), kind: convo.kind == .broadcast ? .direct : convo.kind,
                                text: trimmed, image: image, voice: voice, date: RelayClock.relay(now), expiresIn: convo.disappearAfter,
                                reply: reply.map { ReplyRef(id: $0.id, author: $0.author == "me" ? (me(convo.persona)?.fingerprint ?? "") : $0.author,
                                                            snippet: $0.snippet, picture: $0.picture) },
-                               preview: preview)
+                               preview: preview, collectible: collectible, note: note)
         let recipients = audience(convo)
         for member in recipients { enqueue(.message(wire), to: member, message: message.id) }
         sync(.sent(ref(convo), wire))
@@ -3146,7 +3149,8 @@ final class AppModel {
                                                          snippet: $0.snippet, picture: $0.picture) }
                 let wire = WireMessage(id: message.id, conversation: sharedID(convo), kind: convo.kind, text: message.text,
                                        image: message.image, voice: message.voice, date: RelayClock.relay(message.date),
-                                       expiresIn: message.expiresAt == nil ? nil : convo.disappearAfter, reply: reply, preview: message.preview)
+                                       expiresIn: message.expiresAt == nil ? nil : convo.disappearAfter, reply: reply, preview: message.preview,
+                                       collectible: message.collectible, note: message.note)
                 // Not marked queued: it stays "sent" until the receipt comes, which is what makes it worth sending again.
                 for member in recipients { enqueue(.message(wire), to: member) }
             }
@@ -4315,6 +4319,9 @@ final class AppModel {
         var message = Message(id: wire.id, sender: sender.fingerprint, text: String(wire.text.prefix(20_000)),
                               image: wire.image, voice: wire.voice, date: date, status: .delivered, expiresAt: expires,
                               reply: reply, preview: preview)
+        // Shown only if it's really theirs: a collectible is checked against their key, a note card is just a title.
+        message.collectible = wire.collectible.flatMap { $0.isGenuine(for: sender.signingKey) ? $0 : nil }
+        message.note = wire.note.flatMap(NoteCard.cleaned)
         if let clip = wire.clip {
             // A video: its clip comes in pieces after this (some may be here already).
             message.video = Data()
