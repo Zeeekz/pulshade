@@ -142,9 +142,10 @@ enum StoryFilter: String, CaseIterable, Identifiable, Codable {
 // MARK: - Video
 
 enum StoryVideoError: Error, LocalizedError {
-    case unreadable, tooLarge, failed(String)
+    case unreadable, tooLarge, timedOut, failed(String)
     var errorDescription: String? {
         switch self {
+        case .timedOut: "Preparing that video took too long. Try a shorter one, or try again."
         case .unreadable: "That video can't be read."
         case .tooLarge: "That video is too large to send, even compressed."
         case let .failed(why): "The video couldn't be prepared: \(why)"
@@ -177,6 +178,8 @@ final class MemoryClip: Identifiable, @unchecked Sendable {
 final class ClipLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked Sendable {
     nonisolated(unsafe) static var key: UInt8 = 0
     static let queue = DispatchQueue(label: "pulshade.clip.loader", qos: .userInitiated)
+    /// Where the bytes are handed over, apart from the queue that takes the requests.
+    static let sender = DispatchQueue(label: "pulshade.clip.sender", qos: .userInitiated, attributes: .concurrent)
     private let bytes: Data
     /// QuickTime files (the library's videos) and MP4 files are told apart by the first bytes.
     private let type: String
@@ -194,16 +197,23 @@ final class ClipLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked Send
             info.contentLength = Int64(bytes.count)
             info.isByteRangeAccessSupported = true
         }
-        if let wanted = request.dataRequest {
-            var offset = Int(wanted.requestedOffset)
-            let end = wanted.requestsAllDataToEndOfResource ? bytes.count : min(bytes.count, offset + wanted.requestedLength)
+        guard let wanted = request.dataRequest else { request.finishLoading(); return true }
+        // AVFoundation often asks for "everything to the end" and then reads only the start it needs, cancelling the
+        // rest. Answering that in one go on this queue held everything up (and copied a whole big video) before it
+        // could say it had enough. So the bytes go out in pieces from another queue, stopping when it cancels.
+        let start = Int(wanted.requestedOffset)
+        let end = wanted.requestsAllDataToEndOfResource ? bytes.count : min(bytes.count, start + wanted.requestedLength)
+        let bytes = bytes
+        Self.sender.async {
+            var offset = start
             while offset < end {
-                let next = min(end, offset + 1_000_000)
+                if request.isCancelled { return }
+                let next = min(end, offset + 512_000)
                 wanted.respond(with: bytes.subdata(in: (bytes.startIndex + offset)..<(bytes.startIndex + next)))
                 offset = next
             }
+            if !request.isCancelled { request.finishLoading() }
         }
-        request.finishLoading()
         return true
     }
 }
@@ -239,6 +249,16 @@ enum StoryVideo {
     static let hdSize = CGSize(width: 1080, height: 1920)
     static let size = CGSize(width: 720, height: 1280)
     static let fps: Int32 = 30
+    /// How long an export may take before it's given up on. A 15-second clip takes well under half a minute.
+    static let exportTimeout: TimeInterval = 120
+
+    /// Set from the watchdog's queue and read from the export's.
+    final class Stuck: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        func set() { lock.withLock { value = true } }
+        var isSet: Bool { lock.withLock { value } }
+    }
 
     /// The look to bake into every frame, scaled to fill the story's 9:16 frame and centred.
     static func composition(for asset: AVAsset, filter: StoryFilter, size: CGSize = StoryVideo.size,
@@ -353,6 +373,18 @@ enum StoryVideo {
             throw StoryVideoError.failed((reader.error ?? writer.error)?.localizedDescription ?? "unknown")
         }
         writer.startSession(atSourceTime: .zero)
+        // A clip that has not finished in this long is stuck: stopping the reader and writer lets the wait end, so the
+        // person gets a message and can try again instead of a spinner that never stops.
+        let stuck = Stuck()
+        nonisolated(unsafe) let watchedReader = reader
+        nonisolated(unsafe) let watchedWriter = writer
+        let watchdog = DispatchWorkItem {
+            stuck.set()
+            watchedReader.cancelReading()
+            watchedWriter.cancelWriting()
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + exportTimeout, execute: watchdog)
+        defer { watchdog.cancel() }
         await withTaskGroup(of: Void.self) { group in
             for (output, input) in pumps {
                 group.addTask {
@@ -375,6 +407,7 @@ enum StoryVideo {
                 }
             }
         }
+        if stuck.isSet { throw StoryVideoError.timedOut }
         if reader.status == .failed { writer.cancelWriting(); throw StoryVideoError.failed(reader.error?.localizedDescription ?? "read") }
         await writer.finishWriting()
         guard writer.status == .completed else { throw StoryVideoError.failed(writer.error?.localizedDescription ?? "write") }
