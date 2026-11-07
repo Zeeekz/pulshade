@@ -146,6 +146,30 @@ pub fn run(dir: &mut Directory, req: &AdminRequest, traffic: Traffic) -> Result<
             if dir.take_collectible(item, serial) { Ok(json!({ "taken": item, "serial": serial })) }
             else { Err(format!("No {item} #{serial} to take back")) }
         }
+        "mod-accounts" => Ok(json!(dir.moderation.mods)),
+        "add-mod-account" => {
+            // By handle, or by the account's public key.
+            let key = if arg.starts_with('@') || crate::directory::valid_handle(arg) {
+                let h = handle_arg(arg)?;
+                dir.get(&h).map(|e| e.key).ok_or(format!("@{h} isn't listed"))?
+            } else {
+                arg.to_string()
+            };
+            dir.add_mod_account(&key)?;
+            Ok(json!({ "moderator": key }))
+        }
+        "remove-mod-account" => {
+            let key = if arg.starts_with('@') || crate::directory::valid_handle(arg) {
+                let h = handle_arg(arg)?;
+                dir.get(&h).map(|e| e.key).ok_or(format!("@{h} isn't listed"))?
+            } else {
+                arg.to_string()
+            };
+            match dir.remove_mod_account(&key) {
+                Some(taken) => Ok(json!({ "removed": key, "guardiansTakenBack": taken })),
+                None => Err("That account isn't a moderator".into()),
+            }
+        }
         "eggs" => Ok(json!(dir.eggs())),
         "egg-kinds" => Ok(json!(crate::directory::EGG_KINDS.iter().map(|k| json!({
             "name": k.name,

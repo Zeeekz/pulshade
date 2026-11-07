@@ -357,6 +357,9 @@ pub struct Moderation {
     pub banned_keys: BTreeSet<String>,
     #[serde(default)]
     pub reserved: BTreeSet<String>,
+    /// Accounts (base64 keys) of the moderators. Only they can be given a Guardian.
+    #[serde(default)]
+    pub mods: BTreeSet<String>,
     /// The creator's mailbox for abuse reports: `{ "sendID", "agreementKey", "signingKey" }`, all base64.
     #[serde(default)]
     pub report_inbox: Option<serde_json::Value>,
@@ -920,6 +923,7 @@ impl Directory {
             return Err("A giveaway's name is lowercase letters, numbers and dashes".into());
         }
         if !valid_item(&g.item) { return Err("That isn't an item".into()); }
+        if g.item == "guardian" { return Err("A Guardian can't be given away, only to a moderator".into()); }
         if B64.decode(&g.hash).map(|h| h.len()) != Ok(32) { return Err("That isn't a code hash".into()); }
         if g.closes <= g.opens { return Err("It has to close after it opens".into()); }
         let limit = self.limit_of(&g.item);
@@ -1025,6 +1029,27 @@ impl Directory {
         true
     }
 
+    /// Makes an account a moderator, so it can be given a Guardian.
+    pub fn add_mod_account(&mut self, key_b64: &str) -> Result<(), String> {
+        key(key_b64).ok_or("That isn't an account key")?;
+        self.moderation.mods.insert(key_b64.to_string());
+        self.persist_moderation();
+        Ok(())
+    }
+
+    /// Stops an account being a moderator and takes back any Guardian it wears. Returns the serials taken back.
+    pub fn remove_mod_account(&mut self, key_b64: &str) -> Option<Vec<u32>> {
+        if !self.moderation.mods.remove(key_b64) { return None; }
+        self.persist_moderation();
+        let mut taken = vec![];
+        for g in self.grants.iter_mut().filter(|g| g.item == "guardian" && g.owner == key_b64 && !g.taken) {
+            g.taken = true;
+            taken.push(g.serial);
+        }
+        if !taken.is_empty() { self.persist_grants(); }
+        Some(taken)
+    }
+
     /// How many of `item` there can be: what the operator set, or 100.
     pub fn limit_of(&self, item: &str) -> u32 {
         self.limits.get(item).copied().unwrap_or(DEFAULT_PER_ITEM)
@@ -1064,6 +1089,9 @@ impl Directory {
         key(&grant.owner).ok_or("That isn't an account key")?;
         signature(&grant.sig).ok_or("That isn't a signature")?;
         if grant.taken { return Err("That isn't a collectible".into()); }
+        if grant.item == "guardian" && !self.moderation.mods.contains(&grant.owner) {
+            return Err("A Guardian only goes to a moderator. Add them as one first".into());
+        }
         let next = self.given().get(&grant.item).copied().unwrap_or(0) + 1;
         let limit = self.limit_of(&grant.item);
         if next > limit { return Err(format!("All {limit} of {} have been given out", grant.item)); }
@@ -1837,9 +1865,41 @@ mod tests {
     }
 
     #[test]
+    fn a_guardian_only_goes_to_a_moderator() {
+        let (creator, mut dir) = giveaway_kit();
+        let (alice, bob) = (SigningKey::from_bytes(&[1; 32]), SigningKey::from_bytes(&[2; 32]));
+        assert!(dir.give_collectible(grant_for(&creator, "guardian", 1, &alice)).is_err(), "not a moderator yet");
+        assert!(dir.add_mod_account("not a key").is_err());
+        dir.add_mod_account(&b64k(&alice)).unwrap();
+        assert!(dir.give_collectible(grant_for(&creator, "guardian", 1, &bob)).is_err(), "bob isn't one");
+        dir.give_collectible(grant_for(&creator, "guardian", 1, &alice)).unwrap();
+        assert!(dir.give_collectible(grant_for(&creator, "partyhat", 1, &bob)).is_ok(), "other items go to anyone");
+    }
+
+    #[test]
+    fn removing_a_moderator_takes_their_guardian_back() {
+        let (creator, mut dir) = giveaway_kit();
+        let alice = SigningKey::from_bytes(&[1; 32]);
+        dir.add_mod_account(&b64k(&alice)).unwrap();
+        dir.give_collectible(grant_for(&creator, "guardian", 1, &alice)).unwrap();
+        assert_eq!(dir.remove_mod_account(&b64k(&alice)), Some(vec![1]));
+        assert!(dir.grants_of(&b64k(&alice)).iter().all(|g| g.taken));
+        assert_eq!(dir.remove_mod_account(&b64k(&alice)), None, "no longer a moderator");
+        assert!(dir.give_collectible(grant_for(&creator, "guardian", 2, &alice)).is_err());
+    }
+
+    #[test]
+    fn a_guardian_cannot_be_a_giveaway() {
+        let (_, mut dir) = giveaway_kit();
+        let g = Giveaway { id: "g".into(), item: "guardian".into(), hash: B64.encode([7u8; 32]), opens: 0, closes: 10, max: 1, claims: vec![] };
+        assert!(dir.add_giveaway(g).is_err());
+    }
+
+    #[test]
     fn a_guardian_cannot_be_moved_with_a_backup_code() {
         let (creator, mut dir) = giveaway_kit();
         let alice = SigningKey::from_bytes(&[1; 32]);
+        dir.add_mod_account(&b64k(&alice)).unwrap();
         dir.give_collectible(grant_for(&creator, "guardian", 1, &alice)).unwrap();
         let ts = now();
         let hash = Sha256::digest(b"CODE");
