@@ -1468,6 +1468,33 @@ struct RelayFlowTests {
         #expect((alice.data.stories.first { $0.id == id }?.delivery?.resends ?? 0) == 1)
     }
 
+    /// A relay restart empties what it holds for people who hadn't collected yet. The story goes again at once to
+    /// whoever hasn't said they have it, and not to those who have.
+    @Test func aStoryIsSentAgainAfterARestartOnlyToThoseWhoLackedIt() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        let carol = try await makeUser("Carol")
+        defer { for m in [alice, bob, carol] { m.lock() } }
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        _ = try #require(carol.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, bob, carol)
+        alice.postStory(.text("before the restart", palette: 2))
+        await settle(alice, bob, carol, rounds: 8)
+        let id = try #require(alice.myStories.first).id
+        #expect(alice.data.stories.first { $0.id == id }?.delivery?.confirmed.count == 2)
+
+        // Bob never got his: the relay lost it. Carol has hers and has said so.
+        let bobFP = try #require(alice.visibleContacts.first { $0.name == "Bob" }).fingerprint
+        bob.data.stories.removeAll()
+        let i = try #require(alice.data.stories.firstIndex { $0.id == id })
+        alice.data.stories[i].delivery?.confirmed.removeAll { $0 == bobFP }
+        alice.resendStoriesAfterRestart()
+        await settle(alice, bob, carol, rounds: 8)
+        #expect(bob.friendStories.flatMap(\.stories).map(\.id) == [id], "Bob has it now")
+        #expect(carol.friendStories.flatMap(\.stories).count == 1, "Carol still has just the one")
+        #expect(alice.data.stories.first { $0.id == id }?.delivery?.confirmed.count == 2, "and Bob said so")
+    }
+
     /// Links a second device to `model`'s account through the real relay, like scanning the QR code.
     private func linkNewDevice(to model: AppModel) async throws -> AppModel {
         let code = model.makeLinkCode()
