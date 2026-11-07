@@ -2711,6 +2711,13 @@ final class AppModel {
         save()
     }
 
+    /// Takes back a request you sent that hasn't been accepted. It leaves your list at once; if it already reached them
+    /// it stays in their requests until they decline it, and accepting it does nothing because you no longer wait for it.
+    func cancelRequest(to fingerprint: String) {
+        guard let c = sentRequests.first(where: { $0.fingerprint == fingerprint }) else { return }
+        removeContact(c.fingerprint, persona: c.persona)
+    }
+
     /// Forgets someone and your chat with them: they burned, or one of you removed the other.
     private func forget(_ contact: Contact) {
         let (fp, persona) = (contact.fingerprint, contact.persona)
