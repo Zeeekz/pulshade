@@ -943,6 +943,14 @@ private struct PrivacySettings: View {
                     }
                 }
             }
+            SettingsGroup("Chats", footer: "If messages stop getting through in both directions (after a Detach, say), this opens fresh encrypted sessions with all your contacts, and they accept them by themselves. Nothing is lost that was already delivered.") {
+                SettingRow("Renew keys with contacts") {
+                    Button("Renew") { model.renewChatKeys() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(model.theme.accent)
+                }
+            }
             SettingsGroup {
                 MenuRow(page: .anonymity, symbol: "eye.slash.fill", color: .hex(0x64D2FF), title: "Anonymity Report")
                 RowDivider(inset: 54)

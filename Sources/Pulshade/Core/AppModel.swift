@@ -372,11 +372,57 @@ final class AppModel {
         }
         adoptConnectionChoice()
         didUnlock()
+        // The keys for each chat in a backup are as they were when it was saved, and chat went on after that: they are
+        // behind the ones every contact holds, so neither side could read the other's messages, and nothing said so.
+        // So a recovered account opens a fresh session with each of them now, which they accept, and messages go both
+        // ways again. What was sent to the old keys while the phone was gone can't be read.
+        if backup != nil { startFreshSessions() }
         // Recovered from the sealed backup, with no chats: anyone still holding their side of one is told to clear
         // it, in case the device this came from was wiped (Detach) before it could say so. Contacts stay.
         if backup != nil, !hasOtherDevices { clearChatsForContacts() }
         // It's on this device now. It stays on the relay and is saved over as things change, unless backups are off.
         if backup != nil, !data.security.keepBackup { Task { try? await deleteBackup(of: identity) } }
+    }
+
+    /// Opens fresh sessions with every contact, on request (Settings > Chats), for messages that stopped getting through.
+    func renewChatKeys() {
+        guard phase == .unlocked else { return }
+        startFreshSessions()
+        save()
+    }
+
+    /// Starts a new session with a device whose messages can't be opened, at most every couple of minutes.
+    @ObservationIgnored private var lastMend: [String: Date] = [:]
+
+    private func mendSession(contact i: Int, device d: Int) {
+        guard !data.contacts[i].awaitingAcceptance, data.contacts[i].devices[d].handshake == nil else { return }
+        let key = sessionKey(contact: i, device: d)
+        if let last = lastMend[key], Date().timeIntervalSince(last) < 120 { return }
+        lastMend[key] = Date()
+        startHandshake(contact: i, device: d)
+    }
+
+    /// Drops the saved keys of every chat and opens new ones, with each device of each contact. Their messages are
+    /// held until the new session is ready, as always.
+    private func startFreshSessions() {
+        for i in data.contacts.indices where !data.contacts[i].awaitingAcceptance {
+            for d in data.contacts[i].devices.indices {
+                // The old keys are kept in memory only, to read what was sent to them while the phone was gone.
+                if let old = data.contacts[i].devices[d].session { recoveredSessions[sessionKey(contact: i, device: d)] = old }
+                data.contacts[i].devices[d].session = nil
+                data.contacts[i].devices[d].handshake = nil
+                data.contacts[i].devices[d].awaitingHello = nil
+                data.contacts[i].devices[d].acceptedHello = nil
+                startHandshake(contact: i, device: d)
+            }
+        }
+    }
+
+    /// Keys from before an account was recovered, by contact and device. Held in memory only, and dropped at lock.
+    @ObservationIgnored private var recoveredSessions: [String: Ratchet] = [:]
+
+    private func sessionKey(contact i: Int, device d: Int) -> String {
+        "\(data.contacts[i].persona?.uuidString ?? "main")|\(data.contacts[i].fingerprint)|\(data.contacts[i].devices[d].id.hex)"
     }
 
     func unlock(passcode: String) async -> Bool {
@@ -612,6 +658,7 @@ final class AppModel {
     /// What's held in memory only, for the account that was open: persona keys and its eggs. Whoever unlocks
     /// next, a decoy included, must not find them.
     private func forgetSession() {
+        recoveredSessions = [:]
         identityCache = [:]
         DecodedImages.forget()
         eggs = []
@@ -3079,8 +3126,13 @@ final class AppModel {
         let sendID = c.devices[d].sendID
         // Only the newest of these waits for a mailbox.
         if ephemeral { data.outbox.removeAll { $0.ephemeral == true && $0.sendID == sendID } }
+        // A friend request is the one thing besides a message that should wake a locked phone: it's how you hear that
+        // someone wants to talk to you. The relay is only asked to wake for mail that says so.
+        var asksToWake = false
+        if case .request = payload { asksToWake = true }
         data.outbox.append(Outgoing(sendID: sendID, blob: blob, relay: c.relay, message: message, ephemeral: ephemeral ? true : nil,
-                                  story: story, lane: c.persona == nil ? nil : Outgoing.lane(for: c.persona), rings: rings ? true : nil))
+                                  story: story, lane: c.persona == nil ? nil : Outgoing.lane(for: c.persona), rings: rings ? true : nil,
+                                  wakes: asksToWake ? true : nil))
         kick()
     }
 
@@ -3133,7 +3185,7 @@ final class AppModel {
         let total = relayRestartTotal()
         guard total > restartsHandled else { return }
         restartsHandled = total
-        resendPendingRequests()
+        resendPendingRequests(waking: true)
         resendUnconfirmedMessages()
         resendStoriesAfterRestart()
     }
@@ -3158,7 +3210,7 @@ final class AppModel {
 
     /// Friend requests still waiting for an answer, sealed again from what the contact already holds: the handshake's
     /// public half comes from its saved secrets, and its mailbox from the key kept for it.
-    func resendPendingRequests() {
+    func resendPendingRequests(waking: Bool = false) {
         for c in data.contacts where c.awaitingAcceptance && !c.isSelf && c.addedAt > Date().addingTimeInterval(-7 * 24 * 3600) {
             guard let handshake = c.devices.first?.handshake, let public_ = handshake.publicEphemeral, let key = c.receiveKey,
                   let kem = try? MLKEM768.PrivateKey(seedRepresentation: handshake.kemSeed, publicKey: nil), me(c.persona) != nil else { continue }
@@ -3166,6 +3218,9 @@ final class AppModel {
             let note = requestNotes["\(c.persona?.uuidString ?? "main")|\(c.fingerprint)"] ?? ""
             seal(.request(card(sendID: Mailbox.sendID(for: key), persona: c.persona), request, note: note),
                  to: c.fingerprint, persona: c.persona)
+            // Sent again only to be sure it arrived: it wakes their phone only when the relay may have lost the first
+            // (a restart), not every time this app is opened while it waits.
+            if let last = data.outbox.indices.last, data.outbox[last].sendID == c.devices.first?.sendID { data.outbox[last].wakes = waking ? true : nil }
         }
     }
 
@@ -3826,7 +3881,7 @@ final class AppModel {
                         // As with fetching: a lane without a working route finds one before it sends.
                         if findsRoute { _ = await Self.reach(client) }
                         do {
-                            try await client.deposit(item.blob, to: item.sendID, wake: item.message != nil || item.rings == true, ring: item.rings == true)
+                            try await client.deposit(item.blob, to: item.sendID, wake: item.message != nil || item.rings == true || item.wakes == true, ring: item.rings == true)
                             return (item, lane, nil)
                         } catch { return (item, lane, error) }
                     }
@@ -4040,11 +4095,26 @@ final class AppModel {
             data.contacts[i].devices[d].session = session
             data.contacts[i].devices[d].handshake = nil
         case let .ratchet(message):
-            guard let d = deviceIndex(i, device), var session = data.contacts[i].devices[d].session,
-                  let plain = try? session.decrypt(message) else { return }
-            // Kept before reading what it says, so a message this version can't read (one from a newer app)
-            // still counts and doesn't leave the session behind.
-            data.contacts[i].devices[d].session = session
+            guard let d = deviceIndex(i, device) else { return }
+            let keptKey = sessionKey(contact: i, device: d)
+            var plain: Data?
+            if var session = data.contacts[i].devices[d].session, let opened = try? session.decrypt(message) {
+                data.contacts[i].devices[d].session = session
+                plain = opened
+            } else if var old = recoveredSessions[keptKey], let opened = try? old.decrypt(message) {
+                // Sent to the keys this account had before it was recovered, while the phone was gone: still readable.
+                recoveredSessions[keptKey] = old
+                plain = opened
+            }
+            guard let plain else {
+                // Signed by their account, yet this device's keys can't open it: the two are out of step (a backup that
+                // was a little behind, say). Said once in a while, so a new session is opened with them, which they
+                // accept; until then what they sent can't be read, and what's sent to them can't be either.
+                if data.contacts[i].devices[d].session != nil { mendSession(contact: i, device: d) }
+                return
+            }
+            // The keys were kept above, before reading what it says, so a message this version can't read (one from a
+            // newer app) still counts and doesn't leave the session behind.
             guard let inner = try? Payload.fromWire(plain), !inner.isSetup else { return }
             handle(inner, from: fp, persona: persona, device: device)
             // The first message in lets a new session start sending. Look them up again: handling it may
