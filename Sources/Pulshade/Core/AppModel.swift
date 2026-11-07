@@ -652,10 +652,16 @@ final class AppModel {
         detaching = false
     }
 
-    /// Tells every contact, in every persona, to delete their one-to-one chat with you. They keep the contact.
+    /// Tells every contact, in every persona, to delete their one-to-one chat with you, and takes back the stories you
+    /// still have up, the way deleting one does: they were on this device, and a Detach doesn't keep them, so they
+    /// shouldn't go on showing on everyone else's. They keep the contact.
     private func clearChatsForContacts() {
         for c in data.contacts where !c.isSelf && !c.hidden && !c.awaitingAcceptance {
             enqueue(.chatDeleted(conversation: nil), to: c)
+        }
+        for story in data.stories where story.author == "me" && story.isLive {
+            dropUnsent(story: story.id)
+            for c in audience(of: story) { enqueue(.storyRemoved(id: story.id), to: c) }
         }
     }
 
@@ -3092,8 +3098,26 @@ final class AppModel {
         return hosts.compactMap { URL(string: $0) }.reduce(0) { $0 + RelayClient.restartCount(of: $1) }
     }
 
+    /// The last time the relay was asked for its boot mark, and whether that is under way. Nothing else asks while the
+    /// app is busy fetching, so without this a restart would only be noticed after the fact, or not at all.
+    @ObservationIgnored private var lastBootCheck = Date.distantPast
+    @ObservationIgnored private var checkingBoot = false
+
+    /// Asks the relay for its boot mark about once a minute. A different one is a restart, and what it emptied is sent
+    /// again (see `resendAfterRestart`). A tiny request, the same kind the app already makes.
+    private func watchRelayBoot() {
+        guard appActive, !checkingBoot, Date().timeIntervalSince(lastBootCheck) >= 45, let client = client(nil) else { return }
+        checkingBoot = true
+        lastBootCheck = Date()
+        Task { [weak self] in
+            _ = await client.health()
+            self?.checkingBoot = false
+        }
+    }
+
     /// Housekeeping: notices a restart and sends again what it may have lost.
     private func resendAfterRestart() {
+        watchRelayBoot()
         let total = relayRestartTotal()
         guard total > restartsHandled else { return }
         restartsHandled = total

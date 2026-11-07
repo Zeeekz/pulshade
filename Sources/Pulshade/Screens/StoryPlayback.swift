@@ -279,6 +279,44 @@ struct StoryPick: Identifiable {
 #if os(iOS)
 import PhotosUI
 
+/// A dimmed screen with a spinner and a few words, over everything, for work that takes a moment.
+@MainActor
+enum LoadingHUD {
+    private static var view: UIView?
+
+    static func show(_ text: String) {
+        guard view == nil, let window = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive })?.keyWindow else { return }
+        let dim = UIView(frame: window.bounds)
+        dim.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        dim.backgroundColor = UIColor.black.withAlphaComponent(0.55)
+        let spinner = UIActivityIndicatorView(style: .large)
+        spinner.color = .white
+        spinner.startAnimating()
+        let label = UILabel()
+        label.text = text
+        label.textColor = .white
+        label.font = .systemFont(ofSize: 15, weight: .medium)
+        let stack = UIStackView(arrangedSubviews: [spinner, label])
+        stack.axis = .vertical
+        stack.spacing = 14
+        stack.alignment = .center
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        dim.addSubview(stack)
+        NSLayoutConstraint.activate([stack.centerXAnchor.constraint(equalTo: dim.centerXAnchor),
+                                     stack.centerYAnchor.constraint(equalTo: dim.centerYAnchor)])
+        dim.isAccessibilityElement = true
+        dim.accessibilityLabel = text
+        window.addSubview(dim)
+        view = dim
+    }
+
+    static func hide() {
+        view?.removeFromSuperview()
+        view = nil
+    }
+}
+
 /// Apple's own photo picker, shown straight from UIKit: it hands back the picture, or a copy of the video's file, to
 /// the callback. (SwiftUI's PhotosPicker, shown over the story camera, was closed before it could answer.)
 @MainActor
@@ -313,12 +351,22 @@ final class LibraryPicker: NSObject, PHPickerViewControllerDelegate {
             return
         }
         if provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier) {
+            // At once, so the screen says something while the video is fetched (one kept in iCloud is downloaded first)
+            // and read in: that can take a while, and it used to look like nothing was happening.
+            Task { @MainActor in LoadingHUD.show("Getting your video…") }
             provider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { url, _ in
                 // The file is only there until this returns, so it is read into memory now. Pulshade makes no copy of it
-                // on disk. Anything past 250 MB is too big to hold; the story only uses 15 seconds of it anyway.
-                guard let url, let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size <= 250_000_000,
-                      let bytes = try? Data(contentsOf: url) else {
-                    Task { @MainActor in self.finish(nil, nil) }
+                // on disk. Anything past the limit is too big to hold; the story only uses 15 seconds of it anyway.
+                guard let url, let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize else {
+                    Task { @MainActor in self.fail("That video couldn't be loaded. If it's kept in iCloud, check you're online and try again.") }
+                    return
+                }
+                guard size <= Self.largest else {
+                    Task { @MainActor in self.fail("That video is too big (\(size / 1_000_000) MB; the limit is \(Self.largest / 1_000_000) MB). Trim it to under a minute in Photos and try again.") }
+                    return
+                }
+                guard let bytes = try? Data(contentsOf: url) else {
+                    Task { @MainActor in self.fail("That video couldn't be read.") }
                     return
                 }
                 let clip = MemoryClip(bytes)
@@ -334,7 +382,25 @@ final class LibraryPicker: NSObject, PHPickerViewControllerDelegate {
         }
     }
 
+    /// The biggest video that is held in memory to take 15 seconds from.
+    nonisolated static let largest = 700_000_000
+
+    /// Says why nothing was picked, instead of leaving the person looking at an unchanged screen.
+    private func fail(_ message: String) {
+        LoadingHUD.hide()
+        let alert = UIAlertController(title: "Couldn't use that video", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .cancel))
+        if var top = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive })?.keyWindow?.rootViewController {
+            while let next = top.presentedViewController { top = next }
+            top.present(alert, animated: true)
+        }
+        done = nil
+        Self.current = nil
+    }
+
     private func finish(_ kind: StoryPick.Kind?, _ image: UIImage?) {
+        LoadingHUD.hide()
         done?(kind, image)
         done = nil
         Self.current = nil

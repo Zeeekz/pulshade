@@ -668,6 +668,25 @@ struct RelayFlowTests {
         #expect(bob.visibleContacts.count == 1, "and Alice is still a contact")
     }
 
+    /// Detach wipes your own stories from the phone, so they are taken back from your contacts too, instead of going
+    /// on showing on theirs for the rest of the day.
+    @Test func detachTakesYourStoriesBackFromYourContacts() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, bob)
+        alice.postStory(.text("still up", palette: 3))
+        await settle(alice, bob, rounds: 8)
+        #expect(bob.friendStories.flatMap(\.stories).count == 1, "Bob sees it")
+        #expect(alice.link == .online)
+        await alice.detachNow()
+        #expect(alice.identity == nil, "wiped")
+        await settle(bob, rounds: 8)
+        #expect(bob.friendStories.flatMap(\.stories).isEmpty, "and it's gone from his side too")
+        #expect(bob.visibleContacts.count == 1, "Alice is still a contact")
+    }
+
     /// A story that's over stops going out: what was still waiting to be sent is dropped.
     @Test func aDeletedStoryStopsUploading() async throws {
         let alice = try await makeUser("Alice")
@@ -2028,6 +2047,60 @@ struct RelayFlowTests {
             return
         }
         #expect(!(await restored.saveBackup()), "off means no upload")
+    }
+
+    /// A relay that answers with a different boot mark has restarted: that is counted once, and a repeat of the same
+    /// mark is not.
+    @Test func aDifferentBootMarkIsARestart() throws {
+        let relay = try #require(URL(string: "http://boot-mark-test-\(Int.random(in: 1000...9999)).example"))
+        RelayClient.note(boot: "aaaa", of: relay)
+        #expect(RelayClient.restartCount(of: relay) == 0, "the first mark says nothing")
+        RelayClient.note(boot: "aaaa", of: relay)
+        #expect(RelayClient.restartCount(of: relay) == 0, "the same mark is the same run")
+        RelayClient.note(boot: "bbbb", of: relay)
+        #expect(RelayClient.restartCount(of: relay) == 1)
+        RelayClient.note(boot: "cccc", of: relay)
+        #expect(RelayClient.restartCount(of: relay) == 2)
+    }
+
+    /// After Detach and logging back in, the contacts are back, and messages go both ways again: the sessions are
+    /// opened afresh, because the old ones were never in the backup.
+    @Test func afterDetachAndRestoreMessagesGoBothWaysAgain() async throws {
+        let zee = try await makeUser("Zee")
+        let bob = try await makeUser("Bob")
+        defer { for m in [zee, bob] { m.lock() } }
+        _ = try #require(bob.addContact(code: zee.makeInviteCode(), nickname: ""))
+        await settle(zee, bob)
+        let bobFP = try #require(zee.visibleContacts.first).fingerprint
+        let chat = zee.startConversation(kind: .direct, title: "", members: [bobFP])
+        zee.send("before", in: chat.id)
+        await settle(zee, bob)
+        #expect(bob.data.conversations.first?.messages.map(\.text) == ["before"])
+        let seed = try #require(zee.identity?.seed)
+        let identity = try Identity(seed: seed)
+        #expect(await zee.saveBackup())
+
+        zee.destroyEverything()
+        let restored = testModel("pulshade-after-detach")
+        defer { restored.lock() }
+        guard case let .found(backup) = await restored.backup(of: identity) else {
+            Issue.record("Detaching left nothing to restore")
+            return
+        }
+        try await restored.restore(seed: seed, passcode: "new-device", from: backup)
+        await settle(restored, bob, rounds: 6)
+
+        // The restored account writes first.
+        let again = restored.startConversation(kind: .direct, title: "", members: [bobFP])
+        restored.send("back again", in: again.id)
+        await settle(restored, bob, rounds: 14)
+        #expect(bob.data.conversations.first { $0.kind == .direct }?.messages.map(\.text) == ["back again"], "Bob gets it")
+
+        // And Bob answers.
+        let bobsChat = try #require(bob.data.conversations.first { $0.kind == .direct })
+        bob.send("welcome back", in: bobsChat.id)
+        await settle(restored, bob, rounds: 14)
+        #expect(restored.data.conversations.first { $0.kind == .direct }?.messages.map(\.text).contains("welcome back") == true, "and she gets his")
     }
 
     @Test func aBackupIsPaddedAndOldOnesStillOpen() throws {
