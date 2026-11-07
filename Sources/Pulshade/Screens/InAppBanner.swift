@@ -51,7 +51,7 @@ private struct InAppBannerView: View {
         } label: {
             HStack(spacing: 11) {
                 if banner.showsAvatar {
-                    Avatar(image: banner.avatar, seed: banner.seed, size: 36)
+                    Avatar(image: banner.avatar, seed: banner.seed, size: 36, showsStory: false)
                 } else {
                     PulseMark(size: 20).frame(width: 36, height: 36)
                 }

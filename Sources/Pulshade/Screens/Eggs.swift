@@ -254,7 +254,7 @@ struct GiftSheet: View {
                         if i > 0 { RowDivider(inset: 62) }
                         Button { confirming = c } label: {
                             HStack(spacing: 12) {
-                                Avatar(image: c.avatar, seed: c.fingerprint, size: 34)
+                                Avatar(image: c.avatar, seed: c.fingerprint, size: 34, showsStory: false)
                                 Text(c.displayName).font(.system(size: 15)).foregroundStyle(Ink.text).lineLimit(1)
                                 Spacer()
                                 Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Ink.faint)

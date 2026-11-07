@@ -63,7 +63,8 @@ struct StoryStrip: View {
                                             following: unseenReels(after: entry.author), preceding: reels(before: entry.author))
                     } label: {
                         StoryBubble(image: contact?.avatar, seed: entry.author, name: model.displayName(entry.author),
-                                    active: entry.stories.contains { !$0.seen }, adding: false)
+                                    active: entry.stories.contains { !$0.seen }, adding: false,
+                                    glow: entry.stories.contains { !$0.seen })
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel(model.displayName(entry.author))
@@ -116,7 +117,7 @@ private struct StoryBubble: View {
         VStack(spacing: 5) {
             StoryRing(active: active, size: 60, uploading: uploading, glow: glow) {
                 ZStack(alignment: .bottomTrailing) {
-                    Avatar(image: image, seed: seed, size: 50)
+                    Avatar(image: image, seed: seed, size: 50, showsStory: false)
                     if adding { SymbolBadge(symbol: "plus", size: 18) }
                 }
             }
@@ -813,7 +814,7 @@ struct StoryAudiencePicker: View {
                                 }
                             } label: {
                                 HStack(spacing: 12) {
-                                    Avatar(image: c.avatar, seed: c.fingerprint, size: 34)
+                                    Avatar(image: c.avatar, seed: c.fingerprint, size: 34, showsStory: false)
                                     Text(c.displayName).font(.system(size: 15)).foregroundStyle(Ink.text).lineLimit(1)
                                     Spacer()
                                     Image(systemName: picked.contains(c.fingerprint) ? "checkmark.circle.fill" : "circle")
@@ -901,7 +902,7 @@ struct StoryViewers: View {
                     ForEach(Array(viewers.enumerated()), id: \.element.fingerprint) { i, v in
                         if i > 0 { RowDivider(inset: 62) }
                         HStack(spacing: 12) {
-                            Avatar(image: model.contact(v.fingerprint, in: story.persona)?.avatar, seed: v.fingerprint, size: 34)
+                            Avatar(image: model.contact(v.fingerprint, in: story.persona)?.avatar, seed: v.fingerprint, size: 34, showsStory: false)
                             Text(model.contact(v.fingerprint, in: story.persona)?.displayName ?? "Unknown")
                                 .font(.system(size: 15)).foregroundStyle(Ink.text).lineLimit(1)
                             Spacer()
@@ -1650,7 +1651,7 @@ struct StoryViewer: View {
         let name = mine ? "Your story" : model.displayName(story.author)
         let avatar = mine ? model.activeProfile.avatar : model.contact(story.author)?.avatar
         return HStack(spacing: 8) {
-            Avatar(image: avatar, seed: mine ? model.fingerprint : story.author, size: 30)
+            Avatar(image: avatar, seed: mine ? model.fingerprint : story.author, size: 30, showsStory: false)
             Text(name).font(.system(size: 14, weight: .semibold)).lineLimit(1)
             Text(Self.age(of: story.date)).font(.system(size: 13)).opacity(0.75)
             Spacer()

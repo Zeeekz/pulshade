@@ -40,7 +40,7 @@ struct ReportSheet: View {
         VStack(alignment: .leading, spacing: 16) {
             if let subject {
                 HStack(spacing: 12) {
-                    Avatar(image: nil, seed: Identity.fingerprint(of: subject.key), size: 36)
+                    Avatar(image: nil, seed: Identity.fingerprint(of: subject.key), size: 36, showsStory: false)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(subject.name.isEmpty ? "Anonymous" : subject.name).font(.system(size: 15, weight: .medium)).foregroundStyle(Ink.text)
                         if let h = subject.handle { Text("@\(h)").font(.system(size: 13)).foregroundStyle(Ink.dim) }

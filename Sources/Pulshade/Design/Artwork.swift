@@ -233,12 +233,18 @@ struct GenerativeArt: View {
 /// owner's signature colour on a quiet disc, so a default picture looks like part of the app, not a placeholder.
 struct Avatar: View {
     @Environment(AppModel.self) private var model: AppModel?
+    @Environment(\.theme) private var theme
     var image: Data?
     var seed: String
     var size: CGFloat = 44
     var symbol: String?
+    /// Whether a story nobody here has watched yet makes the picture glow and tapping it open the story. Off where
+    /// a tap means something else (the story viewer itself, a banner, a call, a list you pick from), and where the
+    /// caller draws its own ring.
+    var showsStory = true
 
     var body: some View {
+        let reel = showsStory ? model?.unwatchedReel(of: seed) : nil
         ZStack {
             if let image, let ns = DecodedImages.image(image) {
                 Image(platformImage: ns).resizable().scaledToFill()
@@ -249,6 +255,34 @@ struct Avatar: View {
         .frame(width: size, height: size)
         .clipShape(Circle())
         .overlay(Circle().strokeBorder(Ink.line))
+        .overlay {
+            if reel != nil {
+                Circle().strokeBorder(theme.accent, lineWidth: max(1.5, size * 0.045))
+                    .padding(-size * 0.07)
+                    .shadow(color: theme.accent.opacity(0.85), radius: max(3, size * 0.1))
+                    .allowsHitTesting(false)
+            }
+        }
+        .modifier(OpensStory(reel: reel, model: model))
+    }
+}
+
+/// Makes a picture open its owner's story when tapped. Without one it adds nothing, so the picture's usual tap
+/// (or the row it sits in) still works.
+private struct OpensStory: ViewModifier {
+    var reel: StoryReel?
+    var model: AppModel?
+
+    func body(content: Content) -> some View {
+        if let reel, let model {
+            content
+                .contentShape(Circle())
+                .onTapGesture { Haptics.tick(); model.storyToOpen = reel }
+                .accessibilityAddTraits(.isButton)
+                .accessibilityHint("Opens their story")
+        } else {
+            content
+        }
     }
 }
 

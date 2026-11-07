@@ -150,7 +150,7 @@ struct ContactPicker: View {
                         } label: {
                             VStack(spacing: 6) {
                                 ZStack(alignment: .bottomTrailing) {
-                                    Avatar(image: c.avatar, seed: c.fingerprint, size: 56)
+                                    Avatar(image: c.avatar, seed: c.fingerprint, size: 56, showsStory: false)
                                         .overlay(Circle().strokeBorder(theme.gradient, lineWidth: on ? 3 : 0))
                                         .scaleEffect(on ? 1.06 : 1)
                                     if on { SymbolBadge(symbol: "checkmark", size: 20).transition(.scale) }

@@ -1977,6 +1977,18 @@ final class AppModel {
         return (story.viewers ?? [:]).map { ($0.key, $0.value) }.sorted { $0.at > $1.at }
     }
 
+    /// Someone's stories, from the first one you haven't watched, if there's any you haven't: what tapping their
+    /// glowing picture plays. Nil when they have none live or you've watched them all.
+    func unwatchedReel(of author: String) -> StoryReel? {
+        guard !author.isEmpty, author != "me", data.stories.contains(where: { $0.author == author && !$0.seen }) else { return nil }
+        let live = data.stories.filter { $0.author == author && $0.isLive && $0.persona == activePersona }.sorted { $0.date < $1.date }
+        guard let first = live.firstIndex(where: { !$0.seen }) else { return nil }
+        return StoryReel(stories: live, start: first)
+    }
+
+    /// Set to play someone's story from anywhere in the app. `MainView` shows it.
+    var storyToOpen: StoryReel?
+
     /// Oldest first, the order they play in.
     var myStories: [Story] { data.stories.filter { $0.author == "me" && $0.isLive && $0.isReady && $0.persona == activePersona }.sorted { $0.date < $1.date } }
 

@@ -28,7 +28,7 @@ struct PulseCheckView: View {
                     Avatar(image: model.profile(for: persona).avatar, seed: mine, size: 64)
                     BeatBridge(colors: code.colors, success: verified || result == true)
                         .frame(width: 180, height: 64)
-                    Avatar(image: contact?.avatar, seed: fingerprint, size: 64)
+                    Avatar(image: contact?.avatar, seed: fingerprint, size: 64, showsStory: false)
                 }
 
                 VStack(spacing: 8) {

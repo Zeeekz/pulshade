@@ -412,7 +412,7 @@ struct RestoreFlow: View {
                 ForEach(choices, id: \.handle) { profile in
                     Button { withAnimation(.snappy) { chosen = profile.handle } } label: {
                         HStack(spacing: 12) {
-                            Avatar(image: profile.avatar, seed: profile.fingerprint, size: 44)
+                            Avatar(image: profile.avatar, seed: profile.fingerprint, size: 44, showsStory: false)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(profile.name.isEmpty ? "Anonymous" : profile.name)
                                     .font(.system(size: 15, weight: .medium)).foregroundStyle(Ink.text)

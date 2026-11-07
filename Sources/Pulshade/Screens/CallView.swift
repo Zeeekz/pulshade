@@ -13,7 +13,7 @@ struct CallView: View {
                 VStack(spacing: 0) {
                     Spacer(minLength: 40)
                     VStack(spacing: 16) {
-                        Avatar(image: contact?.avatar, seed: call.peer, size: 112)
+                        Avatar(image: contact?.avatar, seed: call.peer, size: 112, showsStory: false)
                             .overlay {
                                 if call.phase == .ringing, !Platform.reduceMotion {
                                     Circle().strokeBorder(theme.accent.opacity(0.5), lineWidth: 2)

@@ -36,6 +36,12 @@ struct MainView: View {
         .sheet(item: Binding(get: { model.codeAlert }, set: { model.codeAlert = $0 })) { BackupCodeSheet(alert: $0) }
         .overlay { CallView() }
         .animation(.smooth(duration: 0.3), value: model.call == nil)
+        // A glowing picture anywhere in the app plays its story from here.
+        .background {
+            Color.clear.viewerCover(item: Binding(get: { model.storyToOpen }, set: { model.storyToOpen = $0 })) { reel in
+                StoryViewer(stories: reel.stories, start: reel.start, following: reel.following, preceding: reel.preceding)
+            }
+        }
     }
 }
 
@@ -728,7 +734,7 @@ private struct ChatRow: View {
             ZStack(alignment: .bottomTrailing) {
                 Avatar(image: c.avatar ?? (c.kind == .direct ? model.contact(c.members.first ?? "")?.avatar : nil),
                        seed: c.kind == .direct ? (c.members.first ?? c.id.uuidString) : c.id.uuidString,
-                       size: 42, symbol: c.kind == .direct ? nil : c.kind.symbol)
+                       size: 42, symbol: c.kind == .direct ? nil : c.kind.symbol, showsStory: false)
                     .overlay {
                         if c.kind == .direct, let fp = c.members.first {
                             Circle().strokeBorder(model.signature(fp).opacity(0.8), lineWidth: 1.5).padding(-2.5)
@@ -738,6 +744,7 @@ private struct ChatRow: View {
                         if !stories.isEmpty {
                             let fresh = stories.contains { !$0.seen }
                             Circle().strokeBorder(fresh ? theme.accent : Ink.faint, lineWidth: 2.5).padding(-5)
+                                .shadow(color: theme.accent.opacity(fresh ? 0.85 : 0), radius: fresh ? 5 : 0)
                         }
                     }
                     .contentShape(Circle())

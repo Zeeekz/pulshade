@@ -106,3 +106,27 @@ struct MentionFlowTests {
         #expect(plain.text == "hi @Bob" && plain.mentions.isEmpty && !plain.mentionsMe)
     }
 }
+
+/// A picture glows, and opens the story when tapped, only while someone has a story you haven't watched.
+@MainActor
+@Suite struct UnwatchedStoryTests {
+    @Test func onlyUnwatchedLiveStoriesOfThatPersonCount() {
+        let model = testModel("pulshade-test")
+        let old = Story(author: "k", style: .text("a", palette: 0), date: Date().addingTimeInterval(-60), seen: true)
+        let fresh = Story(author: "k", style: .text("b", palette: 0), date: Date())
+        model.data.stories = [old, fresh]
+        let reel = model.unwatchedReel(of: "k")
+        #expect(reel?.stories.map(\.id) == [old.id, fresh.id] && reel?.start == 1, "plays from the first one not watched")
+        #expect(model.unwatchedReel(of: "someone-else") == nil && model.unwatchedReel(of: "me") == nil && model.unwatchedReel(of: "") == nil)
+
+        model.data.stories[1].seen = true
+        #expect(model.unwatchedReel(of: "k") == nil, "watched: the picture goes back to its normal tap")
+
+        let other = Story(author: "k", style: .text("c", palette: 0), persona: UUID())
+        model.data.stories = [other]
+        #expect(model.unwatchedReel(of: "k") == nil, "another persona's story doesn't count")
+        let expired = Story(author: "k", style: .text("d", palette: 0), date: Date().addingTimeInterval(-200_000))
+        model.data.stories = [expired]
+        #expect(model.unwatchedReel(of: "k") == nil)
+    }
+}
