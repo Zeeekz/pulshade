@@ -790,15 +790,16 @@ private struct ChatRow: View {
                     }
                     if c.muted { Image(systemName: "bell.slash.fill").font(.system(size: 10)).foregroundStyle(Ink.faint) }
                     Spacer(minLength: 4)
+                    // Like Telegram: your own last message's ticks sit beside the time, top right.
+                    if let last = c.messages.last, last.isMine {
+                        StatusTicks(status: last.status).foregroundStyle(Ink.faint)
+                    }
                     Text(c.lastActivity.chatStamp)
                         .font(.system(size: stampSize))
                         .foregroundStyle(Ink.faint)
                 }
                 HStack(spacing: 6) {
                     if let last = c.messages.last {
-                        if last.isMine {
-                            StatusTicks(status: last.status).foregroundStyle(Ink.faint)
-                        }
                         if last.image != nil { Image(systemName: "photo").font(.system(size: lineSize - 2)).foregroundStyle(Ink.dim) }
                         if last.voice != nil { Image(systemName: "waveform").font(.system(size: lineSize - 2)).foregroundStyle(Ink.dim) }
                         if last.expiresAt != nil || c.disappearAfter != nil {

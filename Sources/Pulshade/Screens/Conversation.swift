@@ -225,9 +225,7 @@ struct ConversationView: View {
                         }
                         .id(m.id)
                         .modifier(PhoneSwipe(enabled: Platform.isPhone && !m.isSystem, gesture: swipeGesture(for: m)))
-                        .transition(.asymmetric(
-                            insertion: .move(edge: .bottom).combined(with: .opacity),
-                            removal: .opacity))
+                        .transition(messageTransition)
                     }
                 }
                 .padding(.horizontal, Platform.isPhone ? 10 : 20)
@@ -1202,6 +1200,17 @@ private struct VoiceBubble: View {
             Text(Duration.seconds(note.duration).formatted(.time(pattern: .minuteSecond)))
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 .foregroundStyle(mine ? Ink.onAccent.opacity(0.6) : Ink.dim)
+            Button { Haptics.tick(); player.cycleRate() } label: {
+                Text(player.rate == 1 ? "1×" : (player.rate == 2 ? "2×" : "1.5×"))
+                    .font(.system(size: 10.5, weight: .bold))
+                    .foregroundStyle(mine ? Ink.onAccent.opacity(0.85) : Ink.text)
+                    .frame(minWidth: 30)
+                    .padding(.vertical, 3)
+                    .background(mine ? Ink.onAccent.opacity(0.18) : Ink.text.opacity(0.1), in: .capsule)
+                    .contentTransition(.numericText())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Playback speed \(player.rate == 1.5 ? "1.5" : "\(Int(player.rate))") times")
         }
     }
 }
@@ -2079,3 +2088,22 @@ struct ProfileActionStyle: ButtonStyle {
             .contentShape(.capsule)
     }
 }
+
+
+/// An unsent message goes out like a zap: it flashes bright, swells and blurs into a pulse, and is gone.
+struct ZapTransition: Transition {
+    func body(content: Content, phase: TransitionPhase) -> some View {
+        let gone = phase == .identity ? 0.0 : 1.0
+        content
+            .brightness(gone * 0.55)
+            .saturation(1 + gone * 0.6)
+            .scaleEffect(1 + gone * 0.14)
+            .blur(radius: gone * 9)
+            .opacity(1 - gone)
+    }
+}
+
+/// New messages slide up; unsent ones zap out. Kept out of the message list's body so it still type-checks quickly.
+private let messageTransition: AnyTransition = .asymmetric(
+    insertion: .move(edge: .bottom).combined(with: .opacity),
+    removal: AnyTransition(ZapTransition()))

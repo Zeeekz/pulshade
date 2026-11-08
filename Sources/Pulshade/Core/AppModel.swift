@@ -1247,7 +1247,7 @@ final class AppModel {
         guard let i = index(of: id) else { return }
         let convo = data.conversations[i]
         guard convo.messages.contains(where: { $0.id == messageID && $0.isMine }) else { return }
-        withAnimation(.snappy) { data.conversations[i].messages.removeAll { $0.id == messageID } }
+        withAnimation(.easeOut(duration: 0.38)) { data.conversations[i].messages.removeAll { $0.id == messageID } }
         for member in audience(convo) { enqueue(.unsend(ids: [messageID]), to: member) }
         sync(.unsend(ids: [messageID]))
         save()
@@ -4609,7 +4609,7 @@ final class AppModel {
         let ids = Set(ids)
         for i in data.conversations.indices
         where data.conversations[i].messages.contains(where: { ids.contains($0.id) && $0.sender == sender.fingerprint }) {
-            withAnimation(.snappy) {
+            withAnimation(.easeOut(duration: 0.38)) {
                 data.conversations[i].messages.removeAll { ids.contains($0.id) && $0.sender == sender.fingerprint }
             }
             clampUnread(i)

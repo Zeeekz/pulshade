@@ -227,8 +227,16 @@ final class VoicePlayer: NSObject, AVAudioPlayerDelegate {
 
     private(set) var playing: UUID?
     private(set) var progress: Double = 0
+    /// How fast notes play: 1x, 1.5x or 2x. It stays where you left it, like Telegram's.
+    private(set) var rate: Float = 1
     private var player: AVAudioPlayer?
     private var timer: Timer?
+
+    /// Steps 1x, then 1.5x, then 2x, then back to 1x; a note already playing speeds up straight away.
+    func cycleRate() {
+        rate = rate < 1.25 ? 1.5 : (rate < 1.75 ? 2 : 1)
+        player?.rate = rate
+    }
 
     func toggle(_ note: VoiceNote, id: UUID) {
         if playing == id {
@@ -242,6 +250,8 @@ final class VoicePlayer: NSObject, AVAudioPlayerDelegate {
         #endif
         guard let player = try? AVAudioPlayer(data: note.audio) else { return }
         player.delegate = self
+        player.enableRate = true
+        player.rate = rate
         player.play()
         self.player = player
         playing = id
