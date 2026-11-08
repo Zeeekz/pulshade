@@ -276,6 +276,14 @@ final class AppModel {
     func callPushArrived() {
         if phase == .unlocked { reconnect() } else if phase == .locked { warmUp() }
     }
+
+    /// A message push woke Pulshade. Unlocked, it reconnects and fetches at once, then stays awake long enough for
+    /// the delivery receipt (which waits a second or few) to go out, so the sender's tick doesn't wait for you to open it.
+    func messagePushArrived() async {
+        guard phase == .unlocked else { warmUp(); return }
+        callPushArrived()
+        try? await Task.sleep(for: .seconds(12))
+    }
     #endif
 
     func willEnterForeground() {
@@ -899,6 +907,12 @@ final class AppModel {
         // Being @-mentioned gets through a muted chat: that's someone asking for you in particular.
         guard data.security.notifications, !convo.muted || message.mentionsMe else { return }
         if appActive && openConversation == convo.id { return }
+        #if os(iOS)
+        // Behind the screen with push set up for this account, Apple's banner is the notification: Pulshade's own
+        // beside it would be a second one, and one that could name the sender. (Mail for another persona isn't
+        // pushed, so that still gets Pulshade's own.)
+        if !appActive, convo.persona == nil, pushTold != nil { return }
+        #endif
         let content = Notifier.content(for: message, in: convo, sender: displayName(message.sender),
                                        style: data.security.notificationContent)
         #if os(iOS)

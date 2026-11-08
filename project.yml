@@ -65,7 +65,7 @@ targets:
         NSPhotoLibraryAddUsageDescription: Save pictures from your chats to Photos. Pulshade only adds to your library and never reads it.
         NSMicrophoneUsageDescription: Record voice notes, videos and make calls. Audio is encrypted before it leaves your phone.
         # fetch: iOS wakes the app now and then to check for announcements (AnnouncementWatch).
-        UIBackgroundModes: [audio, fetch, voip]
+        UIBackgroundModes: [audio, fetch, voip, remote-notification]
         BGTaskSchedulerPermittedIdentifiers: [app.pulshade.ios.announcements, app.pulshade.ios.upload]
         NSFaceIDUsageDescription: Unlock PULSHADE with Face ID.
         NSLocalNetworkUsageDescription: Reach a PULSHADE relay running on your own network.

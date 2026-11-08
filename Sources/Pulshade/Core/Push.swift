@@ -38,6 +38,16 @@ final class PushDelegate: NSObject, UIApplicationDelegate {
         NotificationCenter.default.post(name: .pulshadePushToken, object: nil)
     }
 
+    /// The message push carries a wake-up too: if Pulshade is open behind a locked screen it fetches at once, so the
+    /// message lands and the sender's second tick comes while the banner is still fresh. iOS gives about 30 seconds.
+    func application(_ application: UIApplication, didReceiveRemoteNotification userInfo: [AnyHashable: Any],
+                     fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void) {
+        Task { @MainActor in
+            await CallRinger.shared.model?.messagePushArrived()
+            completionHandler(.newData)
+        }
+    }
+
     func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
         Push.token = nil
         Push.failure = error.localizedDescription
