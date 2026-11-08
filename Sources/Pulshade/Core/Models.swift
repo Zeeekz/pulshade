@@ -1124,7 +1124,8 @@ struct AppData: Codable {
     /// 8: a message can show a collectible or carry a note as a card.
     /// 9: a message can carry a file kept on the relay, and files still to be erased there are remembered.
     /// 10: a waiting envelope can carry a recall stamp.
-    static let currentFormat = 10
+    /// 11: when the account was made on this device, for a fresh-start order to tell old accounts from new ones.
+    static let currentFormat = 11
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []
@@ -1172,6 +1173,9 @@ struct AppData: Codable {
     var clipParts: [UUID: ClipParts] = [:]
     /// Announcements already shown, so one deleted here doesn't come back.
     var announcementsSeen: [String] = []
+    /// When this account was made or recovered on this device. Accounts from before it was kept have none, which
+    /// counts as older than any fresh-start order (see `Announcement.isFreshStart`).
+    var bornAt: Date?
     /// When the sealed backup on the relay was last saved, and a hash of what it held (without these two fields),
     /// so an unchanged account isn't uploaded again. Neither is ever in the backup itself.
     var backupSavedAt: Date?
@@ -1241,6 +1245,7 @@ struct AppData: Codable {
         storyChoices = (try? c.decodeIfPresent([String: StoryChoice].self, forKey: .storyChoices)) ?? [:]
         clipParts = (try? c.decodeIfPresent([UUID: ClipParts].self, forKey: .clipParts)) ?? [:]
         announcementsSeen = (try? c.decodeIfPresent([String].self, forKey: .announcementsSeen)) ?? []
+        bornAt = try? c.decodeIfPresent(Date.self, forKey: .bornAt)
         backupSavedAt = try? c.decodeIfPresent(Date.self, forKey: .backupSavedAt)
         backupDigest = try? c.decodeIfPresent(Data.self, forKey: .backupDigest)
     }

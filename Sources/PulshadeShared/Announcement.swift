@@ -25,6 +25,16 @@ public struct Announcement: Codable, Equatable, Identifiable, Sendable {
 
     public var sentAt: Date { Date(timeIntervalSince1970: TimeInterval(date)) }
 
+    /// An announcement that starts with this is a fresh-start order: apps that understand it wipe themselves, and
+    /// older ones just show the text, so write it for them too ("[fresh-start] Pulshade has been reset ...").
+    public static let freshStartTag = "[fresh-start]"
+
+    /// A genuine order (the caller checks the signature) that an account made at `bornAt` must obey: only accounts
+    /// older than it do, so the people who start again afterwards aren't wiped by it in turn. No date counts as old.
+    public func orders(freshStartFor bornAt: Date?) -> Bool {
+        text.hasPrefix(Self.freshStartTag) && sentAt > (bornAt ?? .distantPast)
+    }
+
     public static func signedPart(id: String, text: String, date: UInt64) -> Data {
         Data("pulshade.announcement.v1".utf8) + Data(id.utf8) + Data([0])
             + withUnsafeBytes(of: date.bigEndian) { Data($0) } + Data(text.utf8)

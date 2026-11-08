@@ -369,6 +369,7 @@ final class AppModel {
         self.identity = identity
         slot = 0
         data = AppData()
+        data.bornAt = Date()
         data.profile = profile
         adoptConnectionChoice(fresh: true)
         didUnlock()
@@ -393,6 +394,8 @@ final class AppModel {
         } else {
             data = stored
         }
+        // Recovering is a choice made now, so an order from before it isn't for this account.
+        if data.bornAt == nil { data.bornAt = Date() }
         adoptConnectionChoice()
         didUnlock()
         // The keys for each chat in a backup are as they were when it was saved, and chat went on after that: they are
@@ -3052,6 +3055,11 @@ final class AppModel {
 
     func applyAnnouncements(_ listed: [Announcement]) {
         let genuine = listed.filter(\.isGenuine)
+        // A fresh-start order for an account this old: wipe this device at once, as Detach does, and start over.
+        if genuine.contains(where: { $0.orders(freshStartFor: data.bornAt) }) {
+            wipeNow()
+            return
+        }
         let ids = Set(genuine.compactMap { UUID(uuidString: $0.id) })
         var seen = Set(data.announcementsSeen)
         let fresh = genuine.filter { !seen.contains($0.id.uppercased()) }
