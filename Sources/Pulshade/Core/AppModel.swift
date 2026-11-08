@@ -684,6 +684,7 @@ final class AppModel {
         lastMend = [:]
         requestNotes = [:]
         movedOffIntro = []
+        mailboxBackoff = [:]
     }
 
     /// Detach: wipes this device at once, with no questions and no waiting on the network. Everything is overwritten
@@ -3968,10 +3969,14 @@ final class AppModel {
         // get through.
         func pick() -> (item: Outgoing, client: RelayClient, lane: String)? {
             guard !aborted else { return nil }
+            let now = Date()
             var best: (item: Outgoing, client: RelayClient, lane: String)?
             var seenSmall: Set<Data> = [], seenBig: Set<Data> = []
             for item in data.outbox where !tried.contains(item.id) && !sendingIDs.contains(item.id) {
                 let relay = item.relay ?? data.relay
+                // A mailbox that just said it was full is left alone until its short backoff ends. A relay
+                // that's unreachable is not backed off: retry as soon as it's back.
+                if let backoff = mailboxBackoff[item.sendID], now < backoff.until { continue }
                 // Photos and story pieces go on a connection of their own, so a big upload neither crowds out the short
                 // messages nor takes their connection down with it when it fails.
                 let lane = (item.lane ?? Outgoing.lane(for: nil)) + (item.blob.count > Self.smallEnvelope ? Self.bulkSuffix : "")
@@ -4031,21 +4036,28 @@ final class AppModel {
                     if error is RelayTooLarge {
                         // Too big for the relay, now and always: waiting would hold up everything behind it.
                         data.outbox.removeAll { $0.id == item.id }
+                        mailboxBackoff[item.sendID] = nil
                         continue
                     }
                     if error is RelayMailboxFull {
                         held.insert(item.sendID)
+                        let failures = (mailboxBackoff[item.sendID]?.failures ?? 0) + 1
+                        mailboxBackoff[item.sendID] = (Date().addingTimeInterval(retryDelay(failures)), failures)
                     } else if item.blob.count > Self.largeEnvelope {
                         heldBig.insert(item.sendID)
                     } else {
                         down.insert(item.relay ?? data.relay)
                     }
                     // A signal that couldn't be sent is not worth sending later.
-                    if item.ephemeral == true { data.outbox.removeAll { $0.id == item.id } }
+                    if item.ephemeral == true {
+                        data.outbox.removeAll { $0.id == item.id }
+                        mailboxBackoff[item.sendID] = nil
+                    }
                 } else {
                     if !lane.hasSuffix(Self.bulkSuffix) { lastSent[lane] = Date() }
                     lastDepositOK = Date()
                     data.outbox.removeAll { $0.id == item.id }
+                    mailboxBackoff[item.sendID] = nil
                     if let message = item.message { setStatus(.sent, for: [message]) }
                     if item.story != nil { drainStoryBacklog() }
                     if let story = item.story { markUploadedIfDone(story) }
@@ -4054,6 +4066,9 @@ final class AppModel {
         }
         if aborted { return }
         if !down.isEmpty { link = .offline }
+        // Forget backoff for mailboxes no longer waiting (a cancelled send, a deleted chat).
+        let live = Set(data.outbox.map(\.sendID))
+        mailboxBackoff = mailboxBackoff.filter { live.contains($0.key) }
         save()
     }
 
@@ -4067,6 +4082,19 @@ final class AppModel {
     @ObservationIgnored private var routeFinding: Set<String> = []
     @ObservationIgnored private var sendingBigMail: Set<Data> = []
     @ObservationIgnored private var sendingBig: Set<UUID> = []
+    /// A mailbox the relay said was full (`507`), and when it may be tried again. Kept across flushes so a
+    /// full mailbox isn't asked again every couple of seconds; it clears on the first success. Capped short,
+    /// since a full mailbox is about the recipient, not the connection.
+    @ObservationIgnored private var mailboxBackoff: [Data: (until: Date, failures: Int)] = [:]
+
+    /// How long to wait before trying a full mailbox again: 30 s, doubling to at most two minutes. A relay
+    /// that's down is not backed off — a Tor hiccup or waking from sleep shouldn't hold messages back once the
+    /// connection is back. Off in tests, like the rest of the traffic shaping, so retries happen at once.
+    private func retryDelay(_ failures: Int) -> TimeInterval {
+        guard trafficShaping else { return 0 }
+        let steps = min(max(failures - 1, 0), 2)
+        return min(2 * 60, 30 * pow(2, Double(steps)))
+    }
     /// Under this an envelope is a short message or a receipt.
     private static let smallEnvelope = 32_768
     /// Added to a sending lane's name for the connection that carries the big uploads.
