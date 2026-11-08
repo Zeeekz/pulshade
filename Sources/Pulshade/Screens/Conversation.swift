@@ -17,6 +17,7 @@ struct ConversationView: View {
     @State private var videoDraft: VideoDraft?
     @State private var videoTask: Task<Void, Never>?
     @State private var takingPhoto = false
+    @State private var choosingFile = false
     @State private var quickSending = false
     @State private var showInfo = false
     /// Their picture at full size, opened from the header on the phone.
@@ -464,6 +465,10 @@ struct ConversationView: View {
                         .buttonStyle(IconButtonStyle(size: 36))
                         .help("Take or choose a photo or video")
                         .accessibilityLabel("Take or choose a photo or video")
+                    Button { choosingFile = true } label: { Image(systemName: "paperclip") }
+                        .buttonStyle(IconButtonStyle(size: 36))
+                        .help("Send a file")
+                        .accessibilityLabel("Send a file")
                     // Only when there's something pinned to send, so the bar stays clear otherwise.
                     if !(model.activeProfile.links ?? []).isEmpty || !(model.activeProfile.notes ?? []).isEmpty {
                         Button { quickSending = true } label: { Image(systemName: "pin") }
@@ -538,6 +543,12 @@ struct ConversationView: View {
         } filmed: { clip, zoom in
             prepareVideo(clip, zoom)
         }
+        .fileImporter(isPresented: $choosingFile, allowedContentTypes: [.item]) { result in
+            if case let .success(url) = result { model.sendFile(url, replyTo: replyingTo, in: id); replyingTo = nil }
+        }
+        .alert("Can't send that file", isPresented: Binding(get: { model.fileProblem != nil }, set: { if !$0 { model.fileProblem = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: { Text(model.fileProblem ?? "") }
         .animation(.snappy(duration: 0.25), value: videoDraft)
         .animation(.snappy(duration: 0.25), value: recorder.isRecording)
         .animation(.snappy(duration: 0.25), value: attachments.count)
@@ -862,6 +873,9 @@ fileprivate struct Bubble: View {
             }
             if let voice = message.voice {
                 VoiceBubble(note: voice, id: message.id, mine: mine)
+            }
+            if message.attachment?.kind == .file {
+                FileBubble(message: message, mine: mine)
             }
             if let collectible = message.collectible, collectible.kind != nil {
                 CollectibleCard(collectible: collectible, mine: mine)

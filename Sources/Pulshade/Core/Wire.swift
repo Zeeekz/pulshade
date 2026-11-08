@@ -56,6 +56,8 @@ struct WireMessage: Codable, Equatable {
     var note: NoteCard?
     /// People @-mentioned in a group message. Older apps ignore it and just show the "@Name" text.
     var mentions: [Mention]?
+    /// A file on the relay (see `Attachment`). Apps from before it ignore it and show `text`, which names the file.
+    var attachment: Attachment?
 }
 
 /// What a message says about the video that follows it.
@@ -188,6 +190,9 @@ enum Payload: Codable, Equatable {
     /// "Your video stopped arriving": the pieces still missing (nil for all of them), asked of whoever posted it.
     /// They send the story again with those pieces. Builds from before it can't read it and leave it.
     case storyWant(id: UUID, parts: [Int]?)
+    /// A video's clip (a story's, or a chat video's, under the same id as `storyPart`) kept sealed on the relay: fetch it
+    /// from there instead of waiting for pieces. Only sent to apps that said they read files (`Envelope.reads`).
+    case clipBlob(id: UUID, clip: Attachment)
     /// Delete for everyone: the sender takes their own messages back.
     case unsend(ids: [UUID])
     /// Nil emoji clears your reaction.

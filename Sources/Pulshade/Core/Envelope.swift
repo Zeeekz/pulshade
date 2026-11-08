@@ -34,7 +34,8 @@ enum Envelope {
     }
 
     /// What this app tells everyone it can read. Bit 0: framed messages (`Frame`), which carry big fields raw.
-    static let reads: UInt8 = 1
+    /// Bit 1: files kept on the relay (`Attachment`).
+    static let reads: UInt8 = 3
 
     /// Opened envelope: the payload, who sent it, from which of their devices, and when.
     struct Opened {
@@ -45,6 +46,7 @@ enum Envelope {
         /// What the sender's app says it can read (0 from apps before this).
         var caps: UInt8 = 0
         var readsFrames: Bool { caps & 1 == 1 }
+        var readsAttachments: Bool { caps & 2 == 2 }
     }
 
     /// `framed` sends the payload and the inside of the envelope in frames, without the base64 that makes a big

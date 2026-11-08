@@ -84,6 +84,8 @@ struct DeviceLink: Codable {
     /// Their app reads framed messages (it said so on what it last sent), so big ones go to it without the base64
     /// bloat. Nil for an app from before, which gets everything the old way.
     var readsFrames: Bool?
+    /// Their app reads files kept on the relay. Nil for an app from before.
+    var readsAttachments: Bool?
 
     init(id: Data = Data(), sendID: Data) {
         self.id = id
@@ -480,6 +482,8 @@ struct Message: Codable, Identifiable, Equatable {
     var note: NoteCard?
     /// People @-mentioned in a group message. On a received message your own mention names "me".
     var mentions: [Mention] = []
+    /// A file kept on the relay, sealed: this message holds only where it is and the key. Opened in memory when tapped.
+    var attachment: Attachment?
 
     var isVideo: Bool { video != nil }
     /// Whether this message @-mentions you.
@@ -519,6 +523,7 @@ struct Message: Codable, Identifiable, Equatable {
         collectible = try? c.decodeIfPresent(Collectible.self, forKey: .collectible)
         note = try? c.decodeIfPresent(NoteCard.self, forKey: .note)
         mentions = (try? c.decodeIfPresent([Mention].self, forKey: .mentions)) ?? []
+        attachment = try? c.decodeIfPresent(Attachment.self, forKey: .attachment)
     }
 }
 
@@ -918,6 +923,9 @@ struct Story: Codable, Identifiable, Equatable {
     var shownTo: StoryAudience { audience ?? .everyone }
     /// Your own stories only, on the device that posted it: whether contacts have it yet.
     var delivery: StoryDelivery?
+    /// Your own video story only: the clip kept sealed on the relay, once it has been uploaded, so each contact is sent
+    /// a pointer to it instead of the clip. Erased when the story is taken back or runs out.
+    var clipBlob: Attachment?
 
     /// Whether it can ride along in a device sync, which fits a story only as small as a photo.
     var isSyncable: Bool {
@@ -1111,7 +1119,8 @@ struct AppData: Codable {
     /// 5: a sealed backup is kept on the relay, and when it was last saved.
     /// 7: a profile can have more than one @handle in use; messages can be videos; a device says if it reads frames.
     /// 8: a message can show a collectible or carry a note as a card.
-    static let currentFormat = 8
+    /// 9: a message can carry a file kept on the relay, and files still to be erased there are remembered.
+    static let currentFormat = 9
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []
@@ -1163,6 +1172,9 @@ struct AppData: Codable {
     /// so an unchanged account isn't uploaded again. Neither is ever in the backup itself.
     var backupSavedAt: Date?
     var backupDigest: Data?
+    /// Files of yours kept on the relay that still have to be erased there (a message of yours was deleted while the
+    /// relay couldn't be reached). Each is tried again until the relay says it's gone, or its time is up.
+    var blobWipes: [BlobWipe] = []
     init() {}
 
     /// The relay new identities use. A build can set `PulshadeRelay` in its Info.plist (the iPhone
@@ -1210,6 +1222,7 @@ struct AppData: Codable {
         deviceID = try c.decodeIfPresent(Data.self, forKey: .deviceID) ?? .random(16)
         linkOffers = (try? c.decodeIfPresent([LinkOffer].self, forKey: .linkOffers)) ?? []
         chatCodes = (try? c.decodeIfPresent([ChatCodeOffer].self, forKey: .chatCodes)) ?? []
+        blobWipes = (try? c.decodeIfPresent([BlobWipe].self, forKey: .blobWipes)) ?? []
         personas = try c.decodeIfPresent([Persona].self, forKey: .personas) ?? []
         requests = (try? c.decodeIfPresent([FriendRequest].self, forKey: .requests)) ?? []
         blocked = try c.decodeIfPresent([String].self, forKey: .blocked) ?? []

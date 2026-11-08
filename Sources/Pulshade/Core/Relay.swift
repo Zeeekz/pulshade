@@ -683,6 +683,21 @@ extension RelayClient {
 
 extension Data {
     var hex: String { map { String(format: "%02x", $0) }.joined() }
+
+    /// The bytes a string of hex digits names. Nil if it isn't an even number of them.
+    init?(hexString: String) {
+        let chars = Array(hexString.utf8)
+        guard chars.count % 2 == 0 else { return nil }
+        var out = Data(capacity: chars.count / 2)
+        func nibble(_ c: UInt8) -> UInt8? {
+            switch c { case 48...57: c - 48; case 97...102: c - 87; case 65...70: c - 55; default: nil }
+        }
+        for i in stride(from: 0, to: chars.count, by: 2) {
+            guard let hi = nibble(chars[i]), let lo = nibble(chars[i + 1]) else { return nil }
+            out.append(hi << 4 | lo)
+        }
+        self = out
+    }
 }
 
 /// The mailbox being written to is full. Says nothing about the relay as a whole.
@@ -692,3 +707,74 @@ struct RelayTooLarge: Error {}
 
 /// The relay said no to a push registration; `status` is its answer.
 struct PushRefused: Error { var status: Int }
+
+// MARK: Files kept on the relay (see docs/blob-store.md)
+
+/// What the relay says about a file it holds.
+struct BlobHead {
+    var size: Int
+    var complete: Bool
+    var expires: Date
+    /// Which pieces have arrived.
+    var present: Set<Int>
+}
+
+extension RelayClient {
+    /// Uploads one sealed piece. The first piece also names the file's size, the hash of its erase secret and its lifetime.
+    func blobPut(_ id: String, index: Int, piece: Data, start: BlobStart) async throws {
+        var request = URLRequest(url: base.appending(path: "v1/blob/\(id)/\(index)"))
+        request.httpMethod = "PUT"
+        request.timeoutInterval = max(40, 40 + Double(piece.count) / 15_000)
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        // Every piece says it, so they can go in any order.
+        request.setValue(String(start.size), forHTTPHeaderField: "X-Pulshade-Blob-Size")
+        request.setValue(start.secretHash, forHTTPHeaderField: "X-Pulshade-Blob-Delete")
+        request.setValue(String(start.days), forHTTPHeaderField: "X-Pulshade-Blob-Days")
+        let (_, response) = try await load(request, body: piece)
+        switch (response as? HTTPURLResponse)?.statusCode {
+        case 202: return
+        case 413: throw BlobError.tooLarge
+        case 507, 429, 503: throw BlobError.relayFull
+        default: throw URLError(.badServerResponse)
+        }
+    }
+
+    /// Nil when the relay doesn't have the file (never uploaded, erased or expired).
+    func blobHead(_ id: String) async throws -> BlobHead? {
+        var request = URLRequest(url: base.appending(path: "v1/blob/\(id)/head"))
+        request.timeoutInterval = Tor.uses(base) ? 45 : 15
+        let (data, response) = try await load(request)
+        let status = (response as? HTTPURLResponse)?.statusCode
+        if status == 404 { return nil }
+        guard status == 200, let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let size = object["size"] as? Int, let complete = object["complete"] as? Bool else { throw URLError(.badServerResponse) }
+        let bytes = Data(hexString: object["have"] as? String ?? "") ?? Data()
+        var present = Set<Int>()
+        for (n, byte) in bytes.enumerated() { for bit in 0..<8 where byte & (1 << bit) != 0 { present.insert(n * 8 + bit) } }
+        return BlobHead(size: size, complete: complete, expires: Date(timeIntervalSince1970: (object["expires"] as? Double) ?? 0),
+                        present: present)
+    }
+
+    /// A part of the sealed file, by byte range.
+    func blobGet(_ id: String, range: ClosedRange<Int>) async throws -> Data {
+        var request = URLRequest(url: base.appending(path: "v1/blob/\(id)"))
+        request.timeoutInterval = max(40, 40 + Double(range.count) / 15_000)
+        request.setValue("bytes=\(range.lowerBound)-\(range.upperBound)", forHTTPHeaderField: "Range")
+        let (data, response) = try await load(request)
+        switch (response as? HTTPURLResponse)?.statusCode {
+        case 206, 200: return data
+        case 404: throw BlobError.gone
+        case 429, 503: throw BlobError.relayFull
+        default: throw URLError(.badServerResponse)
+        }
+    }
+
+    /// Erases the file. Already gone counts as done; a wrong secret is an error.
+    func blobDelete(_ id: String, secret: Data) async throws {
+        var request = URLRequest(url: base.appending(path: "v1/blob/\(id)/delete"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = Tor.uses(base) ? 60 : 20
+        let (_, response) = try await load(request, body: secret)
+        guard (response as? HTTPURLResponse)?.statusCode == 204 else { throw URLError(.badServerResponse) }
+    }
+}

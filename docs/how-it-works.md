@@ -33,6 +33,17 @@ is next recovered.
 
 The flame on the lock screen does Detach (this device) or Burn without the passcode, using the recovery code instead.
 
+**Files.** A file (up to 100 MB) is not sent inside a message. The app seals it on the device in pieces of 1 MiB with
+ChaCha20-Poly1305 and a fresh random 256-bit key, binding each piece to its place so pieces can't be swapped, reordered
+or cut short, and uploads the sealed pieces once to the relay under a random id. The key, the id, the file's name and
+type and an erase secret travel only inside the ordinary end-to-end encrypted message. The relay seals each file a
+second time with its own random key for that file, keeps the pieces on its disk and the key in a sealed index, and
+can't open either layer. The receiving app fetches the pieces into memory, opens and checks them there, and shows the
+file; it never writes it to disk unless the person taps "Save a copy". Deleting the message sends the erase secret
+(whose hash is all the relay holds) and the relay overwrites the pieces, removes them and destroys the file's key; an
+erase that can't be sent is remembered and tried again. Anything left is erased after 7 days. The relay can see that a
+file of about that size was uploaded and collected, and when.
+
 **The sealed backup.** So that Detach can be instant, the app keeps one backup of your profile, @handles, contacts,
 groups, personas and settings (never chats, stories or requests, nor a message still waiting to be sent, nor
 a decoy or panic identity) on the relay. It is sealed on the device with a key

@@ -14,6 +14,38 @@ how the app and server really work, which you can check in the open source code 
 We can't read your messages, and we don't know who you are. You don't give us a phone number, email address or name
 to use Pulshade, and over Tor the server never sees your IP address. We don't sell data, show ads or track you.
 
+## What is stored on our servers
+
+Everything we store is either encrypted so that we can't read it, or public because you chose to make it public.
+Nothing about you or your messages is kept in readable form. Here is every kind of thing, in plain words:
+
+| What | Where it is kept | How long | Can we read it? |
+| --- | --- | --- | --- |
+| **Messages** (text, receipts, calls' set-up) | The server's memory only, never its disk | Until the other person's phone collects it, or 7 days | No. Sealed on your phone with keys only you and they have. |
+| **Files and videos you send** (files up to 100 MB; story and chat videos a few MB) | The server's disk, in pieces | Until the message is deleted, or at most 7 days | No. Sealed on your phone with a key that travels only inside the encrypted message, and sealed a second time by the server with a key of its own. Its name and type are inside the encrypted message, so we don't even know those. |
+| **Sealed backup** (profile, contacts, groups, settings; never chats) | The server's disk | Until you switch it off, Burn, or 180 days without an update | No. Sealed with a key only your recovery code makes. |
+| **Public @handle and profile** (only if you choose one) | The server's disk | Until you let it go | Yes, it is public by your choice. |
+| **Collectibles you own** | The server's disk | While they exist | They're not secret: the item, its number and a hash of its code. |
+| **Wake-up token** (only if you turn on "Wake when locked") | The server's memory only | While it's on | It is a device token and nothing else. |
+
+Photos, voice notes and text travel inside the encrypted message itself, so they wait in the server's memory like any
+message and are never on its disk.
+
+Your phone keeps what you receive in memory and in its own encrypted vault. A file someone sends you is fetched into
+your phone's memory when you open it and is never written to the phone's disk by Pulshade, unless you choose
+"Save a copy".
+
+When you delete a file you sent (by deleting the message), your app tells the server, and the server erases it at
+once: the piece files are overwritten with random bytes and removed, and the key the server sealed them with is
+destroyed, so even a stray copy left on a solid-state disk can't be opened. If your phone can't reach the server at
+that moment, it tries again until it does. A file nobody deletes is erased after at most 7 days. Detach and Burn also
+erase your files from the server (Burn waits for it; Detach wipes your phone at once and the server forgets the files
+within 7 days at most).
+
+What the server can still see about a file, as with any message: that something of about that size was uploaded,
+when it was uploaded and collected, and, if you connect without Tor, your IP address while you do. It can't see what
+it is, what it's called or who it is for.
+
 ## What we collect
 
 **Account information: none.** Pulshade has no sign-up. Your account is a set of keys made on your device. We never
@@ -21,6 +53,10 @@ see your recovery code, your passcode, your keys or your contacts.
 
 **Messages and calls.** These are encrypted on your device before they leave it. Our server only passes on sealed
 envelopes, padded to a few fixed sizes. We can't read them. Envelopes wait in the server's memory only, are deleted once collected or after 7 days, and are not written to disk or logged.
+
+**Files.** A file you send is encrypted on your device in pieces, with a fresh key that is sent only inside the
+end-to-end encrypted message, and uploaded once to our server, which seals it again and keeps it on its disk until
+you delete the message or 7 days pass. We can't open it. See "What is stored on our servers" above.
 
 **Public handles and profiles (only if you choose them).** If you claim a public @handle, its name, your picture and
 banner and the key it belongs to are stored on our server so anyone can look it up. This is public by your choice.
