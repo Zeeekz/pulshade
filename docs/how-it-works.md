@@ -200,9 +200,9 @@ before use, which drops their location and other metadata. Each story goes to al
 pick, or all but the ones you pick, and lasts 6, 12, 24 or 48 hours; the next story offers the same choices again.
 A story can be edited after posting (its words, who sees it, how long it lasts, but not its photo): people taken
 out of the audience lose it, and the rest get the new version. The first time someone views a story, their app
-sends its author a view through the ratchet like any message, so the server can't see who watches what. Story views
-can be turned off in Privacy & Security; then you send none and don't see your own, and one-time chats never send
-them. A story whose time has run out, or that you delete, stops being sent: copies still waiting to go are dropped.
+sends its author a view through the ratchet like any message, so the server can't see who watches what. Views
+can't be switched off, except that one-time chats never send them. The author's app answers each view, and a view
+that gets no answer is sent again a few times over the next hours, so one lost on the way still arrives. A story whose time has run out, or that you delete, stops being sent: copies still waiting to go are dropped.
 
 **Groups, channels and broadcasts.** Groups and channels fan out one envelope per member; members who aren't your
 contacts are kept as hidden peers, used only inside that group. Each has an owner, optional admins and a posting

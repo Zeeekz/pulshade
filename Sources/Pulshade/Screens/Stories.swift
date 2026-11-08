@@ -897,7 +897,7 @@ struct StoryViewers: View {
                 SheetHeader(symbol: "eye.fill", title: viewers.isEmpty ? "Views" : "Views · \(viewers.count)")
                 SettingsGroup(footer: footer) {
                     if viewers.isEmpty {
-                        SettingRow(model.data.security.storyViews ? "No views yet" : "Story views are off") { EmptyView() }
+                        SettingRow("No views yet") { EmptyView() }
                     }
                     ForEach(Array(viewers.enumerated()), id: \.element.fingerprint) { i, v in
                         if i > 0 { RowDivider(inset: 62) }
@@ -933,9 +933,7 @@ struct StoryViewers: View {
     }
 
     private var footer: String {
-        model.data.security.storyViews
-            ? "Views travel encrypted like messages; the server never sees them. People with story views off aren't listed."
-            : "Turn on Story views in Privacy & Security to see who viewed your stories. While it's off, nobody sees that you viewed theirs."
+        "Views travel encrypted like messages; the server never sees them. People on older versions of Pulshade with story views off aren't listed."
     }
 }
 
@@ -1673,7 +1671,7 @@ struct StoryViewer: View {
         let views = model.viewers(of: story.id).count
         return HStack(spacing: 10) {
             Button { showingViewers = story } label: {
-                Label(model.data.security.storyViews ? (views == 1 ? "1 view" : "\(views) views") : "Views",
+                Label(views == 1 ? "1 view" : "\(views) views",
                       systemImage: "eye")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(.white)

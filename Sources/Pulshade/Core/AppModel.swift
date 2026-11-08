@@ -1791,17 +1791,60 @@ final class AppModel {
         save()
     }
 
-    /// The first time you see someone's story, they're told (with story views on, and never from a one-time chat).
+    /// The first time you see someone's story, they're told (never from a one-time chat).
+    /// The receipt is tried again until their app confirms it reached them.
     func markSeen(_ id: Story.ID, persona: UUID?) {
         guard let i = data.stories.firstIndex(where: { $0.id == id && $0.persona == persona }), !data.stories[i].seen else { return }
         data.stories[i].seen = true
-        let story = data.stories[i]
-        if story.author != "me", data.security.storyViews,
-           data.personas.first(where: { $0.id == story.persona })?.oneTimeChat != true,
-           let author = contact(story.author, in: story.persona), !author.hidden {
-            enqueue(.storyViewed(id: id), to: author)
+        if data.stories[i].author != "me", canReportView(of: data.stories[i]) {
+            data.stories[i].viewReport = StoryViewReport(last: Date())
+            sendViewReport(id, author: data.stories[i].author, persona: data.stories[i].persona)
         }
         save()
+    }
+
+    /// Whether a view of this story can be reported: never from a one-time chat, never to a hidden contact.
+    private func canReportView(of story: Story) -> Bool {
+        guard data.personas.first(where: { $0.id == story.persona })?.oneTimeChat != true else { return false }
+        return contact(story.author, in: story.persona).map { !$0.hidden } ?? false
+    }
+
+    private func sendViewReport(_ id: UUID, author: String, persona: UUID?) {
+        guard let c = contact(author, in: persona) else { return }
+        enqueue(.storyViewed(id: id), to: c)
+    }
+
+    /// How long after a view receipt was last sent to try again. A lost one (a relay restart empties what it holds)
+    /// would otherwise leave the author's list wrong for good. Six tries, then it's left; the story runs out anyway.
+    private static let viewRetry: [TimeInterval] = [60, 2 * 60, 5 * 60, 15 * 60, 3600, 3 * 3600]
+    @ObservationIgnored private var lastViewRetryCheck = Date.distantPast
+
+    private func resendUnconfirmedViews() {
+        let now = Date()
+        guard now.timeIntervalSince(lastViewRetryCheck) > 30 else { return }
+        lastViewRetryCheck = now
+        for i in data.stories.indices {
+            let story = data.stories[i]
+            guard story.author != "me", story.isLive, var report = story.viewReport, !report.confirmed,
+                  report.resends < Self.viewRetry.count,
+                  now.timeIntervalSince(report.last ?? story.date) >= Self.viewRetry[report.resends],
+                  !storyViewQueued(story.id) else { continue }
+            // The chat can't carry one now (the contact was hidden, say): nothing more to send.
+            guard canReportView(of: story) else {
+                data.stories[i].viewReport = nil
+                continue
+            }
+            report.resends += 1
+            report.last = now
+            data.stories[i].viewReport = report
+            sendViewReport(story.id, author: story.author, persona: story.persona)
+        }
+    }
+
+    /// Whether a view receipt for this story is still waiting to go out somewhere.
+    private func storyViewQueued(_ id: Story.ID) -> Bool {
+        let waiting = data.contacts.contains { $0.devices.contains { $0.pending.contains { $0.payload.storyViewID == id } } }
+        return waiting || data.outbox.contains { $0.viewReport == id }
     }
 
     /// How many copies of a story were waiting to go out when it was posted or last changed.
@@ -1984,7 +2027,7 @@ final class AppModel {
     }
 
     var hasUnviewedStory: Bool {
-        data.security.storyViews && myStories.contains { ($0.viewers ?? [:]).isEmpty && !audience(of: $0).isEmpty }
+        myStories.contains { ($0.viewers ?? [:]).isEmpty && !audience(of: $0).isEmpty }
     }
 
     /// A story audience in a few words: "All contacts", "3 people", "All except 2".
@@ -1998,7 +2041,6 @@ final class AppModel {
         }
     }
 
-    /// Who viewed one of your stories, most recent first. Empty with story views off.
     /// How many of the people a story of yours is for have said it reached them (with its video, for a video). Only
     /// people with delivery receipts on can say so, so this can be lower than the truth.
     func storyReceipt(of story: Story) -> (have: Int, of: Int)? {
@@ -2008,8 +2050,9 @@ final class AppModel {
         return (people.filter { delivery.confirmed.contains($0.fingerprint) }.count, people.count)
     }
 
+    /// Who viewed one of your stories, most recent first.
     func viewers(of id: Story.ID) -> [(fingerprint: String, at: Date)] {
-        guard data.security.storyViews, let story = data.stories.first(where: { $0.id == id && $0.author == "me" }) else { return [] }
+        guard let story = data.stories.first(where: { $0.id == id && $0.author == "me" }) else { return [] }
         return (story.viewers ?? [:]).map { ($0.key, $0.value) }.sorted { $0.at > $1.at }
     }
 
@@ -3216,7 +3259,8 @@ final class AppModel {
                     continue
                 }
                 seal(.ratchet(message), contact: i, device: d, message: item.message, ephemeral: item.payload.isEphemeral,
-                     story: item.payload.storyID, rings: item.payload.rings, framed: frames && message.ciphertext.count > Self.smallEnvelope)
+                     story: item.payload.storyID, viewReport: item.payload.storyViewID, rings: item.payload.rings,
+                     framed: frames && message.ciphertext.count > Self.smallEnvelope)
             }
             data.contacts[i].devices[d].session = session
         }
@@ -3252,7 +3296,7 @@ final class AppModel {
 
     /// Seals a payload to one of a contact's devices, as the persona that knows them, and queues it.
     private func seal(_ payload: Payload, contact i: Int, device d: Int, message: UUID? = nil, ephemeral: Bool = false,
-                      story: UUID? = nil, rings: Bool = false, framed: Bool = false) {
+                      story: UUID? = nil, viewReport: UUID? = nil, rings: Bool = false, framed: Bool = false) {
         let c = data.contacts[i]
         guard c.devices.indices.contains(d), let me = me(c.persona),
               let blob = try? Envelope.seal(payload, from: me, device: deviceID(for: c.persona), to: c.agreementKey, framed: framed) else { return }
@@ -3264,7 +3308,7 @@ final class AppModel {
         var asksToWake = false
         if case .request = payload { asksToWake = true }
         data.outbox.append(Outgoing(sendID: sendID, blob: blob, relay: c.relay, message: message, ephemeral: ephemeral ? true : nil,
-                                  story: story, lane: c.persona == nil ? nil : Outgoing.lane(for: c.persona), rings: rings ? true : nil,
+                                  story: story, viewReport: viewReport, lane: c.persona == nil ? nil : Outgoing.lane(for: c.persona), rings: rings ? true : nil,
                                   wakes: asksToWake ? true : nil))
         kick()
     }
@@ -3618,6 +3662,7 @@ final class AppModel {
         resendAfterRestart()
         if introsStale { refileIntros() }
         resendUnconfirmedStories()
+        resendUnconfirmedViews()
         // Only written when something is stale: assigning redraws every view that reads the data.
         let clipCutoff = Date().addingTimeInterval(-(StoryLifetime.twoDays.rawValue + 3600))
         if data.clipParts.contains(where: { $0.value.date <= clipCutoff }) {
@@ -4434,10 +4479,19 @@ final class AppModel {
             clipResent[key] = Date()
             resendStory(story, to: sender, pieces: parts)
         case let .storyViewed(id):
-            guard data.security.storyViews,
-                  let i = data.stories.firstIndex(where: { $0.id == id && $0.author == "me" && $0.persona == persona }),
-                  data.stories[i].shownTo.includes(fp), data.stories[i].viewers?[fp] == nil else { break }
-            data.stories[i].viewers = (data.stories[i].viewers ?? [:]).merging([fp: min(deposited ?? Date(), Date())]) { old, _ in old }
+            if let i = data.stories.firstIndex(where: { $0.id == id && $0.author == "me" && $0.persona == persona }),
+               data.stories[i].shownTo.includes(fp), data.stories[i].viewers?[fp] == nil {
+                data.stories[i].viewers = (data.stories[i].viewers ?? [:]).merging([fp: min(deposited ?? Date(), Date())]) { old, _ in old }
+            }
+            // Recorded or not (the story is gone, or they were taken out of the audience), answer so the viewer can
+            // stop trying.
+            enqueue(.storyViewedAck(id: id), to: sender)
+        case let .storyViewedAck(id):
+            // The author's app has dealt with our view: no more trying.
+            guard let i = data.stories.firstIndex(where: { $0.id == id && $0.author == fp && $0.persona == persona }),
+                  var report = data.stories[i].viewReport else { break }
+            report.confirmed = true
+            data.stories[i].viewReport = report
         case let .storyRemoved(id):
             if data.clipParts[ClipKey(id, persona).stored]?.author == fp { data.clipParts[ClipKey(id, persona).stored] = nil }
             noteRemoved("\(fp)|\(id)")

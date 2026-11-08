@@ -885,6 +885,14 @@ struct StoryDelivery: Codable, Equatable {
     var left: [StoryTarget]?
 }
 
+/// Someone else's story, on the device that viewed it: whether the author's app has confirmed the view, and how many
+/// times the receipt has been sent again since. A build that doesn't know this field simply doesn't keep it.
+struct StoryViewReport: Codable, Equatable {
+    var confirmed = false
+    var resends = 0
+    var last: Date?
+}
+
 struct Story: Codable, Identifiable, Equatable {
     var id = UUID()
     /// Fingerprint of the author, or "me".
@@ -902,6 +910,8 @@ struct Story: Codable, Identifiable, Equatable {
     var viewers: [String: Date]?
     /// Someone else's story only: you've liked it.
     var liked: Bool?
+    /// Someone else's story only: whether the author has been told, and until then, that they still need telling.
+    var viewReport: StoryViewReport?
 
     var expires: Date { date.addingTimeInterval(lifetime ?? StoryLifetime.day.rawValue) }
     var isLive: Bool { expires > Date() }
@@ -967,6 +977,8 @@ struct Outgoing: Codable, Identifiable {
     var ephemeral: Bool?
     /// The story this carries, so its upload can show progress.
     var story: UUID?
+    /// The story whose view this carries, so a receipt waiting on an answer can be told from one already sent.
+    var viewReport: UUID?
     /// The connection it's sent on. Each persona sends on its own, as it reads on its own, so the relay can't tell
     /// from one connection that two personas are the same person. Nil is the main persona's.
     var lane: String?
@@ -1032,8 +1044,6 @@ struct SecuritySettings: Codable, Equatable {
     /// Show people when you have Pulshade open, and see when they do. Off by default: the relay can tell when
     /// the signals go out, even though it can't read them.
     var onlineStatus = false
-    /// Tell people when you've viewed their story, and see who viewed yours. Never from a one-time chat.
-    var storyViews = true
     /// Pulse icon with an unread count in the menu bar.
     var menuBarIcon = true
     /// Reach the relay over Tor, so it never sees your IP address. On, unless this build's relay is on your own
@@ -1077,7 +1087,6 @@ struct SecuritySettings: Codable, Equatable {
         readReceipts = try c.decodeIfPresent(Bool.self, forKey: .readReceipts) ?? d.readReceipts
         typingIndicators = try c.decodeIfPresent(Bool.self, forKey: .typingIndicators) ?? d.typingIndicators
         onlineStatus = try c.decodeIfPresent(Bool.self, forKey: .onlineStatus) ?? d.onlineStatus
-        storyViews = try c.decodeIfPresent(Bool.self, forKey: .storyViews) ?? d.storyViews
         tor = try c.decodeIfPresent(Bool.self, forKey: .tor) ?? d.tor
         torSince = try c.decodeIfPresent(Date.self, forKey: .torSince)
         torFromStart = try c.decodeIfPresent(Bool.self, forKey: .torFromStart) ?? false

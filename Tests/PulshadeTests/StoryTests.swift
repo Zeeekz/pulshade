@@ -14,6 +14,16 @@ struct StoryTests {
         let story = try JSONDecoder().decode(Story.self, from: Data(old.utf8))
         #expect(story.lifetime == nil && story.audience == nil && story.shownTo == .everyone)
         #expect(story.expires == story.date.addingTimeInterval(86_400))
+        #expect(story.viewReport == nil, "an older story owes nobody a view receipt")
+    }
+
+    @Test func aViewReceiptIsAnsweredOnTheWire() throws {
+        let id = UUID()
+        let decoded = try JSONDecoder.pulshade.decode(Payload.self, from: JSONEncoder.pulshade.encode(Payload.storyViewedAck(id: id)))
+        guard case let .storyViewedAck(got) = decoded else { Issue.record("not an ack"); return }
+        #expect(got == id)
+        #expect(Payload.storyViewed(id: id).storyViewID == id)
+        #expect(Payload.storyViewedAck(id: id).storyViewID == nil)
     }
 
     @Test func aStoryFromAnOlderAppStillDecodes() throws {

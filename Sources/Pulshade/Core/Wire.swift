@@ -174,8 +174,11 @@ enum Payload: Codable, Equatable {
     /// Every story the sender had up is taken back, when their device was wiped (Detach) and doesn't remember which
     /// they were. Builds from before can't read it and leave it, so their copies run out with the day.
     case storiesCleared
-    /// The sender viewed this story of yours.
+    /// The sender viewed this story of yours. The author's app answers every one with `storyViewedAck`, so a
+    /// viewer that gets no answer can try again.
     case storyViewed(id: UUID)
+    /// The author's app has dealt with a view of this story, whether or not it recorded one: nothing more is owed.
+    case storyViewedAck(id: UUID)
     /// The sender has this story of yours, whole (a video: with its clip), so you needn't send it again. Sent only
     /// with delivery receipts on. Apps from before this never send it, and are sent a story a few times instead.
     case storyReceived(id: UUID)
@@ -247,6 +250,12 @@ enum Payload: Codable, Equatable {
         case let .storyPart(id, _, _, _): id
         default: nil
         }
+    }
+
+    /// The story whose view this reports, so one still waiting on an answer can be told from one already sent.
+    var storyViewID: UUID? {
+        if case let .storyViewed(id) = self { return id }
+        return nil
     }
 
     /// Setup messages are sealed to the identity key directly; the rest need a session.

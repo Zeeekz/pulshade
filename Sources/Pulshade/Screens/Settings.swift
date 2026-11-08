@@ -925,8 +925,6 @@ private struct MessagePrivacySettings: View {
                 SecurityToggle(title: "Read receipts", key: \.readReceipts)
                 RowDivider()
                 SecurityToggle(title: "Typing indicators", key: \.typingIndicators)
-                RowDivider()
-                SecurityToggle(title: "Story views", key: \.storyViews)
             }
             SettingsGroup("Presence", footer: "Off by default. Only accepted contacts who show theirs can see yours. The relay can tell when it's sent and to whom.") {
                 SecurityToggle(title: "Online status", key: \.onlineStatus)
