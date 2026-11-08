@@ -92,11 +92,45 @@ replaced every hour. It never keeps the address itself. No request log is kept.
 **What the server can see about traffic.** It can see that a sealed envelope arrived at a random mailbox, when, and
 how large (within a few set sizes). It can't see who sent it, who you are behind Tor, or what is inside.
 
+**Your phone's address book: never.** Pulshade doesn't ask for your contacts and doesn't read them. You add friends
+by scanning a code or sharing a link, so there is no phone-number matching and nothing to upload.
+
+**Camera, microphone and photos.** The camera scans codes and takes photos and videos for chats and stories, and the
+microphone records voice notes, videos and calls. Both are encrypted on your phone before they leave it, and camera
+frames are never saved. Pulshade can only add pictures to your photo library when you choose "Save", and never reads it.
+
+**Disappearing messages.** If a chat has a timer, each message disappears from every device when its timer ends. A
+timer is a promise made by the apps, not by the law of physics: a friend could still screenshot or copy a message before
+it goes.
+
+## Why we handle this information
+
+We handle only what is needed to carry your sealed messages and files, keep the backup you switch on and show the
+public handles and collectibles people choose to publish, and to keep the service safe from abuse (the hourly-salted
+request counts above). We have no other purpose for it, and no use for it in advertising or profiling.
+[Lawyer: where the law requires a stated legal basis, this is most likely legitimate interests; confirm and
+word it for each region.]
+
+## Who may see it
+
+- **Other Pulshade users** see what you send them and what you make public (your handle, picture and banner).
+- **The people who run the server and the network it sits on** can see the same traffic facts as any server: that a
+  sealed envelope arrived, when, and how large, plus your IP address if you connect without Tor.
+- **Hosting.** The relay runs on a rented server. The company that rents it can see the machine's network traffic and
+  could take it offline, but cannot read what is sealed. [Say where the server is and who rents it out, if you decide to.]
+- **Law enforcement and other legal requests.** We can only hand over what we hold, and what we hold is sealed or
+  public, as the table above shows. We have no message content, no account identity, no phone numbers or emails, no
+  contact lists and no request logs to give. If a lawful order arrives we will review it, answer it only as far as the
+  law requires, and tell the person it concerns whenever we are allowed to and can reach them. [Decide whether to
+  publish a transparency report.]
+- **Nobody else.** We don't sell, rent or share your information with advertisers or data brokers.
+
 ## What we don't do
 
 - We don't sell, rent or share your information.
 - We don't use advertising, analytics or tracking, in the app or on the server.
 - We don't build profiles of you. We can't link your personas to each other.
+- We don't ask for your phone number, email address, name or contacts.
 - The app talks only to Pulshade's servers.
 
 ## Outside the app
@@ -121,9 +155,15 @@ how large (within a few set sizes). It can't see who sent it, who you are behind
   back, though an up-to-date Pulshade on their side forgets you and everything you sent.
 - Because we hold no account details about you, we usually can't tell which data is yours. For a public handle or a
   collectible, contact us at [contact address] and we'll act on what we can verify.
-- **If you live in the EU, UK or a similar region**, you may have rights to access, correct and delete your data, or
-  to complain to your data-protection authority. We can't look up what we can't link to you, and the above is what
-  we hold. [Lawyer: confirm legal basis, controller details and any representative needed.]
+- **If you live in the EU, UK or a similar region**, you may have rights to access, correct and delete your data,
+  to move it, to restrict or object to how it is used, and to complain to your data-protection authority. We can't
+  look up what we can't link to you, and the above is what we hold. The tools that answer most of these are already in
+  the app: you can see and edit your own profile, turn the backup off, and Burn erases everything we hold for you. For a
+  public handle or collectible, ask us as above. [Lawyer: confirm controller details and any representative needed
+  in the EU or UK.]
+- **How long things are kept**, in one place: messages up to 7 days in memory; files up to 7 days; the sealed backup
+  until you switch it off or Burn, or 180 days after its last update; handles and collectibles until you let them go;
+  the wake-up token while the setting is on; and request counts for an hour. Nothing is kept "just in case".
 
 ## Children
 
@@ -132,8 +172,13 @@ no accounts, can't tell who is a child. If you think a child is using Pulshade, 
 
 ## Changes
 
-If we change this policy we'll update the date above and tell people in the app's announcements. The code and
-documentation show what the app does at any time.
+If we change this policy we'll update the date above, add a line to the list below and tell people in the app's
+announcements. The code and documentation show what the app does at any time.
+
+- **Build 8:** added what Pulshade never asks for (address book), what the camera, microphone and photo permissions
+  are used for, disappearing messages, why we handle information, who may see it (hosting, legal requests), and a single
+  list of how long everything is kept.
+- **Earlier builds:** files and videos on the server's disk, the sealed backup, and Burn and Detach wiping.
 
 ## Contact
 
