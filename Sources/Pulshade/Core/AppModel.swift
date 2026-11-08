@@ -1199,6 +1199,13 @@ final class AppModel {
         }
         for c in data.conversations.indices {
             if let m = data.conversations[c].messages.lastIndex(where: { $0.id == id && $0.isMine }) {
+                // An earlier upload of this video (sent again because someone asked) is erased now, so no copy is left
+                // that a later delete wouldn't know about.
+                if let old = data.conversations[c].messages[m].attachment, old.id != a.id,
+                   !data.blobWipes.contains(where: { $0.id == old.id }) {
+                    data.blobWipes.append(BlobWipe(id: old.id, secret: old.secret, expires: old.expires))
+                    runBlobWipes()
+                }
                 data.conversations[c].messages[m].attachment = a
             }
         }
