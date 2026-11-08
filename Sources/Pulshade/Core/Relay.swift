@@ -286,7 +286,8 @@ struct RelayClient {
 
     /// `wake` says whether this is a real message, which may wake a locked iPhone; typing signals, receipts and
     /// the rest say no, so they don't make a banner. A relay from before this ignores it.
-    func deposit(_ blob: Data, to sendID: Data, wake: Bool = false, ring: Bool = false) async throws {
+    /// `recall` stamps the envelope so a Burn can take it back (see docs/burn-order.md).
+    func deposit(_ blob: Data, to sendID: Data, wake: Bool = false, ring: Bool = false, recall: (n: UInt64, hash: Data)? = nil) async throws {
         var request = URLRequest(url: base.appending(path: "v1/q/\(sendID.hex)"))
         request.httpMethod = "PUT"
         // A send stuck on a slow circuit gives up sooner and is tried again on the next beat. A big one is
@@ -295,6 +296,10 @@ struct RelayClient {
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         // 2 starts a call, which rings a phone that gave the relay a call token; older relays take it as a message.
         request.setValue(ring ? "2" : wake ? "1" : "0", forHTTPHeaderField: "X-Pulshade-Wake")
+        if let recall {
+            request.setValue(recall.hash.hex, forHTTPHeaderField: "X-Pulshade-Recall")
+            request.setValue(String(recall.n), forHTTPHeaderField: "X-Pulshade-Recall-N")
+        }
         let (_, response) = try await load(request, body: blob)
         let status = (response as? HTTPURLResponse)?.statusCode
         if status == 507 { throw RelayMailboxFull() }
@@ -788,6 +793,16 @@ extension RelayClient {
         request.httpMethod = "POST"
         request.timeoutInterval = Tor.uses(base) ? 60 : 20
         let (_, response) = try await load(request, body: token)
+        guard (response as? HTTPURLResponse)?.statusCode == 204 else { throw URLError(.badServerResponse) }
+    }
+
+    /// Sends a burn order (see `BurnOrder`): the relay erases what it names. Done is 204; the same order may be sent again.
+    func burn(_ body: Data) async throws {
+        var request = URLRequest(url: base.appending(path: "v1/burn"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = Tor.uses(base) ? 90 : 30
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let (_, response) = try await load(request, body: body)
         guard (response as? HTTPURLResponse)?.statusCode == 204 else { throw URLError(.badServerResponse) }
     }
 

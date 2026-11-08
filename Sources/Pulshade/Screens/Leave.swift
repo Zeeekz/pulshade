@@ -76,8 +76,6 @@ struct BurnSheet: View {
     @State private var confirm = ""
     @State private var working = false
     @State private var problem: String?
-    /// The relay couldn't be reached: offers to burn this device alone.
-    @State private var offline = false
 
     var body: some View {
         SheetBody(width: 460) {
@@ -97,13 +95,11 @@ struct BurnSheet: View {
                     ProblemText(problem)
                 }
                 BurnButton(working: working, enabled: confirm == "BURN", action: { burn() })
-                if offline {
-                    Text("Or wipe only this device now. The relay's copy of your backup then stays there, opens only with your recovery code, and is erased within 180 days. Your @handles aren't retired and your contacts aren't told.")
-                        .font(.system(size: 13)).foregroundStyle(Ink.dim)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Button("Burn this device only") { burn(deviceOnly: true) }
-                        .disabled(working || confirm != "BURN")
-                }
+                Text("Burn needs no connection to wipe this phone: it wipes everything here at once and finishes erasing on the server, trying again until it is done. Or wipe only this device. The relay's copy of your backup then stays there, opens only with your recovery code, and is erased within 180 days.")
+                    .font(.system(size: 13)).foregroundStyle(Ink.dim)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Burn this device only") { burn(deviceOnly: true) }
+                    .disabled(working || confirm != "BURN")
             }
         }
     }
@@ -114,12 +110,8 @@ struct BurnSheet: View {
         Task {
             do {
                 try await model.burn(thisDeviceOnly: deviceOnly)
-            } catch AppModel.LeaveError.backupNotRemoved {
-                offline = false
-                problem = "Your saved backup couldn't be removed from the relay, so nothing was burned. Try again."
             } catch {
-                offline = true
-                problem = "Can't reach the relay, so nothing was burned yet. Check your connection and try again."
+                problem = "Something went wrong, so nothing was burned. Try again."
             }
             working = false
         }

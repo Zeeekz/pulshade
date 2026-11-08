@@ -996,6 +996,9 @@ struct Outgoing: Codable, Identifiable {
     var wakes: Bool?
     /// When it was queued, for the Network page. Nil for those queued by builds from before.
     var queued: Date? = Date()
+    /// The stamp that lets a Burn take this envelope back from the relay (see `Recall`). Nil for a signal, or one made before.
+    var recallN: UInt64?
+    var recallHash: Data?
 
     /// The sending lane for a persona (nil is the main one).
     static func lane(for persona: UUID?) -> String {
@@ -1120,7 +1123,8 @@ struct AppData: Codable {
     /// 7: a profile can have more than one @handle in use; messages can be videos; a device says if it reads frames.
     /// 8: a message can show a collectible or carry a note as a card.
     /// 9: a message can carry a file kept on the relay, and files still to be erased there are remembered.
-    static let currentFormat = 9
+    /// 10: a waiting envelope can carry a recall stamp.
+    static let currentFormat = 10
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []

@@ -37,6 +37,14 @@ final class AppModel {
     @ObservationIgnored var removedStories: [String: Date] = [:]
     /// A friend's video still arriving: when its last piece (or the story itself) came in. In memory only.
     @ObservationIgnored private var clipActivity: [ClipKey: Date] = [:]
+    /// True while a Burn queues its farewells, so they aren't stamped for recall.
+    @ObservationIgnored var burning = false
+    /// A Burn wiped this phone but the relay still has to be told (see `BurnOrder`): the app keeps trying.
+    var burnPending = false
+    /// What to tell the person about a Burn, shown over every screen even after the wipe.
+    var burnNotice: String?
+    @ObservationIgnored let burnStore: BurnOrderStore
+    @ObservationIgnored private var burnTask: Task<Void, Never>?
     /// How far a file's upload or download has got (0...1), by message. In memory only: a phone keeps no file.
     var fileProgress: [UUID: Double] = [:]
     /// Files that couldn't be sent or fetched, by message, with the reason in words.
@@ -158,9 +166,12 @@ final class AppModel {
 
     init(vault: Vault = .standard, watchSystem: Bool = true) {
         self.vault = vault
+        burnStore = BurnOrderStore(file: vault.directory.deletingLastPathComponent().appendingPathComponent(vault.directory.lastPathComponent + "-burn-order.sealed"),
+                                   service: "app.pulshade.burn-order." + vault.directory.lastPathComponent)
         phase = vault.exists ? .locked : .welcome
         Ink.source = { [weak self] in self?.theme ?? .dark }
         guard watchSystem else { return }
+        resumeBurnCleanup()
         #if os(iOS)
         CallRinger.shared.model = self
         #endif
@@ -3694,9 +3705,16 @@ final class AppModel {
         // someone wants to talk to you. The relay is only asked to wake for mail that says so.
         var asksToWake = false
         if case .request = payload { asksToWake = true }
-        data.outbox.append(Outgoing(sendID: sendID, blob: blob, relay: c.relay, message: message, ephemeral: ephemeral ? true : nil,
-                                  story: story, viewReport: viewReport, lane: c.persona == nil ? nil : Outgoing.lane(for: c.persona), rings: rings ? true : nil,
-                                  wakes: asksToWake ? true : nil))
+        var outgoing = Outgoing(sendID: sendID, blob: blob, relay: c.relay, message: message, ephemeral: ephemeral ? true : nil,
+                                story: story, viewReport: viewReport, lane: c.persona == nil ? nil : Outgoing.lane(for: c.persona), rings: rings ? true : nil,
+                                wakes: asksToWake ? true : nil)
+        // Stamped so a Burn can take it back from the relay while it waits. Not signals, and not the Burn's own farewells.
+        if !ephemeral && !burning {
+            let stamp = Recall.stamp(me.recallKey)
+            outgoing.recallN = stamp.n
+            outgoing.recallHash = stamp.hash
+        }
+        data.outbox.append(outgoing)
         kick()
     }
 
@@ -4455,7 +4473,8 @@ final class AppModel {
                         // As with fetching: a lane without a working route finds one before it sends.
                         if findsRoute { _ = await Self.reach(client) }
                         do {
-                            try await client.deposit(item.blob, to: item.sendID, wake: item.message != nil || item.rings == true || item.wakes == true, ring: item.rings == true)
+                            try await client.deposit(item.blob, to: item.sendID, wake: item.message != nil || item.rings == true || item.wakes == true, ring: item.rings == true,
+                                                     recall: item.recallN.flatMap { n in item.recallHash.map { (n, $0) } })
                             return (item, lane, nil)
                         } catch { return (item, lane, error) }
                     }
@@ -6016,7 +6035,8 @@ extension AppModel {
     /// `thisDeviceOnly` is for when the relay can't be reached: it wipes this device at once and nothing else.
     /// The relay's copy of the backup stays (it opens only with the recovery code and the relay erases it 180 days
     /// after its last save), handles are not retired and contacts are not told.
-    func burn(recoveryCode: String? = nil, thisDeviceOnly: Bool = false) async throws {
+    @discardableResult
+    func burn(recoveryCode: String? = nil, thisDeviceOnly: Bool = false) async throws -> BurnResult {
         try open(recoveryCode: recoveryCode)
         if thisDeviceOnly {
             data.security.keepBackup = false
@@ -6024,41 +6044,135 @@ extension AppModel {
             backupTask = nil
             destroyEverything(leavingNoTrace: true)
             Vault.scrubLeftovers()
-            return
+            burnNotice = "This device is wiped. Your account is still on the server."
+            return .deviceOnly
         }
-        guard let client = client(nil), await client.health(), let identity else { throw LeaveError.offline }
+        guard let identity else { throw LeaveError.offline }
         // No upload may land after the delete.
-        let hadBackup = data.security.keepBackup
         data.security.keepBackup = false
         backupTask?.cancel()
         backupTask = nil
-        // The backup goes first, and if it can't be removed nothing else is touched: burning on while it stays on the
-        // relay would break the promise that nothing is left.
-        do { try await deleteBackup(of: identity) } catch {
-            data.security.keepBackup = hadBackup
-            scheduleBackup()
-            throw LeaveError.backupNotRemoved
-        }
-        for persona in [nil] + data.personas.map(\.id) { await retireHandles(persona: persona) }
+        // Everything to take back from contacts is queued, sealed, but nothing has to be sent yet: it all goes into the order.
+        burning = true
+        let outboxBefore = Set(data.outbox.map(\.id))
         for id in data.conversations.map(\.id) { delete(id) }
-        // The files of yours the relay holds are erased before anything is wiped here.
-        await runBlobWipes().value
         for c in data.contacts where !c.isSelf {
             // Someone we only sent a request to has no session with us yet, so it goes straight to them.
             if c.awaitingAcceptance { seal(.erased, to: c.fingerprint, persona: c.persona) } else { enqueue(.erased, to: c) }
         }
         for id in data.stories.filter({ $0.author == "me" }).map(\.id) { deleteStory(id) }
-        // The video clips of your stories too, before anything is wiped here.
-        await runBlobWipes().value
         sync(.accountErased)
-        try await sendEverything()
-        // Collects whatever is still waiting in our mailboxes, so the relay doesn't hold it for days.
-        let shaping = trafficShaping
-        trafficShaping = false
-        await syncOnce()
-        trafficShaping = shaping
+        let order = makeBurnOrder(identity: identity, outboxBefore: outboxBefore)
+        burning = false
+        // The order is kept first, so a crash from here on still finishes on the relay. Then one go, briefly.
+        burnStore.save(order)
+        let attempt = Task { await self.attemptBurnCleanup() }
+        let timer = Task { try? await Task.sleep(for: .seconds(20)); attempt.cancel() }
+        let finished = await attempt.value
+        timer.cancel()
+        // Whatever the relay said, the phone is wiped now.
         destroyEverything(leavingNoTrace: true)
         Vault.scrubLeftovers()
+        if finished { return .complete }
+        burnNotice = "This phone is wiped. Pulshade is finishing the erase on the server and will keep trying until it is done."
+        startBurnLoop()
+        return .pending
+    }
+
+    /// Everything a Burn still has to do on the relay, signed now while the keys are known: erase the backup, retire the
+    /// handles, take back what is still waiting, erase the files, empty and close every mailbox, and drop the farewells.
+    private func makeBurnOrder(identity: Identity, outboxBefore: Set<UUID>) -> BurnOrder {
+        let ts = UInt64(RelayClock.now.timeIntervalSince1970)
+        func signed(_ label: String, key: Data, by signer: Curve25519.Signing.PrivateKey) -> BurnOrder.Signed {
+            let message = Data(label.utf8) + key + withUnsafeBytes(of: ts.bigEndian) { Data($0) }
+            return BurnOrder.Signed(key: key, sig: (try? signer.signature(for: message)) ?? Data())
+        }
+        var order = BurnOrder(ts: ts, relay: reachable(nil) ?? data.relay)
+        order.backup = signed("pulshade.burn.backup.v1", key: identity.backupSigningKey.publicKey.rawRepresentation, by: identity.backupSigningKey)
+        let personas: [UUID?] = [nil] + data.personas.map { Optional($0.id) }
+        for persona in personas {
+            guard let me = me(persona) else { continue }
+            order.handles.append(signed("pulshade.burn.retire.v1", key: me.card.signing, by: me.signingKey))
+            order.recall.append(me.recallKey)
+        }
+        order.blobs = data.blobWipes
+        order.mailboxes = Array(Set(currentLanes().values.flatMap { $0 })).prefix(2048).map { $0 }
+        var room = 4_000_000
+        for item in data.outbox where !outboxBefore.contains(item.id) {
+            guard let address = reachable(item.relay), room >= item.blob.count else { continue }
+            room -= item.blob.count
+            order.farewells.append(BurnOrder.Farewell(sendID: item.sendID, blob: item.blob, relay: address))
+        }
+        return order
+    }
+
+    /// One go at finishing the burn order kept on this phone. True when nothing is left to do (or there is no order).
+    func attemptBurnCleanup() async -> Bool {
+        guard var order = burnStore.load() else {
+            if !burnStore.exists { burnPending = false; return true }
+            // Can't be opened (its key is gone, or the phone hasn't been unlocked yet): tried again, but not for ever.
+            let made = (try? burnStore.file.resourceValues(forKeys: [.creationDateKey]))?.creationDate ?? Date()
+            if Date().timeIntervalSince(made) > 30 * 86_400 { burnStore.delete(); burnPending = false; return true }
+            return false
+        }
+        if order.isTooOld {
+            burnStore.delete()
+            burnPending = false
+            burnNotice = "Pulshade couldn't finish erasing your account on the server within 30 days. Your phone is wiped, and what is left there can't be opened."
+            return true
+        }
+        guard let base = URL(string: order.relay) else { burnStore.delete(); burnPending = false; return true }
+        let client = RelayClient(base: base, lane: "burn")
+        if !order.serverDone, let body = try? order.requestBody(), (try? await client.burn(body)) != nil {
+            order.serverDone = true
+            burnStore.save(order)
+        }
+        // The farewells, a few at a time; each that is taken is crossed off.
+        var left = order.farewells
+        while !left.isEmpty, !Task.isCancelled {
+            let batch = Array(left.prefix(6))
+            let sent = await withTaskGroup(of: (BurnOrder.Farewell, Bool).self) { group in
+                for farewell in batch {
+                    group.addTask {
+                        guard let url = URL(string: farewell.relay) else { return (farewell, true) }
+                        do { try await RelayClient(base: url, lane: "burn").deposit(farewell.blob, to: farewell.sendID); return (farewell, true) }
+                        catch is RelayTooLarge { return (farewell, true) }
+                        catch { return (farewell, false) }
+                    }
+                }
+                var done: [BurnOrder.Farewell] = []
+                for await (farewell, ok) in group where ok { done.append(farewell) }
+                return done
+            }
+            left.removeAll { sent.contains($0) }
+            if sent.count < batch.count { break }
+        }
+        if left != order.farewells { order.farewells = left; burnStore.save(order) }
+        guard order.isFinished else { return false }
+        burnStore.delete()
+        burnPending = false
+        burnNotice = "Burn complete. Everything is erased from the server and from this device."
+        return true
+    }
+
+    /// Tries the burn order now, again a minute later, then every hour, until the relay confirms.
+    func startBurnLoop() {
+        burnTask?.cancel()
+        burnPending = true
+        burnTask = Task { [weak self] in
+            var early: [Double] = [60, 300, 900]
+            while !Task.isCancelled {
+                guard let self else { return }
+                if await self.attemptBurnCleanup() { return }
+                try? await Task.sleep(for: .seconds(early.isEmpty ? 3600 : early.removeFirst()))
+            }
+        }
+    }
+
+    /// At launch: a burn that wasn't finished carries on.
+    func resumeBurnCleanup() {
+        guard burnStore.exists else { return }
+        startBurnLoop()
     }
 
     /// Burns one persona for good, leaving your main identity and other personas as they are: its @handles are

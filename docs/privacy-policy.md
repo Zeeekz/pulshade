@@ -46,9 +46,9 @@ When you delete something you sent (by deleting the message), it disappears from
 tells the server in the same moment, and the server erases it on the spot: the piece files are overwritten with random bytes and removed, and the key the server sealed them with is
 destroyed, so even a stray copy left on a solid-state disk can't be opened. If your phone can't reach the server at
 that moment, it tries again until it does. A file nobody deletes is erased after at most 7 days. Detach, the panic
-passcode and Burn also erase your files from the server: Burn waits for it, while Detach and the panic passcode wipe
-your phone at once and send the erase requests in the same moment without waiting (on an account's only device; if
-your phone is offline then, the server forgets the files within 7 days at most).
+passcode and Burn also erase your files from the server. All three wipe your phone at once and send the erase
+requests in the same moment without waiting (on an account's only device; if your phone is offline then, the server
+forgets the files within 7 days at most). Burn goes further: see below.
 
 What the server can still see about a file, as with any message: that something of about that size was uploaded,
 when it was uploaded and collected, and, if you connect without Tor, your IP address while you do. It can't see what
@@ -112,7 +112,13 @@ how large (within a few set sizes). It can't see who sent it, who you are behind
 ## Your choices and rights
 
 - **Lock, Detach and Burn** on the Burn tab control what stays on your device and the server. Burn deletes your account
-  everywhere, and it can't be undone.
+  everywhere, and it can't be undone. It wipes your phone at once, whether or not you are connected. At the same
+  time it sends the server an order, signed on your phone, to erase your sealed backup, retire your @handles, take back
+  any sealed messages you sent that are still waiting for friends to collect, erase your files and empty and close your
+  mailboxes. If the server can't be reached, your phone keeps that order, sealed, and tries again a minute later, then
+  every hour while Pulshade is open, until the server confirms, and then deletes it; a message tells you when it is done.
+  The order can erase things but can't read anything. Messages already collected by a friend's phone can't be taken
+  back, though an up-to-date Pulshade on their side forgets you and everything you sent.
 - Because we hold no account details about you, we usually can't tell which data is yours. For a public handle or a
   collectible, contact us at [contact address] and we'll act on what we can verify.
 - **If you live in the EU, UK or a similar region**, you may have rights to access, correct and delete your data, or

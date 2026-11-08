@@ -284,6 +284,7 @@ struct RootView: View {
                 .transition(.blurReplace.combined(with: ScaleTransition(1.03)))
             }
         }
+        .overlay(alignment: .top) { BurnBanner() }
     }
 }
 
