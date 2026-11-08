@@ -39,7 +39,6 @@ Anything that breaks a promise the README makes, for example:
 
 ## Testing safely
 
-Use your own accounts. To test the relay, run your own with `./scripts/run-relay.sh` and a development build
-(`./scripts/build-app.sh debug`), which accepts any relay; please don't load-test or attack Pulshade's servers.
+Use your own accounts. Please don't load-test or attack Pulshade's servers.
 Don't access anyone else's data, and stop as soon as you've shown the problem. Research done in good faith along
 these lines is welcome, and won't be treated as an attack.

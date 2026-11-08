@@ -29,7 +29,7 @@ struct LimitsTests {
         #expect(RelayClock.local(RelayClock.relay(date)) == date)
     }
 
-    /// The relay checks the same vector (relay/src/pow.rs), so both hash a proof the same way.
+    /// The relay checks the same vector, so both hash a proof the same way.
     @Test func proofOfWorkMatchesTheRelay() {
         let first = (0...).first { n in
             Work.leadingZeroBits(SHA256.hash(data: Data("pulshade.pow.v1|vector|1800000000|\(n)".utf8))) >= Work.bits
