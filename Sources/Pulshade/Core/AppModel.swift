@@ -654,6 +654,7 @@ final class AppModel {
             }
         }
         if hadPush { withdrawPush() }
+        eraseAllFilesOnRelayNow()
         syncTask?.cancel()
         tickTask?.cancel()
         // Nothing more goes to the relay from here. The backup already there is what a recovery code brings back.
@@ -1383,6 +1384,23 @@ final class AppModel {
             data.blobWipes.append(BlobWipe(id: a.id, secret: a.secret, expires: a.expires))
         }
         runBlobWipes()
+    }
+
+    /// A wipe (Detach, the panic passcode, Burn) tells the relay to erase every file and clip of yours it holds, in the same
+    /// moment and without waiting for an answer, so the wipe stays instant: the requests are on their way before the
+    /// secrets that allow them are gone. Only when this is the account's one device: with others, they still show those
+    /// files, so nothing is erased. Offline, the files expire within 7 days.
+    private func eraseAllFilesOnRelayNow() {
+        guard isPrimary, !hasOtherDevices else { return }
+        var wipes = data.blobWipes
+        for convo in data.conversations {
+            for m in convo.messages where m.isMine { if let a = m.attachment { wipes.append(BlobWipe(id: a.id, secret: a.secret, expires: a.expires)) } }
+        }
+        for story in data.stories where story.author == "me" {
+            if let a = story.clipBlob { wipes.append(BlobWipe(id: a.id, secret: a.secret, expires: a.expires)) }
+        }
+        guard !wipes.isEmpty, let relay = client(nil, lane: "blob") else { return }
+        Task.detached { for wipe in wipes { _ = try? await relay.blobDelete(wipe.id, secret: wipe.secret) } }
     }
 
     /// Works through the files waiting to be erased on the relay.

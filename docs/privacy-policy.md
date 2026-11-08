@@ -16,7 +16,10 @@ to use Pulshade, and over Tor the server never sees your IP address. We don't se
 
 ## What is stored on our servers
 
-Everything we store is either encrypted so that we can't read it, or public because you chose to make it public.
+**Everything private is encrypted, on our servers and on your phone.** We take every precaution we can for your
+privacy: every message has its own fresh key, sizes are padded, there are no accounts or phone numbers, the server keeps
+no logs, and what is stored is sealed so we can't read it. Everything we store is either encrypted so that we can't
+read it, or public because you chose to make it public.
 Nothing about you or your messages is kept in readable form. Here is every kind of thing, in plain words:
 
 | What | Where it is kept | How long | Can we read it? |
@@ -35,12 +38,13 @@ Your phone keeps what you receive in memory and in its own encrypted vault. A fi
 your phone's memory when you open it and is never written to the phone's disk by Pulshade, unless you choose
 "Save a copy".
 
-When you delete a file you sent (by deleting the message), your app tells the server, and the server erases it at
-once: the piece files are overwritten with random bytes and removed, and the key the server sealed them with is
+When you delete something you sent (by deleting the message), it disappears from your phone straight away, your app
+tells the server in the same moment, and the server erases it on the spot: the piece files are overwritten with random bytes and removed, and the key the server sealed them with is
 destroyed, so even a stray copy left on a solid-state disk can't be opened. If your phone can't reach the server at
-that moment, it tries again until it does. A file nobody deletes is erased after at most 7 days. Detach and Burn also
-erase your files from the server (Burn waits for it; Detach wipes your phone at once and the server forgets the files
-within 7 days at most).
+that moment, it tries again until it does. A file nobody deletes is erased after at most 7 days. Detach, the panic
+passcode and Burn also erase your files from the server: Burn waits for it, while Detach and the panic passcode wipe
+your phone at once and send the erase requests in the same moment without waiting (on an account's only device; if
+your phone is offline then, the server forgets the files within 7 days at most).
 
 What the server can still see about a file, as with any message: that something of about that size was uploaded,
 when it was uploaded and collected, and, if you connect without Tor, your IP address while you do. It can't see what
