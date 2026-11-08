@@ -26,6 +26,7 @@ struct FileBubble: View {
         if let failure { return failure }
         if uploading, let progress { return "Sending… \(Int(progress * 100))%" }
         if let progress { return "Opening… \(Int(progress * 100))%" }
+        if attachment.collected == true { return "Opened. It's been erased from the server" }
         if expired { return "No longer available" }
         return sizeText
     }
@@ -85,10 +86,11 @@ struct FileBubble: View {
             return
         }
         if failure != nil, mine, let id = model.conversationID(of: message.id) { model.cancelFile(message.id, in: id); return }
-        guard !expired else { return }
+        guard !expired, attachment.collected != true else { return }
+        let erases = attachment.token != nil
         Task {
             if let data = try? await model.openFile(of: message) {
-                opened = OpenedFile(name: attachment.shownName, type: attachment.type, data: data)
+                opened = OpenedFile(name: attachment.shownName, type: attachment.type, data: data, erased: erases)
             }
         }
     }
@@ -100,6 +102,8 @@ struct OpenedFile: Identifiable {
     var name: String
     var type: String?
     var data: Data
+    /// The relay has been told it's here and erases it once everyone has it: this is the only time it can be opened.
+    var erased = false
 }
 
 /// What an opened file shows: a picture or text from memory, and, for anything else, what it is. "Save a copy" is the one
@@ -136,7 +140,9 @@ private struct FileSheet: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
-            Text("Opened from memory only. Saving a copy puts an unencrypted file on this device.")
+            Text(file.erased
+                 ? "Opened from memory only, and now erased from the server: this is the only time. Save a copy if you want to keep it (it will be an unencrypted file on this device)."
+                 : "Opened from memory only. Saving a copy puts an unencrypted file on this device.")
                 .font(.system(size: 12)).foregroundStyle(Ink.dim).multilineTextAlignment(.center)
             Button("Save a copy…") { saving = true }
                 .buttonStyle(.borderedProminent)

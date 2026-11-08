@@ -25,11 +25,17 @@ struct Attachment: Codable, Equatable {
     var secret: Data
     /// When the relay forgets it on its own.
     var expires: Date
+    /// A one-time token for this person: spent (sent to the relay) once the whole file has been fetched and checked, so the
+    /// relay can erase the file when everyone it was sent to has it. Nil for a file that stays until it's deleted or expires.
+    var token: Data?
+    /// This phone fetched it and the relay has been told: the file is no longer on the relay, and this phone doesn't keep it.
+    var collected: Bool?
 
     /// Whether a received attachment is well-formed, so nothing odd gets as far as the network.
     var isValid: Bool {
         id.count == 32 && id.allSatisfy { $0.isHexDigit && !$0.isUppercase } && key.count == 32 && secret.count == 32 && sha256.count == 32
             && (1...BlobCrypto.maxFile).contains(size) && (name?.count ?? 0) <= 255 && (type?.count ?? 0) <= 100
+            && (token == nil || token?.count == 32)
     }
 
     /// The name to show: no folders, no control characters, never empty.

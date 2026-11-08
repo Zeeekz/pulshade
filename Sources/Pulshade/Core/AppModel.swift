@@ -1189,18 +1189,61 @@ final class AppModel {
             for contact in waiting { sendClip(clip, id: id, to: contact) }
             return
         }
-        // Kept with the story or message, so it can be pointed to again and erased when that goes.
+        // Kept with the story or message, so it can be erased when that goes.
         if let s = data.stories.firstIndex(where: { $0.id == id && $0.author == "me" }) {
+            // A story's clip stays until its timer runs out: everyone is sent the same pointer.
             data.stories[s].clipBlob = a
-        } else {
-            for c in data.conversations.indices {
-                if let m = data.conversations[c].messages.lastIndex(where: { $0.id == id && $0.isMine }) {
-                    data.conversations[c].messages[m].attachment = a
+            for contact in waiting { enqueue(.clipBlob(id: id, clip: a), to: contact) }
+            save()
+            return
+        }
+        for c in data.conversations.indices {
+            if let m = data.conversations[c].messages.lastIndex(where: { $0.id == id && $0.isMine }) {
+                data.conversations[c].messages[m].attachment = a
+            }
+        }
+        save()
+        // A chat video is erased from the relay once everyone it went to has it: each person gets a pointer with their own token.
+        Task { [weak self] in
+            guard let self else { return }
+            let tokens = await self.registerReaders(for: waiting, of: a)
+            await MainActor.run {
+                for contact in waiting {
+                    var pointer = a
+                    pointer.token = tokens?[Self.personKey(contact)]
+                    self.enqueue(.clipBlob(id: id, clip: pointer), to: contact)
                 }
             }
         }
-        for contact in waiting { enqueue(.clipBlob(id: id, clip: a), to: contact) }
-        save()
+    }
+
+    private static func personKey(_ contact: Contact) -> String { "\(contact.fingerprint)|\(contact.persona?.uuidString ?? "")" }
+
+    /// Makes one token for each person a file goes to and tells the relay who is to collect it, so it can erase the file
+    /// when they all have. Nil if the relay couldn't be told: the file then goes without tokens and stays until it is
+    /// deleted or expires.
+    private func registerReaders(for contacts: [Contact], of a: Attachment) async -> [String: Data]? {
+        var tokens: [String: Data] = [:]
+        var readers: [(hash: Data, uses: Int)] = []
+        for contact in contacts where tokens[Self.personKey(contact)] == nil {
+            let token = Data.random(32)
+            tokens[Self.personKey(contact)] = token
+            readers.append((Data(SHA256.hash(data: token)), max(1, contact.devices.count)))
+        }
+        guard !readers.isEmpty, readers.count <= 1024, let relay = client(nil, lane: "blob") else { return nil }
+        do { try await relay.blobReaders(a.id, secret: a.secret, readers: readers) } catch { return nil }
+        return tokens
+    }
+
+    /// Tells the relay this phone has the whole file, so it can be erased once everyone has it. Tried a few times.
+    private func spendToken(of a: Attachment) {
+        guard let token = a.token, let relay = client(nil, lane: "blob") else { return }
+        Task.detached {
+            for delay in [0.0, 5, 30, 120] {
+                try? await Task.sleep(for: .seconds(delay))
+                if (try? await relay.blobDone(a.id, token: token)) != nil { return }
+            }
+        }
     }
 
     /// A pointer to a clip arrived: fetch it from the relay into memory and put it where its pieces would have gone.
@@ -1219,34 +1262,36 @@ final class AppModel {
             await MainActor.run {
                 guard let self else { return }
                 self.clipFetching.remove(key)
-                if let clip { self.finishClip(id, clip, author: fp, persona: persona) }
+                if let clip, self.finishClip(id, clip, author: fp, persona: persona) { self.spendToken(of: a) }
             }
         }
     }
 
     /// Puts a clip that came from the relay where its message or story is waiting for it.
-    private func finishClip(_ id: UUID, _ clip: Data, author: String, persona: UUID?) {
+    @discardableResult
+    private func finishClip(_ id: UUID, _ clip: Data, author: String, persona: UUID?) -> Bool {
         let key = ClipKey(id, persona)
         if let at = videoMessage(id) {
             let message = data.conversations[at.convo].messages[at.message]
             let theirs = message.sender == author
             let mine = message.isMine && contact(author, in: persona)?.isSelf == true
             guard message.video?.isEmpty == true, theirs || mine, data.conversations[at.convo].persona == persona,
-                  clip.count <= ChatVideo.maxBytes + 500_000 else { return }
+                  clip.count <= ChatVideo.maxBytes + 500_000 else { return false }
             data.clipParts[key.stored] = nil
             clipActivity[key] = nil
             clipAsks[key] = nil
             withAnimation(.snappy) { data.conversations[at.convo].messages[at.message].video = clip }
-            return
+            return true
         }
         guard let i = data.stories.firstIndex(where: { $0.id == id && $0.author == author && $0.persona == persona }),
-              case let .video(have, caption) = data.stories[i].style, have.isEmpty else { return }
+              case let .video(have, caption) = data.stories[i].style, have.isEmpty else { return false }
         data.clipParts[key.stored] = nil
         clipActivity[key] = nil
         clipAsks[key] = nil
         withAnimation(.snappy) { data.stories[i].style = .video(clip, caption: caption) }
         acknowledgeStory(id, author: author, persona: persona)
         save()
+        return true
     }
 
     /// Tells the relay to erase the clips of these stories of yours.
@@ -1330,10 +1375,26 @@ final class AppModel {
                                                                    snippet: $0.snippet, picture: $0.picture) },
                                preview: nil, attachment: a)
         let recipients = audience(convo)
-        for member in recipients { enqueue(.message(wire), to: member, message: message.id) }
-        sync(.sent(ref(convo), wire))
-        if recipients.isEmpty { setStatus(.sent, for: [message.id]) }
-        save()
+        if recipients.isEmpty { setStatus(.sent, for: [message.id]); sync(.sent(ref(convo), wire)); save(); return }
+        // The file is erased from the relay once everyone it goes to has it: each person (and your own other devices)
+        // gets a pointer with a token of their own.
+        let own = selfIndex.map { data.contacts[$0] }.flatMap { $0.devices.isEmpty ? nil : $0 }
+        let ref = ref(convo)
+        Task { [weak self] in
+            guard let self else { return }
+            let tokens = await self.registerReaders(for: recipients + (own.map { [$0] } ?? []), of: a)
+            await MainActor.run {
+                for member in recipients {
+                    var mine = wire
+                    mine.attachment?.token = tokens?[Self.personKey(member)]
+                    self.enqueue(.message(mine), to: member, message: message.id)
+                }
+                var forMyDevices = wire
+                forMyDevices.attachment?.token = own.flatMap { tokens?[Self.personKey($0)] }
+                self.sync(.sent(ref, forMyDevices))
+                self.save()
+            }
+        }
     }
 
     /// Fetches a file into memory and opens it there. Nothing is written to disk. The caller shows it, or saves it to
@@ -1346,9 +1407,22 @@ final class AppModel {
         fileFailed[id] = nil
         defer { fileProgress[id] = nil }
         do {
-            return try await BlobTransfer.download(a, from: client) { value in
+            let file = try await BlobTransfer.download(a, from: client) { value in
                 Task { @MainActor [weak self] in if self?.fileProgress[id] != nil { self?.fileProgress[id] = value } }
             }
+            // The whole file is here: the relay is told, and erases it once everyone it went to has it. This phone doesn't
+            // keep it, so from now on the card says so.
+            if a.token != nil {
+                spendToken(of: a)
+                for c in data.conversations.indices {
+                    if let m = data.conversations[c].messages.firstIndex(where: { $0.id == id && !$0.isMine }) {
+                        data.conversations[c].messages[m].attachment?.collected = true
+                        data.conversations[c].messages[m].attachment?.token = nil
+                    }
+                }
+                save()
+            }
+            return file
         } catch {
             fileFailed[id] = (error as? BlobError)?.words ?? "Couldn't fetch the file. Check your connection and try again."
             throw error
@@ -4782,7 +4856,7 @@ final class AppModel {
                 let key = "\(fp)|\(id)"
                 if let last = clipResent[key], Date().timeIntervalSince(last) < clipQuiet { break }
                 clipResent[key] = Date()
-                deliverClip(clip, id: id, to: sender, known: data.conversations[at.convo].messages[at.message].attachment, only: parts)
+                deliverClip(clip, id: id, to: sender, known: nil, only: parts)
                 break
             }
             // Only for a story of yours that's still up, on this persona, and that they're meant to see.

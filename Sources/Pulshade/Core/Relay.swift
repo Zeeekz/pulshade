@@ -769,6 +769,28 @@ extension RelayClient {
         }
     }
 
+    /// Says who is to collect the file: a hash of each person's one-time token and how many of their devices will. The relay
+    /// erases the file when all of them have.
+    func blobReaders(_ id: String, secret: Data, readers: [(hash: Data, uses: Int)]) async throws {
+        var request = URLRequest(url: base.appending(path: "v1/blob/\(id)/readers"))
+        request.httpMethod = "PUT"
+        request.timeoutInterval = Tor.uses(base) ? 60 : 20
+        request.setValue(secret.hex, forHTTPHeaderField: "X-Pulshade-Blob-Secret")
+        var body = Data()
+        for reader in readers { body += reader.hash; body.append(UInt8(max(1, min(16, reader.uses)))) }
+        let (_, response) = try await load(request, body: body)
+        guard (response as? HTTPURLResponse)?.statusCode == 204 else { throw URLError(.badServerResponse) }
+    }
+
+    /// This phone has the whole file: spends its token.
+    func blobDone(_ id: String, token: Data) async throws {
+        var request = URLRequest(url: base.appending(path: "v1/blob/\(id)/done"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = Tor.uses(base) ? 60 : 20
+        let (_, response) = try await load(request, body: token)
+        guard (response as? HTTPURLResponse)?.statusCode == 204 else { throw URLError(.badServerResponse) }
+    }
+
     /// Erases the file. Already gone counts as done; a wrong secret is an error.
     func blobDelete(_ id: String, secret: Data) async throws {
         var request = URLRequest(url: base.appending(path: "v1/blob/\(id)/delete"))

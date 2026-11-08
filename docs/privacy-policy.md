@@ -25,7 +25,8 @@ Nothing about you or your messages is kept in readable form. Here is every kind 
 | What | Where it is kept | How long | Can we read it? |
 | --- | --- | --- | --- |
 | **Messages** (text, receipts, calls' set-up) | The server's memory only, never its disk | Until the other person's phone collects it, or 7 days | No. Sealed on your phone with keys only you and they have. |
-| **Files and videos you send** (files up to 100 MB; story and chat videos a few MB) | The server's disk, in pieces | Until the message is deleted, or at most 7 days | No. Sealed on your phone with a key that travels only inside the encrypted message, and sealed a second time by the server with a key of its own. Its name and type are inside the encrypted message, so we don't even know those. |
+| **Files and chat videos you send** (files up to 100 MB; videos a few MB) | The server's disk, in pieces | Erased the moment the other person's phone has downloaded it, or when you delete the message, or after 7 days at most | No. Sealed on your phone with a key that travels only inside the encrypted message, and sealed a second time by the server with a key of its own. Its name and type are inside the encrypted message, so we don't even know those. |
+| **Video stories** (a few MB) | The server's disk, one copy for everyone | Until the story's timer runs out (then overwritten and erased), or sooner if you delete the story | No. The same two layers of encryption. |
 | **Sealed backup** (profile, contacts, groups, settings; never chats) | The server's disk | Until you switch it off, Burn, or 180 days without an update | No. Sealed with a key only your recovery code makes. |
 | **Public @handle and profile** (only if you choose one) | The server's disk | Until you let it go | Yes, it is public by your choice. |
 | **Collectibles you own** | The server's disk | While they exist | They're not secret: the item, its number and a hash of its code. |
@@ -33,6 +34,9 @@ Nothing about you or your messages is kept in readable form. Here is every kind 
 
 Photos, voice notes and text travel inside the encrypted message itself, so they wait in the server's memory like any
 message and are never on its disk.
+
+A file you are sent is erased from the server as soon as your phone has it. Your phone does not keep received files:
+you open it once, from memory, and "Save a copy" is how you keep it. A chat video is kept in your chat.
 
 Your phone keeps what you receive in memory and in its own encrypted vault. A file someone sends you is fetched into
 your phone's memory when you open it and is never written to the phone's disk by Pulshade, unless you choose
