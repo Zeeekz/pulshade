@@ -1,6 +1,7 @@
 import SwiftUI
 #if os(macOS)
 import AppKit
+import Darwin
 import ServiceManagement
 #endif
 
@@ -20,6 +21,11 @@ struct PulshadeApp: App {
     init() {
         #if os(macOS)
         NSApplication.shared.setActivationPolicy(.regular)
+        // A crash must not write memory (keys, plaintext) to disk as a core dump.
+        var limit = rlimit(rlim_cur: 0, rlim_max: 0)
+        setrlimit(RLIMIT_CORE, &limit)
+        // Don't keep window contents around between launches: they can name chats and contacts.
+        UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
         #endif
         // Whatever a crash or a quit left of a clip is overwritten and deleted before anything else.
         TempFiles.sweep()
@@ -371,6 +377,8 @@ private struct WindowConfigurator: NSViewRepresentable {
 
     func updateNSView(_ view: NSView, context: Context) {
         DispatchQueue.main.async {
+            // A restorable window leaves a snapshot of its contents in Saved Application State.
+            view.window?.isRestorable = false
             view.window?.sharingType = blockCapture ? .none : .readOnly
         }
     }

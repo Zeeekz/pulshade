@@ -37,6 +37,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key><string>$build_number</string>
     <key>LSMinimumSystemVersion</key><string>26.0</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSQuitAlwaysKeepsWindows</key><false/>
     <key>NSHumanReadableCopyright</key><string>Built by Zeekz</string>
     <key>ITSAppUsesNonExemptEncryption</key><true/>
     <key>NSCameraUsageDescription</key><string>Scan codes to link your devices, add friends and verify them, and take photos and videos for stories. Frames are never saved.</string>
