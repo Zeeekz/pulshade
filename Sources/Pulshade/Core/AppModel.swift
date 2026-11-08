@@ -294,6 +294,7 @@ final class AppModel {
         #endif
         if phase == .locked { warmUp() }
         refreshPush()
+        if phase == .unlocked { resendOverdueMessages(force: true) }
         #if os(iOS)
         // The wake-up banner has done its job once Pulshade is open.
         Task { await Notifier.shared.clearWakeBanners() }
@@ -422,6 +423,8 @@ final class AppModel {
     /// app answers, which it does when it's running. For the chat to say so, instead of showing a clock and nothing else.
     func keysPending(with fingerprint: String) -> Bool {
         guard let c = contact(fingerprint, in: activePersona), !c.awaitingAcceptance, !c.devices.isEmpty else { return false }
+        // Their messages couldn't be opened and new keys are being asked for: said in the chat, not left as silence.
+        if unreadable.values.contains(where: { $0.fingerprint == fingerprint && $0.persona == activePersona }) { return true }
         let ready = c.devices.contains { $0.session?.canSend == true }
         return !ready && c.devices.contains { $0.handshake != nil || $0.session != nil }
     }
@@ -436,8 +439,30 @@ final class AppModel {
     /// Starts a new session with a device whose messages can't be opened, at most every couple of minutes.
     @ObservationIgnored private var lastMend: [String: Date] = [:]
 
+    /// A device whose messages couldn't be opened, until one can be again: the new keys are asked for again every couple
+    /// of minutes meanwhile, not only when another unreadable message happens to arrive.
+    struct Unreadable { var fingerprint: String; var persona: UUID?; var device: Data; var since: Date }
+    private(set) var unreadable: [String: Unreadable] = [:]
+
+    private func retryUnreadable() {
+        guard !unreadable.isEmpty else { return }
+        for (key, item) in unreadable {
+            guard Date().timeIntervalSince(item.since) < 3600, let i = contactIndex(item.fingerprint, item.persona),
+                  let d = data.contacts[i].devices.firstIndex(where: { $0.id == item.device }) else { unreadable[key] = nil; continue }
+            if let started = data.contacts[i].devices[d].handshake?.startedAt {
+                // Asked and not answered (they weren't running Pulshade): asked again after a while.
+                guard Date().timeIntervalSince(started) > 120, Date().timeIntervalSince(lastMend[key] ?? .distantPast) > 120 else { continue }
+                lastMend[key] = Date()
+                startHandshake(contact: i, device: d)
+            } else {
+                mendSession(contact: i, device: d)
+            }
+        }
+    }
+
     private func mendSession(contact i: Int, device d: Int) {
-        guard !data.contacts[i].awaitingAcceptance, data.contacts[i].devices[d].handshake == nil else { return }
+        guard !data.contacts[i].awaitingAcceptance, data.contacts[i].devices[d].handshake == nil,
+              data.contacts[i].devices[d].awaitingHello != true else { return }
         let key = sessionKey(contact: i, device: d)
         if let last = lastMend[key], Date().timeIntervalSince(last) < 120 { return }
         lastMend[key] = Date()
@@ -708,6 +733,8 @@ final class AppModel {
     /// next, a decoy included, must not find them.
     private func forgetSession() {
         recoveredSessions = [:]
+        unreadable = [:]
+        resentAt = [:]
         identityCache = [:]
         DecodedImages.forget()
         eggs = []
@@ -3757,6 +3784,24 @@ final class AppModel {
     private var requestNotes: [String: String] = [:]
     /// The longest a message is sent again for after being sent: well inside what the relay keeps mail.
     private static let resendWindow: TimeInterval = 24 * 3600
+    /// How long a message waits for its receipt before it is sent again, then again after the next wait, and so on.
+    static var resendGaps: [TimeInterval] = [90, 300, 900, 2700, 7200]
+    /// When each of your messages was last sent again, and how many times, while the app is open.
+    @ObservationIgnored private var resentAt: [UUID: (at: Date, count: Int)] = [:]
+    @ObservationIgnored private var lastDueCheck = Date.distantPast
+
+    private func resendIsDue(_ message: Message) -> Bool {
+        let tried = resentAt[message.id]
+        let wait = Self.resendGaps[min(tried?.count ?? 0, Self.resendGaps.count - 1)]
+        return Date().timeIntervalSince(tried?.at ?? message.date) >= wait
+    }
+
+    /// The timed resend, looked at every few seconds at most: housekeeping runs more often than that.
+    private func resendOverdueMessages(force: Bool = false) {
+        guard force || Date().timeIntervalSince(lastDueCheck) >= 15 else { return }
+        lastDueCheck = Date()
+        resendUnconfirmedMessages(dueOnly: true)
+    }
 
     /// How many restarts have been seen across the relays this account uses.
     private func relayRestartTotal() -> Int {
@@ -3831,16 +3876,22 @@ final class AppModel {
 
     /// Your own recent messages the relay took but nobody has confirmed. Videos and stories have their own ways of
     /// asking again, so only text, photos and voice notes go here.
-    func resendUnconfirmedMessages() {
+    ///
+    /// `dueOnly`: the timed kind, for messages that have waited long enough since they were sent (or sent again).
+    /// A restart isn't the only way mail is lost (a phone that wasn't open to notice one, a crash, a reboot), so
+    /// anything still unconfirmed is tried again, soon at first and then less often, until its receipt comes.
+    func resendUnconfirmedMessages(dueOnly: Bool = false) {
         let cutoff = Date().addingTimeInterval(-Self.resendWindow)
+        if dueOnly { resentAt = resentAt.filter { $0.value.at > cutoff } }
         for i in data.conversations.indices {
             let convo = data.conversations[i]
             guard convo.kind == .direct || convo.kind == .group else { continue }
             let lost = convo.messages.filter { $0.isMine && $0.status == .sent && $0.date > cutoff && !$0.isVideo
-                && ($0.expiresAt.map { $0 > Date() } ?? true) }
+                && ($0.expiresAt.map { $0 > Date() } ?? true) && (!dueOnly || resendIsDue($0)) }
             guard !lost.isEmpty else { continue }
             let recipients = audience(convo)
             for message in lost {
+                resentAt[message.id] = (Date(), (resentAt[message.id]?.count ?? 0) + 1)
                 let reply = message.reply.map { ReplyRef(id: $0.id, author: $0.author == "me" ? (me(convo.persona)?.fingerprint ?? "") : $0.author,
                                                          snippet: $0.snippet, picture: $0.picture) }
                 let wire = WireMessage(id: message.id, conversation: sharedID(convo), kind: convo.kind, text: message.text,
@@ -4086,7 +4137,9 @@ final class AppModel {
         watchTor()
         watchStall()
         retryStaleHandshakes()
+        retryUnreadable()
         resendAfterRestart()
+        resendOverdueMessages()
         if introsStale { refileIntros() }
         resendUnconfirmedStories()
         resendUnconfirmedViews()
@@ -4748,11 +4801,15 @@ final class AppModel {
                 // Signed by their account, yet this device's keys can't open it: the two are out of step (a backup that
                 // was a little behind, say). Said once in a while, so a new session is opened with them, which they
                 // accept; until then what they sent can't be read, and what's sent to them can't be either.
-                if data.contacts[i].devices[d].session != nil { mendSession(contact: i, device: d) }
+                // Also with no session at all: a device that lost its keys still hears from a chat it once had.
+                unreadable[keptKey] = Unreadable(fingerprint: fp, persona: persona, device: data.contacts[i].devices[d].id,
+                                                 since: unreadable[keptKey]?.since ?? Date())
+                mendSession(contact: i, device: d)
                 return
             }
             // The keys were kept above, before reading what it says, so a message this version can't read (one from a
             // newer app) still counts and doesn't leave the session behind.
+            unreadable[keptKey] = nil
             guard let inner = try? Payload.fromWire(plain), !inner.isSetup else { return }
             handle(inner, from: fp, persona: persona, device: device)
             // The first message in lets a new session start sending. Look them up again: handling it may
