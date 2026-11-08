@@ -3735,6 +3735,8 @@ final class AppModel {
         data.contacts[i].devices[d].handshake = nil
         data.contacts[i].devices[d].awaitingHello = nil
         data.contacts[i].devices[d].acceptedHello = request.ephemeral
+        // New keys are in place: no more asking for them because of messages that were read with the old ones.
+        unreadable[sessionKey(contact: i, device: d)] = nil
         seal(.sessionAccept(answer), contact: i, device: d)
         let first: Payload = data.contacts[i].isSelf ? .sync(.hello) : profilePayload(data.contacts[i].persona, for: data.contacts[i].fingerprint)
         data.contacts[i].devices[d].pending.insert(PendingPayload(payload: first, message: nil), at: 0)
@@ -4785,6 +4787,8 @@ final class AppModel {
                                                         responderAgreement: data.contacts[i].agreementKey) else { return }
             data.contacts[i].devices[d].session = session
             data.contacts[i].devices[d].handshake = nil
+            // New keys are in place: no more asking for them because of messages that were read with the old ones.
+            unreadable[sessionKey(contact: i, device: d)] = nil
         case let .ratchet(message):
             guard let d = deviceIndex(i, device) else { return }
             let keptKey = sessionKey(contact: i, device: d)
