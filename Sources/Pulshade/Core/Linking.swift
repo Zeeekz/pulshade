@@ -318,15 +318,16 @@ final class DeviceLinker {
     private func waitForBundle(_ relay: RelayClient, secret: Data) async {
         for _ in 0..<300 {
             if Task.isCancelled { return }
-            if let envelopes = try? await relay.fetch([bundleMailbox.receiveKey]), let first = envelopes.first {
+            if let envelopes = try? await relay.fetch([bundleMailbox.receiveKey]), !envelopes.isEmpty {
+                // The mailbox's send id is in the join QR code, so anyone can drop junk into it. Try every
+                // envelope and keep waiting past ones that don't open rather than failing on the first.
+                let bundle = envelopes.lazy.compactMap { self.open($0.blob, secret: secret) }.first
                 try? await relay.ack(envelopes)
-                if let bundle = open(first.blob, secret: secret) {
+                if let bundle {
                     self.bundle = bundle
                     stage = .received
-                } else {
-                    stage = .failed("The account didn't check out")
+                    return
                 }
-                return
             }
             try? await Task.sleep(for: .seconds(2))
         }

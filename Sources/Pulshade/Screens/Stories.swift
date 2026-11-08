@@ -1236,7 +1236,7 @@ struct StoryCamera: View {
         } else if let start, ready == true,
                   ShutterTiming.isTap(duration: Date().timeIntervalSince(start), travel: hypot(drag.translation.width, drag.translation.height)) {
             Haptics.tick()
-            camera.capture { image in pending = PendingCrop(image: image) }
+            camera.capture { image in if let image { pending = PendingCrop(image: image) } }
         }
     }
 
@@ -1277,7 +1277,7 @@ struct StoryCamera: View {
         .accessibilityHint("Hold to record a video")
         .accessibilityAddTraits(.isButton)
         .accessibilityAction {
-            if camera.recording { camera.finishRecording() } else { camera.capture { image in pending = PendingCrop(image: image) } }
+            if camera.recording { camera.finishRecording() } else { camera.capture { image in if let image { pending = PendingCrop(image: image) } } }
         }
         .accessibilityAction(named: camera.recording ? "Stop recording" : "Record video") {
             if camera.recording { camera.finishRecording() } else { startClip() }

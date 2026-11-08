@@ -106,8 +106,15 @@ final class RelayPinning: NSObject, URLSessionDelegate {
     private static func loaded() -> [String: Set<Data>] {
         guard let configured = Bundle.main.object(forInfoDictionaryKey: "PulshadeRelayPin") as? String,
               let host = URL(string: AppData.directRelay ?? "")?.host()?.lowercased() else { return [:] }
-        let hashes = Set(configured.split(separator: ",").compactMap { Data(base64Encoded: $0.trimmingCharacters(in: .whitespaces)) })
-        return hashes.isEmpty ? [:] : [host: hashes]
+        let trimmed = configured.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [:] }
+        // Accept a file's trailing newlines as well as spaces around each comma-separated hash.
+        let hashes = Set(configured.split(separator: ",").compactMap {
+            Data(base64Encoded: $0.trimmingCharacters(in: .whitespacesAndNewlines))
+        })
+        // A pin was configured but nothing usable parsed: fail closed for this host rather than quietly fall
+        // back to plain WebPKI trust while believing the relay is pinned.
+        return [host: hashes]
     }
 
     /// Whether `host`'s pin, if it has one, accepts this leaf certificate. True when the host isn't pinned.

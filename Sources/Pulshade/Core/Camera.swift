@@ -28,7 +28,7 @@ final class Camera: NSObject {
     /// Whether the camera in use has a flash.
     private(set) var hasFlash = false
     @ObservationIgnored private var micAllowed = false
-    @ObservationIgnored private var taken: ((PlatformImage) -> Void)?
+    @ObservationIgnored private var taken: ((PlatformImage?) -> Void)?
     @ObservationIgnored private var recorded: ((MemoryClip?, ZoomTrack) -> Void)?
     @ObservationIgnored private var device: AVCaptureDevice?
     /// The zoom now as the person sees it: 1 is the main lens, below 1 is the ultra wide one.
@@ -94,8 +94,8 @@ final class Camera: NSObject {
         if micAllowed, running { _ = configure() }
     }
 
-    func capture(_ done: @escaping (PlatformImage) -> Void) {
-        guard running, !recording else { return }
+    func capture(_ done: @escaping (PlatformImage?) -> Void) {
+        guard running, !recording else { done(nil); return }
         taken = done
         let settings = AVCapturePhotoSettings()
         #if os(iOS)
@@ -111,7 +111,7 @@ final class Camera: NSObject {
     /// Starts a clip; it stops by itself at `clipLimit` seconds. `done` gets the clip, or nil if nothing was kept. The clip is
     /// built in memory and never written to a file.
     func record(_ done: @escaping (MemoryClip?, ZoomTrack) -> Void) {
-        guard running, !recording else { return }
+        guard running, !recording else { done(nil, ZoomTrack()); return }
         recorded = done
         zoomTrack = ZoomTrack()
         #if os(macOS)
@@ -294,11 +294,20 @@ final class Camera: NSObject {
         recorded?(clip, zoomTrack)
         recorded = nil
     }
+
+    /// The photo didn't come: tell the caller so it can clear its "taking" state instead of waiting forever.
+    fileprivate func failedCapture() {
+        taken?(nil)
+        taken = nil
+    }
 }
 
 extension Camera: AVCapturePhotoCaptureDelegate {
     nonisolated func photoOutput(_ output: AVCapturePhotoOutput, didFinishProcessingPhoto photo: AVCapturePhoto, error: Error?) {
-        guard error == nil, let data = photo.fileDataRepresentation(), let image = PlatformImage(data: data) else { return }
+        guard error == nil, let data = photo.fileDataRepresentation(), let image = PlatformImage(data: data) else {
+            Task { @MainActor in self.failedCapture() }
+            return
+        }
         Task { @MainActor in self.deliver(image) }
     }
 }

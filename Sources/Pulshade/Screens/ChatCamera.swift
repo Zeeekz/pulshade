@@ -205,7 +205,7 @@ struct ChatCamera: View {
         taking = true
         Haptics.tick()
         camera.capture { image in
-            if let data = cleanJPEG(image, maxSide: Self.maxSide) { taken([data]) }
+            if let image, let data = cleanJPEG(image, maxSide: Self.maxSide) { taken([data]) }
             dismiss()
         }
     }

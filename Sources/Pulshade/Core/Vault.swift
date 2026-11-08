@@ -117,9 +117,15 @@ struct Vault {
         let secret = try device.map(Self.deviceSecret)
         var opened: Opened?
         for (index, slot) in slots.enumerated() {
-            let key = Self.slotKey(passcode, salt: slot.salt, iterations: slot.iterations, device: secret)
-            guard opened == nil, let box = try? AES.GCM.SealedBox(combined: slot.sealed),
-                  let plain = try? AES.GCM.open(box, using: key) else { continue }
+            // A malformed salt (only possible in an editable, Keychain-less lock file) would make the KDF
+            // trap; treat such a slot as unusable instead.
+            guard !slot.salt.isEmpty else { continue }
+            // Derive and decrypt every slot even after one matches: stopping early would let the timing (and
+            // the number of decryptions) say which slot a passcode opened, defeating decoy/panic deniability.
+            let key = Self.slotKey(passcode, salt: slot.salt, iterations: Self.safeIterations(slot.iterations), device: secret)
+            let plain = (try? AES.GCM.SealedBox(combined: slot.sealed))
+                .flatMap { try? AES.GCM.open($0, using: key) }
+            guard opened == nil, let plain else { continue }
             if plain.count == 32 {
                 // Written by version 1: a bare seed.
                 opened = .identity(try Identity(seed: plain), slot: index)
@@ -130,6 +136,12 @@ struct Vault {
         }
         guard let opened else { throw VaultError.wrongPasscode }
         return opened
+    }
+
+    /// The stretch count a slot asks for, clamped so an editable (Keychain-less) lock file can neither
+    /// lower the work below what this build uses nor make unlocking take forever.
+    private static func safeIterations(_ stored: UInt32) -> UInt32 {
+        min(max(stored, iterations), 5_000_000)
     }
 
     /// Whether any slot already opens with this passcode.

@@ -56,8 +56,11 @@ final class VoiceRecorder {
     /// Stops and hands back the note, or nil if it was too short to keep.
     func finish() -> VoiceNote? {
         stopEngine()
+        // Take the length from the stream's own frame count, not the last 100 ms timer tick, so a note isn't
+        // stored (or rejected as too short) up to a tick wrong.
+        let measured = stream?.progress().0 ?? elapsed
         let audio = stream?.finish()
-        let duration = elapsed
+        let duration = max(measured, elapsed)
         cleanUp()
         guard let audio, !audio.isEmpty, duration >= 0.5 else { return nil }
         return VoiceNote(audio: audio, duration: duration, levels: Self.downsample(levels, to: 48))
@@ -302,7 +305,8 @@ enum MP4Scrub {
             } else if size == 0 {
                 size = end - i
             }
-            guard size >= header, i + size <= end else { return }
+            // Bounds-checked as `size <= end - i`, so a crafted 64-bit box size can't overflow `i + size`.
+            guard size >= header, size <= end - i else { return }
             let type = String(decoding: b[(i + 4)..<(i + 8)], as: UTF8.self)
             if tags.contains(type) {
                 b.replaceSubrange((i + 4)..<(i + 8), with: Array("free".utf8))

@@ -50,11 +50,13 @@ enum AnnouncementWatch {
     @discardableResult
     static func notice(_ ids: [String]) -> [String] {
         var known = noticed
-        let fresh = ids.map { $0.uppercased() }.filter { !known.contains($0) }
-        if !fresh.isEmpty {
-            known += fresh
-            noticed = known
+        var fresh: [String] = []
+        // `known` grows as we go, so a list that repeats an id still reports it only once.
+        for id in ids.map({ $0.uppercased() }) where !known.contains(id) {
+            known.append(id)
+            fresh.append(id)
         }
+        if !fresh.isEmpty { noticed = known }
         return fresh
     }
 
@@ -110,14 +112,21 @@ enum AnnouncementWatch {
     /// allows. A route into the onion service can stall, so a second try gets a fresh one.
     private static func run(_ task: BGAppRefreshTask) {
         schedule()
-        let work = Task { @MainActor in
+        // Install the expiration handler before the work starts, so a wake that expires immediately still cancels it.
+        let box = TaskBox()
+        task.expirationHandler = { box.task?.cancel() }
+        box.task = Task { @MainActor in
             await Task.detached { Tor.start(); Tor.wake() }.value
             RelayClient.closeAll()
             var reached = await check()
             if !reached, !Task.isCancelled { reached = await check() }
             task.setTaskCompleted(success: reached)
         }
-        task.expirationHandler = { work.cancel() }
     }
     #endif
+}
+
+/// Lets the expiration handler be installed before the work it cancels is created.
+private final class TaskBox: @unchecked Sendable {
+    var task: Task<Void, Never>?
 }

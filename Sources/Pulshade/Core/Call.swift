@@ -76,6 +76,7 @@ final class CallMedia: @unchecked Sendable {
 
     private let lock = NSLock()
     private var crypto: CallCrypto
+    private let session: URLSession
     private let task: URLSessionWebSocketTask
     private let onEvent: @MainActor (Event) -> Void
     private let withAudio: Bool
@@ -101,14 +102,18 @@ final class CallMedia: @unchecked Sendable {
 
     init?(relay: String, invite: CallInvite, caller: Bool, withAudio: Bool, onEvent: @escaping @MainActor (Event) -> Void) {
         guard var parts = URLComponents(string: relay) else { return nil }
-        parts.scheme = parts.scheme == "https" ? "wss" : "ws"
+        // Case-insensitive, so `HTTPS://…` can't fall through to an unencrypted `ws`.
+        parts.scheme = parts.scheme?.lowercased() == "https" ? "wss" : "ws"
         parts.path = (parts.path.hasSuffix("/") ? String(parts.path.dropLast()) : parts.path) + "/v1/call/" + invite.room.hex
         // Each call on its own lane, so over Tor it gets its own circuit.
         guard let url = parts.url, let config = try? RelayClient.configuration(for: url, lane: "call|" + invite.room.hex) else { return nil }
         var request = URLRequest(url: url)
         // Over the onion service, joining is rate-limited per circuit only with a proof of work.
         if Tor.isOnion(url) { request.setValue(Work.proof(for: "call|" + invite.room.hex), forHTTPHeaderField: "X-Pulshade-Pow") }
-        task = URLSession(configuration: config).webSocketTask(with: request)
+        // Pin alongside the relay's other requests, and keep the session so it can be invalidated on hang-up.
+        let session = URLSession(configuration: config, delegate: RelayPinning.shared, delegateQueue: nil)
+        self.session = session
+        task = session.webSocketTask(with: request)
         task.maximumMessageSize = 16 * 1024
         crypto = CallCrypto(key: invite.key, caller: caller)
         self.onEvent = onEvent
@@ -157,7 +162,11 @@ final class CallMedia: @unchecked Sendable {
         watchdog?.cancel()
         audio?.stop()
         task.cancel(with: .normalClosure, reason: nil)
+        // The session is ours alone; invalidating it tears down its connection pool instead of leaking one per call.
+        session.invalidateAndCancel()
     }
+
+    deinit { stop() }
 
     /// Loudspeaker or earpiece (iPhone). Remembered, so it applies once the audio starts too.
     func setSpeaker(_ on: Bool) {
@@ -244,7 +253,11 @@ final class CallAudio: @unchecked Sendable {
     /// Loudspeaker (iPhone) rather than the earpiece. The system forgets the override whenever the audio route
     /// changes or echo cancelling comes on, so it's kept here and applied again each time.
     private var speaker = false
-    var muted = false
+    private var isMuted = false
+    var muted: Bool {
+        get { lock.withLock { isMuted } }
+        set { lock.withLock { isMuted = newValue } }
+    }
 
     init?(onPacket: @escaping (Data) -> Void) {
         var description = AudioStreamBasicDescription(mSampleRate: Self.rate, mFormatID: kAudioFormatOpus, mFormatFlags: 0,

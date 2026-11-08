@@ -1,5 +1,8 @@
 import Foundation
 import CryptoKit
+#if canImport(Darwin)
+import Darwin
+#endif
 
 /// A Pulshade identity is nothing more than 32 random bytes kept on this device.
 /// No phone number, no email, no username: every key is derived from the seed.
@@ -146,14 +149,37 @@ struct Invite: Equatable {
     }
 
     /// This machine, a private network address, or a name that only means something on your network.
+    /// Addresses are parsed rather than pattern-matched, so loopback and private space can't be reached
+    /// through another spelling (IPv4-mapped IPv6, `127.1`, `0x7f.0.0.1`, a bare integer, and so on).
     static func isLocal(_ host: String) -> Bool {
-        let bare = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-        if bare == "localhost" || bare.hasSuffix(".local") || !bare.contains(".") && !bare.contains(":") { return true }
-        if bare == "::1" || bare.hasPrefix("fc") || bare.hasPrefix("fd") || bare.hasPrefix("fe80:") { return bare.contains(":") }
-        let parts = bare.split(separator: ".").compactMap { Int($0) }
-        guard parts.count == 4 else { return false }
-        switch (parts[0], parts[1]) {
-        case (127, _), (10, _), (192, 168), (169, 254): return true
+        let bare = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]")).lowercased()
+        if bare == "localhost" || bare.hasSuffix(".local") { return true }
+        if !bare.contains(".") && !bare.contains(":") { return true }
+        // IPv6, including IPv4-mapped addresses such as `::ffff:127.0.0.1`.
+        var v6 = in6_addr()
+        if inet_pton(AF_INET6, bare, &v6) == 1 {
+            let bytes = withUnsafeBytes(of: v6) { Array($0) }
+            if bytes.allSatisfy({ $0 == 0 }) { return true }
+            if bytes.prefix(15).allSatisfy({ $0 == 0 }), bytes[15] == 1 { return true }
+            if bytes.prefix(10).allSatisfy({ $0 == 0 }), bytes[10] == 0xff, bytes[11] == 0xff {
+                return isLocalIPv4(bytes[12], bytes[13], bytes[14], bytes[15])
+            }
+            if bytes[0] == 0xfe, bytes[1] & 0xc0 == 0x80 { return true }
+            if bytes[0] & 0xfe == 0xfc { return true }
+            return false
+        }
+        // IPv4, through `inet_aton` so the legacy forms Apple's resolver accepts are caught too.
+        var v4 = in_addr()
+        if inet_aton(bare, &v4) == 1 {
+            let bytes = withUnsafeBytes(of: v4) { Array($0) }
+            return isLocalIPv4(bytes[0], bytes[1], bytes[2], bytes[3])
+        }
+        return false
+    }
+
+    private static func isLocalIPv4(_ a: UInt8, _ b: UInt8, _ c: UInt8, _ d: UInt8) -> Bool {
+        switch (a, b) {
+        case (0, _), (127, _), (10, _), (192, 168), (169, 254): return true
         case (172, 16...31): return true
         case (100, 64...127): return true  // carrier-grade NAT, also used by private overlay networks
         default: return false
@@ -231,7 +257,9 @@ enum Base32 {
 extension Data {
     static func random(_ count: Int) -> Data {
         var bytes = Data(count: count)
-        _ = bytes.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, count, $0.baseAddress!) }
+        let status = bytes.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, count, $0.baseAddress!) }
+        // Key material must never silently become a run of zeros.
+        precondition(status == errSecSuccess, "System random generator failed")
         return bytes
     }
 }

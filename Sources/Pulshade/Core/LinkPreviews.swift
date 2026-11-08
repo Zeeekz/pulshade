@@ -46,6 +46,7 @@ enum LinkPreviews {
         let meta = Meta(html: String(decoding: data, as: UTF8.self))
         var image: Data?
         if let src = meta.image, let imageURL = URL(string: src, relativeTo: page)?.absoluteURL, isWebLink(imageURL.absoluteString),
+           let host = imageURL.host()?.lowercased(), !Invite.isLocal(host),
            let (raw, _) = await get(imageURL, in: session, limit: 3 * 1024 * 1024),
            let picture = PlatformImage(data: raw) {
             image = cleanJPEG(picture, maxSide: 600)

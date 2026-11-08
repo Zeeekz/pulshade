@@ -54,7 +54,7 @@ enum Envelope {
         let sender = me.agreementKey.publicKey.rawRepresentation
         let body = try payload.wire(framed: framed)
         let inner = Inner(from: me.signingKey.publicKey.rawRepresentation, bind: try binding(me), body: framed ? Data() : body,
-                          device: device.isEmpty ? nil : device, at: UInt64(RelayClock.now.timeIntervalSince1970), caps: reads)
+                          device: device.isEmpty ? nil : device, at: UInt64(max(0, RelayClock.now.timeIntervalSince1970)), caps: reads)
         let innerPlain = framed ? Frame.join(try JSONEncoder().encode(inner), body) : try JSONEncoder().encode(inner)
 
         let ephemeral = Curve25519.KeyAgreement.PrivateKey()

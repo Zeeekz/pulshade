@@ -451,13 +451,19 @@ final class AppModel {
             case let .panic(landing, slot):
                 // Looks like a normal unlock. Behind it, everything real is gone, and the landing identity
                 // becomes the main one, so nothing about it looks like a disguise afterwards.
-                try? await Task.detached { try vault.panic(keeping: landing, slot: slot, passcode: passcode) }.value
+                do {
+                    try await Task.detached { try vault.panic(keeping: landing, slot: slot, passcode: passcode) }.value
+                } catch {
+                    // The real account couldn't be destroyed. Don't report success or open the landing account
+                    // over whatever is still on disk; refusing the unlock is the safe outcome.
+                    return false
+                }
                 Notifier.shared.clearAll()
                 // The real account's mailboxes can't be named any more: take this phone's token off the relay instead.
                 withdrawPush()
                 self.identity = landing
                 self.slot = 0
-                data = (try? vault.load(with: landing)) ?? AppData()
+                data = try storedData(landing)
             }
             failedAttempts = 0
             didUnlock()
@@ -670,6 +676,14 @@ final class AppModel {
         identityCache = [:]
         DecodedImages.forget()
         eggs = []
+        // Per-contact state derived from the account that was open, including text typed into requests.
+        removedStories = [:]
+        clipActivity = [:]
+        clipAsks = [:]
+        clipResent = [:]
+        lastMend = [:]
+        requestNotes = [:]
+        movedOffIntro = []
     }
 
     /// Detach: wipes this device at once, with no questions and no waiting on the network. Everything is overwritten
@@ -741,6 +755,9 @@ final class AppModel {
 
     /// The newest state waiting to be written, with the account it belongs to.
     @ObservationIgnored private var unsaved: (data: AppData, identity: Identity)?
+    /// Bumped for every write that starts and whenever waiting writes are dropped, so a failed write can tell
+    /// whether anything newer has been queued before it puts its own copy back.
+    @ObservationIgnored private var saveGeneration = 0
     @ObservationIgnored private var saveTimer: Task<Void, Never>?
     /// Writes happen here, one at a time and in order, so the main thread never waits on encrypting the whole vault.
     private static let saveQueue = DispatchQueue(label: "pulshade.save", qos: .userInitiated)
@@ -771,8 +788,22 @@ final class AppModel {
         saveTimer = nil
         guard let (data, identity) = unsaved else { return }
         unsaved = nil
+        saveGeneration += 1
+        let generation = saveGeneration
         let vault = vault
-        Self.saveQueue.async { try? vault.save(data, with: identity) }
+        Self.saveQueue.async { [weak self] in
+            do {
+                try vault.save(data, with: identity)
+            } catch {
+                // A failed write keeps the waiting copy so a later save retries it, rather than losing every
+                // change since the last successful write — unless something newer is already queued, or the
+                // vault was wiped in the meantime.
+                Task { @MainActor in
+                    guard let self, self.unsaved == nil, self.saveGeneration == generation else { return }
+                    self.unsaved = (data, identity)
+                }
+            }
+        }
     }
 
     /// Writes whatever is waiting and returns once it's on disk: before locking, quitting, going to the background,
@@ -787,6 +818,7 @@ final class AppModel {
         saveTimer?.cancel()
         saveTimer = nil
         unsaved = nil
+        saveGeneration += 1
         Self.saveQueue.sync {}
     }
 
@@ -926,9 +958,10 @@ final class AppModel {
         var link = DeviceLink(sendID: invite.sendID)
         link.handshake = handshake
         contact.devices = [link]
+        guard let meCard = card(sendID: mailbox.sendID, persona: owner) else { return nil }
         upsert(contact)
         syncContact(contact.fingerprint, contact.persona)
-        seal(.hello(card(sendID: mailbox.sendID, persona: owner), request), to: contact.fingerprint, persona: owner)
+        seal(.hello(meCard, request), to: contact.fingerprint, persona: owner)
         shareStories(with: contact)
         save()
         return contact
@@ -983,10 +1016,12 @@ final class AppModel {
         }
     }
 
-    private func card(sendID: Data, persona: UUID?) -> PeerCard {
-        let profile = profile(for: persona), keys = me(persona)!.card
+    private func card(sendID: Data, persona: UUID?) -> PeerCard? {
+        // A persona whose stored seed is damaged has no keys; don't force-unwrap and crash the app.
+        guard let keys = me(persona) else { return nil }
+        let profile = profile(for: persona)
         return PeerCard(name: profile.name, avatar: profile.avatar, color: profile.color,
-                        signingKey: keys.signing, agreementKey: keys.agreement, sendID: sendID, device: deviceID(for: persona))
+                        signingKey: keys.card.signing, agreementKey: keys.card.agreement, sendID: sendID, device: deviceID(for: persona))
     }
 
     /// The notes of a profile that one contact is sent: the ones for everyone and the ones chosen for them, checked
@@ -2677,9 +2712,10 @@ final class AppModel {
         contact.relay = Invite.allowedRelay(profile.relay)
         contact.awaitingAcceptance = true
         contact.devices[0].handshake = handshake
+        guard let meCard = card(sendID: mailbox.sendID, persona: persona) else { return nil }
         upsert(contact)
         requestNotes["\(persona?.uuidString ?? "main")|\(profile.fingerprint)"] = String(note.prefix(280))
-        seal(.request(card(sendID: mailbox.sendID, persona: persona), request, note: String(note.prefix(280))),
+        seal(.request(meCard, request, note: String(note.prefix(280))),
              to: profile.fingerprint, persona: persona)
         syncContact(contact.fingerprint, persona)
         save()
@@ -3037,7 +3073,9 @@ final class AppModel {
     func removeDecoy() {
         guard isPrimary else { return pretend { $0.decoy = false } }
         guard let seed = data.decoySeed else { return }
-        try? vault.clearSlot(1, identity: try? Identity(seed: seed))
+        // Only forget the seed once the slot really was cleared; otherwise a live decoy passcode would be
+        // reported as removed and dropped from the files that track it.
+        do { try vault.clearSlot(1, identity: try? Identity(seed: seed)) } catch { return }
         data.decoySeed = nil
         // Face ID may have been turned on inside the decoy.
         vault.disableBiometrics()
@@ -3109,7 +3147,7 @@ final class AppModel {
     func removePanic() {
         guard isPrimary else { return pretend { $0.panic = false } }
         guard let seed = data.panicSeed else { return }
-        try? vault.clearSlot(2, identity: try? Identity(seed: seed))
+        do { try vault.clearSlot(2, identity: try? Identity(seed: seed)) } catch { return }
         data.panicSeed = nil
         save()
         rebalanceFiles()
@@ -3164,17 +3202,22 @@ final class AppModel {
         for d in data.contacts[i].devices.indices {
             guard var session = data.contacts[i].devices[d].session, session.canSend,
                   !data.contacts[i].devices[d].pending.isEmpty else { continue }
-            for item in data.contacts[i].devices[d].pending {
+            let pending = data.contacts[i].devices[d].pending
+            data.contacts[i].devices[d].pending = []
+            for item in pending {
                 // To an app that reads frames, big things go without the base64 that nearly doubles them at each
                 // layer. Short messages are sent exactly as before.
                 let frames = data.contacts[i].devices[d].readsFrames == true
                 guard let plain = try? item.payload.wire(framed: frames),
-                      let message = try? session.encrypt(plain) else { continue }
+                      let message = try? session.encrypt(plain) else {
+                    // Couldn't be sealed: keep it to try again rather than dropping it silently.
+                    data.contacts[i].devices[d].pending.append(item)
+                    continue
+                }
                 seal(.ratchet(message), contact: i, device: d, message: item.message, ephemeral: item.payload.isEphemeral,
                      story: item.payload.storyID, rings: item.payload.rings, framed: frames && message.ciphertext.count > Self.smallEnvelope)
             }
             data.contacts[i].devices[d].session = session
-            data.contacts[i].devices[d].pending = []
         }
     }
 
@@ -3305,7 +3348,8 @@ final class AppModel {
                   let kem = try? MLKEM768.PrivateKey(seedRepresentation: handshake.kemSeed, publicKey: nil), me(c.persona) != nil else { continue }
             let request = SessionInit(ephemeral: public_, kem: kem.publicKey.rawRepresentation)
             let note = requestNotes["\(c.persona?.uuidString ?? "main")|\(c.fingerprint)"] ?? ""
-            seal(.request(card(sendID: Mailbox.sendID(for: key), persona: c.persona), request, note: note),
+            guard let meCard = card(sendID: Mailbox.sendID(for: key), persona: c.persona) else { continue }
+            seal(.request(meCard, request, note: note),
                  to: c.fingerprint, persona: c.persona)
             // Sent again only to be sure it arrived: it wakes their phone only when the relay may have lost the first
             // (a restart), not every time this app is opened while it waits.
@@ -4403,7 +4447,14 @@ final class AppModel {
         case let .disappearing(shared, seconds):
             guard let i = conversationIndex(shared, from: sender, create: true),
                   data.conversations[i].kind != .channel, data.conversations[i].disappearAfter != seconds else { break }
-            let valid = seconds.flatMap(Disappear.init(rawValue:))?.rawValue
+            // An unknown or out-of-range value is ignored, not applied as "turn the timer off".
+            let valid: TimeInterval?
+            if let seconds {
+                guard let timer = Disappear(rawValue: seconds) else { break }
+                valid = timer.rawValue
+            } else {
+                valid = nil
+            }
             applyTimer(valid, at: i)
         case .burn:
             forget(sender)
