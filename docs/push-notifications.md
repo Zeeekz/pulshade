@@ -34,9 +34,3 @@ keeps running.
 It's like notifications in any app, minus the content. People who need the strongest anonymity should leave it off.
 Settings says so plainly beside the switch.
 
-## For the operator
-
-Apple's push key (a `.p8` file) and its two IDs live on the relay's server only, never in this repository. See
-[Maintaining Pulshade](maintaining.md). A relay without a key answers `{"enabled": false}` to `GET /v1/push`, and
-phones don't register. Registrations are kept in memory only and never written to disk, so a restart or crash clears them until
-each phone renews (every 15 minutes while Pulshade is open, and at every launch).

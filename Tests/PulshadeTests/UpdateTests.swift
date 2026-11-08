@@ -45,7 +45,7 @@ struct UpdateTests {
         #expect(Updater.acceptable(201))
     }
 
-    /// The relay hands out whatever release sits in its folder, untouched. Needs the throwaway relay from scripts/test.sh.
+    /// The relay hands out whatever release sits in its folder, untouched. Needs a throwaway relay.
     @Test(.enabled(if: ProcessInfo.processInfo.environment["PULSHADE_RELAY_TEST"] == "1"))
     func theRelayHandsOutTheReleaseInItsFolder() async throws {
         let relay = try #require(ProcessInfo.processInfo.environment["PULSHADE_TEST_RELAY"].flatMap(URL.init(string:)))
