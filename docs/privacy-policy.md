@@ -20,7 +20,8 @@ to use Pulshade, and over Tor the server never sees your IP address. We don't se
 privacy: every message has its own fresh key, sizes are padded, there are no accounts or phone numbers, the server keeps
 no logs, and what is stored is sealed so we can't read it. Everything we store is either encrypted so that we can't
 read it, or public because you chose to make it public.
-Nothing about you or your messages is kept in readable form. Here is every kind of thing, in plain words:
+Nothing about you or your messages is kept in readable form. Even the server's own files are sealed, with a key that
+is never written to its disk. Here is every kind of thing, in plain words:
 
 | What | Where it is kept | How long | Can we read it? |
 | --- | --- | --- | --- |
@@ -30,6 +31,7 @@ Nothing about you or your messages is kept in readable form. Here is every kind 
 | **Sealed backup** (profile, contacts, groups, settings; never chats) | The server's disk | Until you switch it off, Burn, or 180 days without an update | No. Sealed with a key only your recovery code makes. |
 | **Public @handle and profile** (only if you choose one) | The server's disk | Until you let it go | Yes, it is public by your choice. |
 | **Collectibles you own** | The server's disk | While they exist | They're not secret: the item, its number and a hash of its code. |
+| **The server's own records and keys** (handle directory, held handles, moderation lists, collectible records, announcements; its push, pet-signing and onion keys) | The server's disk | While the service runs | Only the server, which needs them to work. Sealed with its storage key, which is held in memory only and never written to the disk; after a reboot the server stays locked until we unlock it. The admin password is kept only as a hash. |
 | **Wake-up token** (only if you turn on "Wake when locked") | The server's memory only | While it's on | It is a device token and nothing else. |
 
 Photos, voice notes and text travel inside the encrypted message itself, so they wait in the server's memory like any
@@ -87,7 +89,10 @@ throwaway key and carries your handle only if you add it.
 **Network information.** Over Tor, the server sees a made-up address for each connection, not your IP address. If you
 turn Tor off in Settings, the server sees your IP address and roughly where you are, and your personas could be tied
 together by it. To limit abuse, the server counts requests per sender using a hash of the address with a salt that is
-replaced every hour. It never keeps the address itself. No request log is kept.
+replaced every hour. It never keeps the address itself: there is no request log, and the web proxy in front of the
+server keeps no access log. On Fast your address is still in the server's memory while you're connected, and a server
+could in principle match the address that sent a message with the one that collected it. Ours doesn't record that, but
+on Fast you are trusting us not to; Tor removes the need.
 
 **What the server can see about traffic.** It can see that a sealed envelope arrived at a random mailbox, when, and
 how large (within a few set sizes). It can't see who sent it, who you are behind Tor, or what is inside.
@@ -117,7 +122,9 @@ word it for each region.]
 - **The people who run the server and the network it sits on** can see the same traffic facts as any server: that a
   sealed envelope arrived, when, and how large, plus your IP address if you connect without Tor.
 - **Hosting.** The relay runs on a rented server. The company that rents it can see the machine's network traffic and
-  could take it offline, but cannot read what is sealed. [Say where the server is and who rents it out, if you decide to.]
+  could take it offline. Its disk holds nothing readable, because the key that opens the server's files is never stored
+  there. Like anyone who controls a running computer, the host could in principle read its memory, which is why
+  everything personal is sealed on your phone first.
 - **Law enforcement and other legal requests.** We can only hand over what we hold, and what we hold is sealed or
   public, as the table above shows. We have no message content, no account identity, no phone numbers or emails, no
   contact lists and no request logs to give. If a lawful order arrives we will review it, answer it only as far as the
@@ -129,7 +136,8 @@ word it for each region.]
 
 - We don't sell, rent or share your information.
 - We don't use advertising, analytics or tracking, in the app or on the server.
-- We don't build profiles of you. We can't link your personas to each other.
+- We don't build profiles of you. Over Tor we can't link your personas to each other; on Fast they connect from the same
+  IP address, which we don't record.
 - We don't ask for your phone number, email address, name or contacts.
 - The app talks only to Pulshade's servers.
 
@@ -175,6 +183,9 @@ no accounts, can't tell who is a child. If you think a child is using Pulshade, 
 If we change this policy we'll update the date above, add a line to the list below and tell people in the app's
 announcements. The code and documentation show what the app does at any time.
 
+- **Build 10:** the server's own records and keys are sealed with a key that is never written to its disk; the admin
+  password is kept only as a hash; what Fast means for your IP address, and that the web proxy keeps no access log;
+  what the hosting company could see.
 - **Build 8:** added what Pulshade never asks for (address book), what the camera, microphone and photo permissions
   are used for, disappearing messages, why we handle information, who may see it (hosting, legal requests), and a single
   list of how long everything is kept.
