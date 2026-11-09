@@ -6,7 +6,9 @@ import CryptoKit
 /// phone locked or the app swiped away. It confirms to friends that their messages reached this phone (see
 /// `LockedDelivery`), then shows the notification exactly as it came: "New message", nothing more.
 ///
-/// It never opens a message and never takes mail off the relay: Pulshade itself still collects and reads it.
+/// It never opens a message. Short mail (texts, receipts, reactions) it takes off the relay into a sealed inbox on the
+/// phone, so it's gone from the server within seconds; Pulshade reads it from there. Photos, videos and story pieces
+/// stay on the relay for Pulshade itself: they're too big for the few seconds and little memory the helper gets.
 final class NotificationService: UNNotificationServiceExtension {
     private let lock = NSLock()
     private var content: UNNotificationContent?
@@ -53,8 +55,15 @@ private enum Helper {
         let session = URLSession(configuration: config, delegate: Pinning(host: base.host()), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
 
-        let mail = await fetch(bundle.receiveKeys, from: base, in: session)
-        guard !mail.isEmpty, !Task.isCancelled else { return }
+        let fetched = await fetch(bundle.receiveKeys, from: base, in: session)
+        guard !fetched.isEmpty, !Task.isCancelled else { return }
+        let mail = fetched.map(\.mail)
+
+        // Short mail into the inbox first, and only what was kept comes off the relay: saved, then acknowledged,
+        // so nothing can be lost in between. A full inbox (Pulshade not opened for days) leaves the rest where it is.
+        let kept = LockedDelivery.keepShortMail(fetched)
+        if !kept.isEmpty, !Task.isCancelled { await acknowledge(kept, at: base, in: session) }
+
         let notes = LockedDelivery.notes(for: mail, bundle: bundle, confirmed: Set(HelperStore.confirmed().keys))
         var sent: [Data] = []
         for note in notes where !Task.isCancelled {
@@ -63,11 +72,14 @@ private enum Helper {
         if !sent.isEmpty { HelperStore.remember(sent) }
     }
 
-    /// What's waiting in these mailboxes, without acknowledging any of it.
-    private static func fetch(_ keys: [Data], from base: URL, in session: URLSession) async -> [LockedDelivery.Mail] {
-        struct Item: Decodable { var k: Int; var blob: String }
+    typealias Fetched = LockedDelivery.Fetched
+
+    /// What's waiting in these mailboxes. Nothing comes off the relay here.
+    private static func fetch(_ keys: [Data], from base: URL, in session: URLSession) async -> [Fetched] {
+        struct Item: Decodable { var k: Int; var id: UInt64; var blob: String; var age: Double? }
         struct Answer: Decodable { var items: [Item] }
-        var mail: [LockedDelivery.Mail] = []
+        var mail: [Fetched] = []
+        let now = Date()
         for start in stride(from: 0, to: keys.count, by: 256) {
             let chunk = Array(keys[start..<min(start + 256, keys.count)])
             var request = URLRequest(url: base.appending(path: "v1/fetch"))
@@ -79,10 +91,23 @@ private enum Helper {
                   (response as? HTTPURLResponse)?.statusCode == 200,
                   let answer = try? JSONDecoder().decode(Answer.self, from: data) else { continue }
             for item in answer.items where chunk.indices.contains(item.k) {
-                if let blob = Data(base64Encoded: item.blob) { mail.append(.init(receiveKey: chunk[item.k], blob: blob)) }
+                guard let blob = Data(base64Encoded: item.blob) else { continue }
+                mail.append(Fetched(mail: .init(receiveKey: chunk[item.k], blob: blob), id: item.id,
+                                    deposited: item.age.map { now.addingTimeInterval(-max(0, $0)) }))
             }
         }
         return mail
+    }
+
+    /// Takes what the inbox now holds off the relay.
+    private static func acknowledge(_ items: [Fetched], at base: URL, in session: URLSession) async {
+        let grouped = Dictionary(grouping: items, by: \.mail.receiveKey)
+        let acks: [[String: Any]] = grouped.map { ["key": hex($0.key), "ids": $0.value.map(\.id)] }
+        var request = URLRequest(url: base.appending(path: "v1/ack"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        guard let json = try? JSONSerialization.data(withJSONObject: ["acks": acks]) else { return }
+        _ = try? await session.upload(for: request, from: json)
     }
 
     /// Hands a note to the relay without waking anyone: it's only a tick.

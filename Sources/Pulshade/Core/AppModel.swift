@@ -4090,6 +4090,36 @@ final class AppModel {
         identity.flatMap { helperBundle($0, relay: relay) }
     }
 
+    /// Reads what the helper took off the relay while the phone was locked, through the same path as mail from the
+    /// relay, oldest first. Each is removed only once what it changed is saved, as with the relay's acknowledgement.
+    /// One this device can't use yet (a device it hasn't met) waits as long as it would have on the relay.
+    func drainHelperInbox() {
+        guard phase == .unlocked, isPrimary, identity != nil else { return }
+        let waiting = HelperStore.inbox()
+        guard !waiting.isEmpty else { return }
+        var done: [String] = []
+        for (name, item) in waiting {
+            // Not a mailbox this account reads: never thrown away for that, only once it's as old as the relay would
+            // keep it.
+            guard persona(forMailbox: item.receiveKey) != nil else {
+                if Date().timeIntervalSince(item.collected) > 7 * 24 * 3600 { done.append(name) }
+                continue
+            }
+            let envelope = RelayEnvelope(receiveKey: item.receiveKey, id: 0, blob: item.blob, deposited: item.deposited)
+            switch receive(envelope) {
+            case .handled, .junk:
+                done.append(name)
+            case .retry:
+                if Date().timeIntervalSince(item.deposited ?? item.collected) >= Self.deferredMailLimit { done.append(name) }
+            }
+        }
+        guard !done.isEmpty else { return }
+        lastMailReceived = Date()
+        save()
+        settleSaves()
+        HelperStore.remove(done)
+    }
+
     /// The bundle as last written, so it's only written again when it changes.
     @ObservationIgnored private var helperWritten: HelperBundle?
     @ObservationIgnored private var helperKnown = false
@@ -4103,7 +4133,13 @@ final class AppModel {
         helperChecked = Date()
         let bundle = lockedDeliveryOn ? helperBundle(identity) : nil
         guard !helperKnown || bundle != helperWritten else { return }
-        if let bundle { HelperStore.save(bundle) } else { HelperStore.clear() }
+        if let bundle {
+            HelperStore.save(bundle)
+        } else {
+            // Turned off: what the helper took off the relay is read first, so none of it goes unread.
+            drainHelperInbox()
+            HelperStore.clear()
+        }
         helperWritten = bundle
         helperKnown = true
         #endif
@@ -4515,6 +4551,7 @@ final class AppModel {
     /// Sending, retries and receipts, every couple of seconds. Also keeps the sending lane's circuit warm, so
     /// pressing send doesn't wait for Tor to build one.
     private func housekeep() async {
+        drainHelperInbox()
         tendStoryUpload()
         refreshPush()
         watchTor()

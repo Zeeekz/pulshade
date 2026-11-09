@@ -45,12 +45,36 @@ enum LockedDelivery {
         var blob: Data
     }
 
+    /// An envelope as fetched, with what's needed to take it off the relay later.
+    struct Fetched {
+        var mail: Mail
+        var id: UInt64
+        var deposited: Date?
+    }
+
+    /// Puts the short ones into the phone's inbox, as many as there's room for, and returns those: only they may come
+    /// off the relay, and only after this. Big ones (photos, videos, story pieces) are left for Pulshade.
+    static func keepShortMail(_ fetched: [Fetched], now: Date = Date()) -> [Fetched] {
+        var room = HelperStore.inboxLimit - HelperStore.inboxCount
+        var kept: [Fetched] = []
+        for item in fetched where item.mail.blob.count <= shortMail && room > 0 {
+            let entry = HelperStore.InboxItem(receiveKey: item.mail.receiveKey, blob: item.mail.blob,
+                                              deposited: item.deposited, collected: now)
+            if HelperStore.keep(entry) { kept.append(item); room -= 1 }
+        }
+        return kept
+    }
+
     /// A note to one of a friend's devices naming the envelopes of theirs that reached this one.
     struct Note {
         var sendID: Data
         var blob: Data
         var digests: [Data]
     }
+
+    /// The biggest envelope the helper takes off the relay into the phone's inbox: the relay's own line between a
+    /// message and a photo or story piece. Bigger ones wait for Pulshade.
+    static let shortMail = 64 * 1024
 
     /// How an envelope is named, by both sides: the first 16 bytes of the SHA-256 of the envelope exactly as it sat
     /// on the relay. The sender works it out when the relay takes it; this phone when it collects it.
