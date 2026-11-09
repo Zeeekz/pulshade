@@ -255,11 +255,11 @@ struct ConversationView: View {
             // are. Never while your finger is on it. This is the one place that moves the chat on its own, so
             // nothing fights it.
             .onScrollGeometryChange(for: ScrollShape.self) {
-                ScrollShape(content: $0.contentSize.height, container: $0.containerSize.height, offset: $0.contentOffset.y)
+                ScrollShape(content: $0.contentSize.height, container: $0.containerSize.height, bottom: $0.visibleRect.maxY)
             } action: { old, new in
-                scrollTrack.distance = new.content - new.offset - new.container
+                scrollTrack.distance = new.content - new.bottom
                 guard new.content != old.content || new.container != old.container, !scrollTrack.touching else { return }
-                let wasNear = old.content - old.offset - old.container < 120
+                let wasNear = old.content - old.bottom < 120
                 guard pinnedToEnd || wasNear else { return }
                 // Rows are only measured as they come into view, so a chat that has just opened settles from a guess:
                 // straight there, not in a glide.
@@ -274,7 +274,7 @@ struct ConversationView: View {
                 DispatchQueue.main.async { proxy.scrollTo("end", anchor: .bottom) }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { opening = false }
             }
-            .onScrollGeometryChange(for: Bool.self) { $0.contentSize.height - $0.contentOffset.y - $0.containerSize.height > 320 } action: { _, far in
+            .onScrollGeometryChange(for: Bool.self) { $0.contentSize.height - $0.visibleRect.maxY > 320 } action: { _, far in
                 if showJumpDown != far { withAnimation(.snappy(duration: 0.2)) { showJumpDown = far } }
                 if !far { unreadBelow = 0 }
             }
@@ -304,7 +304,9 @@ struct ConversationView: View {
                 }
             }
             .overlay(alignment: .bottomTrailing) {
-                if showJumpDown {
+                // Only once you've scrolled up yourself: while the chat follows the bottom it can be far from it for
+                // a moment (a tall photo arriving, a chat still settling as it opens), and the button flashed up.
+                if showJumpDown && !pinnedToEnd {
                     Button {
                         pinnedToEnd = true
                         unreadBelow = 0
@@ -1386,7 +1388,8 @@ private final class ScrollTrack {
 private struct ScrollShape: Equatable {
     var content: CGFloat
     var container: CGFloat
-    var offset: CGFloat
+    /// The bottom of what's on screen, in the content's own measure: at the newest message it equals `content`.
+    var bottom: CGFloat
 }
 
 private struct TypingDots: View {
