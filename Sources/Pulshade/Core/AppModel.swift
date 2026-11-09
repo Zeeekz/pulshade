@@ -3826,6 +3826,7 @@ final class AppModel {
         data.contacts[i].devices[d].session = session
         data.contacts[i].devices[d].handshake = nil
         data.contacts[i].devices[d].awaitingHello = nil
+        data.contacts[i].devices[d].answeredAt = nil
         data.contacts[i].devices[d].acceptedHello = request.ephemeral
         // New keys are in place: no more asking for them because of messages that were read with the old ones.
         unreadable[sessionKey(contact: i, device: d)] = nil
@@ -4115,6 +4116,14 @@ final class AppModel {
         if data.contacts[i].devices.count >= Self.maxDevicesPerContact { data.contacts[i].devices.removeFirst() }
         data.contacts[i].devices.append(DeviceLink(id: id, sendID: sendID))
         return data.contacts[i].devices.count - 1
+    }
+
+    /// Whether a hello was sent before the other device answered ours: the two started at once, ours won and theirs
+    /// got here after our session was already open. Taking it would replace that session with one they no longer have
+    /// (they gave theirs up to answer ours), and nothing after would open on either side.
+    private func hello(_ sentAt: Date, crossedOurs link: DeviceLink) -> Bool {
+        guard link.session != nil, let answered = link.answeredAt else { return false }
+        return sentAt <= answered
     }
 
     /// When two devices start a handshake with each other at once, the lower (fingerprint, device) wins.
@@ -4991,6 +5000,10 @@ final class AppModel {
             if data.contacts[i].devices[d].handshake != nil && myHandshakeWins(me: me.fingerprint, persona: persona, them: fp, theirDevice: device) {
                 return .handled
             }
+            if hello(opened.sentAt, crossedOurs: data.contacts[i].devices[d])
+                && myHandshakeWins(me: me.fingerprint, persona: persona, them: fp, theirDevice: device) {
+                return .handled
+            }
             acceptSession(request, contact: i, device: d)
             return .handled
         case let .sessionInit(request):
@@ -4999,6 +5012,10 @@ final class AppModel {
                 return .handled
             }
             if data.contacts[i].devices[d].handshake != nil && myHandshakeWins(me: me.fingerprint, persona: persona, them: fp, theirDevice: device) {
+                return .handled
+            }
+            if hello(opened.sentAt, crossedOurs: data.contacts[i].devices[d])
+                && myHandshakeWins(me: me.fingerprint, persona: persona, them: fp, theirDevice: device) {
                 return .handled
             }
             acceptSession(request, contact: i, device: d)
@@ -5010,6 +5027,8 @@ final class AppModel {
                                                         responderAgreement: data.contacts[i].agreementKey) else { return .junk }
             data.contacts[i].devices[d].session = session
             data.contacts[i].devices[d].handshake = nil
+            // When they answered, by their clock: a hello of theirs sent before that crossed ours (see `hello(_:crossedOurs:)`).
+            data.contacts[i].devices[d].answeredAt = opened.sentAt
             // New keys are in place: no more asking for them because of messages that were read with the old ones.
             unreadable[sessionKey(contact: i, device: d)] = nil
             return .handled

@@ -89,6 +89,9 @@ struct DeviceLink: Codable {
     /// Their app answers group messages with a receipt, so a group's tick can wait for this device. Nil for an app
     /// from before, which neither sends nor expects one.
     var readsGroupReceipts: Bool?
+    /// When this device answered a handshake of ours, by its own clock. A hello of theirs sent no later than this
+    /// crossed ours on the way and is not taken (it would replace the session this answer opened).
+    var answeredAt: Date?
 
     init(id: Data = Data(), sendID: Data) {
         self.id = id
