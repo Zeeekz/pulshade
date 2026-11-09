@@ -238,8 +238,82 @@ final class SegmentSink: NSObject, AVAssetWriterDelegate, @unchecked Sendable {
 }
 
 /// Short, small story clips: at most 15 seconds, portrait 720p H.264, small enough for one encrypted message.
+/// Where a picture or video sits in the story's frame. `zoom` is relative to the size that just fills the frame, so
+/// 1 fills it (and cuts off what spills over), and less than that shrinks it until it all shows (with a blurred copy
+/// of itself behind the rest). The move is in fractions of the frame's width and height, down and to the right.
+struct StoryFraming: Equatable, Sendable {
+    var zoom: CGFloat = 1
+    var dx: CGFloat = 0
+    var dy: CGFloat = 0
+
+    static let fill = StoryFraming()
+    static let mostZoom: CGFloat = 4
+
+    /// The size where the whole picture shows: the zoom (against filling) at which the longer side just fits.
+    static func fitZoom(source: CGSize, frame: CGSize) -> CGFloat {
+        guard source.width > 0, source.height > 0 else { return 1 }
+        let fill = max(frame.width / source.width, frame.height / source.height)
+        let fit = min(frame.width / source.width, frame.height / source.height)
+        return min(1, fit / fill)
+    }
+
+    static func fit(source: CGSize, frame: CGSize) -> StoryFraming {
+        StoryFraming(zoom: fitZoom(source: source, frame: frame))
+    }
+
+    /// How far it may still move along each side, in fractions of the frame. Shrunk, it stays inside; grown, it stays
+    /// covering.
+    func spare(source: CGSize, frame: CGSize) -> (x: CGFloat, y: CGFloat) {
+        guard source.width > 0, source.height > 0 else { return (0, 0) }
+        let scale = max(frame.width / source.width, frame.height / source.height) * zoom
+        return (abs(source.width * scale - frame.width) / 2 / frame.width,
+                abs(source.height * scale - frame.height) / 2 / frame.height)
+    }
+
+    func clamped(source: CGSize, frame: CGSize) -> StoryFraming {
+        let low = Self.fitZoom(source: source, frame: frame)
+        var out = self
+        out.zoom = min(max(zoom.isFinite ? zoom : 1, low), Self.mostZoom)
+        let room = out.spare(source: source, frame: frame)
+        out.dx = min(max(dx.isFinite ? dx : 0, -room.x), room.x)
+        out.dy = min(max(dy.isFinite ? dy : 0, -room.y), room.y)
+        return out
+    }
+}
+
+/// The framing the picture is read through, changed from the editor while the preview plays and read by the frame
+/// renderer on its own thread.
+final class FramingBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: StoryFraming
+    init(_ value: StoryFraming = .fill) { current = value }
+    var value: StoryFraming {
+        get { lock.withLock { current } }
+        set { lock.withLock { current = newValue } }
+    }
+}
+
 enum StoryVideo {
     static let maxSeconds: Double = 15
+    /// The longest video that can be turned into stories: it is cut into parts of `maxSeconds`, like Instagram does.
+    static let longestSeconds: Double = 300
+    /// What the parts of one video may add up to, since every contact gets every part: more parts, smaller parts.
+    static let totalBudget = 24_000_000
+
+    /// How many stories a video of this length becomes.
+    static func parts(of seconds: Double) -> Int {
+        guard seconds.isFinite, seconds > 0 else { return 1 }
+        return max(1, Int((min(seconds, longestSeconds) / maxSeconds).rounded(.up)))
+    }
+
+    /// The size each part may be, when a video comes in `parts`.
+    static func budget(parts: Int) -> Int { min(maxBytes, max(1_200_000, totalBudget / max(parts, 1))) }
+
+    /// The whole length of a clip, up to `longestSeconds`.
+    static func fullDuration(of clip: MemoryClip) async -> Double {
+        let seconds = (try? await clip.makeAsset().load(.duration).seconds) ?? 0
+        return seconds.isFinite ? min(max(seconds, 0), longestSeconds) : 0
+    }
     /// What goes in a story, in bytes. It travels in pieces, each its own relay message, and the receiver joins them:
     /// two of `StoryClipPieces.framedSize` to an app that reads frames (4 MiB on the wire), four of
     /// `StoryClipPieces.size` to an older one (12 MiB, see there). At 15 seconds this leaves about 1.9 Mbit/s,
@@ -262,18 +336,32 @@ enum StoryVideo {
 
     /// The look to bake into every frame, scaled to fill the story's 9:16 frame and centred.
     static func composition(for asset: AVAsset, filter: StoryFilter, size: CGSize = StoryVideo.size,
-                            zoom: ZoomTrack = .none, text: CIImage? = nil) -> AVMutableVideoComposition {
+                            zoom: ZoomTrack = .none, text: CIImage? = nil, framing: FramingBox? = nil) -> AVMutableVideoComposition {
         // The words are drawn once at full HD and fitted to this clip's size, then laid over every frame.
         let words = text.map { $0.transformed(by: CGAffineTransform(scaleX: size.width / $0.extent.width, y: size.width / $0.extent.width)) }
         let composition = AVMutableVideoComposition(asset: asset) { request in
             let source = request.sourceImage
             let e = source.extent
-            let scale = max(size.width / e.width, size.height / e.height)
-            var image = source.transformed(by: CGAffineTransform(translationX: -e.minX, y: -e.minY))
-                .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-            let w = e.width * scale, h = e.height * scale
-            image = image.transformed(by: CGAffineTransform(translationX: (size.width - w) / 2, y: (size.height - h) / 2))
             let frame = CGRect(origin: .zero, size: size)
+            let fillScale = max(size.width / e.width, size.height / e.height)
+            let placed = framing?.value ?? .fill
+            let scale = fillScale * placed.zoom
+            let w = e.width * scale, h = e.height * scale
+            let moved = CGAffineTransform(translationX: (size.width - w) / 2 + placed.dx * size.width,
+                                          y: (size.height - h) / 2 - placed.dy * size.height)
+            let flat = source.transformed(by: CGAffineTransform(translationX: -e.minX, y: -e.minY))
+            var image = flat.transformed(by: CGAffineTransform(scaleX: scale, y: scale)).transformed(by: moved)
+            // Smaller than the frame, or moved off an edge: a soft, darkened copy of the picture fills what's left.
+            if !image.extent.contains(frame.insetBy(dx: 0.5, dy: 0.5)) {
+                let back = flat.transformed(by: CGAffineTransform(scaleX: fillScale, y: fillScale))
+                    .transformed(by: CGAffineTransform(translationX: (size.width - e.width * fillScale) / 2,
+                                                       y: (size.height - e.height * fillScale) / 2))
+                    .clampedToExtent()
+                    .applyingGaussianBlur(sigma: size.width / 14)
+                    .cropped(to: frame)
+                let dim = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0.3)).cropped(to: frame)
+                image = image.composited(over: dim.composited(over: back))
+            }
             // Digital zoom recorded where the camera couldn't zoom for real (the Mac).
             let z = zoom.value(at: request.compositionTime.seconds)
             if z > 1.001 {
@@ -290,6 +378,16 @@ enum StoryVideo {
         return composition
     }
 
+    /// The picture's size as it is shown (rotation applied), or nil if it can't be read.
+    static func uprightSize(of clip: MemoryClip) async -> CGSize? {
+        let asset = clip.makeAsset()
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+              let (natural, transform) = try? await track.load(.naturalSize, .preferredTransform) else { return nil }
+        let upright = natural.applying(transform)
+        let size = CGSize(width: abs(upright.width), height: abs(upright.height))
+        return size.width > 0 && size.height > 0 ? size : nil
+    }
+
     /// How long the clip plays in a story, capped.
     static func duration(of clip: MemoryClip) async -> Double {
         let seconds = (try? await clip.makeAsset().load(.duration).seconds) ?? 0
@@ -299,38 +397,66 @@ enum StoryVideo {
     /// Re-encodes a recording or picked clip with the look baked in: first 15 seconds, portrait 720p, bitrate
     /// chosen to fit `maxBytes`, no location or device metadata. Returns the file's bytes.
     static func export(from clip: MemoryClip, filter: StoryFilter, zoom: ZoomTrack = .none, maxBytes: Int = StoryVideo.maxBytes,
-                       maxSeconds: Double = StoryVideo.maxSeconds, size: CGSize? = nil, text: CIImage? = nil) async throws -> Data {
+                       maxSeconds: Double = StoryVideo.maxSeconds, size: CGSize? = nil, text: CIImage? = nil,
+                       from start: Double = 0, framing: StoryFraming = .fill) async throws -> Data {
         let asset = clip.makeAsset()
         guard let track = try? await asset.loadTracks(withMediaType: .video).first,
               let total = try? await asset.load(.duration), total.seconds.isFinite, total.seconds > 0 else { throw StoryVideoError.unreadable }
-        let seconds = min(total.seconds, maxSeconds)
+        let seconds = min(total.seconds - start, maxSeconds)
+        guard seconds > 0.05 else { throw StoryVideoError.unreadable }
         // Full HD when the clip is at least that sharp; otherwise it isn't blown up.
         let upright = (try? await track.load(.naturalSize, .preferredTransform)).map { $0.0.applying($0.1) } ?? .zero
-        let size = size ?? (max(abs(upright.width), abs(upright.height)) >= 1700 ? hdSize : StoryVideo.size)
+        let fixedSize = size != nil
+        // A small budget (one part of a long video) is spent on 720p: full HD would be too thin.
+        let size = size ?? (max(abs(upright.width), abs(upright.height)) >= 1700 && maxBytes >= 2_500_000 ? hdSize : StoryVideo.size)
+        // If the phone's encoder refuses the first settings (HEVC at full HD on some hardware, say), the same clip is
+        // tried with H.264, then at 720p, rather than giving up.
+        var configs: [(size: CGSize, hevc: Bool)] = [(size, true), (size, false)]
+        if !fixedSize, size != StoryVideo.size { configs.append((StoryVideo.size, false)) }
+        var config = 0
         // Each retry spends less of the budget, in case the encoder overshoots on busy footage.
         for share in [0.85, 0.65, 0.45] {
             try Task.checkCancellation()
             // A very short clip would otherwise ask for a bitrate no encoder takes (and a huge one). The
             // budget still decides the rate; this only stops it running away on the first fraction of a second.
             let wanted = Double(maxBytes) * share * 8 / max(seconds, 0.5)
-            let ceiling = size.width >= 1_000 || size.height >= 1_000 ? 16_000_000.0 : 8_000_000.0
-            let data = try await transcode(asset, seconds: seconds, filter: filter, zoom: zoom, size: size, text: text,
-                                           bitsPerSecond: max(Int(min(wanted, ceiling)) - 48_000, 150_000))
-            if data.count <= maxBytes { return data }
+            var data: Data?
+            while data == nil {
+                try Task.checkCancellation()
+                let (size, hevc) = configs[config]
+                let ceiling = size.width >= 1_000 || size.height >= 1_000 ? 16_000_000.0 : 8_000_000.0
+                do {
+                    data = try await transcode(asset, seconds: seconds, filter: filter, zoom: zoom, size: size, text: text,
+                                               bitsPerSecond: max(Int(min(wanted, ceiling)) - 48_000, 150_000), allowHEVC: hevc, from: start, framing: FramingBox(framing))
+                } catch StoryVideoError.failed(let why) {
+                    config += 1
+                    if config >= configs.count { throw StoryVideoError.failed(why) }
+                }
+            }
+            if let data, data.count <= maxBytes { return data }
         }
         throw StoryVideoError.tooLarge
     }
 
+    /// The error with its domain and code (and the one under it), so a failure says which part gave up.
+    private static func describe(_ error: Error?, _ stage: String) -> String {
+        guard let error = error as NSError? else { return "\(stage) failed" }
+        var text = "\(error.localizedDescription) [\(stage) \(error.domain) \(error.code)"
+        if let under = error.userInfo[NSUnderlyingErrorKey] as? NSError { text += ", \(under.domain) \(under.code)" }
+        return text + "]"
+    }
+
     private static func transcode(_ asset: AVURLAsset, seconds: Double, filter: StoryFilter, zoom: ZoomTrack, size: CGSize,
-                                  text: CIImage? = nil, bitsPerSecond: Int) async throws -> Data {
-        let range = CMTimeRange(start: .zero, duration: CMTime(seconds: seconds, preferredTimescale: 600))
+                                  text: CIImage? = nil, bitsPerSecond: Int, allowHEVC: Bool = true, from start: Double = 0, framing: FramingBox? = nil) async throws -> Data {
+        let begin = CMTime(seconds: start, preferredTimescale: 600)
+        let range = CMTimeRange(start: begin, duration: CMTime(seconds: seconds, preferredTimescale: 600))
         let reader = try AVAssetReader(asset: asset)
         reader.timeRange = range
         let videoTracks = try await asset.loadTracks(withMediaType: .video)
         let readerVideo = AVAssetReaderVideoCompositionOutput(videoTracks: videoTracks, videoSettings: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
         ])
-        readerVideo.videoComposition = composition(for: asset, filter: filter, size: size, zoom: zoom, text: text)
+        readerVideo.videoComposition = composition(for: asset, filter: filter, size: size, zoom: zoom, text: text, framing: framing)
         guard reader.canAdd(readerVideo) else { throw StoryVideoError.unreadable }
         reader.add(readerVideo)
 
@@ -339,7 +465,7 @@ enum StoryVideo {
         let writer = AVAssetWriter(contentType: UTType.mpeg4Movie)
         writer.outputFileTypeProfile = .mpeg4AppleHLS
         writer.preferredOutputSegmentInterval = CMTime(seconds: 2, preferredTimescale: 1)
-        writer.initialSegmentStartTime = .zero
+        writer.initialSegmentStartTime = begin
         writer.delegate = sink
         // HEVC gives the same picture in about half the bits; H.264 is the fallback where it can't be encoded.
         func settings(_ codec: AVVideoCodecType) -> [String: Any] {
@@ -352,7 +478,7 @@ enum StoryVideo {
             return [AVVideoCodecKey: codec, AVVideoWidthKey: Int(size.width), AVVideoHeightKey: Int(size.height),
                     AVVideoCompressionPropertiesKey: compression]
         }
-        let video = AVAssetWriterInput(mediaType: .video, outputSettings: writer.canApply(outputSettings: settings(.hevc), forMediaType: .video)
+        let video = AVAssetWriterInput(mediaType: .video, outputSettings: allowHEVC && writer.canApply(outputSettings: settings(.hevc), forMediaType: .video)
                                        ? settings(.hevc) : settings(.h264))
         video.expectsMediaDataInRealTime = false
         writer.add(video)
@@ -375,9 +501,9 @@ enum StoryVideo {
         }
 
         guard reader.startReading(), writer.startWriting() else {
-            throw StoryVideoError.failed((reader.error ?? writer.error)?.localizedDescription ?? "unknown")
+            throw StoryVideoError.failed(Self.describe(reader.error ?? writer.error, "start"))
         }
-        writer.startSession(atSourceTime: .zero)
+        writer.startSession(atSourceTime: begin)
         // A clip that has not finished in this long is stuck: stopping the reader and writer lets the wait end, so the
         // person gets a message and can try again instead of a spinner that never stops.
         let stuck = Stuck()
@@ -420,9 +546,9 @@ enum StoryVideo {
             }
         }
         if stuck.isSet { throw StoryVideoError.timedOut }
-        if reader.status == .failed { writer.cancelWriting(); throw StoryVideoError.failed(reader.error?.localizedDescription ?? "read") }
+        if reader.status == .failed { writer.cancelWriting(); throw StoryVideoError.failed(Self.describe(reader.error, "read")) }
         await writer.finishWriting()
-        guard writer.status == .completed else { throw StoryVideoError.failed(writer.error?.localizedDescription ?? "write") }
+        guard writer.status == .completed else { throw StoryVideoError.failed(Self.describe(writer.error, "write")) }
         return sink.bytes
     }
 

@@ -71,6 +71,8 @@ final class AppModel {
     private(set) var profileNeedsUpdate = false
     /// The format this build saves profiles in. Only tests change it, to stand in for an older or newer version.
     var profileFormat = AppData.currentFormat
+    /// Set for a moment when you switch to another persona, so the screen can show the change over.
+    var personaFlash: PersonaFlash?
     /// The chat on screen, so incoming messages there don't count as unread.
     var openConversation: Conversation.ID?
     /// A chat something outside the window (a notification, the menu bar) asked to show.
@@ -2685,7 +2687,13 @@ final class AppModel {
         presenceDue = [:]
         openConversation = nil
         if id != data.activePersona { eggs = [] }
+        let changed = id != data.activePersona
         withAnimation(.smooth(duration: 0.4)) { data.activePersona = id }
+        if changed {
+            let profile = profile(for: id)
+            personaFlash = PersonaFlash(name: profile.displayName, avatar: profile.avatar,
+                                        seed: me(id)?.fingerprint ?? "", isMain: id == nil)
+        }
         save()
     }
 
@@ -7095,4 +7103,14 @@ extension AppModel {
             openedCode = url.absoluteString
         }
     }
+}
+
+
+/// What the persona-switch animation shows: who you have just become.
+struct PersonaFlash: Identifiable, Equatable {
+    let id = UUID()
+    var name: String
+    var avatar: Data?
+    var seed: String
+    var isMain: Bool
 }

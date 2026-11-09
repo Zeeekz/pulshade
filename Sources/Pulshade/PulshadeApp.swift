@@ -307,7 +307,10 @@ private struct CaptureShield: UIViewControllerRepresentable {
         controller.hosting.rootView = content
         if controller.epoch != epoch {
             controller.epoch = epoch
-            controller.reseat()
+            // Not while something is open over the app (the story editor, the photo picker): taking the content out
+            // of the window and back closes it. Coming back from the photo picker bumped the epoch, and the story
+            // editor vanished a moment after it opened.
+            if !controller.hasModalOpen { controller.reseat() }
         }
         controller.shield(on)
     }
@@ -339,6 +342,12 @@ private struct CaptureShield: UIViewControllerRepresentable {
             addChild(hosting)
             shield(shielding ?? true)
             hosting.didMove(toParent: self)
+        }
+
+        /// Whether a full-screen cover, sheet or system picker is up over the content.
+        var hasModalOpen: Bool {
+            hosting.presentedViewController != nil || presentedViewController != nil
+                || view.window?.rootViewController?.presentedViewController != nil
         }
 
         /// Takes the content out of the shielded layer so the next `shield` puts it back and redraws it.

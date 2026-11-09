@@ -35,6 +35,7 @@ struct MainView: View {
         // The backup code now covers something new: save it, or know it's covered.
         .sheet(item: Binding(get: { model.codeAlert }, set: { model.codeAlert = $0 })) { BackupCodeSheet(alert: $0) }
         .overlay { CallView() }
+        .overlay { PersonaSwitchOverlay() }
         .animation(.smooth(duration: 0.3), value: model.call == nil)
         // A glowing picture anywhere in the app plays its story from here.
         .background {
@@ -939,4 +940,56 @@ private struct PersonaSwitcher: View {
 /// A rectangle that can change without redrawing anything that holds it.
 private final class FrameBox {
     var rect = CGRect.null
+}
+
+
+/// A short animation over the app when you switch persona: the app dims and blurs, the new persona's picture rises into
+/// the middle with a ring that opens round it and its name beneath, then it all lets go. Touches go through it.
+private struct PersonaSwitchOverlay: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.theme) private var theme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var shown = false
+
+    var body: some View {
+        ZStack {
+            if let flash = model.personaFlash, shown {
+                Rectangle().fill(.ultraThinMaterial).overlay(Color.black.opacity(0.25))
+                    .ignoresSafeArea()
+                    .transition(.opacity)
+                VStack(spacing: 14) {
+                    ZStack {
+                        Circle().strokeBorder(theme.accent.opacity(0.5), lineWidth: 2)
+                            .frame(width: 128, height: 128)
+                            .scaleEffect(shown ? 1.25 : 0.8).opacity(shown ? 0 : 1)
+                            .animation(reduceMotion ? nil : .easeOut(duration: 0.9), value: shown)
+                        Avatar(image: flash.avatar, seed: flash.seed, size: 96, showsStory: false)
+                            .overlay(Circle().strokeBorder(theme.accent, lineWidth: 3).padding(-5))
+                            .shadow(color: theme.accent.opacity(0.6), radius: 24)
+                    }
+                    VStack(spacing: 2) {
+                        Text(flash.name).font(.system(size: 20, weight: .semibold)).foregroundStyle(Ink.text)
+                        Text(flash.isMain ? "Main account" : "Persona").font(.system(size: 12, weight: .medium)).foregroundStyle(Ink.dim)
+                    }
+                }
+                .transition(reduceMotion ? .opacity : .scale(scale: 0.6).combined(with: .opacity))
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Switched to \(flash.name)")
+            }
+        }
+        .allowsHitTesting(false)
+        .onChange(of: model.personaFlash) { _, flash in
+            guard flash != nil else { return }
+            Haptics.tick()
+            withAnimation(reduceMotion ? .easeOut(duration: 0.15) : .spring(duration: 0.4, bounce: 0.3)) { shown = true }
+        }
+        .task(id: model.personaFlash?.id) {
+            guard model.personaFlash != nil else { return }
+            try? await Task.sleep(for: .seconds(1.0))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeIn(duration: 0.3)) { shown = false }
+            try? await Task.sleep(for: .seconds(0.35))
+            if !Task.isCancelled { model.personaFlash = nil }
+        }
+    }
 }

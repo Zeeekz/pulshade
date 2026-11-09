@@ -268,10 +268,19 @@ struct StoryComposer: View {
     /// Zoom recorded with the clip, for cameras that couldn't zoom for real.
     @State private var clipZoom = ZoomTrack.none
     @State private var clipPreview: ClipPreview?
+    /// Where a clip sits in the story's frame: it starts fitted whole, and pinch, drag and the button change it. The
+    /// box is what the preview and the export read it from.
+    @State private var framing = StoryFraming.fill
+    @State private var framingBox = FramingBox()
+    @State private var sourceSize: CGSize?
+    @State private var framingBase: StoryFraming?
     @State private var filter = StoryFilter.none
     /// The photo with the look applied, for the preview.
     @State private var looked: Data?
     @State private var exporting = false
+    /// How long the picked clip is, up to five minutes, and which part is being made when it is cut into several.
+    @State private var clipSeconds = 0.0
+    @State private var partMaking = 0
     @State private var failure: String?
     @State private var audience: StoryAudience = .everyone
     @State private var lifetime = StoryLifetime.day.rawValue
@@ -334,7 +343,18 @@ struct StoryComposer: View {
             startTyping()
         }
         .onChange(of: image == nil && clip == nil) { _, plain in if plain { startTyping() } }
-        .task(id: clip?.id) { openClip() }
+        .task(id: clip?.id) {
+            // How the clip is shaped first, so it opens fitted whole rather than jumping from filled to fitted.
+            sourceSize = nil
+            if let clip, editing == nil, let size = await StoryVideo.uprightSize(of: clip) {
+                sourceSize = size
+                setFraming(.fit(source: size, frame: StoryVideo.size))
+            } else {
+                setFraming(.fill)
+            }
+            openClip()
+            if let clip { clipSeconds = await StoryVideo.fullDuration(of: clip) }
+        }
         .task(id: [filter.rawValue, String(image?.count ?? 0)]) { await look() }
         .onChange(of: filter) { _, new in clipPreview?.set(new) }
         .onDisappear {
@@ -358,7 +378,16 @@ struct StoryComposer: View {
                     .shadow(color: theme.accent.opacity(0.35), radius: 30)
                     .animation(.smooth, value: palette)
                     .animation(.smooth, value: image)
-                if canFilter { FilterDots(filter: $filter) }
+                if let note = partsNote {
+                Text(exporting ? "Preparing part \(partMaking) of \(partCount)…" : note)
+                    .font(.system(size: 13)).foregroundStyle(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 6).background(.black.opacity(0.5), in: .capsule)
+            }
+            if canReframe {
+                Text("Pinch to resize · Drag to move")
+                    .font(.system(size: 12, weight: .medium)).foregroundStyle(.white.opacity(0.75))
+            }
+            if canFilter { FilterDots(filter: $filter) }
 
                 if image == nil && clip == nil && !isVideoEdit {
                     HStack(spacing: 10) {
@@ -470,12 +499,21 @@ struct StoryComposer: View {
                 }
                 .frame(width: canvas.width, height: canvas.height)
                 .clipShape(.rect(cornerRadius: Platform.isPhone ? 0 : 16))
+                // Pinch to resize a video and drag to move it, as on Instagram.
+                .simultaneousGesture(DragGesture(minimumDistance: 4).simultaneously(with: MagnifyGesture())
+                    .onChanged { reframe($0, canvas: canvas) }
+                    .onEnded { _ in framingBase = nil })
 
                 if typing == nil {
                     VStack {
                         HStack {
                             floating("xmark", label: "Close") { dismiss() }
                             Spacer()
+                            if clip != nil, sourceSize != nil {
+                                floating(isFilled ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right",
+                                         label: isFilled ? "Fit the whole video" : "Fill the screen") { toggleFill() }
+                                    .disabled(exporting)
+                            }
                             floating("textformat", label: "Add text") { addText() }
                         }
                         .padding(.horizontal, 14).padding(.top, 6)
@@ -655,8 +693,43 @@ struct StoryComposer: View {
     private func openClip() {
         clipPreview?.close()
         clipPreview = nil
-        guard let clip else { return }
-        clipPreview = ClipPreview(clip: clip, filter: filter, zoom: clipZoom)
+        guard let clip else { clipSeconds = 0; return }
+        clipPreview = ClipPreview(clip: clip, filter: filter, zoom: clipZoom, framing: framingBox)
+    }
+
+    private func setFraming(_ new: StoryFraming) {
+        framing = new
+        framingBox.value = new
+    }
+
+    /// Whether a pinch or drag on the picture moves a clip (not while there is text on it, which they move instead).
+    private var canReframe: Bool { clip != nil && editing == nil && typing == nil && overlays.isEmpty && !exporting && sourceSize != nil }
+
+    private var isFilled: Bool { framing.zoom >= 0.999 }
+
+    private func toggleFill() {
+        guard let size = sourceSize else { return }
+        withAnimation(.snappy(duration: 0.2)) { setFraming(isFilled ? .fit(source: size, frame: StoryVideo.size) : .fill) }
+    }
+
+    private func reframe(_ value: SimultaneousGesture<DragGesture, MagnifyGesture>.Value, canvas: CGSize) {
+        guard canReframe, let size = sourceSize else { return }
+        let base = framingBase ?? framing
+        framingBase = base
+        var next = base
+        if let m = value.second?.magnification { next.zoom = base.zoom * m }
+        if let t = value.first?.translation {
+            next.dx = base.dx + t.width / max(canvas.width, 1)
+            next.dy = base.dy + t.height / max(canvas.height, 1)
+        }
+        setFraming(next.clamped(source: size, frame: StoryVideo.size))
+    }
+
+    /// How many stories the clip becomes, and what to tell the person about it.
+    private var partCount: Int { StoryVideo.parts(of: clipSeconds) }
+    private var partsNote: String? {
+        guard partCount > 1 else { return nil }
+        return "Posts as \(partCount) stories of 15 seconds" + (clipSeconds >= StoryVideo.longestSeconds ? " (the first 5 minutes)" : "")
     }
 
     /// Colours the photo for the preview.
@@ -676,18 +749,30 @@ struct StoryComposer: View {
         } else if let clip {
             exporting = true
             failure = nil
-            let look = filter, track = clipZoom
+            let look = filter, track = clipZoom, placed = framing
             let words = StoryOverlayRender.text(overlays)
             Task {
+                // A long clip goes up as several stories, in order, each 15 seconds. The parts share a size budget,
+                // since every contact receives every one of them.
+                let total = await StoryVideo.fullDuration(of: clip)
+                let parts = StoryVideo.parts(of: total)
+                let budget = StoryVideo.budget(parts: parts)
+                var posted = 0
                 do {
-                    let began = Date()
-                    let data = try await StoryVideo.export(from: clip, filter: look, zoom: track, text: words)
-                    model.postStory(.video(data, caption: ""), audience: audience, lifetime: lifetime)
+                    for part in 0..<parts {
+                        partMaking = part + 1
+                        let data = try await StoryVideo.export(from: clip, filter: look, zoom: track, maxBytes: budget,
+                                                               text: words, from: Double(part) * StoryVideo.maxSeconds, framing: placed)
+                        model.postStory(.video(data, caption: ""), audience: audience, lifetime: lifetime)
+                        posted += 1
+                    }
                     exporting = false
                     finish()
                 } catch {
                     exporting = false
-                    failure = (error as? LocalizedError)?.errorDescription ?? "The video couldn't be prepared."
+                    let why = (error as? LocalizedError)?.errorDescription ?? "The video couldn't be prepared."
+                    // Parts already up stay up; say so, so the same video isn't posted again from the top by mistake.
+                    failure = posted > 0 ? "\(posted) of \(parts) parts are posted. \(why)" : why
                 }
             }
         } else if let image {
@@ -1402,7 +1487,11 @@ struct StoryViewer: View {
         ZStack(alignment: .top) {
             if stories.indices.contains(index) {
                 // The picture goes under the status bar and home bar; everything written over it stays inside them.
+                // The story's own 9:16 shape, fitted whole to the screen: filling a taller or wider screen cut off
+                // the sides (and any words near them), so whatever was framed in the editor is what everyone sees.
                 StoryFace(story: stories[index], clip: clip)
+                    .aspectRatio(9.0 / 16.0, contentMode: .fit)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .ignoresSafeArea()
                     .id(stories[index].id)
                     .transition(.opacity)

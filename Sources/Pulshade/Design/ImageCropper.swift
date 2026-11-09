@@ -1,4 +1,5 @@
 import SwiftUI
+import CoreImage
 
 /// The shape a picture is framed to before it's used.
 struct CropFrame: Equatable {
@@ -7,10 +8,12 @@ struct CropFrame: Equatable {
     var circle = false
     /// The longest side of the result, in pixels.
     var maxSide: CGFloat
+    /// Whether the picture may be made smaller than the frame, to show all of it with a soft copy of it behind.
+    var allowsFit = false
 
     static let avatar = CropFrame(aspect: 1, circle: true, maxSide: 512)
     static let banner = CropFrame(aspect: 3, maxSide: 1200)
-    static let story = CropFrame(aspect: 9.0 / 16.0, maxSide: 1600)
+    static let story = CropFrame(aspect: 9.0 / 16.0, maxSide: 1600, allowsFit: true)
 }
 
 /// A picture waiting to be framed.
@@ -90,7 +93,7 @@ struct ImageCropper: View {
                                 commitIfIdle()
                             })
                 )
-                .onAppear { boxCache = box }
+                .onAppear { boxCache = box; startFitted() }
                 .onChange(of: geo.size) {
                     boxCache = boxSize(in: geo.size)
                     guard let picture else { return }
@@ -104,8 +107,16 @@ struct ImageCropper: View {
 
             HStack(spacing: 10) {
                 Image(systemName: "minus.magnifyingglass").foregroundStyle(Ink.faint)
-                Slider(value: Binding(get: { zoom }, set: { setZoom($0) }), in: 1...Self.maxZoom)
+                Slider(value: Binding(get: { zoom }, set: { setZoom($0) }), in: min(minZoom, Self.maxZoom - 0.01)...Self.maxZoom)
                 Image(systemName: "plus.magnifyingglass").foregroundStyle(Ink.faint)
+                if frame.allowsFit, minZoom < 0.999 {
+                    Button { setZoom(zoom > minZoom + 0.01 ? minZoom : 1, centred: true) } label: {
+                        Image(systemName: zoom > minZoom + 0.01 ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                            .frame(width: 34, height: 34)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(zoom > minZoom + 0.01 ? "Fit the whole picture" : "Fill the frame")
+                }
             }
             .font(.system(size: 13))
 
@@ -115,7 +126,10 @@ struct ImageCropper: View {
             }
         }
         .padding(20)
-        .task { picture = cleanJPEG(image, maxSide: 2400).flatMap { PlatformImage(data: $0) }?.cgImageValue }
+        .task {
+            picture = cleanJPEG(image, maxSide: 2400).flatMap { PlatformImage(data: $0) }?.cgImageValue
+            startFitted()
+        }
         .frame(minWidth: Platform.isPhone ? nil : 460, minHeight: Platform.isPhone ? nil : 560)
         .background(Theme.dark.ink.base)
         .preferredColorScheme(.dark)
@@ -128,11 +142,29 @@ struct ImageCropper: View {
     @State private var dragging = false
     @State private var pinching = false
     private static let maxZoom: CGFloat = 8
+    @State private var started = false
+
+    /// The zoom at which all of the picture shows, where the frame allows that; filling is 1.
+    private var minZoom: CGFloat {
+        guard frame.allowsFit, let picture, boxCache.width > 0 else { return 1 }
+        let fit = min(boxCache.width / CGFloat(picture.width), boxCache.height / CGFloat(picture.height))
+        return min(1, fit / fill(picture, box: boxCache))
+    }
+
+    /// A story's picture opens fitted whole, so nothing is cut off until you choose to fill the frame.
+    private func startFitted() {
+        guard !started, frame.allowsFit, picture != nil, boxCache.width > 0 else { return }
+        started = true
+        zoom = minZoom
+        settledZoom = zoom
+        offset = .zero
+        settledOffset = .zero
+    }
 
     /// Moves and zooms from where the last gesture left off. A pinch holds the spot under your fingers still.
     private func apply(_ area: CGSize, box: CGSize) {
         guard let picture else { return }
-        let target = min(Self.maxZoom, max(1, settledZoom * pinch))
+        let target = min(Self.maxZoom, max(minZoom, settledZoom * pinch))
         let k = target / settledZoom
         let p = pinchAnchor
         let moved = CGSize(width: p.x - (p.x - settledOffset.width) * k + drag.width,
@@ -151,12 +183,13 @@ struct ImageCropper: View {
     }
 
     /// Zoom from the slider, around the middle of the frame.
-    private func setZoom(_ value: CGFloat) {
+    private func setZoom(_ value: CGFloat, centred: Bool = false) {
         guard let picture else { return }
+        let value = max(value, minZoom)
         let k = value / max(zoom, 0.001)
         zoom = value
         settledZoom = value
-        offset = clamp(CGSize(width: offset.width * k, height: offset.height * k), picture, box: boxCache, zoom: value)
+        offset = centred ? .zero : clamp(CGSize(width: offset.width * k, height: offset.height * k), picture, box: boxCache, zoom: value)
         settledOffset = offset
     }
 
@@ -185,14 +218,24 @@ struct ImageCropper: View {
     /// Keeps the frame covered by the picture.
     private func clamp(_ o: CGSize, _ picture: CGImage, box: CGSize, zoom: CGFloat) -> CGSize {
         let s = fill(picture, box: box) * zoom
-        let spareX = max(0, (CGFloat(picture.width) * s - box.width) / 2)
-        let spareY = max(0, (CGFloat(picture.height) * s - box.height) / 2)
+        // Grown past the frame it stays covering it; shrunk inside it, it stays inside.
+        let spareX = frame.allowsFit ? abs(CGFloat(picture.width) * s - box.width) / 2 : max(0, (CGFloat(picture.width) * s - box.width) / 2)
+        let spareY = frame.allowsFit ? abs(CGFloat(picture.height) * s - box.height) / 2 : max(0, (CGFloat(picture.height) * s - box.height) / 2)
         return CGSize(width: min(spareX, max(-spareX, o.width)), height: min(spareY, max(-spareY, o.height)))
+    }
+
+    /// The result's size in pixels, how many of them one of the picture's pixels covers, and how far it is moved.
+    fileprivate func fittedLayout(_ picture: CGImage) -> (CGSize, CGFloat, CGSize) {
+        let out = frame.aspect <= 1 ? CGSize(width: frame.maxSide * frame.aspect, height: frame.maxSide)
+                                    : CGSize(width: frame.maxSide, height: frame.maxSide / frame.aspect)
+        let k = out.width / boxCache.width
+        return (out, fill(picture, box: boxCache) * zoom * k, CGSize(width: offset.width * k, height: offset.height * k))
     }
 
     /// The part of the picture inside the frame, as a JPEG.
     private func crop(_ picture: CGImage?) -> Data? {
         guard let picture, boxCache.width > 0 else { return nil }
+        if frame.allowsFit { return renderFitted(picture) }
         let s = fill(picture, box: boxCache) * zoom
         let w = boxCache.width / s, h = boxCache.height / s
         let x = CGFloat(picture.width) / 2 - offset.width / s - w / 2
@@ -201,6 +244,44 @@ struct ImageCropper: View {
             .intersection(CGRect(x: 0, y: 0, width: picture.width, height: picture.height))
         guard let cropped = picture.cropping(to: rect) else { return nil }
         return cleanJPEG(.from(cgImage: cropped), maxSide: frame.maxSide)
+    }
+}
+
+/// A picture drawn into a frame of `out` pixels at `scale` (one of its pixels covers that many of the frame's), moved
+/// `shift` down and to the right from the middle. Where it doesn't reach, a dimmed, blurred copy of it fills the frame.
+func drawFitted(_ picture: CGImage, out: CGSize, scale: CGFloat, shift: CGSize) -> CGImage? {
+    guard let ctx = CGContext(data: nil, width: Int(out.width.rounded()), height: Int(out.height.rounded()), bitsPerComponent: 8,
+                              bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+    let canvas = CGRect(origin: .zero, size: out)
+    let placed = CGRect(x: out.width / 2 - CGFloat(picture.width) * scale / 2 + shift.width,
+                        y: out.height / 2 - CGFloat(picture.height) * scale / 2 - shift.height,
+                        width: CGFloat(picture.width) * scale, height: CGFloat(picture.height) * scale)
+    if !placed.insetBy(dx: -0.5, dy: -0.5).contains(canvas) {
+        let fillScale = max(out.width / CGFloat(picture.width), out.height / CGFloat(picture.height))
+        let back = CIImage(cgImage: picture)
+            .transformed(by: CGAffineTransform(scaleX: fillScale, y: fillScale))
+            .transformed(by: CGAffineTransform(translationX: (out.width - CGFloat(picture.width) * fillScale) / 2,
+                                               y: (out.height - CGFloat(picture.height) * fillScale) / 2))
+            .clampedToExtent()
+            .applyingGaussianBlur(sigma: out.width / 14)
+            .cropped(to: canvas)
+        let dim = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0.3)).cropped(to: canvas)
+        if let softened = CIContext().createCGImage(dim.composited(over: back), from: canvas) {
+            ctx.draw(softened, in: canvas)
+        }
+    }
+    ctx.interpolationQuality = .high
+    ctx.draw(picture, in: placed)
+    return ctx.makeImage()
+}
+
+extension ImageCropper {
+    /// The frame drawn out for the result.
+    fileprivate func renderFitted(_ picture: CGImage) -> Data? {
+        let (out, scale, shift) = fittedLayout(picture)
+        guard let made = drawFitted(picture, out: out, scale: scale, shift: shift) else { return nil }
+        return cleanJPEG(.from(cgImage: made), maxSide: frame.maxSide)
     }
 }
 

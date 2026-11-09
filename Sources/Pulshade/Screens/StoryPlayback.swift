@@ -98,13 +98,15 @@ final class ClipPreview {
     @ObservationIgnored let layer: AVPlayerLayer
     @ObservationIgnored private let asset: AVURLAsset
     @ObservationIgnored private let zoom: ZoomTrack
+    @ObservationIgnored private let framing: FramingBox?
     @ObservationIgnored private var end: NSObjectProtocol?
 
-    init(clip: MemoryClip, filter: StoryFilter, zoom: ZoomTrack = .none) {
+    init(clip: MemoryClip, filter: StoryFilter, zoom: ZoomTrack = .none, framing: FramingBox? = nil) {
         asset = clip.makeAsset()
         self.zoom = zoom
+        self.framing = framing
         let item = AVPlayerItem(asset: asset)
-        item.videoComposition = StoryVideo.composition(for: asset, filter: filter, zoom: zoom)
+        item.videoComposition = StoryVideo.composition(for: asset, filter: filter, zoom: zoom, framing: framing)
         // Only the first 15 seconds are kept.
         item.forwardPlaybackEndTime = CMTime(seconds: StoryVideo.maxSeconds, preferredTimescale: 600)
         player.replaceCurrentItem(with: item)
@@ -117,7 +119,7 @@ final class ClipPreview {
     }
 
     func set(_ filter: StoryFilter) {
-        player.currentItem?.videoComposition = StoryVideo.composition(for: asset, filter: filter, zoom: zoom)
+        player.currentItem?.videoComposition = StoryVideo.composition(for: asset, filter: filter, zoom: zoom, framing: framing)
     }
 
     func close() {
@@ -323,6 +325,22 @@ enum LoadingHUD {
 final class LibraryPicker: NSObject, PHPickerViewControllerDelegate {
     private static var current: LibraryPicker?
     private var done: ((StoryPick.Kind?, UIImage?) -> Void)?
+    /// Whether the picker has finished leaving the screen. Whatever comes next (the editor, an alert) is shown only
+    /// after, since UIKit refuses to present over a screen that is still being dismissed and SwiftUI then quietly
+    /// drops the editor: a video that loaded quickly used to bring you straight back to the camera.
+    private var dismissed = false
+    private var afterDismissal: (() -> Void)?
+
+    private func whenDismissed(_ work: @escaping () -> Void) {
+        if dismissed { work() } else { afterDismissal = work }
+    }
+
+    private func pickerGone() {
+        dismissed = true
+        let work = afterDismissal
+        afterDismissal = nil
+        work?()
+    }
 
     /// A clip comes back as `.clip` (already copied somewhere that stays), a picture as an image to be framed.
     static func present(videosOnly: Bool = false, done: @escaping (StoryPick.Kind?, UIImage?) -> Void) {
@@ -345,7 +363,9 @@ final class LibraryPicker: NSObject, PHPickerViewControllerDelegate {
     }
 
     nonisolated func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
-        DispatchQueue.main.async { picker.dismiss(animated: true) }
+        Task { @MainActor in
+            picker.dismiss(animated: true) { Task { @MainActor in self.pickerGone() } }
+        }
         guard let provider = results.first?.itemProvider else {
             Task { @MainActor in self.finish(nil, nil) }
             return
@@ -384,11 +404,16 @@ final class LibraryPicker: NSObject, PHPickerViewControllerDelegate {
         }
     }
 
-    /// The biggest video that is held in memory to take 15 seconds from.
-    nonisolated static let largest = 700_000_000
+    /// The biggest video that is held in memory to cut stories from (up to five minutes of it is used). It is mapped, not
+    /// copied, so it is mostly the phone's storage rather than its memory.
+    nonisolated static let largest = 1_500_000_000
 
     /// Says why nothing was picked, instead of leaving the person looking at an unchanged screen.
     private func fail(_ message: String) {
+        whenDismissed { self.showFailure(message) }
+    }
+
+    private func showFailure(_ message: String) {
         LoadingHUD.hide()
         let alert = UIAlertController(title: "Couldn't use that video", message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "OK", style: .cancel))
@@ -402,10 +427,12 @@ final class LibraryPicker: NSObject, PHPickerViewControllerDelegate {
     }
 
     private func finish(_ kind: StoryPick.Kind?, _ image: UIImage?) {
-        LoadingHUD.hide()
-        done?(kind, image)
-        done = nil
-        Self.current = nil
+        whenDismissed {
+            LoadingHUD.hide()
+            self.done?(kind, image)
+            self.done = nil
+            Self.current = nil
+        }
     }
 }
 #endif
