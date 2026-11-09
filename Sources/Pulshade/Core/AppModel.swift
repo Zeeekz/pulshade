@@ -261,6 +261,8 @@ final class AppModel {
         if phase == .unlocked, data.security.onlineStatus { sendPresence(false) }
         presenceDue = [:]
         save()
+        // iOS may suspend the app before the usual moment passes: what just arrived or queued must be on disk.
+        settleSaves()
         refreshDisguises()
         #if os(iOS)
         AnnouncementWatch.schedule()
@@ -730,6 +732,8 @@ final class AppModel {
         // locked Pulshade is still woken for new mail.
         pushTold = nil
         save()
+        // Everything is written before the keys leave memory, so locking can't lose the last messages or outbox.
+        settleSaves()
         refreshDisguises()
         vault.rotate()
         forgetRoutes()
@@ -3851,6 +3855,8 @@ final class AppModel {
     private var requestNotes: [String: String] = [:]
     /// The longest a message is sent again for after being sent: well inside what the relay keeps mail.
     private static let resendWindow: TimeInterval = 24 * 3600
+    /// How long mail this device can't use yet (a contact or device it hasn't met) is left on the relay.
+    static let deferredMailLimit: TimeInterval = 10 * 60
     /// How long a message waits for its receipt before it is sent again, then again after the next wait, and so on.
     static var resendGaps: [TimeInterval] = [90, 300, 900, 2700, 7200]
     /// When each of your messages was last sent again, and how many times, while the app is open.
@@ -3953,23 +3959,41 @@ final class AppModel {
         for i in data.conversations.indices {
             let convo = data.conversations[i]
             guard convo.kind == .direct || convo.kind == .group else { continue }
-            let lost = convo.messages.filter { $0.isMine && $0.status == .sent && $0.date > cutoff && !$0.isVideo
-                && ($0.expiresAt.map { $0 > Date() } ?? true) && (!dueOnly || resendIsDue($0)) }
+            let lost = convo.messages.filter {
+                $0.isMine && $0.status == .sent && $0.date > cutoff && !$0.isVideo
+                    && ($0.expiresAt.map { $0 > Date() } ?? true) && (!dueOnly || resendIsDue($0))
+                    // A group message is answered with a receipt now, so it leaves this set on arrival. With
+                    // receipts turned off there's no answer to wait for; trying twice is enough, and repeating
+                    // it for a day only crowds out what's new.
+                    && (convo.kind == .direct || (resentAt[$0.id]?.count ?? 0) < 2)
+            }
             guard !lost.isEmpty else { continue }
             let recipients = audience(convo)
             for message in lost {
                 resentAt[message.id] = (Date(), (resentAt[message.id]?.count ?? 0) + 1)
-                let reply = message.reply.map { ReplyRef(id: $0.id, author: $0.author == "me" ? (me(convo.persona)?.fingerprint ?? "") : $0.author,
-                                                         snippet: $0.snippet, picture: $0.picture) }
-                let wire = WireMessage(id: message.id, conversation: sharedID(convo), kind: convo.kind, text: message.text,
-                                       image: message.image, voice: message.voice, date: RelayClock.relay(message.date),
-                                       expiresIn: message.expiresAt == nil ? nil : convo.disappearAfter, reply: reply, preview: message.preview,
-                                       collectible: message.collectible, note: message.note,
-                                       mentions: message.mentions.isEmpty ? nil : message.mentions)
+                let wire = wireForResend(message, in: convo)
                 // Not marked queued: it stays "sent" until the receipt comes, which is what makes it worth sending again.
                 for member in recipients { enqueue(.message(wire), to: member) }
             }
         }
+    }
+
+    /// A message rebuilt as it goes out again. It must carry everything the first copy did: a file's pointer that
+    /// only travelled with the lost copy can't be fetched, so the retry would show as an empty bubble.
+    func wireForResend(_ message: Message, in convo: Conversation) -> WireMessage {
+        let mine = me(convo.persona)?.fingerprint
+        let reply = message.reply.map {
+            ReplyRef(id: $0.id, author: $0.author == "me" ? (mine ?? "") : $0.author,
+                     snippet: $0.snippet, picture: $0.picture)
+        }
+        return WireMessage(id: message.id, conversation: sharedID(convo),
+                           kind: convo.kind == .broadcast ? .direct : convo.kind,
+                           text: message.text, image: message.image, voice: message.voice,
+                           date: RelayClock.relay(message.date),
+                           expiresIn: message.expiresAt == nil ? nil : convo.disappearAfter,
+                           reply: reply, preview: message.preview, collectible: message.collectible, note: message.note,
+                           mentions: message.mentions.isEmpty ? nil : message.mentions,
+                           attachment: message.attachment)
     }
 
     /// Handshakes that got no answer (the other side didn't know us yet, say) are tried again. Not a request's: it
@@ -4182,12 +4206,37 @@ final class AppModel {
                 // Mail, or an empty answer after a real wait. An instant empty one means the relay doesn't wait.
                 let waited = wait > 0 && (!envelopes.isEmpty || Date().timeIntervalSince(started) > Double(wait) / 2)
                 guard identity?.fingerprint == owner, !envelopes.isEmpty else { return waited }
-                for envelope in envelopes { receive(envelope) }
+                // Only what this device is finished with comes off the relay. One it can't use yet (a device it
+                // hasn't met, a chat whose details haven't arrived) stays for the next check instead of being lost.
+                var done: [RelayEnvelope] = []
+                var deferred = false
+                for envelope in envelopes {
+                    switch receive(envelope) {
+                    case .retry:
+                        // Held only briefly. Past that it isn't waiting on a hello or a roster, it's from someone
+                        // we don't know, and keeping it would have it fetched again on every check (and crowd out
+                        // newer mail: the relay hands out the oldest first). Without a deposit time, don't hold it.
+                        if let at = envelope.deposited, Date().timeIntervalSince(at) < Self.deferredMailLimit {
+                            deferred = true
+                        } else {
+                            done.append(envelope)
+                        }
+                    case .handled, .junk: done.append(envelope)
+                    }
+                }
                 lastMailReceived = Date()
                 deposited = nil
-                save()
-                try await client.ack(envelopes)
-                if wait > 0 { return waited }
+                // When every envelope was deferred, nothing changed: don't rewrite the whole vault just to
+                // acknowledge nothing, and leave the mail where it is.
+                if !done.isEmpty {
+                    save()
+                    // The relay forgets everything it acknowledges. Write first, so a crash or a suspended app
+                    // between the answer and the disk can't take the message down with it.
+                    settleSaves()
+                    try await client.ack(done)
+                }
+                // A lane left holding only mail it couldn't use isn't in a hurry: take the ordinary beat.
+                if wait > 0 { return waited && !deferred }
             }
             return false
         } catch {
@@ -4205,6 +4254,12 @@ final class AppModel {
         watchStall()
         retryStaleHandshakes()
         retryUnreadable()
+        // An app left open for days would otherwise keep every envelope digest it ever saw. Only assign when
+        // something has actually aged out: writing redraws every view that reads the data.
+        let stale = Date().addingTimeInterval(-Self.replayWindow)
+        if data.seenEnvelopes.contains(where: { $0.value <= stale }) {
+            data.seenEnvelopes = data.seenEnvelopes.filter { $0.value > stale }
+        }
         resendAfterRestart()
         resendOverdueMessages()
         if introsStale { refileIntros() }
@@ -4760,15 +4815,26 @@ final class AppModel {
     /// Tests only: sees every envelope this device takes in, so one can be handed to `receive` again.
     @ObservationIgnored var envelopeTap: ((RelayEnvelope) -> Void)?
 
-    func receive(_ envelope: RelayEnvelope) {
+    /// What became of an envelope taken from the relay.
+    enum ReceiveResult: Equatable {
+        /// Read and acted on: it can be acknowledged and forgotten.
+        case handled
+        /// Not for this device, or impossible to use: acknowledging it is all that can be done.
+        case junk
+        /// Unusable yet, but it may be once the contact or device it names is known. Left on the relay.
+        case retry
+    }
+
+    @discardableResult
+    func receive(_ envelope: RelayEnvelope) -> ReceiveResult {
         envelopeTap?(envelope)
         deposited = envelope.deposited
         if let offer = data.linkOffers.firstIndex(where: { $0.receiveKey == envelope.receiveKey }) {
             receiveLinkRequest(envelope.blob, offer: offer)
-            return
+            return .handled
         }
         guard let persona = persona(forMailbox: envelope.receiveKey), let me = me(persona),
-              let opened = try? Envelope.openFull(envelope.blob, with: me) else { return }
+              let opened = try? Envelope.openFull(envelope.blob, with: me) else { return .junk }
         let payload = opened.payload, signer = opened.signer, device = opened.device
         let fp = Identity.fingerprint(of: signer)
         // Anything outside a ratchet session could be sent again by the relay. Each one counts once, and only
@@ -4776,27 +4842,27 @@ final class AppModel {
         if case .ratchet = payload {} else {
             let digest = Data(SHA256.hash(data: envelope.blob).prefix(16)).hex
             let age = RelayClock.now.timeIntervalSince(opened.sentAt)
-            guard age < Self.replayWindow, age > -24 * 3600, data.seenEnvelopes[digest] == nil else { return }
+            guard age < Self.replayWindow, age > -24 * 3600, data.seenEnvelopes[digest] == nil else { return .junk }
             data.seenEnvelopes[digest] = Date()
         }
 
         if case .erased = payload {
             // Signed by their identity key, so only they can erase themselves from here.
             eraseTraces(of: fp)
-            return
+            return .handled
         }
 
         if case let .hello(card, request) = payload {
             guard card.signingKey == signer,
-                  let invite = data.invites.first(where: { $0.receiveKey == envelope.receiveKey && !$0.isPublic }) else { return }
+                  let invite = data.invites.first(where: { $0.receiveKey == envelope.receiveKey && !$0.isPublic }) else { return .junk }
             acceptHello(card, request, fingerprint: fp, device: device, via: invite)
             noteReads(opened, from: fp, persona: invite.persona)
-            return
+            return .handled
         }
         if case let .request(card, request, note) = payload {
             guard card.signingKey == signer, !data.blocked.contains(fp),
                   card.relay == nil || Invite.allowedRelay(card.relay) != nil,
-                  let invite = data.invites.first(where: { $0.receiveKey == envelope.receiveKey && $0.isPublic }) else { return }
+                  let invite = data.invites.first(where: { $0.receiveKey == envelope.receiveKey && $0.isPublic }) else { return .junk }
             var incoming = FriendRequest(fingerprint: fp, card: card, handshake: request, note: String(note.prefix(280)),
                                          persona: invite.persona)
             incoming.device = device
@@ -4805,10 +4871,10 @@ final class AppModel {
                 // Already a friend: they've lost the chat on their side (a reinstall, a detach), and their identity
                 // key signed this, so it's them. Reconnect now, rather than leave each side waiting on the other.
                 if !data.contacts[known].awaitingAcceptance { reconnect(incoming, keeping: data.contacts[known]) }
-                return
+                return .handled
             }
             // The same request sent again (the relay may have lost the first): already here, so no second banner.
-            if data.requests.contains(where: { $0.fingerprint == fp && $0.persona == invite.persona && $0.handshake == request }) { return }
+            if data.requests.contains(where: { $0.fingerprint == fp && $0.persona == invite.persona && $0.handshake == request }) { return .handled }
             withAnimation(.snappy) {
                 data.requests.removeAll { $0.fingerprint == fp && $0.persona == invite.persona }
                 data.requests.insert(incoming, at: 0)
@@ -4817,9 +4883,11 @@ final class AppModel {
             if data.security.notifications {
                 Notifier.shared.post(("PULSHADE", "New friend request"), conversation: incoming.id, sound: data.security.notificationSound)
             }
-            return
+            return .handled
         }
-        guard let i = contactIndex(fp, persona) else { return }
+        // A message from someone this persona doesn't know yet. Kept rather than acknowledged: the contact
+        // may arrive a moment later (a group's roster, a hello in the same fetch).
+        guard let i = contactIndex(fp, persona) else { return .retry }
         noteReads(opened, from: fp, persona: persona)
         let viaIntro = data.conversations.contains { $0.introsMine.contains { $0.receiveKey == envelope.receiveKey } }
         defer { if viaIntro { moveOffIntro(fp, persona) } }
@@ -4830,42 +4898,47 @@ final class AppModel {
         case let .deviceHello(card, request):
             // A device introducing itself (a new one, or one restarting its session). Signed by the account,
             // so it really is theirs.
-            guard card.id == device else { return }
+            guard card.id == device else { return .junk }
             let d = upsertDevice(i, id: card.id, sendID: card.sendID)
             // The same hello again (a relay redelivery) must not replace the session it already opened.
             if data.contacts[i].devices[d].session != nil && data.contacts[i].devices[d].acceptedHello == request.ephemeral {
-                return
+                return .handled
             }
             if data.contacts[i].devices[d].handshake != nil && myHandshakeWins(me: me.fingerprint, persona: persona, them: fp, theirDevice: device) {
-                return
+                return .handled
             }
             acceptSession(request, contact: i, device: d)
+            return .handled
         case let .sessionInit(request):
-            guard let d = deviceIndex(i, device) else { return }
+            guard let d = deviceIndex(i, device) else { return .junk }
             if data.contacts[i].devices[d].session != nil && data.contacts[i].devices[d].acceptedHello == request.ephemeral {
-                return
+                return .handled
             }
             if data.contacts[i].devices[d].handshake != nil && myHandshakeWins(me: me.fingerprint, persona: persona, them: fp, theirDevice: device) {
-                return
+                return .handled
             }
             acceptSession(request, contact: i, device: d)
+            return .handled
         case let .sessionAccept(answer):
             guard let d = deviceIndex(i, device), let pending = data.contacts[i].devices[d].handshake,
                   pending.publicEphemeral == answer.replyTo,
                   let session = try? Handshake.complete(pending, answer, me: me,
-                                                        responderAgreement: data.contacts[i].agreementKey) else { return }
+                                                        responderAgreement: data.contacts[i].agreementKey) else { return .junk }
             data.contacts[i].devices[d].session = session
             data.contacts[i].devices[d].handshake = nil
             // New keys are in place: no more asking for them because of messages that were read with the old ones.
             unreadable[sessionKey(contact: i, device: d)] = nil
+            return .handled
         case let .ratchet(message):
-            guard let d = deviceIndex(i, device) else { return }
+            // A message from a device this account hasn't met yet (its hello may be right behind in the same
+            // fetch). Kept rather than acknowledged, so it can be read once the device is known.
+            guard let d = deviceIndex(i, device) else { return .retry }
             let keptKey = sessionKey(contact: i, device: d)
             // The very same ciphertext again (the relay sent it twice, or its sender sent it again after a dropped
             // connection): already read, so nothing to do. Without this it can't be opened a second time, which looked
             // like the two phones being out of step and started new keys over a healthy chat.
             let readBefore = Data(SHA256.hash(data: envelope.blob).prefix(16)).hex
-            if data.seenEnvelopes[readBefore] != nil { return }
+            if data.seenEnvelopes[readBefore] != nil { return .handled }
             var plain: Data?
             if var session = data.contacts[i].devices[d].session, let opened = try? session.decrypt(message) {
                 data.contacts[i].devices[d].session = session
@@ -4883,20 +4956,21 @@ final class AppModel {
                 unreadable[keptKey] = Unreadable(fingerprint: fp, persona: persona, device: data.contacts[i].devices[d].id,
                                                  since: unreadable[keptKey]?.since ?? Date())
                 mendSession(contact: i, device: d)
-                return
+                return .handled
             }
             // The keys were kept above, before reading what it says, so a message this version can't read (one from a
             // newer app) still counts and doesn't leave the session behind.
             unreadable[keptKey] = nil
             data.seenEnvelopes[readBefore] = Date()
-            guard let inner = try? Payload.fromWire(plain), !inner.isSetup else { return }
+            guard let inner = try? Payload.fromWire(plain), !inner.isSetup else { return .handled }
             handle(inner, from: fp, persona: persona, device: device)
             // The first message in lets a new session start sending. Look them up again: handling it may
             // have removed them (a burned burner, say).
             if let i = contactIndex(fp, persona) { sendPending(contact: i) }
+            return .handled
         default:
             // Anything else arriving outside a session is refused.
-            return
+            return .junk
         }
     }
 
@@ -5213,12 +5287,13 @@ final class AppModel {
         min(RelayClock.local(sent), deposited ?? Date(), Date())
     }
 
-    private func deliver(_ wire: WireMessage, from sender: Contact) {
+    func deliver(_ wire: WireMessage, from sender: Contact) {
         guard let i = conversationIndex(wire.conversation, from: sender, create: true) else { return }
         if wire.conversation != nil, !data.conversations[i].canPost(sender.fingerprint) { return }
         guard !data.conversations[i].messages.contains(where: { $0.id == wire.id }) else {
             // Sent again because the relay may have lost it: say again that it's here, so their tick catches up.
-            if wire.conversation == nil { queueReceipt(wire.id, to: sender) }
+            // This matters to groups too, which have no read ticks but still need to be told the message landed.
+            queueReceipt(wire.id, to: sender)
             return
         }
         let date = dated(wire.date)
@@ -5268,6 +5343,10 @@ final class AppModel {
             // Seen straight away when the chat is open in front of you.
             let seen = openConversation == data.conversations[i].id && appActive && sendsReadReceipts(data.conversations[i])
             queueReceipt(wire.id, to: sender, read: seen)
+        } else {
+            // A group or channel message has no read tick. The receipt only says it arrived, so the sender
+            // stops sending it again (see resendUnconfirmedMessages).
+            queueReceipt(wire.id, to: sender)
         }
     }
 
@@ -5309,7 +5388,7 @@ final class AppModel {
                                             due: Date().addingTimeInterval(wait)))
     }
 
-    private func sendDueReceipts() {
+    func sendDueReceipts() {
         let now = Date()
         let due = pendingReceipts.filter { $0.due <= now }
         guard !due.isEmpty else { return }
