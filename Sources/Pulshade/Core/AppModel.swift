@@ -610,6 +610,7 @@ final class AppModel {
         unlockedAt = Date()
         lastRelayContact = Date()
         moveToOnionRelay()
+        forgetUnusableRelays()
         purgeExpired()
         data.seenEnvelopes = data.seenEnvelopes.filter { $0.value > Date().addingTimeInterval(-Self.replayWindow) }
         // Unused contact invites die with the relay's 7-day retention.
@@ -662,6 +663,19 @@ final class AppModel {
                 for c in contacts(of: persona) { enqueue(profilePayload(persona, for: c.fingerprint), to: c) }
             }
         }
+    }
+
+    /// This build only talks to PULSHADE's own relay, so everyone it can reach collects their mail there. A contact,
+    /// invite or waiting envelope that names any other address (an old one, another spelling, a relay from a build
+    /// that had more) could never be sent as it is: it sat in the outbox forever and counted as waiting. They use the
+    /// built-in relay instead, where those mailboxes really are.
+    private func forgetUnusableRelays() {
+        guard Invite.officialRelaysOnly else { return }
+        func unusable(_ relay: String?) -> Bool { relay != nil && Invite.allowedRelay(relay) == nil }
+        for i in data.contacts.indices where unusable(data.contacts[i].relay) { data.contacts[i].relay = nil }
+        for i in data.invites.indices where unusable(data.invites[i].relay) { data.invites[i].relay = nil }
+        for i in data.outbox.indices where unusable(data.outbox[i].relay) { data.outbox[i].relay = nil }
+        if unusable(data.inviteRelay) { data.inviteRelay = nil }
     }
 
     /// When this build's relay is an onion service, a local relay address is that same relay reached the old way
@@ -817,6 +831,11 @@ final class AppModel {
         identityCache = [:]
         DecodedImages.forget()
         LinkPreviews.forgetLinked()
+        sendHolds = [:]
+        refusals = [:]
+        unsentMessages = []
+        retriedAt = [:]
+        keysAnsweredAt = [:]
         eggs = []
         // Per-contact state derived from the account that was open, including text typed into requests.
         removedStories = [:]
@@ -4038,6 +4057,59 @@ final class AppModel {
         }
     }
 
+    // MARK: Messages that didn't send
+
+    /// How long a message may wait on this device before it shows as not sent, with a way to try again.
+    static var unsentAfter: TimeInterval = 3 * 60
+
+    /// Your messages that never reached the relay: still waiting after a few minutes, or given up on (the relay
+    /// refused them, say). The chat shows them as "Not sent" with a tap to try again. Worked out every few seconds,
+    /// and only assigned when it changes, so chats don't redraw for nothing.
+    private(set) var unsentMessages: Set<UUID> = []
+
+    /// When each message was last tried again by hand, so the wait starts over from then. Memory only.
+    @ObservationIgnored private var retriedAt: [UUID: Date] = [:]
+
+    /// Message ids something is still trying to send: an envelope in the outbox, or one waiting for a session.
+    private var stillGoing: Set<UUID> {
+        var ids = Set(data.outbox.compactMap(\.message))
+        for c in data.contacts { for d in c.devices { for p in d.pending { if let m = p.message { ids.insert(m) } } } }
+        return ids
+    }
+
+    private func noteUnsent() {
+        let now = Date()
+        let going = stillGoing
+        var found: Set<UUID> = []
+        for convo in data.conversations where convo.kind != .channel {
+            // Only the newest ones need looking at. Videos aren't here: their clip has its own upload and retries.
+            for message in convo.messages.suffix(200) where message.isMine && message.status == .queued && !message.isSystem && !message.isVideo {
+                let since = retriedAt[message.id] ?? message.date
+                if !going.contains(message.id) || now.timeIntervalSince(since) > Self.unsentAfter { found.insert(message.id) }
+            }
+        }
+        if found != unsentMessages { unsentMessages = found }
+    }
+
+    /// Sends a message that didn't go once more, from the start: whatever was left of the first try is taken out of
+    /// the queue first, so it can't go twice. Someone who did get the first copy just ignores the second.
+    func retrySend(_ id: UUID, in conversation: Conversation.ID) {
+        guard let convo = self.conversation(conversation), convo.kind != .channel,
+              let message = convo.messages.first(where: { $0.id == id && $0.isMine && !$0.isVideo }) else { return }
+        data.outbox.removeAll { $0.message == id && !sendingIDs.contains($0.id) }
+        for i in data.contacts.indices {
+            for d in data.contacts[i].devices.indices where data.contacts[i].devices[d].pending.contains(where: { $0.message == id }) {
+                data.contacts[i].devices[d].pending.removeAll { $0.message == id }
+            }
+        }
+        retriedAt[id] = Date()
+        unsentMessages.remove(id)
+        let wire = wireForResend(message, in: convo)
+        for member in audience(convo) { enqueue(.message(wire), to: member, message: id) }
+        save()
+        kick()
+    }
+
     /// Who still needs a message of yours. A direct chat has one person; a group only the members whose device
     /// hasn't confirmed it. A nil `deliveredTo` (a message from before this) counts as nobody having confirmed.
     func unconfirmedRecipients(_ message: Message, in convo: Conversation) -> [Contact] {
@@ -4108,17 +4180,42 @@ final class AppModel {
     /// went with the request and is answered when they accept, which can be days later. Starting it again would
     /// leave their answer to the first one with nothing to open it.
     private func retryStaleHandshakes() {
-        let cutoff = Date().addingTimeInterval(-60)
+        let now = Date()
+        let cutoff = now.addingTimeInterval(-60)
+        let patience = now.addingTimeInterval(-Self.keysPatience)
         for i in data.contacts.indices where !data.contacts[i].awaitingAcceptance {
             for d in data.contacts[i].devices.indices {
                 let link = data.contacts[i].devices[d]
-                if link.session == nil && link.awaitingHello != true && !link.pending.isEmpty
-                    && (link.handshake?.startedAt ?? .distantPast) < cutoff {
+                guard link.awaitingHello != true else { continue }
+                let key = sessionKey(contact: i, device: d)
+                if link.session == nil && !link.pending.isEmpty && (link.handshake?.startedAt ?? .distantPast) < cutoff {
+                    startHandshake(contact: i, device: d)
+                } else if link.session == nil, let started = link.handshake?.startedAt, started < patience {
+                    // Asked for new keys and never answered, with nothing waiting to send: the ask itself was lost
+                    // (a relay restart, an app restart before it went). It used to wait forever, on "Setting up new
+                    // keys", until you happened to write to them. Asked again, rarely, so a slow answer to the last
+                    // one isn't overtaken.
+                    startHandshake(contact: i, device: d)
+                } else if let session = link.session, !session.canSend, link.handshake == nil {
+                    // They answered our ask, and we can write on the new keys once their first message arrives.
+                    // They send it straight away; when it never comes (lost, or stuck on their phone) the chat sat on
+                    // "Setting up new keys" for good. After a while we ask again. The keys we have stay readable.
+                    guard let since = keysAnsweredAt[key] else { keysAnsweredAt[key] = now; continue }
+                    guard since < patience else { continue }
+                    keysAnsweredAt[key] = nil
+                    recoveredSessions[key] = session
                     startHandshake(contact: i, device: d)
                 }
             }
         }
     }
+
+    /// How long new keys wait for the other side before asking again. Long enough that an answer on its way over a
+    /// slow Tor circuit isn't overtaken by a second ask (which would leave it with nothing to open it).
+    static var keysPatience: TimeInterval = 5 * 60
+
+    /// When a contact answered this device's ask for new keys, by contact and device. Memory only.
+    @ObservationIgnored private var keysAnsweredAt: [String: Date] = [:]
 
     /// One of a contact's devices by id. A device we only knew by its mailbox learns its id here.
     private func deviceIndex(_ i: Int, _ id: Data) -> Int? {
@@ -4380,6 +4477,7 @@ final class AppModel {
         }
         resendAfterRestart()
         resendOverdueMessages()
+        noteUnsent()
         if introsStale { refileIntros() }
         resendUnconfirmedStories()
         resendUnconfirmedViews()
@@ -4414,6 +4512,58 @@ final class AppModel {
     var waitingToSend: (count: Int, oldest: Date?) {
         let items = data.outbox.filter { $0.ephemeral != true }
         return (items.count, items.compactMap(\.queued).min())
+    }
+
+    /// Why a waiting envelope didn't go the last time it was tried. Memory only, for the Network page.
+    enum SendHold: String {
+        case unreachable = "The relay didn't answer"
+        case full = "Their mailbox on the relay is full"
+        case slowUpload = "Upload timed out"
+        case busy = "The relay asked this connection to slow down"
+        case refused = "The relay refused it"
+    }
+
+    private(set) var sendHolds: [UUID: SendHold] = [:]
+    /// Times the relay has refused each envelope outright. A few refusals and it never will take it.
+    @ObservationIgnored private var refusals: [UUID: Int] = [:]
+
+    /// What's waiting to send, for the Network page: what kind of thing it is, why it's waiting, and who it's for.
+    struct WaitingReport {
+        var kinds: [(String, Int)] = []
+        var reasons: [(String, Int)] = []
+        var people: [(String, Int)] = []
+        var mailboxes = 0
+    }
+
+    var waitingReport: WaitingReport {
+        let items = data.outbox.filter { $0.ephemeral != true }
+        func tally(_ names: [String]) -> [(String, Int)] {
+            Dictionary(names.map { ($0, 1) }, uniquingKeysWith: +).sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
+        }
+        let kinds = items.map { item -> String in
+            if item.story != nil { return "Story pieces" }
+            if item.viewReport != nil { return "Story views" }
+            if item.rings == true { return "Calls" }
+            if item.message != nil { return item.blob.count > Self.smallEnvelope ? "Photos and videos" : "Messages" }
+            if item.wakes == true { return "Friend requests" }
+            return "Receipts and updates"
+        }
+        let reasons = items.map { item -> String in
+            if sendingIDs.contains(item.id) { return "Sending now" }
+            if reachable(item.relay) == nil { return "Addressed to a relay this app can't use" }
+            if let hold = sendHolds[item.id] { return hold.rawValue }
+            if mailboxBackoff[item.sendID] != nil { return SendHold.full.rawValue }
+            return "Not tried yet"
+        }
+        // Who it's for, by the mailbox it goes to: one of a contact's devices, or one of your own.
+        var owners: [Data: String] = [:]
+        for c in data.contacts {
+            let name = c.isSelf ? "Your other devices" : displayName(c.fingerprint)
+            for d in c.devices { owners[d.sendID] = name }
+        }
+        return WaitingReport(kinds: tally(kinds), reasons: tally(reasons),
+                             people: Array(tally(items.map { owners[$0.sendID] ?? "Someone no longer in your contacts" }).prefix(5)),
+                             mailboxes: Set(items.map(\.sendID)).count)
     }
 
     /// Under Automatic bridges: when the relay hasn't answered for a while over Tor, try the other way in. Plain Tor
@@ -4726,6 +4876,8 @@ final class AppModel {
         // to just failed: that was a slow upload, not the mailbox, so short messages to it still go.
         var held: Set<Data> = []
         var heldBig: Set<Data> = []
+        // Connections the relay asked to slow down this time: only what goes on them waits.
+        var heldLanes: Set<String> = []
         var tried: Set<UUID> = []
         var aborted = false
 
@@ -4747,7 +4899,7 @@ final class AppModel {
                 // Photos and story pieces go on a connection of their own, so a big upload neither crowds out the short
                 // messages nor takes their connection down with it when it fails.
                 let lane = (item.lane ?? Outgoing.lane(for: nil)) + (item.blob.count > Self.smallEnvelope ? Self.bulkSuffix : "")
-                guard !down.contains(relay), !held.contains(item.sendID) else { continue }
+                guard !down.contains(relay), !held.contains(item.sendID), !heldLanes.contains(lane) else { continue }
                 if item.blob.count > Self.smallEnvelope {
                     guard !heldBig.contains(item.sendID), !seenBig.contains(item.sendID),
                           !sendingBigMail.contains(item.sendID) else { continue }
@@ -4807,14 +4959,35 @@ final class AppModel {
                         mailboxBackoff[item.sendID] = nil
                         continue
                     }
+                    let refused = (error as? RelayRefused)?.status
                     if error is RelayMailboxFull {
                         held.insert(item.sendID)
                         let failures = (mailboxBackoff[item.sendID]?.failures ?? 0) + 1
                         mailboxBackoff[item.sendID] = (Date().addingTimeInterval(retryDelay(failures)), failures)
+                        sendHolds[item.id] = .full
+                    } else if refused == 429 {
+                        heldLanes.insert(lane)
+                        sendHolds[item.id] = .busy
+                    } else if let refused, (400..<500).contains(refused) {
+                        // The relay answered and turned down this one envelope: the relay is fine, so everything
+                        // else still goes. (This used to count as the relay being down, and a tiny envelope it always
+                        // refused, tried first for being the smallest, held the whole outbox back on every try.)
+                        // Refused a few times, it never will be taken.
+                        let times = (refusals[item.id] ?? 0) + 1
+                        if times >= 3 {
+                            data.outbox.removeAll { $0.id == item.id }
+                            refusals[item.id] = nil
+                            sendHolds[item.id] = nil
+                            continue
+                        }
+                        refusals[item.id] = times
+                        sendHolds[item.id] = .refused
                     } else if item.blob.count > Self.largeEnvelope {
                         heldBig.insert(item.sendID)
+                        sendHolds[item.id] = .slowUpload
                     } else {
                         down.insert(item.relay ?? data.relay)
+                        sendHolds[item.id] = .unreachable
                     }
                     // A signal that couldn't be sent is not worth sending later.
                     if item.ephemeral == true {
@@ -4826,6 +4999,8 @@ final class AppModel {
                     lastDepositOK = Date()
                     data.outbox.removeAll { $0.id == item.id }
                     mailboxBackoff[item.sendID] = nil
+                    if sendHolds[item.id] != nil { sendHolds[item.id] = nil }
+                    refusals[item.id] = nil
                     if let message = item.message { setStatus(.sent, for: [message]) }
                     if item.story != nil { drainStoryBacklog() }
                     if let story = item.story { markUploadedIfDone(story) }
@@ -4837,6 +5012,9 @@ final class AppModel {
         // Forget backoff for mailboxes no longer waiting (a cancelled send, a deleted chat).
         let live = Set(data.outbox.map(\.sendID))
         mailboxBackoff = mailboxBackoff.filter { live.contains($0.key) }
+        let waiting = Set(data.outbox.map(\.id))
+        if sendHolds.keys.contains(where: { !waiting.contains($0) }) { sendHolds = sendHolds.filter { waiting.contains($0.key) } }
+        refusals = refusals.filter { waiting.contains($0.key) }
         save()
     }
 
@@ -5058,6 +5236,8 @@ final class AppModel {
             data.contacts[i].devices[d].answeredAt = opened.sentAt
             // New keys are in place: no more asking for them because of messages that were read with the old ones.
             unreadable[sessionKey(contact: i, device: d)] = nil
+            // We can write on these keys once their first message arrives; they send it straight after answering.
+            keysAnsweredAt[sessionKey(contact: i, device: d)] = Date()
             return .handled
         case let .ratchet(message):
             // A message from a device this account hasn't met yet (its hello may be right behind in the same

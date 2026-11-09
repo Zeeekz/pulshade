@@ -5,7 +5,7 @@ import PulshadeShared
 
 /// The pages Settings opens, each from a row on the main list.
 enum SettingsPage: String, Hashable {
-    case profile, handles, pinned, collectibles, pets, privacy, privacyLock, privacyMessages, privacyPasscodes, privacyBackup, blocked, notifications, appearance, devices, network, anonymity, account, updates
+    case profile, handles, pinned, collectibles, pets, privacy, privacyLock, privacyMessages, privacyPasscodes, privacyBackup, blocked, notifications, appearance, devices, network, networkWaiting, anonymity, account, updates
 }
 
 /// Settings, laid out like a phone's own: your profile on top, then a short list of rows,
@@ -98,6 +98,7 @@ struct SettingsView: View {
                     case .appearance: AppearanceSettings()
                     case .devices: DevicesSettings()
                     case .network: NetworkSettings()
+                    case .networkWaiting: WaitingToSendView()
                     case .anonymity: AnonymityReport()
                     case .account: AccountSettings()
                     case .updates:
@@ -1187,7 +1188,21 @@ private struct NetworkSettings: View {
                         RowDivider()
                         SettingRow("Mail received") { Self.dim(Self.ago(model.lastMailReceived)) }
                         RowDivider()
-                        SettingRow("Waiting to send") { Self.dim(waitingText) }
+                        if model.waitingToSend.count > 0 {
+                            // Opens what's waiting, why, and for whom.
+                            NavigationLink(value: SettingsPage.networkWaiting) {
+                                SettingRow("Waiting to send") {
+                                    HStack(spacing: 6) {
+                                        Self.dim(waitingText)
+                                        Image(systemName: "chevron.right").font(.system(size: 11, weight: .semibold)).foregroundStyle(Ink.faint)
+                                    }
+                                }
+                                .contentShape(.rect)
+                            }
+                            .buttonStyle(.plain)
+                        } else {
+                            SettingRow("Waiting to send") { Self.dim(waitingText) }
+                        }
                     }
                 }
                 RowDivider()
@@ -1322,6 +1337,50 @@ private struct NetworkSettings: View {
             return "Off: faster, but the server sees your IP address (or your VPN's) and can tie your personas together by it."
         }
         return "Hides your IP from the server; each persona has its own circuit. Slower."
+    }
+}
+
+/// What's waiting on this device to reach the relay: what it is, why it hasn't gone, and who it's for. Nothing here
+/// leaves the phone; it's worked out from the outbox each time the page draws.
+private struct WaitingToSendView: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        SettingsScreen(title: "Waiting to send", back: "Network") {
+            TimelineView(.periodic(from: .now, by: 2)) { _ in
+                let report = model.waitingReport
+                VStack(spacing: 22) {
+                    if report.kinds.isEmpty {
+                        SettingsGroup(footer: "Everything has reached the relay.") {
+                            SettingRow("Waiting") { Self.dim("Nothing") }
+                        }
+                    } else {
+                        group("Why it's waiting", report.reasons,
+                              footer: "From the last time each one was tried. They're tried again on their own.")
+                        group("What it is", report.kinds, footer: nil)
+                        group("Who it's for", report.people,
+                              footer: "\(report.mailboxes) \(report.mailboxes == 1 ? "device" : "devices") in all. A friend's old phone that never collects can fill up its mailbox.")
+                    }
+                    SettingsGroup {
+                        ActionRow(title: model.retryingRelay ? "Trying…" : "Try again now") { Task { await model.retryRelay() } }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func group(_ title: String, _ rows: [(String, Int)], footer: String?) -> some View {
+        SettingsGroup(title, footer: footer) {
+            ForEach(Array(rows.enumerated()), id: \.offset) { i, row in
+                if i > 0 { RowDivider() }
+                SettingRow(row.0) { Self.dim("\(row.1)") }
+            }
+        }
+    }
+
+    private static func dim(_ text: String) -> some View {
+        Text(text).font(.system(size: 14)).foregroundStyle(Ink.dim).monospacedDigit()
     }
 }
 

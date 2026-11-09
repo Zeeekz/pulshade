@@ -308,7 +308,7 @@ struct RelayClient {
         let status = (response as? HTTPURLResponse)?.statusCode
         if status == 507 { throw RelayMailboxFull() }
         if status == 413 { throw RelayTooLarge() }
-        guard status == 202 else { throw URLError(.badServerResponse) }
+        guard status == 202 else { throw RelayRefused(status: status ?? 0) }
     }
 
     /// With `wait`, the relay holds the request open for up to that many seconds and answers the moment mail
@@ -713,6 +713,9 @@ extension Data {
 struct RelayMailboxFull: Error {}
 /// The relay refuses this envelope for its size, and always will.
 struct RelayTooLarge: Error {}
+/// The relay answered, but not with "taken". 429 is this connection sending too much this hour, 503 a relay
+/// pausing (a handover), anything else a refusal of this one envelope.
+struct RelayRefused: Error { var status: Int }
 
 /// The relay said no to a push registration; `status` is its answer.
 struct PushRefused: Error { var status: Int }

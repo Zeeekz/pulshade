@@ -32,6 +32,8 @@ struct ConversationView: View {
     @State private var flash: UUID?
     /// The chat follows the bottom as it fills and settles, until you scroll away from it yourself.
     @State private var pinnedToEnd = true
+    /// The first moment after the chat opens, while its rows are still being measured.
+    @State private var opening = true
     /// Updated every scroll frame, so it lives outside view state: only crossing the threshold redraws.
     @State private var scrollTrack = ScrollTrack()
     @State private var showJumpDown = false
@@ -197,6 +199,7 @@ struct ConversationView: View {
                         Constellation(symbol: "lock", text: "Messages here are end-to-end encrypted")
                             .padding(.top, 120)
                     }
+                    let unsent = model.unsentMessages
                     ForEach(Array(c.messages.enumerated()), id: \.element.id) { i, m in
                         let prev = i > 0 ? c.messages[i - 1] : nil
                         let next = i + 1 < c.messages.count ? c.messages[i + 1] : nil
@@ -223,7 +226,9 @@ struct ConversationView: View {
                                        reply: { startReply(m) },
                                        unsend: { model.unsend(m.id, in: id) },
                                        jump: { target in jump(to: target, proxy: proxy) },
-                                       hover: { inside in if inside { hovered = m.id } else if hovered == m.id { hovered = nil } })
+                                       hover: { inside in if inside { hovered = m.id } else if hovered == m.id { hovered = nil } },
+                                       notSent: unsent.contains(m.id),
+                                       retry: { model.retrySend(m.id, in: id) })
                                 .equatable()
                             }
                         }
@@ -244,18 +249,38 @@ struct ConversationView: View {
             // Opens at the newest message, and a short chat sits at the bottom like any messenger.
             .defaultScrollAnchor(.bottom, for: .initialOffset)
             .defaultScrollAnchor(.bottom, for: .alignment)
-            // While it's following the bottom, the scroll view itself keeps it there as anything grows: a new
-            // message, a photo or preview measured late, the keyboard, someone typing. One owner for the scroll
-            // position, so nothing jumps or fights. Scrolled up to read, the rows you're reading stay still.
-            .defaultScrollAnchor(pinnedToEnd ? .bottom : nil, for: .sizeChanges)
-            .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height - $0.contentOffset.y - $0.containerSize.height } action: { _, new in
-                scrollTrack.distance = new
+            // Following the bottom, like other messengers: whenever the chat or its window changes size (a new
+            // message, the three dots, the keyboard, the text box growing as you type, a photo measured late) and
+            // you were at or near the newest message, it moves down with it. Scrolled up to read, it stays where you
+            // are. Never while your finger is on it. This is the one place that moves the chat on its own, so
+            // nothing fights it.
+            .onScrollGeometryChange(for: ScrollShape.self) {
+                ScrollShape(content: $0.contentSize.height, container: $0.containerSize.height, offset: $0.contentOffset.y)
+            } action: { old, new in
+                scrollTrack.distance = new.content - new.offset - new.container
+                guard new.content != old.content || new.container != old.container, !scrollTrack.touching else { return }
+                let wasNear = old.content - old.offset - old.container < 120
+                guard pinnedToEnd || wasNear else { return }
+                // Rows are only measured as they come into view, so a chat that has just opened settles from a guess:
+                // straight there, not in a glide.
+                if opening {
+                    proxy.scrollTo("end", anchor: .bottom)
+                } else {
+                    withAnimation(.smooth(duration: 0.25)) { proxy.scrollTo("end", anchor: .bottom) }
+                }
+            }
+            .onAppear {
+                opening = true
+                DispatchQueue.main.async { proxy.scrollTo("end", anchor: .bottom) }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { opening = false }
             }
             .onScrollGeometryChange(for: Bool.self) { $0.contentSize.height - $0.contentOffset.y - $0.containerSize.height > 320 } action: { _, far in
                 if showJumpDown != far { withAnimation(.snappy(duration: 0.2)) { showJumpDown = far } }
                 if !far { unreadBelow = 0 }
             }
             .onScrollPhaseChange { old, new in
+                scrollTrack.touching = new == .interacting || new == .decelerating
+                if new == .interacting { opening = false }
                 if new == .interacting, pinnedToEnd { pinnedToEnd = false }
                 if new == .idle, old == .interacting || old == .decelerating {
                     let near = scrollTrack.distance < 80
@@ -268,8 +293,8 @@ struct ConversationView: View {
             #endif
             .onChange(of: c.messages.count) { old, new in
                 guard new > old, let last = c.messages.last else { return }
-                // At the bottom, the anchor above brings a new message into view by itself. Scrolled up to read,
-                // it waits below with a count, except your own, which takes you down to it.
+                // Near the bottom, following it (above) brings a new message into view. Scrolled up to read, it
+                // waits below with a count, except your own, which takes you down to it.
                 if last.isMine, !pinnedToEnd {
                     pinnedToEnd = true
                     unreadBelow = 0
@@ -763,6 +788,9 @@ fileprivate struct Bubble: View, Equatable {
     var unsend: () -> Void
     var jump: (UUID) -> Void
     var hover: (Bool) -> Void
+    /// It never reached the relay: said under the bubble, with a tap to send it again.
+    var notSent = false
+    var retry: () -> Void = {}
     @State private var hovering = false
     @State private var picking = false
     @State private var viewingImage = false
@@ -775,7 +803,7 @@ fileprivate struct Bubble: View, Equatable {
     static func == (a: Bubble, b: Bubble) -> Bool {
         a.message == b.message && a.kind == b.kind && a.senderName == b.senderName && a.senderAvatar == b.senderAvatar
             && a.tint == b.tint && a.quoteAuthor == b.quoteAuthor && a.first == b.first && a.last == b.last
-            && a.canReact == b.canReact && a.highlighted == b.highlighted && a.swipe == b.swipe
+            && a.canReact == b.canReact && a.highlighted == b.highlighted && a.swipe == b.swipe && a.notSent == b.notSent
     }
 
     /// Message text: a size up from before, so chats read easily at a glance.
@@ -819,6 +847,21 @@ fileprivate struct Bubble: View, Equatable {
                         .padding(.horizontal, 8)
                         .transition(.scale(scale: 0.6, anchor: mine ? .topTrailing : .topLeading).combined(with: .opacity))
                 }
+                if notSent && mine {
+                    Button(action: retry) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.circle.fill")
+                            Text("Not sent · Tap to retry")
+                        }
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.red)
+                        .padding(.top, 9).padding(.horizontal, 4)
+                        .contentShape(.rect)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Not sent. Try again")
+                    .transition(.opacity)
+                }
             }
             .offset(x: swipe * 0.6)
             .overlay(alignment: mine ? .leading : .trailing) {
@@ -848,6 +891,7 @@ fileprivate struct Bubble: View, Equatable {
             hover(h)
         }
         .contextMenu {
+            if notSent && mine { Button("Try sending again", action: retry) }
             Button("Reply", action: reply)
             if !message.text.isEmpty { Button("Copy") { copyToClipboard(message.text, clearAfter: 60) } }
             if canReact {
@@ -1334,6 +1378,15 @@ private struct RecordingBar: View {
 /// A value that changes often but shouldn't redraw anything when it does.
 private final class ScrollTrack {
     var distance: CGFloat = 0
+    /// A finger on the chat, or the chat still gliding from one: it's yours, nothing moves it.
+    var touching = false
+}
+
+/// The sizes that decide whether the chat should follow the bottom.
+private struct ScrollShape: Equatable {
+    var content: CGFloat
+    var container: CGFloat
+    var offset: CGFloat
 }
 
 private struct TypingDots: View {
