@@ -231,6 +231,14 @@ whoever made it can't read it. After the first hello, the member opens a mailbox
 to write there instead. If the group was made before its owner had heard from a member's device (someone added a
 moment earlier), that member is told its mailbox again once the owner knows the device.
 
+A group's details also name each member's keys and mailbox, and those names are only the group's word: an owner
+or admin who wanted to interfere could put a member's signing key beside an agreement key or mailbox of their
+own. That cannot read what you say to that member, because a message is only sealed once a session opens, and a
+session only opens when the other side answers with an envelope signed by the member's own identity key. What a
+poisoned card can do is stop you reaching that member, and show the attacker the introduction card (your profile
+and public keys) that is sent first. Checking the safety code out of band, or meeting in person, settles it. A
+later version can have each member sign their own card, which would close even that.
+
 **Linked devices.** One account, several devices, like Signal. Your identity keys are shared between your devices,
 but each device has its own id, its own mailboxes and its own ratchet session with every contact device, so no
 message key is ever used twice. Linking: the logged-in device shows a QR code holding a one-time secret and a
@@ -350,3 +358,7 @@ kept in memory only.
   rely on iOS behaviour Apple doesn't document; if an update changes it, screenshots would show the app again.
 - **Groups cap out at 300 members.** Every message goes out as one envelope per member, so that's the most an owner can
   add: fine for friends and communities, not for 10,000-person channels.
+- **A group's member list is only as trustworthy as its admins.** The keys and mailboxes in a group's details are
+  asserted by whoever sent them. A poisoned card can't read your messages to that member (a session only opens on
+  an answer signed by the member's own identity key), but it can stop you reaching them. Check the safety code
+  when it matters.

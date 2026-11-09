@@ -153,6 +153,8 @@ final class AppModel {
     let vault: Vault
     private var syncTask: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
+    /// The first-reach loop started at unlock; stopped at lock like the others.
+    private var readyTask: Task<Void, Never>?
     /// The sealed backup upload waiting its turn, and how long it waits (seconds, picked at random each time so the
     /// relay can't line an upload up with an edit). Tests shorten the wait.
     @ObservationIgnored private var backupTask: Task<Void, Never>?
@@ -485,6 +487,9 @@ final class AppModel {
         let key = sessionKey(contact: i, device: d)
         if let last = lastMend[key], Date().timeIntervalSince(last) < 120 { return }
         lastMend[key] = Date()
+        // Keep the keys this chat was using, in memory only, so a message that was sealed under them and arrives
+        // while the new session is being set up can still be read. Dropped at lock with the other recovery keys.
+        if let old = data.contacts[i].devices[d].session { recoveredSessions[key] = old }
         startHandshake(contact: i, device: d)
     }
 
@@ -504,8 +509,9 @@ final class AppModel {
         }
     }
 
-    /// Keys from before an account was recovered, by contact and device. Held in memory only, and dropped at lock.
-    @ObservationIgnored private var recoveredSessions: [String: Ratchet] = [:]
+    /// Keys from before an account was recovered or a session was repaired, by contact and device. Held in memory
+    /// only, and dropped at lock.
+    @ObservationIgnored private(set) var recoveredSessions: [String: Ratchet] = [:]
 
     private func sessionKey(contact i: Int, device d: Int) -> String {
         "\(data.contacts[i].persona?.uuidString ?? "main")|\(data.contacts[i].fingerprint)|\(data.contacts[i].devices[d].id.hex)"
@@ -623,8 +629,9 @@ final class AppModel {
         withAnimation(.smooth(duration: 0.6)) { phase = .unlocked }
         scheduleBackup()
         // Ask straight away, and again until it answers, so the wait is only as long as Tor needs.
-        Task { [weak self] in
-            while let self, self.connecting, self.phase == .unlocked, let client = self.client(nil) {
+        readyTask?.cancel()
+        readyTask = Task { [weak self] in
+            while let self, !Task.isCancelled, self.connecting, self.phase == .unlocked, let client = self.client(nil) {
                 self.noteRelay(reached: await Self.reach(client))
                 if self.connecting { try? await Task.sleep(for: .seconds(1)) }
             }
@@ -721,6 +728,7 @@ final class AppModel {
         if call != nil { hangUp() }
         syncTask?.cancel()
         tickTask?.cancel()
+        readyTask?.cancel()
         typing = [:]
         lastTypingSent = [:]
         online = [:]
@@ -799,6 +807,8 @@ final class AppModel {
     /// What's held in memory only, for the account that was open: persona keys and its eggs. Whoever unlocks
     /// next, a decoy included, must not find them.
     private func forgetSession() {
+        readyTask?.cancel()
+        readyTask = nil
         recoveredSessions = [:]
         unreadable = [:]
         resentAt = [:]
@@ -941,6 +951,16 @@ final class AppModel {
     func settleSaves() {
         flushSave()
         Self.saveQueue.sync {}
+    }
+
+    /// The same, for a caller that can wait without holding the main actor: the encrypting stays on the save queue
+    /// and this returns once the write that was waiting has landed. Used before acknowledging mail, so receiving
+    /// stays durable without stalling the interface.
+    func settleSavesAsync() async {
+        flushSave()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            Self.saveQueue.async { continuation.resume() }
+        }
     }
 
     /// Drops a waiting write and lets any under way finish, so nothing lands after the vault's files are wiped.
@@ -1252,6 +1272,8 @@ final class AppModel {
         // Only people of this group that are your contacts can be mentioned.
         let allowed = Set(mentionable(in: convo).map(\.fingerprint))
         message.mentions = Mention.locate(picks.filter { allowed.contains($0.fingerprint) }, in: trimmed)
+        // A group message is confirmed member by member, so it starts with nobody having confirmed it.
+        if convo.kind == .group { message.deliveredTo = [] }
         withAnimation(.snappy(duration: 0.4)) { data.conversations[i].messages.append(message) }
 
         let wire = WireMessage(id: message.id, conversation: sharedID(convo), kind: convo.kind == .broadcast ? .direct : convo.kind,
@@ -1459,6 +1481,7 @@ final class AppModel {
         let reply = replyTo.map { ReplyRef(id: $0.id, author: $0.sender, snippet: Self.snippet(of: $0), picture: Self.quotePicture($0.image)) }
         var message = Message(sender: "me", text: "", date: now, expiresAt: convo.disappearAfter.map { now.addingTimeInterval($0) }, reply: reply)
         message.attachment = a
+        if convo.kind == .group { message.deliveredTo = [] }
         withAnimation(.snappy(duration: 0.4)) { data.conversations[i].messages.append(message) }
         fileProgress[message.id] = 0
         fileFailed[message.id] = nil
@@ -3859,6 +3882,9 @@ final class AppModel {
     static let deferredMailLimit: TimeInterval = 10 * 60
     /// How long a message waits for its receipt before it is sent again, then again after the next wait, and so on.
     static var resendGaps: [TimeInterval] = [90, 300, 900, 2700, 7200]
+    /// How long a group message is sent again to members whose device hasn't confirmed it. Long enough for a slow
+    /// phone, short enough that a group whose receipts are off can't keep rewriting it for a day.
+    static var groupResendWindow: TimeInterval = 60 * 60
     /// When each of your messages was last sent again, and how many times, while the app is open.
     @ObservationIgnored private var resentAt: [UUID: (at: Date, count: Int)] = [:]
     @ObservationIgnored private var lastDueCheck = Date.distantPast
@@ -3959,22 +3985,76 @@ final class AppModel {
         for i in data.conversations.indices {
             let convo = data.conversations[i]
             guard convo.kind == .direct || convo.kind == .group else { continue }
-            let lost = convo.messages.filter {
-                $0.isMine && $0.status == .sent && $0.date > cutoff && !$0.isVideo
-                    && ($0.expiresAt.map { $0 > Date() } ?? true) && (!dueOnly || resendIsDue($0))
-                    // A group message is answered with a receipt now, so it leaves this set on arrival. With
-                    // receipts turned off there's no answer to wait for; trying twice is enough, and repeating
-                    // it for a day only crowds out what's new.
-                    && (convo.kind == .direct || (resentAt[$0.id]?.count ?? 0) < 2)
+            let now = Date()
+            let lost = convo.messages.filter { message in
+                guard message.isMine, !message.isVideo, message.date > cutoff,
+                      message.expiresAt.map({ $0 > now }) ?? true,
+                      !dueOnly || resendIsDue(message) else { return false }
+                guard convo.kind == .group else { return message.status == .sent }
+                // A group keeps trying the members who can't confirm (an older build) for the window, even after
+                // the tick has caught up on the ones that can.
+                guard now.timeIntervalSince(message.date) < Self.groupResendWindow else { return false }
+                return message.status == .sent || !unconfirmedRecipients(message, in: convo).isEmpty
             }
             guard !lost.isEmpty else { continue }
-            let recipients = audience(convo)
             for message in lost {
+                let missing = unconfirmedRecipients(message, in: convo)
+                // Every member's device has it: let the tick catch up even if the last receipt arrived quietly.
+                if convo.kind == .group, missing.isEmpty { setStatus(.delivered, for: [message.id]); continue }
+                guard !missing.isEmpty else { continue }
                 resentAt[message.id] = (Date(), (resentAt[message.id]?.count ?? 0) + 1)
                 let wire = wireForResend(message, in: convo)
                 // Not marked queued: it stays "sent" until the receipt comes, which is what makes it worth sending again.
-                for member in recipients { enqueue(.message(wire), to: member) }
+                for member in missing { enqueue(.message(wire), to: member) }
             }
+        }
+    }
+
+    /// Who still needs a message of yours. A direct chat has one person; a group only the members whose device
+    /// hasn't confirmed it. A nil `deliveredTo` (a message from before this) counts as nobody having confirmed.
+    func unconfirmedRecipients(_ message: Message, in convo: Conversation) -> [Contact] {
+        let recipients = audience(convo)
+        guard convo.kind == .group else { return recipients }
+        let confirmed = Set(message.deliveredTo ?? [])
+        return recipients.filter { !confirmed.contains($0.fingerprint) }
+    }
+
+    /// The members a group message's tick can wait for: those whose app said it answers group messages. A build
+    /// from before never does, so it isn't waited on. Empty until a device has said anything, and then one receipt
+    /// is all there is to go on (see `noteDelivery`).
+    private func requiredConfirmations(_ convo: Conversation) -> Set<String> {
+        guard convo.kind == .group else { return [] }
+        return Set(audience(convo).filter { contact in
+            contact.devices.contains { $0.readsGroupReceipts == true }
+        }.map(\.fingerprint))
+    }
+
+    /// A device has the message. In a group that's one member of many: the message stays "sent" until every
+    /// member whose app answers group messages has confirmed, so one quiet member can't hide it from the rest.
+    /// A build from before that never answers isn't waited on. Read ticks stay for direct chats; a group's
+    /// receipt only says it arrived.
+    func noteDelivery(of id: UUID, by fingerprint: String, read: Bool) {
+        for c in data.conversations.indices {
+            guard let m = data.conversations[c].messages.firstIndex(where: { $0.id == id && $0.isMine }) else { continue }
+            let convo = data.conversations[c]
+            if convo.kind == .group {
+                let expected = Set(audience(convo).map(\.fingerprint))
+                guard expected.contains(fingerprint) else { return }
+                var confirmed = Set(data.conversations[c].messages[m].deliveredTo ?? [])
+                confirmed.insert(fingerprint)
+                data.conversations[c].messages[m].deliveredTo = confirmed.sorted()
+                let required = requiredConfirmations(convo)
+                if required.isEmpty {
+                    // Nothing is known to answer yet (older builds, or devices that haven't sent anything since):
+                    // one receipt is all there is to go on.
+                    if !confirmed.isEmpty { setStatus(.delivered, for: [id]) }
+                } else if required.isSubset(of: confirmed) {
+                    setStatus(.delivered, for: [id])
+                }
+            } else {
+                setStatus(read ? .read : .delivered, for: [id])
+            }
+            return
         }
     }
 
@@ -4231,7 +4311,9 @@ final class AppModel {
                 if !done.isEmpty {
                     save()
                     // The relay forgets everything it acknowledges. Write first, so a crash or a suspended app
-                    // between the answer and the disk can't take the message down with it.
+                    // between the answer and the disk can't take the message down with it. This one blocks until the
+                    // write lands: `settleSavesAsync` (waits off the main actor) let a second check start in the gap
+                    // and made the relay-flow video test fail under load, so it isn't used here yet.
                     settleSaves()
                     try await client.ack(done)
                 }
@@ -4853,14 +4935,16 @@ final class AppModel {
         }
 
         if case let .hello(card, request) = payload {
-            guard card.signingKey == signer,
+            // The card must name the agreement key the envelope was actually sealed with: the signing key's
+            // binding covers that one, not whatever a payload chooses to claim.
+            guard card.signingKey == signer, card.agreementKey == opened.agreement,
                   let invite = data.invites.first(where: { $0.receiveKey == envelope.receiveKey && !$0.isPublic }) else { return .junk }
             acceptHello(card, request, fingerprint: fp, device: device, via: invite)
             noteReads(opened, from: fp, persona: invite.persona)
             return .handled
         }
         if case let .request(card, request, note) = payload {
-            guard card.signingKey == signer, !data.blocked.contains(fp),
+            guard card.signingKey == signer, card.agreementKey == opened.agreement, !data.blocked.contains(fp),
                   card.relay == nil || Invite.allowedRelay(card.relay) != nil,
                   let invite = data.invites.first(where: { $0.receiveKey == envelope.receiveKey && $0.isPublic }) else { return .junk }
             var incoming = FriendRequest(fingerprint: fp, card: card, handshake: request, note: String(note.prefix(280)),
@@ -4983,6 +5067,9 @@ final class AppModel {
         if (data.contacts[i].devices[d].readsAttachments == true) != opened.readsAttachments {
             data.contacts[i].devices[d].readsAttachments = opened.readsAttachments ? true : nil
         }
+        if (data.contacts[i].devices[d].readsGroupReceipts == true) != opened.readsGroupReceipts {
+            data.contacts[i].devices[d].readsGroupReceipts = opened.readsGroupReceipts ? true : nil
+        }
     }
 
     static let maxAvatarBytes = 512 * 1024
@@ -5044,7 +5131,7 @@ final class AppModel {
         case let .receipt(ids, read):
             // With read receipts off you don't see other people's either.
             let seen = read == true && data.security.readReceipts
-            withAnimation(.smooth) { setStatus(seen ? .read : .delivered, for: ids) }
+            withAnimation(.smooth) { for id in ids { noteDelivery(of: id, by: fp, read: seen) } }
         case let .group(info):
             joinGroup(info, from: sender)
         case let .story(id, style, date, lasts):

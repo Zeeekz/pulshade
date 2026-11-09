@@ -86,6 +86,9 @@ struct DeviceLink: Codable {
     var readsFrames: Bool?
     /// Their app reads files kept on the relay. Nil for an app from before.
     var readsAttachments: Bool?
+    /// Their app answers group messages with a receipt, so a group's tick can wait for this device. Nil for an app
+    /// from before, which neither sends nor expects one.
+    var readsGroupReceipts: Bool?
 
     init(id: Data = Data(), sendID: Data) {
         self.id = id
@@ -484,6 +487,9 @@ struct Message: Codable, Identifiable, Equatable {
     var mentions: [Mention] = []
     /// A file kept on the relay, sealed: this message holds only where it is and the key. Opened in memory when tapped.
     var attachment: Attachment?
+    /// For one of your messages in a group: the members whose device has confirmed it. Nil for a direct chat or
+    /// channel, where one receipt covers everyone, and for messages from before this, which confirmed once for all.
+    var deliveredTo: [String]?
 
     var isVideo: Bool { video != nil }
     /// Whether this message @-mentions you.
@@ -524,6 +530,7 @@ struct Message: Codable, Identifiable, Equatable {
         note = try? c.decodeIfPresent(NoteCard.self, forKey: .note)
         mentions = (try? c.decodeIfPresent([Mention].self, forKey: .mentions)) ?? []
         attachment = try? c.decodeIfPresent(Attachment.self, forKey: .attachment)
+        deliveredTo = try? c.decodeIfPresent([String].self, forKey: .deliveredTo)
     }
 }
 

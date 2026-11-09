@@ -222,7 +222,11 @@ struct RelayClient {
             defer { sessions = [:]; established = [] }
             return sessions.values
         }
-        old.forEach { finishing ? $0.finishTasksAndInvalidate() : $0.invalidateAndCancel() }
+        // Dropping them from the cache is enough for the finishing case: a request already under way keeps its
+        // own reference and ends safely, and the session goes once that reference does. Invalidating it here,
+        // even with `finishTasksAndInvalidate`, could catch a request that had just picked it up and make
+        // CFNetwork raise "task created in a session that has been invalidated", which Swift can't catch.
+        if !finishing { old.forEach { $0.invalidateAndCancel() } }
     }
 
     /// The same plain configuration everywhere, calls included, over Tor when it's on.

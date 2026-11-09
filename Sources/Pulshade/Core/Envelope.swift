@@ -34,19 +34,24 @@ enum Envelope {
     }
 
     /// What this app tells everyone it can read. Bit 0: framed messages (`Frame`), which carry big fields raw.
-    /// Bit 1: files kept on the relay (`Attachment`).
-    static let reads: UInt8 = 3
+    /// Bit 1: files kept on the relay (`Attachment`). Bit 2: it answers group messages with a receipt, so a group
+    /// tick can wait for it. Builds from before that never do, and aren't waited on.
+    static let reads: UInt8 = 7
 
     /// Opened envelope: the payload, who sent it, from which of their devices, and when.
     struct Opened {
         var payload: Payload
         var signer: Data
+        /// The sender's agreement key, the one the sealing used and the signing key's binding covers. A card
+        /// inside the payload that names any other agreement key isn't the one that proved these keys are theirs.
+        var agreement: Data
         var device: Data
         var sentAt: Date
         /// What the sender's app says it can read (0 from apps before this).
         var caps: UInt8 = 0
         var readsFrames: Bool { caps & 1 == 1 }
         var readsAttachments: Bool { caps & 2 == 2 }
+        var readsGroupReceipts: Bool { caps & 4 == 4 }
     }
 
     /// `framed` sends the payload and the inside of the envelope in frames, without the base64 that makes a big
@@ -102,7 +107,7 @@ enum Envelope {
 
         let signer = try Curve25519.Signing.PublicKey(rawRepresentation: inner.from)
         guard signer.isValidSignature(inner.bind, for: bindLabel + sender) else { throw EnvelopeError.badSignature }
-        return Opened(payload: try Payload.fromWire(inner.body), signer: inner.from,
+        return Opened(payload: try Payload.fromWire(inner.body), signer: inner.from, agreement: sender,
                       device: inner.device ?? Data(), sentAt: Date(timeIntervalSince1970: TimeInterval(inner.at)), caps: inner.caps ?? 0)
     }
 
