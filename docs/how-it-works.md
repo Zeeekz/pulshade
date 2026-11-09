@@ -268,8 +268,8 @@ key. On a Mac that key is in the Keychain; on a Linux server it is a file outsid
 disk. So the seal keeps these files closed to anyone who gets a copy of the data folder or of its backups, and does
 not protect them from someone who holds the whole disk or controls the server, who can read the key as well. A
 backup that hasn't been saved again for 180 days (a detached account's, once its device is gone) is erased. The server turns off core dumps, so a crash never writes its memory to disk. Rate
-limits never keep an IP address, only a hash with a salt that's replaced every hour. Admin actions need the token in
-`admin.token`, which only the server can read; the Pulshade app has no admin in it at all. Abuse reports are sealed to
+limits never keep an IP address, only a hash with a salt that's replaced every hour. Admin actions need the operator's token, which only root
+on the server can read (the relay keeps just a hash of it); the Pulshade app has no admin in it at all. Abuse reports are sealed to
 Pulshade Admin's reports key and go only to a mailbox signed by the admin key built into the app, from a throwaway key,
 without your handle unless you add it, so the server can't read them. Nothing in the admin tools can read anyone's
 messages.
