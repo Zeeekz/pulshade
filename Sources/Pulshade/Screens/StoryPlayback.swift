@@ -362,7 +362,7 @@ final class LibraryPicker: NSObject, PHPickerViewControllerDelegate {
                     return
                 }
                 guard size <= Self.largest else {
-                    Task { @MainActor in self.fail("That video is too big (\(size / 1_000_000) MB; the limit is \(Self.largest / 1_000_000) MB). Trim it to under a minute in Photos and try again.") }
+                    Task { @MainActor in self.fail("That video is too big (\(size / 1_000_000) MB; the limit is \(Self.largest / 1_000_000) MB).") }
                     return
                 }
                 guard let bytes = try? Data(contentsOf: url) else {

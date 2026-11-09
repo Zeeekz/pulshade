@@ -31,7 +31,7 @@ struct PinnedEditor: View {
     var body: some View {
         let empty = links.isEmpty && notes.isEmpty
         SettingsGroup("Pinned to your profile",
-                      footer: "Links and wallets are public. A note can be public, locked with a password, or sent only to contacts you choose.") {
+                      footer: "Links and wallets are public. Notes can be public, locked, or sent to chosen contacts.") {
             if empty {
                 SettingRow("Nothing pinned yet") { EmptyView() }
                     .foregroundStyle(Ink.faint)

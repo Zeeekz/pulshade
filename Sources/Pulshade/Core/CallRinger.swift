@@ -64,9 +64,6 @@ final class CallRinger: NSObject {
         _ = provider
     }
 
-    /// Whether a call is on the system's screen, so the app doesn't also put up a banner for it.
-    var isRinging: Bool { uuid != nil }
-
     // MARK: From the app
 
     /// A call's envelope has been opened. If the system's screen is up for it, it learns the name.

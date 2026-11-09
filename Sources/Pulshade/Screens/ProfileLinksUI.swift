@@ -159,7 +159,7 @@ private struct WalletSheet: View {
                 .foregroundStyle(Ink.text)
                 .multilineTextAlignment(.center)
             Text(isMine ? "This is the address people see on your profile."
-                        : "This is the address they sent you. Pulshade checked that it is a real address, not whose it is. Compare all of it, not just the start and end, and confirm with them another way.")
+                        : "Pulshade checked this is a real address, not whose it is. Compare all of it and confirm with them another way.")
                 .font(.system(size: 12))
                 .foregroundStyle(Ink.faint)
                 .multilineTextAlignment(.center)

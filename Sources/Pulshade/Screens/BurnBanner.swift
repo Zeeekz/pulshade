@@ -6,7 +6,7 @@ struct BurnBanner: View {
     @Environment(AppModel.self) private var model
 
     private var text: String? {
-        if model.burnPending { return "Burned on this phone. Finishing the erase on the server, and trying again until it is done." }
+        if model.burnPending { return "Burned on this phone. Finishing the erase on the server." }
         return model.burnNotice
     }
 

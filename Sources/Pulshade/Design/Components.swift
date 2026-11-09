@@ -177,32 +177,6 @@ struct QRCode: View {
     }
 }
 
-/// Two panes side by side on the Mac, stacked and scrollable on iPhone.
-struct Split<Leading: View, Trailing: View>: View {
-    @ViewBuilder var leading: Leading
-    @ViewBuilder var trailing: Trailing
-
-    var body: some View {
-        #if os(iOS)
-        ScrollView {
-            VStack(spacing: 28) {
-                leading
-                Rectangle().fill(Ink.line).frame(height: 1)
-                trailing
-            }
-            .padding(.vertical, 12)
-        }
-        .scrollIndicators(.never)
-        #else
-        HStack(spacing: 0) {
-            leading.frame(maxWidth: .infinity)
-            Rectangle().fill(Ink.line).frame(width: 1)
-            trailing.frame(maxWidth: .infinity)
-        }
-        #endif
-    }
-}
-
 /// Small round badge with a symbol, used for counts and kinds.
 struct SymbolBadge: View {
     @Environment(\.theme) private var theme

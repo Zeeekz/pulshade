@@ -213,7 +213,7 @@ struct HatchedSheet: View {
                         .multilineTextAlignment(.center).padding(.top, 4)
                 }
             }
-            Text("It's yours now. If you already have one, you can gift it to someone, or let it go to go back into circulation, from its page.")
+            Text("It's yours now. Gift it or let it go from its page.")
                 .font(.system(size: 12)).foregroundStyle(Ink.faint).multilineTextAlignment(.center)
             Spacer(minLength: 0)
             Button("Done") { dismiss() }.buttonStyle(PrimaryButtonStyle())

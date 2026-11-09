@@ -1680,7 +1680,7 @@ private struct ConversationInfo: View {
     private func burnButton(_ persona: UUID) -> some View {
         Button {
             pending = Pending(title: "Burn this persona now?",
-                              message: "It's deleted for good, with its chats and contacts. Your main identity and other personas aren't touched.",
+                              message: "It's deleted for good, with its chats and contacts.",
                               confirm: "Burn") {
                 dismiss()
                 model.burn(persona)
@@ -1732,7 +1732,7 @@ private struct ConversationInfo: View {
     // MARK: Groups & channels
 
     private func announcementsSection(_ c: Conversation) -> some View {
-        Card(title: "About", footer: "Each announcement is signed by PULSHADE and checked on this device, so nobody else can post here. Fetching them tells nobody who you are.") {
+        Card(title: "About", footer: "Signed by PULSHADE and checked on this device.") {
             Text(c.about ?? "")
                 .foregroundStyle(Ink.text)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1924,7 +1924,7 @@ private struct ConversationInfo: View {
                             model.blockContact(fp, persona: c.persona)
                         }
                     } message: {
-                        Text("This chat is deleted on your side and anything they send is dropped. They aren't told. You can unblock them in Privacy & Security.")
+                        Text("Deleted on your side; anything they send is dropped. They aren't told. Unblock in Privacy & Security.")
                     }
                 }
                 if !contact.hidden && !contact.isSelf {

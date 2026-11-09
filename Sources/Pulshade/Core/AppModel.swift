@@ -1571,9 +1571,6 @@ final class AppModel {
         save()
     }
 
-    /// Tries a failed upload again, if the phone still has the file's picker access; otherwise the message is removed.
-    func retryFile(_ messageID: UUID, in id: Conversation.ID) { cancelFile(messageID, in: id) }
-
     /// Tells the relay to erase the files of yours that these messages name. If it can't be reached the erase is remembered
     /// and tried again; a file the relay still holds expires on its own after at most a week.
     private func eraseFiles(in messages: [Message]) {

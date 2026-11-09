@@ -90,7 +90,7 @@ struct ReportSheet: View {
                     Toggle("Say it's from @\(mine)", isOn: $includeHandle).toggleStyle(GlowToggleStyle())
                 }
             }
-            Text(branded: "Only the PULSHADE team can read this. It's sent from a throwaway identity, so it doesn't say who you are unless you add your handle. The person you report is never told.")
+            Text(branded: "Only the PULSHADE team reads this. It's sent anonymously unless you add your handle, and the person you report isn't told.")
                 .font(.system(size: 12)).foregroundStyle(Ink.faint)
                 .fixedSize(horizontal: false, vertical: true)
             if let problem {
@@ -108,7 +108,7 @@ struct ReportSheet: View {
                 PulseMark(size: 34)
                 VStack(alignment: .leading, spacing: 6) {
                     Text(branded: "PULSHADE Safety").font(.system(size: 14, weight: .semibold)).foregroundStyle(Ink.text)
-                    Text(branded: "Thanks, we've got your report. A person on the PULSHADE team reviews every one, and we can remove handles and ban accounts that break the rules.")
+                    Text(branded: "Thanks, we've got your report. The PULSHADE team reviews every one.")
                         .font(.system(size: 14)).foregroundStyle(Ink.dim)
                         .fixedSize(horizontal: false, vertical: true)
                     Text("If you don't want to hear from them again, block them too.")

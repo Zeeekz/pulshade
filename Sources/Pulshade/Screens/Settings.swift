@@ -563,7 +563,7 @@ private struct ProfileSettings: View {
             }
             VStack(spacing: 6) {
                 hero
-                sectionNote("Tap your picture or banner to change it. Your colour rings your picture and tints your messages.")
+                sectionNote("Tap your picture or banner to change it.")
             }
             SettingsGroup("About you", footer: "Only people you chat with see these.") {
                 fieldRow("Name") {
@@ -606,7 +606,7 @@ private struct ProfileSettings: View {
                 }
             }
             if let id = model.activePersona {
-                SettingsGroup(footer: "Burning this persona deletes it for good. Your main identity and other personas aren't touched.") {
+                SettingsGroup(footer: "Burning this persona deletes it for good.") {
                     ActionRow(title: "Burn persona", destructive: true) { burningPersona = true }
                 }
                 .sheet(isPresented: $burningPersona) { PersonaBurnSheet(persona: id) }
@@ -664,7 +664,7 @@ struct HandlesEditor: View {
     private var used: Int { active.count + off.count }
 
     var body: some View {
-        SettingsGroup("Handles", footer: "Every handle that's on takes chat requests for this profile. Up to \(AppModel.maxHandles) per persona; one you turn off stays yours for 3 months. Handles can't move between personas.") {
+        SettingsGroup("Handles", footer: "Handles that are on take chat requests. Up to \(AppModel.maxHandles) per persona; one you turn off stays yours for 3 months.") {
             if active.isEmpty && off.isEmpty && !loading {
                 SettingRow("No public handle", symbol: "at") { Text("Private").font(.system(size: 13)).foregroundStyle(Ink.faint) }
                 RowDivider()
@@ -716,7 +716,7 @@ struct HandlesEditor: View {
                             titleVisibility: .visible, presenting: lettingGo) { kept in
             Button("Let go", role: .destructive) { letGo(kept) }
         } message: { _ in
-            Text("It frees a spot for another handle. Nobody can claim it for 30 days, you included; after that anyone can. Links you shared won't open your profile.")
+            Text("Frees a spot. Nobody can claim it for 30 days, you included. Shared links stop working.")
         }
     }
 
@@ -906,7 +906,7 @@ private struct LockSettings: View {
             }
             SettingsGroup("While locked", footer: model.biometricsBlocked
                           ? "Not available while a decoy or panic passcode is set."
-                          : "Auto-lock hides PULSHADE but keeps it running, so a locked phone still gets messages and your friends see them delivered at once. Off, auto-lock closes everything and nothing arrives or is confirmed until you unlock. Pressing Lock yourself always closes everything.") {
+                          : "Auto-lock keeps PULSHADE running so messages still arrive. Off closes everything until you unlock. Pressing Lock always closes everything.") {
                 SecurityToggle(title: "Keep receiving while locked", key: \.keepReceivingLocked)
                     .disabled(model.biometricsBlocked)
             }
@@ -923,7 +923,7 @@ private struct LockSettings: View {
 private struct MessagePrivacySettings: View {
     var body: some View {
         SettingsScreen(title: "What others see", back: "Privacy") {
-            SettingsGroup("Messages", footer: "Receipts go out in batches, so their timing gives nothing away. Turn one off and you stop seeing theirs too.") {
+            SettingsGroup("Messages", footer: "Turn one off and you stop seeing theirs too.") {
                 SecurityToggle(title: "Link previews", key: \.linkPreviews)
                 RowDivider()
                 SecurityToggle(title: "Delivery receipts", key: \.deliveryReceipts)
@@ -932,11 +932,11 @@ private struct MessagePrivacySettings: View {
                 RowDivider()
                 SecurityToggle(title: "Typing indicators", key: \.typingIndicators)
             }
-            SettingsGroup("Presence", footer: "Off by default. Only accepted contacts who show theirs can see yours. The relay can tell when it's sent and to whom.") {
+            SettingsGroup("Presence", footer: "Off by default. Only contacts who show theirs see yours.") {
                 SecurityToggle(title: "Online status", key: \.onlineStatus)
             }
             LearnMore(title: "Link previews",
-                      text: "Made on your device over Tor, so the site never sees your IP (with Tor off, it does). The people you send to never contact the site.")
+                      text: "Fetched over Tor, so the site never sees your IP (with Tor off, it does).")
         }
     }
 }
@@ -982,7 +982,7 @@ private struct BackupSettings: View {
 
     var body: some View {
         SettingsScreen(title: "Backup & keys", back: "Privacy") {
-            SettingsGroup("Backup", footer: "A sealed copy of your profile, contacts, groups and settings (never chats) sits on the relay. Only your recovery code opens it, so the relay can't. Off erases it.") {
+            SettingsGroup("Backup", footer: "A sealed copy of your profile, contacts, groups and settings (never chats) on the relay. Only your recovery code opens it. Off erases it.") {
                 SettingRow("Keep a sealed backup") {
                     Toggle("Keep a sealed backup", isOn: Binding(get: { model.data.security.keepBackup },
                                              set: { v in withAnimation(.snappy) { model.setKeepBackup(v) } }))
@@ -995,7 +995,7 @@ private struct BackupSettings: View {
                     }
                 }
             }
-            SettingsGroup("Chat keys", footer: "Use if messages stop arriving both ways, after a Detach say. Opens fresh encrypted sessions with every contact. Nothing already delivered is lost.") {
+            SettingsGroup("Chat keys", footer: "Use if messages stop arriving both ways. Opens fresh sessions with every contact.") {
                 SettingRow("Renew keys with contacts") {
                     Button("Renew") { model.renewChatKeys() }
                         .buttonStyle(.plain)
@@ -1014,7 +1014,7 @@ private struct BlockedSettings: View {
 
     var body: some View {
         SettingsScreen(title: "Blocked", back: "Privacy") {
-            SettingsGroup(footer: "Anything blocked people send is dropped without telling them. Unblocking lets them send you a new request; your old chat doesn't come back.") {
+            SettingsGroup(footer: "Blocked people's messages are dropped without telling them. Your old chat doesn't come back on unblock.") {
                 if model.data.blocked.isEmpty {
                     SettingRow("Nobody") { EmptyView() }
                 } else {
@@ -1083,7 +1083,7 @@ private struct NotificationSettings: View {
             }
             if on {
                 LearnMore(title: "Waking a locked iPhone",
-                          text: "Apple wakes your iPhone with a note that only says \"New message\". Apple learns when it woke, and the relay keeps your push token. Off, you only hear about messages while PULSHADE is open. Friend request alerts also let the relay see that this iPhone owns your @handle's mailbox. Off by default.")
+                          text: "Apple wakes your iPhone with a note that only says \"New message\". Apple learns when, and the relay keeps your push token. Off, you only hear about messages while PULSHADE is open.")
             }
             #endif
             #if os(macOS)
@@ -1135,8 +1135,7 @@ private struct DevicesSettings: View {
     var body: some View {
         SettingsScreen(title: "Devices") {
             SettingsGroup("Account",
-                          footer: "Every device here is this one account: the same profile, @handle, contacts, chats and requests. "
-                              + "To use a different account on a device, erase it in Account & Recovery and create a new one.") {
+                          footer: "Every device here is this one account.") {
                 HStack(spacing: 12) {
                     Avatar(image: model.data.profile.avatar, seed: model.fingerprint, size: 40)
                     VStack(alignment: .leading, spacing: 2) {
@@ -1194,7 +1193,7 @@ private struct NetworkSettings: View {
                 RowDivider()
                 ActionRow(title: model.retryingRelay ? "Checking…" : "Check connection") { Task { await model.retryRelay() } }
             }
-            SettingsGroup("Relay", footer: "The server that passes on your encrypted messages. It can't read them.") {
+            SettingsGroup("Relay", footer: "Passes on your encrypted messages. It can't read them.") {
                 SettingRow("Server") {
                     // The built-in relay's address isn't shown; a development build may be pointed at another.
                     Text(branded: model.data.relay == AppData.defaultRelay ? "PULSHADE" : relayURL?.host() ?? model.data.relay)
@@ -1233,7 +1232,7 @@ private struct NetworkSettings: View {
                     }
                 }
             }
-            SettingsGroup(footer: "The route your messages took to the relay, hop by hop, and what the relay can and can't see.") {
+            SettingsGroup(footer: "The route to the relay, hop by hop, and what it can see.") {
                 MenuRow(page: .anonymity, symbol: "eye.slash.fill", color: .hex(0x64D2FF), title: "Anonymity Report",
                         value: nil)
             }
@@ -1322,7 +1321,7 @@ private struct NetworkSettings: View {
         if !model.data.security.tor {
             return "Off: faster, but the server sees your IP address (or your VPN's) and can tie your personas together by it."
         }
-        return "Hides your IP from the server, and each persona uses its own circuit so none can be linked by address. Slower."
+        return "Hides your IP from the server; each persona has its own circuit. Slower."
     }
 }
 
@@ -1336,7 +1335,7 @@ private struct BridgeLinesSheet: View {
         SheetBody(width: 520) {
             VStack(alignment: .leading, spacing: 18) {
                 SheetHeader(symbol: "point.3.connected.trianglepath.dotted", title: "Your bridges")
-                Text("Paste bridge lines, one per line: webtunnel or Snowflake. Get them from bridges.torproject.org, or from someone who runs one.")
+                Text("Paste bridge lines, one per line (webtunnel or Snowflake). Get them from bridges.torproject.org.")
                     .font(.system(size: 14)).foregroundStyle(Ink.dim)
                     .fixedSize(horizontal: false, vertical: true)
                 TextEditor(text: $lines)

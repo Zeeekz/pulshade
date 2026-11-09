@@ -913,7 +913,7 @@ struct StoryViewers: View {
                         .frame(minHeight: 52)
                     }
                 }
-                SettingsGroup(footer: model.storyReceipt(of: story) == nil ? nil : "Counts only people who have delivery receipts on, so it can be lower than the number who really have it.") {
+                SettingsGroup(footer: model.storyReceipt(of: story) == nil ? nil : "Counts only people with delivery receipts on.") {
                     SettingRow("Shared with", symbol: "person.2") {
                         Text(model.summary(of: story.shownTo)).font(.system(size: 14)).foregroundStyle(Ink.faint)
                     }
@@ -933,7 +933,7 @@ struct StoryViewers: View {
     }
 
     private var footer: String {
-        "Views travel encrypted like messages; the server never sees them. People on older versions of Pulshade with story views off aren't listed."
+        "Views travel encrypted. People with story views off aren't listed."
     }
 }
 

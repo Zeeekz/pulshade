@@ -81,7 +81,7 @@ struct ConnectionChoice: View {
                        subtitle: "Fast is much quicker. Tor hides your IP address. You can change it later in Settings.", back: nil) {
             VStack(spacing: 14) {
                 option(symbol: "bolt.fill", title: "Fast",
-                       detail: "Messages arrive in seconds. The server and your network can see your IP address, but nothing you say, and PULSHADE keeps no logs.",
+                       detail: "Fast. The server and your network see your IP address, never what you say.",
                        tor: false)
                 option(symbol: "lock.shield.fill", title: "Private, through Tor",
                        detail: "Hides your IP address through Tor. Slower: messages can arrive late on some networks.",
@@ -262,7 +262,7 @@ struct CreateFlow: View {
             VStack(spacing: 16) {
                 RecoveryCodeGrid(code: identity.recoveryCode)
                 // No copy button: clipboards sync between devices and clipboard apps keep history.
-                Text("Write it on paper. It isn't offered for copying, because clipboards sync to other devices and keep history.")
+                Text("Write it on paper. Copying is off because clipboards sync and keep history.")
                     .font(.system(size: 12)).foregroundStyle(Ink.faint).multilineTextAlignment(.center)
                 if let problem { ProblemText(problem).multilineTextAlignment(.center) }
             }
@@ -388,7 +388,7 @@ struct RestoreFlow: View {
                     ProblemText(problem)
                         .multilineTextAlignment(.center)
                 }
-                Text("If you detached, your profile, @handles, contacts and groups come back. Chats don't: they only ever lived on your devices.")
+                Text("Your profile, @handles, contacts and groups come back. Chats don't.")
                     .font(.system(size: 12))
                     .foregroundStyle(Ink.faint)
                     .multilineTextAlignment(.center)
@@ -461,7 +461,7 @@ struct RestoreFlow: View {
                 lookup = nil
                 working = false
                 withAnimation(.snappy) {
-                    problem = "The relay didn't answer in time. If you just changed networks, Tor can take a few minutes to reach it again; try once more shortly."
+                    problem = "The relay didn't answer in time. Try again shortly."
                 }
             }
             defer { timer.cancel() }
@@ -651,7 +651,7 @@ struct UnlockView: View {
             .disabled(working)
             .padding(.top, 28)
             if model.dataUnreadable {
-                Text(branded: "That passcode is right, but this account's data couldn't be read, so PULSHADE didn't open it. Nothing on this device was changed. An update to PULSHADE may fix it.")
+                Text(branded: "Right passcode, but this account's data couldn't be read. Nothing was changed. An update may fix it.")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(.orange)
                     .multilineTextAlignment(.center)
@@ -988,7 +988,7 @@ struct PrivacyChoice: View {
 
     var body: some View {
         OnboardingPage(title: "Your privacy",
-                       subtitle: "Set up how private PULSHADE is before you start. These apply to a new account, and you can change every one later in Settings.",
+                       subtitle: "Choose your privacy settings. You can change any later in Settings.",
                        back: back) {
             VStack(alignment: .leading, spacing: 22) {
                 HStack(spacing: 10) {
@@ -1001,16 +1001,16 @@ struct PrivacyChoice: View {
                     toggle("Delivery receipts", $s.deliveryReceipts, "Tells people when a message reaches your phone.")
                     toggle("Read receipts", $s.readReceipts, "Tells people when you've seen their message.")
                     toggle("Typing indicators", $s.typingIndicators, "Shows people when you're writing to them.")
-                    toggle("Online status", $s.onlineStatus, "Shows people you've accepted when PULSHADE is open. The server can tell when the signal goes out, though not read it.")
+                    toggle("Online status", $s.onlineStatus, "Shows accepted contacts when PULSHADE is open.")
                 }
                 group("Links & backup") {
                     toggle("Link previews", $s.linkPreviews, "Builds a preview when you send a link, which visits the website from your connection.")
-                    toggle("Sealed backup", $s.keepBackup, "Keeps a copy of your profile, contacts and groups (never chats) on the server that only your recovery code opens. It's what brings them back after a Detach.")
+                    toggle("Sealed backup", $s.keepBackup, "A sealed copy of your profile, contacts and groups (never chats) that only your recovery code opens.")
                 }
                 group("Notifications") {
                     toggle("Notifications", $s.notifications, "Banners for new messages.")
                     #if os(iOS)
-                    toggle("Wake a locked iPhone", $s.pushWake, "Lets the server tell Apple to wake your phone for new mail. Apple learns that it was woken, and when, never what for.")
+                    toggle("Wake a locked iPhone", $s.pushWake, "Apple wakes your phone for new mail. Apple learns when, never what for.")
                     #endif
                     choice("On the lock screen", $s.notificationContent, NotificationContent.allCases.map { ($0, $0.label) },
                            "How much a notification shows: nothing, who it's from, or the message.")
@@ -1019,7 +1019,7 @@ struct PrivacyChoice: View {
                     choice("Auto-lock", $s.autoLockMinutes, [(1, "1 min"), (5, "5 min"), (15, "15 min"), (0, "Never")],
                            "Locks PULSHADE after this long, so a borrowed or stolen phone shows nothing.")
                     toggle("Keep receiving while locked", $s.keepReceivingLocked,
-                           "Auto-lock hides PULSHADE but keeps it running, so a locked phone still gets messages and people see them delivered. Off closes everything, and nothing arrives until you unlock.")
+                           "Auto-lock keeps PULSHADE running so messages still arrive. Off closes everything until you unlock.")
                     toggle("Block screenshots & recording", $s.blockCapture, "Keeps chats out of screenshots and screen recordings.")
                     toggle(Platform.isPhone ? "Hide in app switcher" : "Blur when in background", $s.blurWhenInactive,
                            "Blurs your chats whenever PULSHADE isn't in front.")

@@ -420,12 +420,6 @@ struct Vault {
         return Data(plain.dropFirst(8).prefix(length))
     }
 
-    /// Wipes one identity: its data, and Touch ID if it was the one using it.
-    func wipeData(for identity: Identity) {
-        shred(dataURL(for: identity))
-        disableBiometrics()
-    }
-
     /// There are always exactly this many data files, real or random, so counting them reveals nothing.
     static let dataFileCount = slotCount + 1
 

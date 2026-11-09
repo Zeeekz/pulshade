@@ -95,8 +95,8 @@ struct CollectiblesView: View {
             }
             ClaimCodeCard()
             Text(branded: pets
-                 ? "Each pet is numbered and belongs to this persona only. A backup code restores them if the account is lost."
-                 : "Each one is numbered and belongs to this persona only. The one you pick shows after your name. A backup code restores them if the account is lost.")
+                 ? "Each pet is numbered and belongs to this persona. A backup code restores them."
+                 : "Each one is numbered and belongs to this persona. The one you pick shows after your name. A backup code restores them.")
                 .font(.system(size: 12)).foregroundStyle(Ink.faint)
                 .fixedSize(horizontal: false, vertical: true)
             if let problem {

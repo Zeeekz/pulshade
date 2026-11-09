@@ -255,7 +255,7 @@ struct LinkedDevicesCard: View {
                     Menu {
                         Button("Stop syncing with this device", role: .destructive) {
                             pending = Pending(title: "Stop syncing with \(device.name ?? "this device")?",
-                                              message: "It stops getting your messages and changes. What's already on it stays there until it's wiped.",
+                                              message: "It stops getting your messages. What's on it stays until wiped.",
                                               confirm: "Stop syncing") { model.unlinkDevice(device.id) }
                         }
                     } label: {

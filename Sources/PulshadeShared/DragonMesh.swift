@@ -251,18 +251,6 @@ enum DragonMesh {
         return ctx.makeImage()!
     }
 
-    /// A sky to reflect, from a bright horizon to a deep top, so shiny things have something to catch.
-    static func environmentImage() -> CGImage {
-        let w = 256, h = 128
-        let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
-                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
-        let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: [
-            CGColor(red: 0.05, green: 0.07, blue: 0.14, alpha: 1), CGColor(red: 0.42, green: 0.50, blue: 0.62, alpha: 1), CGColor(red: 0.20, green: 0.24, blue: 0.20, alpha: 1),
-        ] as CFArray, locations: [0, 0.5, 1])!
-        ctx.drawLinearGradient(gradient, start: CGPoint(x: 0, y: h), end: CGPoint(x: 0, y: 0), options: [])
-        return ctx.makeImage()!
-    }
-
     /// The wall of a cave: dark rock, an electric blue glow coming up from below, stalactites hanging from the roof and stalagmites
     /// rising at the sides, a vignette round the edge.
     static func lairImage() -> CGImage {

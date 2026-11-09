@@ -54,7 +54,7 @@ struct BackupCodeSheet: View {
                         .font(.system(size: 13)).foregroundStyle(Ink.dim)
                         .fixedSize(horizontal: false, vertical: true)
                 } else {
-                    Text("Your backup code was made on another of your devices and hasn't reached this one yet. You can see it there, or make a new one here: the old one then stops working.")
+                    Text("Your backup code was made on another device and hasn't reached this one yet. Make a new one here and the old one stops working.")
                         .font(.system(size: 13)).foregroundStyle(Ink.dim)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -74,7 +74,7 @@ struct BackupCodeSheet: View {
                     .confirmationDialog("Make a new code?", isPresented: $confirmReplace, titleVisibility: .visible) {
                         Button("Make a new code", role: .destructive, action: replace)
                     } message: {
-                        Text("The code you have now stops working for all your collectibles. Use this if someone else may have seen it.")
+                        Text("Stops the current code working. Use this if someone may have seen it.")
                     }
                 }
             }
@@ -83,9 +83,9 @@ struct BackupCodeSheet: View {
 
     private var explanation: String {
         if let alert, !alert.newCode {
-            return "\(names) is now covered by your backup code, the same one as before. Nothing new to write down."
+            return "\(names) is covered by your existing backup code."
         }
-        return "One code covers \(names) and any you get later. Enter it in a new account to get them back. Anyone with the code can take them, so keep it safe."
+        return "One code covers \(names) and any you get later. Anyone with it can take them, so keep it safe."
     }
 
     private func replace() {
@@ -155,11 +155,11 @@ struct ClaimCodeCard: View {
                     result = ("\(names) will show up here once PULSHADE has signed \(found.count == 1 ? "it" : "them") over to you.", false)
                 case let .giveaway(item, place):
                     let name = Collectible.Kind(rawValue: item)?.name ?? item
-                    result = ("You're in: number \(place) in line for \(name). It shows up here once PULSHADE has signed it over to you, usually within a few minutes.", false)
+                    result = ("You're number \(place) in line for \(name). It shows up here within a few minutes.", false)
                 }
                 code = ""
             } catch RelayClient.ClaimError.unknownCode, RelayClient.GiveawayError.unknownCode {
-                result = ("That code doesn't match anything. It may have been used already, replaced, or the giveaway isn't open.", true)
+                result = ("That code doesn't match anything. It may be used, replaced, or closed.", true)
             } catch RelayClient.GiveawayError.full {
                 result = ("That giveaway has run out. Every one has been claimed.", true)
             } catch {

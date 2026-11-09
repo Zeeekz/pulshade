@@ -15,13 +15,13 @@ struct LeaveView: View {
                     LeaveOption(symbol: "lock.fill", color: Ink.dim, title: "Lock",
                                 detail: "Close PULSHADE now. Your passcode opens it again.") { model.lock() }
                     LeaveOption(symbol: "person.crop.circle.badge.minus", color: .orange, title: "Detach",
-                                detail: "Wipes this device, with no questions: everything on it is overwritten and PULSHADE starts fresh. \(model.hasOtherDevices ? "Nothing is sent, so your other devices keep the account and its chats." : "If you're online, the people you chat with are first told to clear their chat with you (they keep you as a contact); it waits a few seconds at most.") \(model.data.security.keepBackup ? "Your recovery code brings back your profile, contacts and groups from the sealed backup (\(model.backupStatus.lowercased())), never your chats." : "Backups are off, so nothing comes back from the relay.")") { Task { await model.detachNow() } }
+                                detail: "Wipes this device at once. \(model.hasOtherDevices ? "Your other devices keep the account." : "If you're online, your contacts are first told to clear their chat with you.") \(model.data.security.keepBackup ? "Your recovery code brings back your profile, contacts and groups (\(model.backupStatus.lowercased())), never chats." : "Backups are off, so nothing comes back.")") { Task { await model.detachNow() } }
                     if model.activePersona != nil {
                         LeaveOption(symbol: "flame", color: .red, title: "Burn persona",
-                                    detail: "Delete \(model.activeProfile.displayName) for good. Your main identity and other personas aren't touched.") { burningPersona = true }
+                                    detail: "Delete \(model.activeProfile.displayName) for good.") { burningPersona = true }
                     }
                     LeaveOption(symbol: "flame.fill", color: .red, title: "Burn",
-                                detail: "Delete your account everywhere, as if it never existed. It can't be undone.") { burning = true }
+                                detail: "Delete your account everywhere. It can't be undone.") { burning = true }
                 }
             }
             .padding(.horizontal, 16)
@@ -81,12 +81,12 @@ struct BurnSheet: View {
         SheetBody(width: 460) {
             VStack(alignment: .leading, spacing: 18) {
                 SheetHeader(symbol: "flame.fill", title: "Burn")
-                Text("This deletes your account everywhere, as if it never existed. It can't be undone, and the recovery code won't bring it back.")
+                Text("This deletes your account everywhere. It can't be undone, and the recovery code won't bring it back.")
                     .font(.system(size: 14, weight: .medium)).foregroundStyle(Ink.text)
                     .fixedSize(horizontal: false, vertical: true)
                 BurnPoints()
                 if !(model.activeProfile.collectibles ?? []).isEmpty {
-                    Label("Your collectibles can come back in a new account with your backup code. Write it down from Collectibles before you burn.", systemImage: "key.horizontal")
+                    Label("Collectibles come back with your backup code. Write it down first.", systemImage: "key.horizontal")
                         .font(.system(size: 13)).foregroundStyle(Ink.dim)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -95,7 +95,7 @@ struct BurnSheet: View {
                     ProblemText(problem)
                 }
                 BurnButton(working: working, enabled: confirm == "BURN", action: { burn() })
-                Text("Burn needs no connection to wipe this phone: it wipes everything here at once and finishes erasing on the server, trying again until it is done. Or wipe only this device. The relay's copy of your backup then stays there, opens only with your recovery code, and is erased within 180 days.")
+                Text("Burn wipes this phone at once and keeps erasing on the server until done. Detach leaves the sealed backup on the relay, erased within 180 days.")
                     .font(.system(size: 13)).foregroundStyle(Ink.dim)
                     .fixedSize(horizontal: false, vertical: true)
                 Button("Burn this device only") { burn(deviceOnly: true) }
@@ -134,7 +134,7 @@ struct PersonaBurnSheet: View {
         SheetBody(width: 460) {
             VStack(alignment: .leading, spacing: 18) {
                 SheetHeader(symbol: "flame.fill", title: "Burn \(name)")
-                Text("This deletes the persona \(name) everywhere, as if it never existed. It can't be undone. Your main identity and your other personas aren't touched.")
+                Text("This deletes the persona \(name) everywhere. It can't be undone.")
                     .font(.system(size: 14, weight: .medium)).foregroundStyle(Ink.text)
                     .fixedSize(horizontal: false, vertical: true)
                 VStack(alignment: .leading, spacing: 10) {
@@ -143,7 +143,7 @@ struct PersonaBurnSheet: View {
                     BurnPoint(symbol: "at", text: "Its @handles can't be claimed for 3 months, and the relay forgets they were its.")
                     BurnPoint(symbol: "laptopcomputer.and.iphone", text: "It's removed from every device on your account.")
                     if hasCollectibles {
-                        BurnPoint(symbol: "key.horizontal", text: "Its collectibles can come back in another persona or account with its backup code. Write it down from Collectibles first.")
+                        BurnPoint(symbol: "key.horizontal", text: "Its collectibles come back with its backup code. Write it down first.")
                     }
                 }
                 BurnConfirmField(confirm: $confirm)
@@ -184,9 +184,9 @@ struct LockedLeaveSheet: View {
             VStack(alignment: .leading, spacing: 18) {
                 SheetHeader(symbol: "flame.fill", title: "Burn or detach")
                 VStack(spacing: 8) {
-                    LeaveChoice(title: "Detach", detail: "This device lets go of the account. Your profile, @handles, contacts and groups wait up to 180 days for your recovery code; this device's chats are deleted.",
+                    LeaveChoice(title: "Detach", detail: "This device lets go of the account. Your profile, contacts and groups wait up to 180 days for your recovery code.",
                                 chosen: !burning) { burning = false }
-                    LeaveChoice(title: "Burn", detail: "The account is deleted everywhere, as if it never existed.",
+                    LeaveChoice(title: "Burn", detail: "The account is deleted everywhere.",
                                 chosen: burning) { burning = true }
                 }
                 Text("Without the passcode, your recovery code proves it's yours.")

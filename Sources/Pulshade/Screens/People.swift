@@ -87,7 +87,7 @@ struct PeopleView: View {
             }
             .frame(maxWidth: .infinity)
         } footer: {
-            "Each code works for one person. Show it, or send the link, then make a new one for the next."
+            "Each code works for one person."
         }
     }
 
@@ -150,7 +150,7 @@ struct PeopleView: View {
             .animation(.snappy, value: parsed != nil)
             .animation(.snappy, value: added?.fingerprint)
         } footer: {
-            "They'll appear in your contacts once their device answers. Nobody can find you this way unless you give them a code."
+            "They appear in your contacts once their device answers."
         }
     }
 

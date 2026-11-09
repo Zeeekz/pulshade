@@ -94,7 +94,7 @@ struct CollectibleViewerSheet: View {
                 }
             }
         } message: {
-            Text("It leaves your collection and goes back into circulation, so someone else can hatch this very one. You won't get it back unless it hatches for you again.")
+            Text("It goes back into circulation, so someone else can hatch this one. You won't get it back.")
         }
         .padding(20)
         .frame(maxWidth: 520)

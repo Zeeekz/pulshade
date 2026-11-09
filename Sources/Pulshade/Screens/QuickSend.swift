@@ -42,7 +42,7 @@ struct QuickSendSheet: View {
                         VStack(spacing: 8) {
                             Image(systemName: "pin").font(.system(size: 26)).foregroundStyle(Ink.faint)
                             Text("Nothing pinned yet").font(.system(size: 15, weight: .semibold)).foregroundStyle(Ink.text)
-                            Text("Pin links, wallets and notes to your profile in Settings, or collect some collectibles, and they'll be here to send in one tap.")
+                            Text("Pin links, wallets, notes or collectibles to send them in one tap.")
                                 .font(.system(size: 13)).foregroundStyle(Ink.dim).multilineTextAlignment(.center)
                         }
                         .padding(.vertical, 40).padding(.horizontal, 24)

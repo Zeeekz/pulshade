@@ -886,7 +886,7 @@ private struct PersonaSwitcher: View {
                 }
                 .buttonStyle(.plain)
             } else {
-                Text("You can have up to \(AppModel.personaLimit) personas besides your main one. Burn one to make another.")
+                Text("Up to \(AppModel.personaLimit) personas besides your main. Burn one to make another.")
                     .font(.system(size: 11)).foregroundStyle(Ink.faint)
                     .fixedSize(horizontal: false, vertical: true)
             }

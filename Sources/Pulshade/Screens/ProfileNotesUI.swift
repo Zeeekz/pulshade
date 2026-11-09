@@ -324,10 +324,10 @@ struct NoteEditSheet: View {
                         .buttonStyle(.plain).foregroundStyle(theme.accent).accessibilityLabel("Copy password")
                 }
                 .padding(12).background(Ink.raised, in: .rect(cornerRadius: 12, style: .continuous))
-                Text("Save it somewhere safe, and give it to whoever should read the note. Pulshade can't recover it.")
+                Text("Pulshade can't recover this password. Keep it safe.")
                     .font(.system(size: 12)).foregroundStyle(Ink.faint)
             }
-            Text("Anyone can copy a locked note and guess passwords offline, so use a strong one. The title isn't locked.")
+            Text("Use a strong password. The title isn't locked.")
                 .font(.system(size: 12)).foregroundStyle(Ink.faint)
         }
     }
@@ -364,7 +364,7 @@ struct NoteEditSheet: View {
                 Text(chosen.isEmpty ? "Pick at least one contact." : chosen.count == 1 ? "1 contact will be able to read this." : "\(chosen.count) contacts will be able to read this.")
                     .font(.system(size: 12, weight: .medium)).foregroundStyle(chosen.isEmpty ? Color.orange : Ink.dim)
             }
-            Text("Only the contacts you pick get this note, inside your encrypted chat with them. It's never public. Removing someone hides it, but they keep anything already read or copied.")
+            Text("Only the contacts you pick get this note, inside your encrypted chat. Removing someone hides it, but not what they already read.")
                 .font(.system(size: 12)).foregroundStyle(Ink.faint)
         }
     }

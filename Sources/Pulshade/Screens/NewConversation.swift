@@ -235,7 +235,7 @@ private struct ChatLinkForm: View {
                         .buttonStyle(PrimaryButtonStyle())
                 }
             } else {
-                Text("Anyone who opens the link can chat with you until it runs out. Neither of you sees the other's account, and the chat disappears for both of you at the end.")
+                Text("Anyone with the link can chat with you until it runs out. The chat is deleted for both of you at the end.")
                     .font(.system(size: 12)).foregroundStyle(Ink.dim).multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 8) {

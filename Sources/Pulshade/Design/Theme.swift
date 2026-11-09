@@ -18,9 +18,6 @@ struct Theme: Identifiable, Equatable {
     var vivid: LinearGradient {
         LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
     }
-    var angular: AngularGradient {
-        AngularGradient(colors: colors + [colors[0]], center: .center)
-    }
     /// Accent tinted for backgrounds of selected things.
     var wash: Color { colors[0].opacity(scheme == .light ? 0.12 : 0.14) }
 

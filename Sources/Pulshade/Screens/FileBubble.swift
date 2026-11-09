@@ -141,7 +141,7 @@ private struct FileSheet: View {
                 }
             }
             Text(file.erased
-                 ? "Opened from memory only, and now erased from the server: this is the only time. Save a copy if you want to keep it (it will be an unencrypted file on this device)."
+                 ? "Opened from memory only and erased from the server. Saving a copy makes an unencrypted file on this device."
                  : "Opened from memory only. Saving a copy puts an unencrypted file on this device.")
                 .font(.system(size: 12)).foregroundStyle(Ink.dim).multilineTextAlignment(.center)
             Button("Save a copy…") { saving = true }
