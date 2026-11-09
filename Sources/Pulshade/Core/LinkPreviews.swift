@@ -17,8 +17,30 @@ enum LinkPreviews {
         return detector?.matches(in: text, range: range).compactMap(\.url).first { isWebLink($0.absoluteString) }
     }
 
+    /// Finding links is slow next to drawing, and a chat redraws its bubbles often, so each text is looked at once.
+    /// In memory only, and emptied on lock and Burn with the decoded pictures.
+    private final class Linked {
+        let value: AttributedString
+        init(_ value: AttributedString) { self.value = value }
+    }
+
+    private static let linkedCache: NSCache<NSString, Linked> = {
+        let cache = NSCache<NSString, Linked>()
+        cache.countLimit = 600
+        return cache
+    }()
+
+    static func forgetLinked() { linkedCache.removeAllObjects() }
+
     /// Text with every web link made clickable.
     static func linked(_ text: String) -> AttributedString {
+        if let hit = linkedCache.object(forKey: text as NSString) { return hit.value }
+        let made = findLinks(text)
+        linkedCache.setObject(Linked(made), forKey: text as NSString)
+        return made
+    }
+
+    private static func findLinks(_ text: String) -> AttributedString {
         var out = AttributedString(text)
         let range = NSRange(text.startIndex..., in: text)
         for match in detector?.matches(in: text, range: range) ?? [] {

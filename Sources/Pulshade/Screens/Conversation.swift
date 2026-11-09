@@ -200,10 +200,12 @@ struct ConversationView: View {
                     ForEach(Array(c.messages.enumerated()), id: \.element.id) { i, m in
                         let prev = i > 0 ? c.messages[i - 1] : nil
                         let next = i + 1 < c.messages.count ? c.messages[i + 1] : nil
-                        if prev.map({ m.date.timeIntervalSince($0.date) > 3600 }) ?? true {
-                            DayPill(date: m.date).padding(.vertical, 14)
-                        }
-                        Group {
+                        // One view per message, its day marker inside it, so the list measures and moves each row
+                        // as a whole instead of rows that come and go beside it.
+                        VStack(spacing: 0) {
+                            if prev.map({ m.date.timeIntervalSince($0.date) > 3600 }) ?? true {
+                                DayPill(date: m.date).padding(.vertical, 14)
+                            }
                             if m.isSystem {
                                 SystemPill(text: m.text).padding(.vertical, 8)
                             } else {
@@ -222,6 +224,7 @@ struct ConversationView: View {
                                        unsend: { model.unsend(m.id, in: id) },
                                        jump: { target in jump(to: target, proxy: proxy) },
                                        hover: { inside in if inside { hovered = m.id } else if hovered == m.id { hovered = nil } })
+                                .equatable()
                             }
                         }
                         .id(m.id)
@@ -238,9 +241,13 @@ struct ConversationView: View {
                 Color.clear.frame(height: 1).id("end")
             }
             .scrollIndicators(.automatic)
-            .defaultScrollAnchor(.bottom)
-            // Rows are only measured as they come into view, so a chat opened at the bottom can grow under you
-            // (photos, previews) and end up scrolled up. While it's following the bottom, it stays there.
+            // Opens at the newest message, and a short chat sits at the bottom like any messenger.
+            .defaultScrollAnchor(.bottom, for: .initialOffset)
+            .defaultScrollAnchor(.bottom, for: .alignment)
+            // While it's following the bottom, the scroll view itself keeps it there as anything grows: a new
+            // message, a photo or preview measured late, the keyboard, someone typing. One owner for the scroll
+            // position, so nothing jumps or fights. Scrolled up to read, the rows you're reading stay still.
+            .defaultScrollAnchor(pinnedToEnd ? .bottom : nil, for: .sizeChanges)
             .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height - $0.contentOffset.y - $0.containerSize.height } action: { _, new in
                 scrollTrack.distance = new
             }
@@ -248,23 +255,26 @@ struct ConversationView: View {
                 if showJumpDown != far { withAnimation(.snappy(duration: 0.2)) { showJumpDown = far } }
                 if !far { unreadBelow = 0 }
             }
-            .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height } action: { old, new in
-                if pinnedToEnd, new != old { proxy.scrollTo("end", anchor: .bottom) }
-            }
             .onScrollPhaseChange { old, new in
-                if new == .interacting { pinnedToEnd = false }
-                if new == .idle, old == .interacting || old == .decelerating { pinnedToEnd = scrollTrack.distance < 80 }
+                if new == .interacting, pinnedToEnd { pinnedToEnd = false }
+                if new == .idle, old == .interacting || old == .decelerating {
+                    let near = scrollTrack.distance < 80
+                    if pinnedToEnd != near { pinnedToEnd = near }
+                }
             }
             #if os(iOS)
             .scrollDismissesKeyboard(.interactively)
             .onTapGesture { focused = false }
             #endif
-            .onChange(of: c.messages.count) {
-                // A new message follows you down, unless you've scrolled up to read: then it waits, except yours.
-                if let last = c.messages.last, pinnedToEnd || last.isMine {
+            .onChange(of: c.messages.count) { old, new in
+                guard new > old, let last = c.messages.last else { return }
+                // At the bottom, the anchor above brings a new message into view by itself. Scrolled up to read,
+                // it waits below with a count, except your own, which takes you down to it.
+                if last.isMine, !pinnedToEnd {
                     pinnedToEnd = true
+                    unreadBelow = 0
                     withAnimation(.smooth(duration: 0.3)) { proxy.scrollTo("end", anchor: .bottom) }
-                } else if let last = c.messages.last, !last.isMine, !last.isSystem {
+                } else if !pinnedToEnd, !last.isMine, !last.isSystem {
                     unreadBelow += 1
                 }
             }
@@ -461,21 +471,12 @@ struct ConversationView: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             } else {
                 HStack(alignment: .bottom, spacing: 8) {
-                    Button { takingPhoto = true } label: { Image(systemName: "camera") }
-                        .buttonStyle(IconButtonStyle(size: 36))
-                        .help("Take or choose a photo or video")
-                        .accessibilityLabel("Take or choose a photo or video")
-                    Button { choosingFile = true } label: { Image(systemName: "paperclip") }
-                        .buttonStyle(IconButtonStyle(size: 36))
-                        .help("Send a file")
-                        .accessibilityLabel("Send a file")
-                    // Only when there's something pinned to send, so the bar stays clear otherwise.
-                    if !(model.activeProfile.links ?? []).isEmpty || !(model.activeProfile.notes ?? []).isEmpty {
-                        Button { quickSending = true } label: { Image(systemName: "pin") }
-                            .buttonStyle(IconButtonStyle(size: 36))
-                            .help("Send something pinned to your profile")
-                            .accessibilityLabel("Send something pinned to your profile")
-                    }
+                    // Camera, files and pinned items behind one pulse button, so the text box gets the room.
+                    // Pinned only shows when there's something pinned to send.
+                    AttachMenu(hasPinned: !(model.activeProfile.links ?? []).isEmpty || !(model.activeProfile.notes ?? []).isEmpty,
+                               camera: { takingPhoto = true },
+                               file: { choosingFile = true },
+                               pinned: { quickSending = true })
 
                     TextField("", text: $draft, prompt: Text(placeholder(c)).foregroundStyle(Ink.faint), axis: .vertical)
                         .textFieldStyle(.plain)
@@ -484,12 +485,14 @@ struct ConversationView: View {
                         // Autocorrect learns what you type and keeps it outside Pulshade's encryption.
                         .autocorrectionDisabled()
                         .focused($focused)
-                        .padding(.leading, 12)
-                        .padding(.trailing, 34)
+                        .padding(.leading, 16)
+                        .padding(.trailing, Platform.isPhone ? 16 : 34)
                         .padding(.vertical, 9)
-                        .background(Ink.raised, in: .rect(cornerRadius: 10))
+                        .frame(minHeight: Self.barHeight)
+                        // Round ends, like other messengers: a pill on one line, softly rounded as it grows.
+                        .background(Ink.raised, in: .rect(cornerRadius: Self.barHeight / 2, style: .continuous))
                         .overlay {
-                            RoundedRectangle(cornerRadius: 10)
+                            RoundedRectangle(cornerRadius: Self.barHeight / 2, style: .continuous)
                                 .strokeBorder(focused ? theme.accent.opacity(0.45) : Ink.line)
                         }
                         .animation(.easeOut(duration: 0.15), value: focused)
@@ -507,21 +510,21 @@ struct ConversationView: View {
                                     .buttonStyle(.plain)
                                     .font(.system(size: 15))
                                     .foregroundStyle(Ink.faint)
-                                    .padding(.trailing, 10)
-                                    .padding(.bottom, 9)
+                                    .padding(.trailing, 12)
+                                    .padding(.bottom, 11)
                                     .accessibilityLabel("Emoji")
                             }
                         }
 
                     if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty && videoDraft == nil {
                         Button { Task { _ = await recorder.start() } } label: { Image(systemName: "mic") }
-                            .buttonStyle(IconButtonStyle(size: 36))
+                            .buttonStyle(BarButtonStyle(size: Self.barHeight))
                             .help("Record a voice message")
                             .accessibilityLabel("Record voice note")
                             .transition(.opacity)
                     } else {
                         Button(action: send) { Image(systemName: "arrow.up") }
-                            .buttonStyle(GlowButtonStyle(size: 36))
+                            .buttonStyle(BarButtonStyle(prominent: true, size: Self.barHeight))
                             .keyboardShortcut(.return, modifiers: .command)
                             .accessibilityLabel("Send")
                             // A video still being made ready can't go yet.
@@ -555,6 +558,9 @@ struct ConversationView: View {
         .animation(.snappy(duration: 0.25), value: replyingTo?.id)
         .animation(.snappy(duration: 0.25), value: draftPreview)
     }
+
+    /// The height of the text box on one line, and of the round buttons beside it.
+    static let barHeight: CGFloat = 40
 
     private func placeholder(_ c: Conversation) -> String {
         switch c.kind {
@@ -643,6 +649,38 @@ struct ConversationView: View {
     }
 }
 
+/// The pulse button left of the text box. It opens a short menu: camera, file, and pinned when there is any.
+private struct AttachMenu: View {
+    @Environment(\.theme) private var theme
+    var hasPinned: Bool
+    var camera: () -> Void
+    var file: () -> Void
+    var pinned: () -> Void
+
+    var body: some View {
+        Menu {
+            Button(action: camera) { Label("Photo or video", systemImage: "camera") }
+            Button(action: file) { Label("File", systemImage: "paperclip") }
+            if hasPinned { Button(action: pinned) { Label("Pinned", systemImage: "pin") } }
+        } label: {
+            PulseLine()
+                .stroke(theme.accent, style: StrokeStyle(lineWidth: 2.2, lineCap: .round, lineJoin: .round))
+                .frame(width: 20, height: 15)
+                .frame(width: ConversationView.barHeight, height: ConversationView.barHeight)
+                .background(Circle().fill(Ink.raised))
+                .overlay(Circle().strokeBorder(Ink.line))
+                .contentShape(Circle())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .menuOrder(.fixed)
+        .fixedSize()
+        .help("Photo, video, file or pinned")
+        .accessibilityLabel("Add a photo, video, file or something pinned")
+    }
+}
+
 /// What the next message is attached to: a reply, or a link preview. Click × to drop it.
 private struct ComposerContext: View {
     @Environment(\.theme) private var theme
@@ -705,7 +743,7 @@ private struct ReadOnlyBar: View {
     }
 }
 
-fileprivate struct Bubble: View {
+fileprivate struct Bubble: View, Equatable {
     @Environment(\.theme) private var theme
     var message: Message
     var kind: ConversationKind
@@ -730,6 +768,15 @@ fileprivate struct Bubble: View {
     @State private var viewingImage = false
     /// Counts double-tap hearts, so each one plays the burst again.
     @State private var hearts = 0
+
+    /// A bubble is drawn again only when what it shows changes, not each time anything in the app does (someone
+    /// typing, a tick on another message, a chat elsewhere). The actions only carry the message's id, so they
+    /// stay right between redraws.
+    static func == (a: Bubble, b: Bubble) -> Bool {
+        a.message == b.message && a.kind == b.kind && a.senderName == b.senderName && a.senderAvatar == b.senderAvatar
+            && a.tint == b.tint && a.quoteAuthor == b.quoteAuthor && a.first == b.first && a.last == b.last
+            && a.canReact == b.canReact && a.highlighted == b.highlighted && a.swipe == b.swipe
+    }
 
     /// Message text: a size up from before, so chats read easily at a glance.
     static let textSize: CGFloat = Platform.isPhone ? 17 : 15.5
@@ -833,7 +880,7 @@ fileprivate struct Bubble: View {
                 Button { jump(quote.id) } label: {
                     HStack(spacing: 8) {
                         Rectangle().fill(mine ? Ink.onAccent.opacity(0.35) : tint).frame(width: 2).clipShape(.capsule)
-                        if let data = quote.picture, let img = PlatformImage(data: data) {
+                        if let data = quote.picture, let img = DecodedImages.image(data, fit: 200) {
                             // A story's quote is tall, like the story; a photo's is a small square.
                             let tall = img.size.height > img.size.width * 1.5
                             Image(platformImage: img).resizable().scaledToFill()
@@ -861,7 +908,7 @@ fileprivate struct Bubble: View {
             }
             if message.isVideo {
                 VideoBubble(message: message)
-            } else if let data = message.image, let img = PlatformImage(data: data) {
+            } else if let data = message.image, let img = DecodedImages.image(data, fit: 1100) {
                 Image(platformImage: img).resizable().scaledToFit()
                     .frame(maxWidth: Platform.isPhone ? 250 : 320, maxHeight: 340)
                     .clipShape(.rect(cornerRadius: 10))
@@ -1123,7 +1170,7 @@ private struct PreviewCard: View {
             if let url = URL(string: preview.url), LinkPreviews.isWebLink(preview.url) { Platform.open(url) }
         } label: {
             VStack(alignment: .leading, spacing: 0) {
-                if let image = preview.image, let ns = PlatformImage(data: image) {
+                if let image = preview.image, let ns = DecodedImages.image(image, fit: 900) {
                     Image(platformImage: ns).resizable().scaledToFill()
                         .frame(width: Platform.isPhone ? 250 : 300, height: Platform.isPhone ? 125 : 150).clipped()
                 }
@@ -2119,5 +2166,6 @@ struct ZapTransition: Transition {
 
 /// New messages slide up; unsent ones zap out. Kept out of the message list's body so it still type-checks quickly.
 private let messageTransition: AnyTransition = .asymmetric(
-    insertion: .move(edge: .bottom).combined(with: .opacity),
+    // A short rise and fade, like other messengers: the bubble arrives without the rows around it jumping.
+    insertion: .offset(y: 14).combined(with: .opacity),
     removal: AnyTransition(ZapTransition()))

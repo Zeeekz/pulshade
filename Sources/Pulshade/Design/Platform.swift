@@ -13,18 +13,38 @@ typealias PlatformImage = UIImage
 /// Pictures already decoded, so a list that redraws doesn't decode every avatar again. Held in memory only, and
 /// emptied by the system when it needs the room.
 enum DecodedImages {
-    private static let cache: NSCache<NSString, PlatformImage> = {
-        let cache = NSCache<NSString, PlatformImage>()
+    /// The bytes are kept beside the picture so a hit is checked, not trusted: two photos that happen to share a
+    /// key can never show one in place of the other.
+    private final class Entry {
+        let data: Data
+        let image: PlatformImage
+        init(data: Data, image: PlatformImage) { self.data = data; self.image = image }
+    }
+
+    private static let cache: NSCache<NSString, Entry> = {
+        let cache = NSCache<NSString, Entry>()
         cache.countLimit = 200
         return cache
     }()
 
-    static func image(_ data: Data) -> PlatformImage? {
-        let key = "\(data.count)-\(data.hashValue)" as NSString
-        if let hit = cache.object(forKey: key) { return hit }
+    /// `fit` is the longest side, in pixels, the picture is drawn at: a big photo is then decoded once, at the size
+    /// it shows, instead of again on every redraw while scrolling.
+    static func image(_ data: Data, fit: CGFloat? = nil) -> PlatformImage? {
+        let key = "\(data.count)-\(data.hashValue)-\(Int(fit ?? 0))" as NSString
+        if let hit = cache.object(forKey: key), hit.data == data { return hit.image }
         guard let made = PlatformImage(data: data) else { return nil }
-        cache.setObject(made, forKey: key)
-        return made
+        var shown = made
+        #if os(iOS)
+        let longest = max(made.size.width, made.size.height) * made.scale
+        if let fit, longest > fit {
+            let ratio = fit / longest
+            shown = made.preparingThumbnail(of: CGSize(width: made.size.width * ratio, height: made.size.height * ratio)) ?? made
+        } else {
+            shown = made.preparingForDisplay() ?? made
+        }
+        #endif
+        cache.setObject(Entry(data: data, image: shown), forKey: key)
+        return shown
     }
 
     /// Burn and lock: nothing decoded stays behind.

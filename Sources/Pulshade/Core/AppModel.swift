@@ -816,6 +816,7 @@ final class AppModel {
         resentAt = [:]
         identityCache = [:]
         DecodedImages.forget()
+        LinkPreviews.forgetLinked()
         eggs = []
         // Per-contact state derived from the account that was open, including text typed into requests.
         removedStories = [:]
