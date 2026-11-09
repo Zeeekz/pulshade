@@ -62,7 +62,7 @@ struct PulshadeApp: App {
             CommandMenu("PULSHADE") {
                 Button("Lock") { model.lock() }
                     .keyboardShortcut("l", modifiers: [.command, .shift])
-                    .disabled(model.phase != .unlocked)
+                    .disabled(!model.isOpen)
             }
         }
 
@@ -70,7 +70,7 @@ struct PulshadeApp: App {
             MenuBarContent()
                 .environment(model)
         } label: {
-            MenuBarLabel(unread: model.phase == .unlocked ? model.unreadTotal : 0)
+            MenuBarLabel(unread: model.isOpen ? model.unreadTotal : 0)
         }
         #else
         WindowGroup {
@@ -145,7 +145,7 @@ private struct MenuBarContent: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        if model.phase == .unlocked {
+        if model.isOpen {
             let unread = model.unreadConversations
             if unread.isEmpty {
                 Text("No new messages")
@@ -268,20 +268,25 @@ struct RootView: View {
 
     private var content: some View {
         ZStack {
-            if model.phase == .unlocked { Backdrop() } else { Aurora() }
+            if model.isOpen { Backdrop() } else { Aurora() }
             switch model.phase {
             case .welcome:
                 WelcomeView().transition(.blurReplace)
             case .locked:
                 UnlockView().transition(.blurReplace)
             case .unlocked:
-                VStack(spacing: 0) {
-                    if model.connecting || model.relayUnreachable {
-                        ConnectionStrip().transition(.move(edge: .top).combined(with: .opacity))
+                if model.covered {
+                    // Still running underneath, so messages arrive and receipts go out; only the passcode shows.
+                    UnlockView().transition(.blurReplace)
+                } else {
+                    VStack(spacing: 0) {
+                        if model.connecting || model.relayUnreachable {
+                            ConnectionStrip().transition(.move(edge: .top).combined(with: .opacity))
+                        }
+                        MainView()
                     }
-                    MainView()
+                    .transition(.blurReplace.combined(with: ScaleTransition(1.03)))
                 }
-                .transition(.blurReplace.combined(with: ScaleTransition(1.03)))
             }
         }
         .overlay(alignment: .top) { BurnBanner() }

@@ -1023,6 +1023,10 @@ enum NotificationContent: String, Codable, CaseIterable, Identifiable {
 struct SecuritySettings: Codable, Equatable {
     /// Minutes of inactivity before locking. 0 means never.
     var autoLockMinutes = 5
+    /// Auto-lock hides PULSHADE behind the passcode but keeps it running, so a locked phone still takes in messages and
+    /// sends delivery receipts, as other messengers do. Off: auto-lock closes everything and drops the keys from memory.
+    /// Never with a decoy or panic passcode set, and a lock you press yourself always closes everything.
+    var keepReceivingLocked = false
     /// Hide the window from screenshots and screen recording.
     var blockCapture = true
     /// Blur chats whenever Pulshade isn't the front app.
@@ -1083,6 +1087,7 @@ struct SecuritySettings: Codable, Equatable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = SecuritySettings()
         autoLockMinutes = try c.decodeIfPresent(Int.self, forKey: .autoLockMinutes) ?? d.autoLockMinutes
+        keepReceivingLocked = try c.decodeIfPresent(Bool.self, forKey: .keepReceivingLocked) ?? d.keepReceivingLocked
         blockCapture = try c.decodeIfPresent(Bool.self, forKey: .blockCapture) ?? d.blockCapture
         blurWhenInactive = try c.decodeIfPresent(Bool.self, forKey: .blurWhenInactive) ?? d.blurWhenInactive
         notifications = try c.decodeIfPresent(Bool.self, forKey: .notifications) ?? d.notifications

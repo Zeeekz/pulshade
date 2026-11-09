@@ -193,7 +193,7 @@ final class AppModel {
         let center = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.screensDidSleepNotification, NSWorkspace.sessionDidResignActiveNotification] {
             center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor in self?.lock() }
+                Task { @MainActor in self?.lock(keepingKeys: true) }
             }
         }
         // While locked, announcements still come, as a notification: they're public, so no vault is opened.
@@ -315,7 +315,7 @@ final class AppModel {
         #endif
         guard phase == .unlocked, let since = backgroundedAt else { return }
         let minutes = data.security.autoLockMinutes
-        if minutes > 0, Date().timeIntervalSince(since) > Double(minutes) * 60 { lock() } else { lastActivity = Date() }
+        if minutes > 0, Date().timeIntervalSince(since) > Double(minutes) * 60 { lock(keepingKeys: true) } else { lastActivity = Date() }
         markOpenConversationRead()
     }
 
@@ -511,6 +511,16 @@ final class AppModel {
         if failedAttempts > 2 {
             try? await Task.sleep(for: .seconds(min(30, 1 << min(failedAttempts - 2, 5))))
         }
+        if covered {
+            let vault = vault
+            let opened = try? await Task.detached { try vault.unlock(passcode: passcode) }.value
+            guard case let .identity(who, at)? = opened, at == slot, who.fingerprint == identity?.fingerprint else {
+                failedAttempts += 1
+                return false
+            }
+            uncover()
+            return true
+        }
         dataUnreadable = false
         do {
             let vault = vault
@@ -661,8 +671,44 @@ final class AppModel {
         if local(data.inviteRelay) { data.inviteRelay = nil }
     }
 
-    func lock() {
+    /// Hidden behind the passcode with everything still running underneath (see `SecuritySettings.keepReceivingLocked`).
+    private(set) var covered = false
+    /// Open and showing chats: unlocked, and not covered.
+    var isOpen: Bool { phase == .unlocked && !covered }
+
+    /// Whether an automatic lock may keep the keys loaded. Not with a decoy or panic passcode, which need the
+    /// passcode to pick the account, and not while burning.
+    private var canCover: Bool {
+        data.security.keepReceivingLocked && isPrimary && !hasDecoy && !hasPanic && !burning && identity != nil
+    }
+
+    /// Hides everything but keeps receiving, so messages still arrive and delivery receipts still go out.
+    private func cover() {
+        dismissBanner()
+        if call != nil { hangUp() }
+        typing = [:]
+        lastTypingSent = [:]
+        presenceDue = [:]
+        data.outbox.removeAll { $0.ephemeral == true }
+        Notifier.shared.clearAll()
+        openConversation = nil
+        save()
+        withAnimation(.smooth(duration: 0.5)) { covered = true }
+    }
+
+    private func uncover() {
+        failedAttempts = 0
+        lastActivity = Date()
+        withAnimation(.smooth(duration: 0.5)) { covered = false }
+        Task { await syncOnce() }
+    }
+
+    /// Locks. `keepingKeys` is for the automatic locks (idle, leaving the app, the Mac sleeping): with the setting on
+    /// they only cover. A lock you press yourself always closes everything.
+    func lock(keepingKeys: Bool = false) {
         guard phase == .unlocked else { return }
+        if covered { return }
+        if keepingKeys, canCover { cover(); return }
         dismissBanner()
         connecting = false
         relayUnreachable = false
@@ -964,7 +1010,7 @@ final class AppModel {
             if onChatsTab { return }
             // The banner only shows while Pulshade is open, so once it's unlocked it says who wrote and what,
             // whatever the lock-screen setting is. Locked, it follows that setting.
-            let style: NotificationContent = phase == .unlocked ? .full : data.security.notificationContent
+            let style: NotificationContent = isOpen ? .full : data.security.notificationContent
             let content = Notifier.content(for: message, in: convo, sender: displayName(message.sender), style: style)
             let named = style != .hidden
             showBanner(InAppBanner(conversation: convo.id, title: content.title, body: content.body,
@@ -3539,7 +3585,7 @@ final class AppModel {
         // Locking stops a story part-way out to its audience, and nobody touches the screen while waiting for one.
         if storyUploadProgress != nil { lastActivity = Date(); return }
         guard minutes > 0, Date().timeIntervalSince(lastActivity) > Double(minutes) * 60 else { return }
-        lock()
+        lock(keepingKeys: true)
     }
 
     /// Face ID would open one identity without asking which, skipping a decoy, so it's off while one is set.
@@ -3669,6 +3715,11 @@ final class AppModel {
         guard let (identity, slot) = try? await Task.detached(operation: {
             try vault.unlockWithBiometrics(reason: "unlock PULSHADE")
         }).value else { return false }
+        if covered {
+            guard slot == self.slot, identity.fingerprint == self.identity?.fingerprint else { return false }
+            uncover()
+            return true
+        }
         dataUnreadable = false
         guard let stored = try? storedData(identity) else { return false }
         self.identity = identity

@@ -76,4 +76,28 @@ struct PushTests {
         let saved = try JSONEncoder.pulshade.encode(model.data.security)
         #expect(try JSONDecoder.pulshade.decode(SecuritySettings.self, from: saved).pushWake == false)
     }
+
+    /// With "keep receiving while locked" on, an automatic lock only hides the app behind the passcode: the keys stay
+    /// loaded so mail still comes in and receipts go out. A lock pressed by hand, or with the setting off, closes it.
+    @MainActor @Test func autoLockCanKeepReceivingBehindThePasscode() async throws {
+        let model = testModel("pulshade-cover")
+        defer { model.lock() }
+        try await model.create(identity: .generate(), profile: Profile(name: "C"), passcode: "test-passcode")
+
+        model.lock(keepingKeys: true)
+        #expect(model.phase == .locked, "off by default: an automatic lock closes everything")
+        #expect(await model.unlock(passcode: "test-passcode"))
+
+        model.updateSecurity { $0.keepReceivingLocked = true }
+        model.lock(keepingKeys: true)
+        #expect(model.phase == .unlocked && model.covered && model.identity != nil)
+        #expect(!model.isOpen)
+        #expect(await model.unlock(passcode: "wrong") == false)
+        #expect(model.covered)
+        #expect(await model.unlock(passcode: "test-passcode"))
+        #expect(model.isOpen)
+
+        model.lock()
+        #expect(model.phase == .locked && model.identity == nil, "a lock pressed by hand always closes it")
+    }
 }

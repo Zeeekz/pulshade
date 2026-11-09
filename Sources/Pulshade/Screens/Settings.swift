@@ -904,6 +904,12 @@ private struct LockSettings: View {
                     model.updateSecurity { $0.autoLockMinutes = m }
                 }
             }
+            SettingsGroup("While locked", footer: model.biometricsBlocked
+                          ? "Not available while a decoy or panic passcode is set."
+                          : "Auto-lock hides PULSHADE but keeps it running, so a locked phone still gets messages and your friends see them delivered at once. Off, auto-lock closes everything and nothing arrives or is confirmed until you unlock. Pressing Lock yourself always closes everything.") {
+                SecurityToggle(title: "Keep receiving while locked", key: \.keepReceivingLocked)
+                    .disabled(model.biometricsBlocked)
+            }
             SettingsGroup("Screen", footer: "Keeps chats out of screenshots, screen recordings and the app switcher.") {
                 SecurityToggle(title: Platform.isPhone ? "Hide in app switcher" : "Blur when in background", key: \.blurWhenInactive)
                 RowDivider()
