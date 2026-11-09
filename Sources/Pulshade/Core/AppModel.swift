@@ -126,6 +126,8 @@ final class AppModel {
     private(set) var typing: [Conversation.ID: [String: Date]] = [:]
     /// Receipts waiting for their moment. Memory only.
     private var pendingReceipts: [ReceiptBatch] = []
+    /// When a message last reached this device (or came again). Lets a push-woken app know its message has arrived.
+    @ObservationIgnored private var lastIncomingAt = Date.distantPast
     private struct ReceiptBatch {
         var fingerprint: String
         var persona: UUID?
@@ -277,12 +279,24 @@ final class AppModel {
         if phase == .unlocked { reconnect() } else if phase == .locked { warmUp() }
     }
 
-    /// A message push woke Pulshade. Unlocked, it reconnects and fetches at once, then stays awake long enough for
-    /// the delivery receipt (which waits a second or few) to go out, so the sender's tick doesn't wait for you to open it.
+    /// A message push woke Pulshade. Unlocked, it reconnects and fetches at once, then stays awake until the message
+    /// has come in and its delivery receipt has gone out (not for a fixed time: after a spell asleep Tor can take
+    /// longer than that to carry anything), so the sender's second tick comes when this phone gets the message.
+    /// iOS allows about 30 seconds in all.
     func messagePushArrived() async {
         guard phase == .unlocked else { warmUp(); return }
+        let started = Date()
         callPushArrived()
-        try? await Task.sleep(for: .seconds(12))
+        while true {
+            try? await Task.sleep(for: .milliseconds(500))
+            let waited = Date().timeIntervalSince(started)
+            let arrived = lastIncomingAt >= started
+            // Nothing came for this push: no point holding the app awake for it.
+            if !arrived && waited > 15 { return }
+            // The message is in; done once its receipt is sealed and has left the outbox.
+            if arrived && pendingReceipts.isEmpty && data.outbox.isEmpty { return }
+            if waited > 25 { return }
+        }
     }
     #endif
 
@@ -5219,6 +5233,7 @@ final class AppModel {
     /// enough to show the relay who was writing to whom.
     /// Read receipts are batched the same way.
     private func queueReceipt(_ id: UUID, to sender: Contact, read: Bool = false) {
+        lastIncomingAt = Date()
         // A read receipt stands in for the delivery one, so it goes even with delivery receipts off.
         guard read || data.security.deliveryReceipts else { return }
         if let i = pendingReceipts.firstIndex(where: { $0.fingerprint == sender.fingerprint && $0.persona == sender.persona
@@ -5226,7 +5241,9 @@ final class AppModel {
             pendingReceipts[i].ids.append(id)
             return
         }
-        let wait = trafficShaping ? Double.random(in: 1...5) : 0
+        // Woken by a push in the background there is only a few seconds to spare, and the push itself already
+        // told Apple when this device heard, so the wait is short then.
+        let wait = trafficShaping ? (appActive ? Double.random(in: 1...5) : Double.random(in: 0.2...0.8)) : 0
         pendingReceipts.append(ReceiptBatch(fingerprint: sender.fingerprint, persona: sender.persona, ids: [id], read: read,
                                             due: Date().addingTimeInterval(wait)))
     }
