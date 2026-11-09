@@ -33,11 +33,18 @@ targets:
       - sdk: Security.framework
       - sdk: SystemConfiguration.framework
       - sdk: libresolv.tbd
+      # The notification helper (two ticks while the phone is locked), carried inside the app.
+      - target: PulshadeNotify
     # Push: Xcode swaps "development" for "production" when it signs a build for TestFlight or the App Store.
     entitlements:
       path: ios/Pulshade.entitlements
       properties:
         aps-environment: development
+        # The app's own group first, so everything it keeps in the Keychain stays where only it can read it. The
+        # shared group holds only the notification helper's items (HelperStore).
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)app.pulshade.ios
+          - $(AppIdentifierPrefix)app.pulshade.shared
     info:
       path: ios/Info.plist
       properties:
@@ -45,6 +52,7 @@ targets:
         PulshadeRelay: $(PULSHADE_RELAY)
         PulshadeRelayDirect: $(PULSHADE_RELAY_DIRECT)
         PulshadeRelayPin: $(PULSHADE_RELAY_PIN)
+        PulshadeKeychainGroup: $(AppIdentifierPrefix)app.pulshade.shared
         PulshadeAdminKey: $(PULSHADE_ADMIN_KEY)
         PulshadePetKey: $(PULSHADE_PET_KEY)
         CFBundleShortVersionString: $(MARKETING_VERSION)
@@ -93,3 +101,39 @@ targets:
         PULSHADE_ADMIN_KEY: ""
         # The relay's pet-signing public key (relay/pet-key.pub), for hatched and gifted collectibles.
         PULSHADE_PET_KEY: ""
+
+  # Pulshade's notification helper: iOS runs it when a message push arrives, even while the phone is locked, so a
+  # friend's message can get its second tick (LockedDelivery). Only what it needs: no Tor, no vault, no chats.
+  PulshadeNotify:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ios/Notify
+        excludes: ["*.plist", "*.entitlements"]
+      - path: Sources/Pulshade/Core/EnvelopeCore.swift
+      - path: Sources/Pulshade/Core/LockedDelivery.swift
+      - path: Sources/Pulshade/Core/HelperStore.swift
+    entitlements:
+      path: ios/Notify/Notify.entitlements
+      properties:
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)app.pulshade.shared
+    info:
+      path: ios/Notify/Info.plist
+      properties:
+        CFBundleDisplayName: PULSHADE
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        PulshadeRelayPin: $(PULSHADE_RELAY_PIN)
+        PulshadeKeychainGroup: $(AppIdentifierPrefix)app.pulshade.shared
+        NSHumanReadableCopyright: Built by Zeekz
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.pulshade.ios.notify
+        PRODUCT_NAME: PulshadeNotify
+        TARGETED_DEVICE_FAMILY: "1"
+        SKIP_INSTALL: YES
+        "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64

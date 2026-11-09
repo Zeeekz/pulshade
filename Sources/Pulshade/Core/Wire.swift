@@ -91,33 +91,6 @@ struct GroupInfo: Codable, Equatable {
 ///
 /// Only the session setup cases travel bare. Everything people actually say goes inside
 /// `.ratchet`, so it gets a fresh key per message.
-/// A short description followed by raw bytes: `0`, the description's length (4 bytes, big-endian), the description,
-/// then the bytes. JSON never starts with a zero byte, so a reader can tell this from plain JSON at a glance.
-///
-/// Bytes inside JSON are written as base64, a third bigger each time, and a video piece sat inside three layers of
-/// it (the piece in its payload, the ciphertext in the ratchet message, that in the envelope): 1 MB went up as 3 MiB.
-/// Framed, the bytes ride along as they are.
-enum Frame {
-    static let mark: UInt8 = 0
-
-    static func join(_ header: Data, _ tail: Data) -> Data {
-        var out = Data(capacity: 5 + header.count + tail.count)
-        out.append(mark)
-        withUnsafeBytes(of: UInt32(header.count).bigEndian) { out.append(contentsOf: $0) }
-        out.append(header)
-        out.append(tail)
-        return out
-    }
-
-    static func split(_ data: Data) -> (header: Data, tail: Data)? {
-        let bytes = Data(data)
-        guard bytes.count >= 5, bytes[0] == mark else { return nil }
-        let length = bytes[1..<5].reduce(0) { $0 << 8 | Int($1) }
-        guard length <= bytes.count - 5 else { return nil }
-        return (Data(bytes[5..<(5 + length)]), Data(bytes[(5 + length)...]))
-    }
-}
-
 extension Payload {
     /// The payload as it travels. `framed` (only for someone whose app says it reads frames, see `Envelope.reads`)
     /// sends the one big field of a ratchet message or a video piece raw, after the rest as JSON; everything else,
@@ -233,6 +206,10 @@ enum Payload: Codable, Equatable {
     case callAnswer(id: UUID, accepted: Bool)
     /// Hung up, or stopped ringing.
     case callEnd(id: UUID)
+    /// From a friend's notification helper while their phone is locked: "this device has these envelopes of yours",
+    /// each named by `LockedDelivery.digest(of:)`. Sent outside the chat's keys, which the helper never holds, so it
+    /// can't say which message: the sender's app knows from the envelope. Older apps can't read it and drop it.
+    case collected(digests: [Data])
 
     /// Signals that are worthless late: only the newest one waiting for a mailbox is kept, and one that fails
     /// to send is dropped, not retried.

@@ -781,6 +781,9 @@ final class AppModel {
     func destroyEverything(leavingNoTrace: Bool = false) {
         if call != nil { hangUp() }
         Notifier.shared.clearAll()
+        // The notification helper's keys and contacts go with everything else.
+        HelperStore.clear()
+        helperKnown = false
         // This account's mailboxes stop waking the phone. Done first, while the account's keys are still known.
         let hadPush = pushTold != nil || data.security.pushWake
         if hadPush, case let keys = currentLanes()[Lane(relay: nil, name: "main")] ?? [], !keys.isEmpty {
@@ -4057,6 +4060,55 @@ final class AppModel {
         }
     }
 
+    // MARK: Two ticks while locked
+
+    /// Whether the notification helper may confirm delivery while this iPhone is locked (see `LockedDelivery`).
+    var lockedDeliveryOn: Bool {
+        let s = data.security
+        guard pushWanted, s.deliveryReceipts, s.lockedDeliveryChosen, !hasDecoy, !hasPanic, AppData.directRelay != nil
+        else { return false }
+        return true
+    }
+
+    /// What the helper is given: this account's two envelope keys, this device's id, the relay's direct address and
+    /// the main persona's friends with their mailboxes. Never the seed, the chats' keys or any message. Personas
+    /// aren't here: their phones aren't woken by push, so the relay can't tie them to this one.
+    private func helperBundle(_ me: Identity, relay: String? = AppData.directRelay) -> HelperBundle? {
+        guard let relay else { return nil }
+        var friends: [String: HelperBundle.Friend] = [:]
+        for c in data.contacts where c.persona == nil && !c.isSelf && !c.awaitingAcceptance && !data.blocked.contains(c.fingerprint) {
+            guard let key = c.receiveKey, !c.devices.isEmpty, friends[c.fingerprint] == nil else { continue }
+            friends[c.fingerprint] = HelperBundle.Friend(agreementKey: c.agreementKey, receiveKey: key,
+                                                         devices: c.devices.map { .init(id: $0.id, sendID: $0.sendID) })
+        }
+        return HelperBundle(signing: me.signingKey.rawRepresentation, agreement: me.agreementKey.rawRepresentation,
+                            device: deviceID(for: nil), relay: relay, friends: friends)
+    }
+
+    /// The helper's bundle for this account as it stands, pointed at `relay` (tests use their own relay).
+    func lockedDeliveryBundle(relay: String) -> HelperBundle? {
+        identity.flatMap { helperBundle($0, relay: relay) }
+    }
+
+    /// The bundle as last written, so it's only written again when it changes.
+    @ObservationIgnored private var helperWritten: HelperBundle?
+    @ObservationIgnored private var helperKnown = false
+    @ObservationIgnored private var helperChecked = Date.distantPast
+
+    /// Keeps the helper's bundle in step with the friends list and the setting, or removes it. Only with the main
+    /// account open: a decoy never writes, and with a decoy or panic passcode set up there's no bundle at all.
+    private func refreshHelper() {
+        #if os(iOS)
+        guard phase == .unlocked, isPrimary, let identity, Date().timeIntervalSince(helperChecked) >= 10 else { return }
+        helperChecked = Date()
+        let bundle = lockedDeliveryOn ? helperBundle(identity) : nil
+        guard !helperKnown || bundle != helperWritten else { return }
+        if let bundle { HelperStore.save(bundle) } else { HelperStore.clear() }
+        helperWritten = bundle
+        helperKnown = true
+        #endif
+    }
+
     // MARK: Messages that didn't send
 
     /// How long a message may wait on this device before it shows as not sent, with a way to try again.
@@ -4475,9 +4527,13 @@ final class AppModel {
         if data.seenEnvelopes.contains(where: { $0.value <= stale }) {
             data.seenEnvelopes = data.seenEnvelopes.filter { $0.value > stale }
         }
+        if data.sentDigests.contains(where: { $0.value.at <= stale }) {
+            data.sentDigests = data.sentDigests.filter { $0.value.at > stale }
+        }
         resendAfterRestart()
         resendOverdueMessages()
         noteUnsent()
+        refreshHelper()
         if introsStale { refileIntros() }
         resendUnconfirmedStories()
         resendUnconfirmedViews()
@@ -5001,7 +5057,11 @@ final class AppModel {
                     mailboxBackoff[item.sendID] = nil
                     if sendHolds[item.id] != nil { sendHolds[item.id] = nil }
                     refusals[item.id] = nil
-                    if let message = item.message { setStatus(.sent, for: [message]) }
+                    if let message = item.message {
+                        setStatus(.sent, for: [message])
+                        // So their phone can confirm it while locked (`Payload.collected`).
+                        data.sentDigests[LockedDelivery.digest(of: item.blob).hex] = SentDigest(message: message, at: Date())
+                    }
                     if item.story != nil { drainStoryBacklog() }
                     if let story = item.story { markUploadedIfDone(story) }
                 }
@@ -5239,6 +5299,12 @@ final class AppModel {
             // We can write on these keys once their first message arrives; they send it straight after answering.
             keysAnsweredAt[sessionKey(contact: i, device: d)] = Date()
             return .handled
+        case let .collected(digests):
+            // A friend's phone has these envelopes of yours, said by its notification helper while it was locked
+            // (see `LockedDelivery`): the second tick, before they've opened Pulshade.
+            let ids = digests.compactMap { data.sentDigests[$0.hex]?.message }
+            if !ids.isEmpty { withAnimation(.smooth) { for id in ids { noteDelivery(of: id, by: fp, read: false) } } }
+            return .handled
         case let .ratchet(message):
             // A message from a device this account hasn't met yet (its hello may be right behind in the same
             // fetch). Kept rather than acknowledged, so it can be read once the device is known.
@@ -5316,7 +5382,7 @@ final class AppModel {
             data.contacts[i].devices.removeAll { $0.id == device }
         case .erased:
             eraseTraces(of: fp)
-        case .hello, .request, .sessionInit, .deviceHello, .sessionAccept, .ratchet:
+        case .hello, .request, .sessionInit, .deviceHello, .sessionAccept, .ratchet, .collected:
             break
         case let .sync(event):
             // Only your own devices may tell this one what you did.

@@ -1069,6 +1069,10 @@ private struct NotificationSettings: View {
                     if security.pushWake {
                         RowDivider()
                         SecurityToggle(title: "Friend request alerts when locked", key: \.pushRequests)
+                        if security.deliveryReceipts {
+                            RowDivider()
+                            SecurityToggle(title: "Confirm delivery when locked", key: \.lockedDeliveryChosen)
+                        }
                     }
                     #endif
                 }
@@ -1082,9 +1086,15 @@ private struct NotificationSettings: View {
                     .padding(.horizontal, 14)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if on, security.pushWake, security.deliveryReceipts, security.tor, security.lockedDeliveryChosen {
+                Text("Confirming while locked connects directly for a moment, so the server sees your IP.")
+                    .font(.system(size: 12)).foregroundStyle(Ink.faint)
+                    .padding(.horizontal, 14)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if on {
                 LearnMore(title: "Waking a locked iPhone",
-                          text: "Apple wakes your iPhone with a note that only says \"New message\". Apple learns when, and the relay keeps your push token. Off, you only hear about messages while PULSHADE is open.")
+                          text: "Apple wakes your iPhone with a note that only says \"New message\". Apple learns when, and the relay keeps your push token. Off, you only hear about messages while PULSHADE is open. Confirm delivery when locked lets friends see their second tick before you open PULSHADE: a small helper checks which messages arrived without opening them, using keys kept on this iPhone after you first unlock it.")
             }
             #endif
             #if os(macOS)

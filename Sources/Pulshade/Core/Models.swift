@@ -982,6 +982,12 @@ struct PendingPayload: Codable {
     var message: UUID?
 }
 
+/// One of your messages as it was handed to the relay for one device: which message, and when.
+struct SentDigest: Codable, Equatable {
+    var message: UUID
+    var at: Date
+}
+
 /// A sealed envelope waiting to go out. Kept in the vault so restarts don't lose it.
 struct Outgoing: Codable, Identifiable {
     var id = UUID()
@@ -1124,6 +1130,15 @@ struct SecuritySettings: Codable, Equatable {
     /// Keep a sealed copy of your profile, contacts, groups, handles and settings (never chats) on the relay, so Detach
     /// can be an instant wipe and your recovery code still brings them back. The relay can't open it.
     var keepBackup = true
+    /// Let a friend's message get its second tick while this iPhone is locked (see `LockedDelivery`). Nil is
+    /// automatic: on when connecting the fast way, off on Tor, since the helper can't run Tor and connects
+    /// directly for those few seconds.
+    var lockedDelivery: Bool?
+    /// `lockedDelivery` as it stands, automatic choice included, for the switch.
+    var lockedDeliveryChosen: Bool {
+        get { lockedDelivery ?? !tor }
+        set { lockedDelivery = newValue }
+    }
 
     /// A new account's settings.
     init() {
@@ -1141,6 +1156,7 @@ struct SecuritySettings: Codable, Equatable {
         let d = SecuritySettings()
         autoLockMinutes = try c.decodeIfPresent(Int.self, forKey: .autoLockMinutes) ?? d.autoLockMinutes
         keepReceivingLocked = try c.decodeIfPresent(Bool.self, forKey: .keepReceivingLocked) ?? d.keepReceivingLocked
+        lockedDelivery = try? c.decodeIfPresent(Bool.self, forKey: .lockedDelivery)
         blockCapture = try c.decodeIfPresent(Bool.self, forKey: .blockCapture) ?? d.blockCapture
         blurWhenInactive = try c.decodeIfPresent(Bool.self, forKey: .blurWhenInactive) ?? d.blurWhenInactive
         notifications = try c.decodeIfPresent(Bool.self, forKey: .notifications) ?? d.notifications
@@ -1183,7 +1199,8 @@ struct AppData: Codable {
     /// 9: a message can carry a file kept on the relay, and files still to be erased there are remembered.
     /// 10: a waiting envelope can carry a recall stamp.
     /// 11: when the account was made on this device, for a fresh-start order to tell old accounts from new ones.
-    static let currentFormat = 11
+    /// 12: your sent envelopes by digest, so a friend's locked phone can confirm delivery (`Payload.collected`).
+    static let currentFormat = 12
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []
@@ -1220,6 +1237,9 @@ struct AppData: Codable {
     var facade = Facade()
     /// Hashes of envelopes that came outside a ratchet session, so a replayed one is ignored.
     var seenEnvelopes: [String: Date] = [:]
+    /// Your messages' envelopes the relay took, by `LockedDelivery.digest(of:)`, so a friend's phone can confirm one
+    /// while locked (`Payload.collected`). Kept as long as `seenEnvelopes`.
+    var sentDigests: [String: SentDigest] = [:]
     /// Leftover handles from older versions have been looked for. Done once, not at every unlock.
     var handlesTidied = false
     /// Which profile fields have been sent to contacts once since they started travelling with profiles: 1 bios,
@@ -1298,6 +1318,7 @@ struct AppData: Codable {
         pendingBackupForget = try c.decodeIfPresent(Data.self, forKey: .pendingBackupForget)
         facade = (try? c.decodeIfPresent(Facade.self, forKey: .facade)) ?? Facade()
         seenEnvelopes = (try? c.decodeIfPresent([String: Date].self, forKey: .seenEnvelopes)) ?? [:]
+        sentDigests = (try? c.decodeIfPresent([String: SentDigest].self, forKey: .sentDigests)) ?? [:]
         handlesTidied = (try? c.decodeIfPresent(Bool.self, forKey: .handlesTidied)) ?? false
         profileShared = (try? c.decodeIfPresent(Int.self, forKey: .profileShared)) ?? 0
         storyChoices = (try? c.decodeIfPresent([String: StoryChoice].self, forKey: .storyChoices)) ?? [:]

@@ -67,6 +67,8 @@
 	<string>Save pictures from your chats to Photos. Pulshade only adds to your library and never reads it.</string>
 	<key>PulshadeAdminKey</key>
 	<string>$(PULSHADE_ADMIN_KEY)</string>
+	<key>PulshadeKeychainGroup</key>
+	<string>$(AppIdentifierPrefix)app.pulshade.shared</string>
 	<key>PulshadePetKey</key>
 	<string>$(PULSHADE_PET_KEY)</string>
 	<key>PulshadeRelay</key>

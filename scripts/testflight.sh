@@ -40,7 +40,8 @@ names="/Users/"
 # So the check runs on a copy with those taken out.
 check="$out/name-check/Pulshade.app"
 rm -rf "$out/name-check"; mkdir -p "$out/name-check"; ditto "$app" "$check"
-rm -f "$check/embedded.mobileprovision"
+# Every signing profile, the notification helper's inside PlugIns too: they name the developer account, not the build.
+find "$check" -name embedded.mobileprovision -delete
 find "$check" -name _CodeSignature -type d -prune -exec rm -rf {} +
 find "$check" -type f -print0 | while IFS= read -r -d '' f; do
   file -b "$f" | grep -q '^Mach-O' && codesign --remove-signature "$f" 2>/dev/null || true
