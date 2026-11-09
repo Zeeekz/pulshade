@@ -264,9 +264,12 @@ pickup or after 7 days; their ids are random, so they don't reveal how busy it i
 registrations (which device token to wake for which mailbox) are never written to the server's disk, so a restart or crash
 empties them: a message not yet collected is lost and must be sent again. The handle directory, held handles, moderation
 lists and accounts' sealed backups (no chats) are saved to disk too, the first three sealed with the same storage
-key. On a Mac that key is in the Keychain; on a Linux server it is a file outside the data folder but on the same
-disk. So the seal keeps these files closed to anyone who gets a copy of the data folder or of its backups, and does
-not protect them from someone who holds the whole disk or controls the server, who can read the key as well. A
+key, as are the push key, the pet signing key and the onion service's key (Arti's own keystore is kept in memory, and
+the relay hands it the unsealed key at start). On a Mac that key is in the Keychain. On the Linux server it is never
+written to disk: it sits in a memory-only folder (ramfs, which is never swapped out) and on the operator's Mac, and
+after a reboot the relay stays locked until the operator sends it back (`pulshade-admin server unlock`). So a copy of
+the disk, a snapshot or its backups hold nothing that can be opened; someone who controls the running server could
+still read the key from memory. A
 backup that hasn't been saved again for 180 days (a detached account's, once its device is gone) is erased. The server turns off core dumps, so a crash never writes its memory to disk. Rate
 limits never keep an IP address, only a hash with a salt that's replaced every hour. Admin actions need the operator's token, which only root
 on the server can read (the relay keeps just a hash of it); the Pulshade app has no admin in it at all. Abuse reports are sealed to
