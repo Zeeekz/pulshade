@@ -820,6 +820,10 @@ final class AppModel {
         clipActivity = [:]
         clipAsks = [:]
         clipResent = [:]
+        // An upload for the account that was open must not carry on behind the lock for whoever opens next.
+        for task in clipUploads.values { task.cancel() }
+        clipUploads = [:]
+        clipWaiting = [:]
         lastMend = [:]
         requestNotes = [:]
         movedOffIntro = []
@@ -1331,6 +1335,8 @@ final class AppModel {
         let waiting = clipWaiting.removeValue(forKey: id) ?? []
         guard let a else {
             for contact in waiting { sendClip(clip, id: id, to: contact) }
+            // The fallback pieces are copies of the story too, so they keep it uploading.
+            trackUpload(of: id)
             return
         }
         // Kept with the story or message, so it can be erased when that goes.
@@ -1339,6 +1345,9 @@ final class AppModel {
             data.stories[s].clipBlob = a
             for contact in waiting { enqueue(.clipBlob(id: id, clip: a), to: contact) }
             save()
+            // The clip is on the relay now: let the progress catch up, and let more people be queued for.
+            trackUpload(of: id)
+            drainStoryBacklog()
             return
         }
         for c in data.conversations.indices {
@@ -2491,7 +2500,9 @@ final class AppModel {
         let waiting = data.contacts.reduce(0) { n, c in
             n + c.devices.reduce(0) { $0 + $1.pending.filter { $0.payload.storyID == id }.count }
         }
-        return waiting + data.outbox.filter { $0.story == id }.count
+        // A video's clip can be uploading to the relay while the small story copies have already gone. It is
+        // part of the upload, and counting it keeps the progress (and iOS's background permission) alive.
+        return waiting + data.outbox.filter { $0.story == id }.count + (clipUploads[id] == nil ? 0 : 1)
     }
 
     /// A story that's over (its time ran out, or you deleted it) stops going out: the copies still waiting to be
@@ -2501,6 +2512,10 @@ final class AppModel {
         storyBacklog[id] = nil
         noteBacklog(id)
         storyUploadTotal[id] = nil
+        // A clip still going up for a story that's over is of no use to anyone.
+        clipUploads[id]?.cancel()
+        clipUploads[id] = nil
+        clipWaiting[id] = nil
         if data.outbox.contains(where: { $0.story == id && !sendingIDs.contains($0.id) }) {
             data.outbox.removeAll { $0.story == id && !sendingIDs.contains($0.id) }
         }
@@ -2525,7 +2540,9 @@ final class AppModel {
     /// Once nothing of a story is left in the outbox, its upload is over for good. The sends that come later, to
     /// people who never confirmed, happen quietly.
     private func markUploadedIfDone(_ id: Story.ID) {
-        guard outboxCopies(of: id) == 0, storyBacklog[id] == nil, let i = data.stories.firstIndex(where: { $0.id == id }),
+        guard outboxCopies(of: id) == 0, storyBacklog[id] == nil,
+              clipUploads[id] == nil, (clipWaiting[id] ?? []).isEmpty,
+              let i = data.stories.firstIndex(where: { $0.id == id }),
               data.stories[i].delivery != nil, data.stories[i].delivery?.uploaded != true else { return }
         data.stories[i].delivery?.uploaded = true
         storyUploadTotal[id] = nil
@@ -2536,6 +2553,7 @@ final class AppModel {
         guard let story = data.stories.first(where: { $0.id == id }), story.author == "me",
               story.delivery != nil, story.delivery?.uploaded != true else { return false }
         return outboxCopies(of: id) > 0 || storyBacklog[id] != nil
+            || clipUploads[id] != nil || !(clipWaiting[id] ?? []).isEmpty
     }
 
     /// How far a story you posted has got to its audience, 0...1, or nil once it's all gone (or never needed to).

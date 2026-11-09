@@ -192,6 +192,23 @@ import CryptoKit
         #expect(try Envelope.openFull(blob, with: me).readsGroupReceipts)
     }
 
+    @Test func aVideoStoryStaysUploadingWhileItsClipIsOnItsWay() async throws {
+        let model = try await makeModel()
+        defer { model.lock() }
+        let them = Identity.generate()
+        var contact = makeContact(them, device: 1)
+        // This friend's app reads files kept on the relay, so the story's clip goes up there first.
+        contact.devices[0].readsAttachments = true
+        contact.persona = nil
+        model.data.contacts = [contact]
+
+        model.postStory(.video(Data(repeating: 7, count: 4_000), caption: ""), audience: .everyone)
+        let story = try #require(model.data.stories.first)
+        // The little story copies can go at once; the clip is still on its way, so the upload isn't over.
+        #expect(model.isUploading(story.id), "the clip upload counts as part of the story")
+        #expect(model.data.stories[0].delivery?.uploaded != true)
+    }
+
     @Test func waitingForTheWritePutsItOnDisk() async throws {
         let model = try await makeModel()
         defer { model.lock() }

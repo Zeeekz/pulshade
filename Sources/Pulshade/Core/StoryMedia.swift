@@ -309,8 +309,13 @@ enum StoryVideo {
         let size = size ?? (max(abs(upright.width), abs(upright.height)) >= 1700 ? hdSize : StoryVideo.size)
         // Each retry spends less of the budget, in case the encoder overshoots on busy footage.
         for share in [0.85, 0.65, 0.45] {
+            try Task.checkCancellation()
+            // A very short clip would otherwise ask for a bitrate no encoder takes (and a huge one). The
+            // budget still decides the rate; this only stops it running away on the first fraction of a second.
+            let wanted = Double(maxBytes) * share * 8 / max(seconds, 0.5)
+            let ceiling = size.width >= 1_000 || size.height >= 1_000 ? 16_000_000.0 : 8_000_000.0
             let data = try await transcode(asset, seconds: seconds, filter: filter, zoom: zoom, size: size, text: text,
-                                           bitsPerSecond: Int(Double(maxBytes) * share * 8 / seconds) - 48_000)
+                                           bitsPerSecond: max(Int(min(wanted, ceiling)) - 48_000, 150_000))
             if data.count <= maxBytes { return data }
         }
         throw StoryVideoError.tooLarge
@@ -385,6 +390,12 @@ enum StoryVideo {
         }
         DispatchQueue.global().asyncAfter(deadline: .now() + exportTimeout, execute: watchdog)
         defer { watchdog.cancel() }
+        // Pull the samples ourselves rather than waiting for the writer to call back. A writer can stop asking
+        // for one track while it waits on another (a clip with sound can do this at its first frames), and a
+        // callback that never comes would leave the export waiting for ever, past even the watchdog. Polling
+        // the same readiness flag always gets to the end, and gives up when the watchdog or the writer does.
+        // Each track gets a thread of its own: reading one track can wait on the other being read, and on the
+        // shared pool several exports at once filled it with readers waiting, so the other track never ran.
         await withTaskGroup(of: Void.self) { group in
             for (output, input) in pumps {
                 group.addTask {
@@ -392,16 +403,17 @@ enum StoryVideo {
                         let queue = DispatchQueue(label: "pulshade.story.export.\(input.mediaType.rawValue)")
                         nonisolated(unsafe) let output = output
                         nonisolated(unsafe) let input = input
-                        input.requestMediaDataWhenReady(on: queue) {
-                            while input.isReadyForMoreMediaData {
-                                if let buffer = output.copyNextSampleBuffer() {
-                                    if !input.append(buffer) { input.markAsFinished(); done.resume(); return }
-                                } else {
-                                    input.markAsFinished()
-                                    done.resume()
-                                    return
+                        queue.async {
+                            while !stuck.isSet, watchedWriter.status == .writing {
+                                guard input.isReadyForMoreMediaData else {
+                                    usleep(5_000)
+                                    continue
                                 }
+                                guard let buffer = output.copyNextSampleBuffer() else { break }
+                                if !input.append(buffer) { break }
                             }
+                            input.markAsFinished()
+                            done.resume()
                         }
                     }
                 }

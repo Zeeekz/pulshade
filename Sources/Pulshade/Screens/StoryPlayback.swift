@@ -365,7 +365,9 @@ final class LibraryPicker: NSObject, PHPickerViewControllerDelegate {
                     Task { @MainActor in self.fail("That video is too big (\(size / 1_000_000) MB; the limit is \(Self.largest / 1_000_000) MB).") }
                     return
                 }
-                guard let bytes = try? Data(contentsOf: url) else {
+                // Mapped, not copied: a minute of 4K is hundreds of megabytes, and it only needs to be read, not
+                // held in a second buffer. The mapping outlives the picker's temporary file.
+                guard let bytes = try? Data(contentsOf: url, options: .mappedIfSafe) else {
                     Task { @MainActor in self.fail("That video couldn't be read.") }
                     return
                 }
