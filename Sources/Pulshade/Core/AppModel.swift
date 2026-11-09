@@ -395,6 +395,7 @@ final class AppModel {
         data.bornAt = Date()
         data.profile = profile
         adoptConnectionChoice(fresh: true)
+        if let chosen = PendingPrivacy.chosen { data.security.adopt(chosen) }
         didUnlock()
     }
 
@@ -416,6 +417,8 @@ final class AppModel {
             data = backup
         } else {
             data = stored
+            // A brand-new account (no earlier data on this device) gets what was chosen on the sign-up screen.
+            if stored.bornAt == nil, let chosen = PendingPrivacy.chosen { data.security.adopt(chosen) }
         }
         // Recovering is a choice made now, so an order from before it isn't for this account.
         if data.bornAt == nil { data.bornAt = Date() }

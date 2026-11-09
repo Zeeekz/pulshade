@@ -1,9 +1,9 @@
 import SwiftUI
 
 struct WelcomeView: View {
-    enum Route { case connection, home, create, restore, link }
-    /// With no account on the device, it asks how to connect before it connects to anything.
-    @State private var route: Route = Tor.needsChoice ? .connection : .home
+    enum Route { case connection, privacy, home, create, restore, link }
+    /// With no account on the device, it asks how to connect before it connects to anything, then how private to be.
+    @State private var route: Route = Tor.needsChoice ? .connection : (PendingPrivacy.asked ? .home : .privacy)
     @State private var appeared = false
     @State private var signingIn = false
 
@@ -13,9 +13,12 @@ struct WelcomeView: View {
             case .connection:
                 ConnectionChoice { tor in
                     Tor.enabled = tor
-                    go(.home)
+                    go(PendingPrivacy.asked ? .home : .privacy)
                 }
                 .transition(.opacity)
+            case .privacy:
+                PrivacyChoice(back: Tor.needsChoice ? { go(.connection) } : nil) { go(.home) }
+                    .transition(.opacity)
             case .home: home.transition(.opacity)
             case .create: CreateFlow(back: { go(.home) }).transition(.push(from: .trailing))
             case .restore: RestoreFlow(back: { go(.home) }).transition(.push(from: .trailing))
@@ -972,5 +975,100 @@ struct Shake: GeometryEffect {
 
     func effectValue(size: CGSize) -> ProjectionTransform {
         ProjectionTransform(CGAffineTransform(translationX: 10 * sin(progress * .pi * 6), y: 0))
+    }
+}
+
+
+/// Asked after how to connect and before anything else: every privacy setting, explained, so they're set up before
+/// the account exists. Applies to the account made next; logging in to an existing one keeps that account's own.
+struct PrivacyChoice: View {
+    var back: (() -> Void)?
+    var done: () -> Void
+    @State private var s = PendingPrivacy.chosen ?? SecuritySettings()
+
+    var body: some View {
+        OnboardingPage(title: "Your privacy",
+                       subtitle: "Set up how private PULSHADE is before you start. These apply to a new account, and you can change every one later in Settings.",
+                       back: back) {
+            VStack(alignment: .leading, spacing: 22) {
+                HStack(spacing: 10) {
+                    Button("Recommended") { withAnimation(.snappy) { s = SecuritySettings() } }
+                        .buttonStyle(SecondaryButtonStyle())
+                    Button("Maximum privacy") { withAnimation(.snappy) { s = .strictest } }
+                        .buttonStyle(SecondaryButtonStyle())
+                }
+                group("What others see", footer: "Turn one off and you stop seeing theirs too.") {
+                    toggle("Delivery receipts", $s.deliveryReceipts, "Tells people when a message reaches your phone.")
+                    toggle("Read receipts", $s.readReceipts, "Tells people when you've seen their message.")
+                    toggle("Typing indicators", $s.typingIndicators, "Shows people when you're writing to them.")
+                    toggle("Online status", $s.onlineStatus, "Shows people you've accepted when PULSHADE is open. The server can tell when the signal goes out, though not read it.")
+                }
+                group("Links & backup") {
+                    toggle("Link previews", $s.linkPreviews, "Builds a preview when you send a link, which visits the website from your connection.")
+                    toggle("Sealed backup", $s.keepBackup, "Keeps a copy of your profile, contacts and groups (never chats) on the server that only your recovery code opens. It's what brings them back after a Detach.")
+                }
+                group("Notifications") {
+                    toggle("Notifications", $s.notifications, "Banners for new messages.")
+                    #if os(iOS)
+                    toggle("Wake a locked iPhone", $s.pushWake, "Lets the server tell Apple to wake your phone for new mail. Apple learns that it was woken, and when, never what for.")
+                    #endif
+                    choice("On the lock screen", $s.notificationContent, NotificationContent.allCases.map { ($0, $0.label) },
+                           "How much a notification shows: nothing, who it's from, or the message.")
+                }
+                group("Lock & screen") {
+                    choice("Auto-lock", $s.autoLockMinutes, [(1, "1 min"), (5, "5 min"), (15, "15 min"), (0, "Never")],
+                           "Locks PULSHADE after this long, so a borrowed or stolen phone shows nothing.")
+                    toggle("Keep receiving while locked", $s.keepReceivingLocked,
+                           "Auto-lock hides PULSHADE but keeps it running, so a locked phone still gets messages and people see them delivered. Off closes everything, and nothing arrives until you unlock.")
+                    toggle("Block screenshots & recording", $s.blockCapture, "Keeps chats out of screenshots and screen recordings.")
+                    toggle(Platform.isPhone ? "Hide in app switcher" : "Blur when in background", $s.blurWhenInactive,
+                           "Blurs your chats whenever PULSHADE isn't in front.")
+                }
+            }
+        } actions: {
+            Button("Continue") {
+                PendingPrivacy.chosen = s
+                PendingPrivacy.asked = true
+                done()
+            }
+            .buttonStyle(PrimaryButtonStyle())
+        }
+    }
+
+    private func group<C: View>(_ title: String, footer: String? = nil, @ViewBuilder _ content: () -> C) -> some View {
+        SettingsGroup(title, footer: footer) { content() }
+    }
+
+    private func toggle(_ title: String, _ value: Binding<Bool>, _ detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            SettingRow(title) {
+                Toggle(title, isOn: value).toggleStyle(GlowToggleStyle())
+            }
+            explain(detail)
+        }
+        .overlay(alignment: .bottom) { RowDivider() }
+    }
+
+    private func choice<V: Hashable>(_ title: String, _ value: Binding<V>, _ options: [(V, String)], _ detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            SettingRow(title) { EmptyView() }
+            Picker(title, selection: value) {
+                ForEach(options, id: \.0) { Text($0.1).tag($0.0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(.horizontal, 16)
+            explain(detail)
+        }
+        .overlay(alignment: .bottom) { RowDivider() }
+    }
+
+    private func explain(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 12))
+            .foregroundStyle(Ink.faint)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 12)
     }
 }

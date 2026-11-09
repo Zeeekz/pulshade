@@ -100,4 +100,17 @@ struct PushTests {
         model.lock()
         #expect(model.phase == .locked && model.identity == nil, "a lock pressed by hand always closes it")
     }
+
+    /// What was chosen on the sign-up screen goes to the account made next, and nowhere else.
+    @MainActor @Test func privacyChosenBeforeSignUpGoesToTheNewAccount() async throws {
+        defer { PendingPrivacy.chosen = nil }
+        PendingPrivacy.chosen = .strictest
+        let model = testModel("pulshade-pending")
+        defer { model.lock() }
+        try await model.create(identity: .generate(), profile: Profile(name: "N"), passcode: "test-passcode")
+        let s = model.data.security
+        #expect(!s.deliveryReceipts && !s.readReceipts && !s.typingIndicators && !s.onlineStatus && !s.linkPreviews)
+        #expect(s.autoLockMinutes == 1 && s.notificationContent == .hidden)
+        #expect(s.tor == Tor.enabled, "the connection choice is its own screen and is left alone")
+    }
 }

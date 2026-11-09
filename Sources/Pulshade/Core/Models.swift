@@ -1020,6 +1020,49 @@ enum NotificationContent: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+/// Privacy choices made on the sign-up screens, before any account exists. Kept in memory only, and applied to the
+/// account made next (or recovered with no backup); one logged in from a backup or another device keeps its own.
+enum PendingPrivacy {
+    nonisolated(unsafe) static var chosen: SecuritySettings?
+    /// Asked once per launch, however many times the first screen is shown.
+    nonisolated(unsafe) static var asked = false
+}
+
+extension SecuritySettings {
+    /// The settings the sign-up screen offers, copied from what was chosen there.
+    mutating func adopt(_ c: SecuritySettings) {
+        deliveryReceipts = c.deliveryReceipts
+        readReceipts = c.readReceipts
+        typingIndicators = c.typingIndicators
+        onlineStatus = c.onlineStatus
+        linkPreviews = c.linkPreviews
+        notifications = c.notifications
+        if pushWake != c.pushWake { pushWake = c.pushWake; pushWakeChosen = true }
+        notificationContent = c.notificationContent
+        autoLockMinutes = c.autoLockMinutes
+        keepReceivingLocked = c.keepReceivingLocked
+        blockCapture = c.blockCapture
+        blurWhenInactive = c.blurWhenInactive
+        keepBackup = c.keepBackup
+    }
+
+    /// The strictest choice for each, short of turning off the backup that makes Detach and recovery work.
+    static var strictest: SecuritySettings {
+        var s = SecuritySettings()
+        s.deliveryReceipts = false
+        s.readReceipts = false
+        s.typingIndicators = false
+        s.onlineStatus = false
+        s.linkPreviews = false
+        s.notificationContent = .hidden
+        s.autoLockMinutes = 1
+        s.keepReceivingLocked = false
+        s.blockCapture = true
+        s.blurWhenInactive = true
+        return s
+    }
+}
+
 struct SecuritySettings: Codable, Equatable {
     /// Minutes of inactivity before locking. 0 means never.
     var autoLockMinutes = 5
