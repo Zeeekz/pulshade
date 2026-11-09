@@ -3842,7 +3842,7 @@ final class AppModel {
 
     // MARK: Sending again what a relay restart may have emptied
 
-    /// Waiting mail lives in the relay's memory only, so a restart empties it. What the relay took but the other side
+    /// Waiting mail lives in the relay's memory and, from this build's relay on, in a sealed journal on its disk, so a restart or crash keeps it; a relay without the journal, or a lost disk, still empties it. What the relay took but the other side
     /// hasn't confirmed is sent again, with nothing kept anywhere new: a friend request that hasn't been accepted, and
     /// your messages still marked "sent". The other side ignores a message it already has, and answers it with a
     /// receipt again, so a copy that wasn't needed does no harm.
@@ -4757,7 +4757,11 @@ final class AppModel {
         enqueue(.accepted(sendID: Mailbox.sendID(for: receiveKey)), to: c)
     }
 
-    private func receive(_ envelope: RelayEnvelope) {
+    /// Tests only: sees every envelope this device takes in, so one can be handed to `receive` again.
+    @ObservationIgnored var envelopeTap: ((RelayEnvelope) -> Void)?
+
+    func receive(_ envelope: RelayEnvelope) {
+        envelopeTap?(envelope)
         deposited = envelope.deposited
         if let offer = data.linkOffers.firstIndex(where: { $0.receiveKey == envelope.receiveKey }) {
             receiveLinkRequest(envelope.blob, offer: offer)
@@ -4857,6 +4861,11 @@ final class AppModel {
         case let .ratchet(message):
             guard let d = deviceIndex(i, device) else { return }
             let keptKey = sessionKey(contact: i, device: d)
+            // The very same ciphertext again (the relay sent it twice, or its sender sent it again after a dropped
+            // connection): already read, so nothing to do. Without this it can't be opened a second time, which looked
+            // like the two phones being out of step and started new keys over a healthy chat.
+            let readBefore = Data(SHA256.hash(data: envelope.blob).prefix(16)).hex
+            if data.seenEnvelopes[readBefore] != nil { return }
             var plain: Data?
             if var session = data.contacts[i].devices[d].session, let opened = try? session.decrypt(message) {
                 data.contacts[i].devices[d].session = session
@@ -4879,6 +4888,7 @@ final class AppModel {
             // The keys were kept above, before reading what it says, so a message this version can't read (one from a
             // newer app) still counts and doesn't leave the session behind.
             unreadable[keptKey] = nil
+            data.seenEnvelopes[readBefore] = Date()
             guard let inner = try? Payload.fromWire(plain), !inner.isSetup else { return }
             handle(inner, from: fp, persona: persona, device: device)
             // The first message in lets a new session start sending. Look them up again: handling it may

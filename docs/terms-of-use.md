@@ -47,7 +47,7 @@ envelopes. Public handles, names and pictures you choose to publish are visible 
 
 - Pulshade is provided "as is". It has **not yet had an independent security audit**, as the README says. Don't rely
   on it where your safety depends on it.
-- Messages may be delayed or lost if the server restarts, because waiting envelopes are kept in the server's memory only, never on its disk. Files you send are kept on the server's disk, sealed, for at most 7 days or until you delete them, and are lost if the server's disk is lost.
+- Messages may be delayed or, in rare cases, lost if the server fails: waiting envelopes are kept in the server's memory and in a sealed journal on its disk, which a restart or crash does not empty but a lost disk would. Files you send are kept on the server's disk, sealed, for at most 7 days or until you delete them, and are lost if the server's disk is lost.
 - We may change, pause or end the service. We'll try to give notice in the app's announcements.
 - To the extent the law allows, we are not liable for loss or damage from using Pulshade, other than what the law
   doesn't allow us to exclude. [Lawyer: adapt for your country and for consumer-protection rules.]

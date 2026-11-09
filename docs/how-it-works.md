@@ -259,10 +259,7 @@ a contact once said. Every code you scan or open asks before it does anything, a
 app can never link a device; that only works from the camera. The code is open, so anyone can check what the app and
 the server do; a build someone makes themselves uses its own server, and isn't Pulshade.
 
-**The server (relay).** A small Rust program. No accounts and no request logs (it prints only start-up and error lines, none naming an address or a mailbox). Envelopes are held in memory only and deleted on
-pickup or after 7 days; their ids are random, so they don't reveal how busy it is. Waiting envelopes and wake-up
-registrations (which device token to wake for which mailbox) are never written to the server's disk, so a restart or crash
-empties them: a message not yet collected is lost and must be sent again. The handle directory, held handles, moderation
+**The server (relay).** A small Rust program. No accounts and no request logs (it prints only start-up and error lines, none naming an address or a mailbox). Envelopes are held in memory, and in a journal on the server's disk with every record sealed by its storage key, and deleted on pickup or after 7 days; their ids are random, so they don't reveal how busy it is. Wake-up registrations (which device token to wake for which mailbox, only for phones that turned "Wake when locked" on) are kept the same way, in a sealed file that is rewritten within seconds of a change and drops a phone as soon as it turns the setting off. Waiting envelopes survive a restart, a crash and a reboot: each deposit and each removal is appended to the sealed journal as it happens, and the file is rewritten (the old one overwritten and removed) every ten minutes when mail has left and straight after a burn, so collected mail does not linger. On a disk that writes new blocks elsewhere overwriting only helps; what makes old bytes unreadable is that they are sealed and the key is held only in memory. The handle directory, held handles, moderation
 lists and accounts' sealed backups (no chats) are saved to disk too, the first three sealed with the same storage
 key, as are the push key, the pet signing key and the onion service's key (Arti's own keystore is kept in memory, and
 the relay hands it the unsealed key at start). On a Mac that key is in the Keychain. On the Linux server it is never

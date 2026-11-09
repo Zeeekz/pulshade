@@ -39,9 +39,8 @@ possible:
   don't carry their sender.
 - **Not where you are.** Over Tor the server sees a made-up address for each connection, never your IP address.
   Each persona and inbox uses its own Tor circuit, so they can't be linked by address.
-- **Nothing for long.** Envelopes are deleted once collected, or after 7 days. While they wait they are held in
-  memory only and never written to the server's disk, so a restart or crash empties them (a message not yet collected is lost and has to be sent again).
-  Files you send (up to 100 MB) are the one thing the server keeps on disk besides profiles and backups: sealed on your
+- **Nothing for long.** Envelopes are deleted once collected, or after 7 days. While they wait they are held in memory and, sealed, in a journal on the server's disk (every record sealed with a key the server keeps only in memory), so a restart, crash or reboot doesn't lose them. Collected mail is overwritten and removed from the journal within minutes.
+  Files you send (up to 100 MB) are the one other thing the server keeps on disk besides that journal, profiles and backups: sealed on your
   phone with a key that only travels inside the end-to-end encrypted message, sealed again by the server, erased the
   moment the message is deleted (the server's key for it is destroyed) or after 7 days. A phone only ever holds a
   received file in memory.

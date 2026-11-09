@@ -16,7 +16,7 @@ keeps running.
 3. **Waking.** For a message, the relay sends Apple one push saying only "New message", and nothing about who or
    what. The phone then fetches and decrypts as usual. A phone is woken at most once every 3 seconds, however much
    mail lands, and the relay as a whole sends at most 30 pushes a second.
-4. **Staying registered.** The relay keeps registrations in memory only, never on its disk, so a restart forgets them until each phone renews. It
+4. **Staying registered.** The relay keeps registrations in memory and, sealed, in a file on its disk, so a restart, crash or reboot keeps them, and a locked phone is still woken. Turning the setting off takes the phone out of the file within seconds. It
    forgets one after 7 days without a renewal. The phone renews every 15 minutes while Pulshade is open and at every launch.
 5. **Removing.** Turning the switch off, Burn, Detach, a panic passcode or opening a decoy takes the phone's
    registrations off the relay.
@@ -27,7 +27,7 @@ keeps running.
 |---|---|
 | Message content | Hidden from everyone but the recipient |
 | Apple | That your iPhone was woken for Pulshade, and when. Never who wrote or what |
-| The relay | Which of your mailboxes belong to one device token (in memory only), and whether each deposit to them is a message. It already saw when envelopes arrive and roughly how big they are |
+| The relay | Which of your mailboxes belong to one device token (in memory, and sealed on its disk), and whether each deposit to them is a message. It already saw when envelopes arrive and roughly how big they are |
 | Your IP address | Reaches Apple when the phone registers, outside Tor, and reaches the relay as for any request |
 | Other mail | Receipts, typing signals and reactions don't wake the phone |
 
