@@ -7,6 +7,8 @@ struct PeopleView: View {
     var openChat: (Conversation.ID) -> Void
     /// Off only for rendering the page to an image, which can't draw a scroll view.
     var scrolls = true
+    /// Opened from the Account tab on iPhone: a page with a back button, not a tab of its own.
+    var inSettings = false
 
     @State private var invite = ""
     @State private var theirCode = ""
@@ -20,7 +22,8 @@ struct PeopleView: View {
 
     var body: some View {
         Group {
-            if scrolls { ScrollView { content }.scrollIndicators(.never) } else { content }
+            if inSettings { SettingsScreen(title: "Invite") { VStack(spacing: 20) { mine; theirs } } }
+            else if scrolls { ScrollView { content }.scrollIndicators(.never) } else { content }
         }
             .onAppear { if invite.isEmpty { invite = model.makeInviteCode() } }
             .sheet(isPresented: $scanning) { ScanSheet() }

@@ -294,7 +294,8 @@ struct ContactsView: View {
             VStack(spacing: 10) {
                 Constellation(symbol: "person.2", text: query.isEmpty ? "No contacts yet" : "No contacts match")
                 if query.isEmpty {
-                    Text("Find people by their @handle above, or share your invite code from the Invite tab.")
+                    Text(Platform.isPhone ? "Find people by their @handle above, or share your invite from Account > Invite."
+                         : "Find people by their @handle above, or share your invite code from Invite.")
                         .font(.system(size: 12)).foregroundStyle(Ink.faint)
                         .multilineTextAlignment(.center)
                 }

@@ -95,9 +95,6 @@ private struct PhoneMainView: View {
             Tab("Burn", systemImage: "flame", value: Section.burn) {
                 LeaveView().background(Ink.base)
             }
-            Tab("Invite", systemImage: "qrcode", value: Section.people) {
-                PeopleView(openChat: open).background(Ink.base)
-            }
             // Your account: its picture is the tab. A tap opens settings; double-tapping it switches to your next persona, and holding it picks one or adds one.
             Tab(value: Section.settings) {
                 SettingsView().background(Ink.base)
@@ -140,7 +137,7 @@ private struct PhoneMainView: View {
             model.onChatsTab = section == .chats
             if section == .chats { model.dismissBanner() }
         }
-        .background(TabHold(tab: 4, action: { switchingPersona = true }, doubleTap: { model.switchToNextPersona() }))
+        .background(TabHold(tab: 3, action: { switchingPersona = true }, doubleTap: { model.switchToNextPersona() }))
         .sheet(isPresented: $switchingPersona) {
             PersonaSwitcher(done: { switchingPersona = false })
                 .presentationDetents([.medium, .large])
@@ -148,7 +145,7 @@ private struct PhoneMainView: View {
         }
         #if DEBUG
         .onAppear {
-            // Screenshots: PULSHADE_DEMO_SCREEN=contacts|burn|people|settings|chat opens that screen.
+            // Screenshots: PULSHADE_DEMO_SCREEN=contacts|burn|settings|chat opens that screen (Invite is a page in Account: PULSHADE_DEMO_SETTINGS=invite).
             guard AppModel.demoRequested, let name = ProcessInfo.processInfo.environment["PULSHADE_DEMO_SCREEN"] else { return }
             if name == "chat", let first = model.data.conversations.first { open(first.id) }
             else if let s = Section(rawValue: name) { section = s }

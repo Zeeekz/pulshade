@@ -5,7 +5,7 @@ import PulshadeShared
 
 /// The pages Settings opens, each from a row on the main list.
 enum SettingsPage: String, Hashable {
-    case profile, handles, pinned, collectibles, pets, privacy, privacyLock, privacyMessages, privacyPasscodes, privacyBackup, blocked, notifications, appearance, devices, network, networkWaiting, anonymity, account, updates
+    case profile, invite, handles, pinned, collectibles, pets, privacy, privacyLock, privacyMessages, privacyPasscodes, privacyBackup, blocked, notifications, appearance, devices, network, networkWaiting, anonymity, account, updates
 }
 
 /// Settings, laid out like a phone's own: your profile on top, then a short list of rows,
@@ -30,6 +30,9 @@ struct SettingsView: View {
                         MenuRow(page: .profile, symbol: "person.crop.circle.fill", color: .hex(0x3D8BFF), title: "Profile",
                                 value: model.activeProfile.handle.map { "@\($0)" } ?? "Private")
                         if Platform.isPhone {
+                            RowDivider(inset: 54)
+                            MenuRow(page: .invite, symbol: "qrcode", color: .hex(0x30D158), title: "Invite",
+                                    value: "QR code or link")
                             RowDivider(inset: 54)
                             MenuRow(page: .collectibles, symbol: "crown.fill", color: .hex(0xE5383B), title: "Collectibles",
                                     value: model.activeProfile.badge?.kind?.name)
@@ -84,6 +87,7 @@ struct SettingsView: View {
                 Group {
                     switch page {
                     case .profile: ProfileSettings()
+                    case .invite: PeopleView(openChat: { model.requestedConversation = $0 }, inSettings: true)
                     case .handles: HandleSettings()
                     case .pinned: PinnedSettings()
                     case .collectibles: CollectiblesView(inSettings: true, pets: false)
