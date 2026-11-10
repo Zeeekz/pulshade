@@ -41,12 +41,13 @@ struct ContactCollectiblesDeliveryTests {
         return model
     }
 
-    private func settle(_ models: AppModel..., seconds: Int = 5) async {
-        for _ in 0..<seconds {
+    /// Checks mailboxes until `done`, or for at most `seconds`.
+    private func settle(_ models: AppModel..., seconds: Double, until done: () -> Bool) async {
+        let end = Date().addingTimeInterval(seconds)
+        while !done() && Date() < end {
             for m in models { await m.syncOnce() }
-            try? await Task.sleep(for: .seconds(1))
+            try? await Task.sleep(for: .milliseconds(200))
         }
-        for m in models { await m.syncOnce() }
     }
 
     @Test func aContactSeesOnlyWhatIsGenuine() async throws {
@@ -59,14 +60,16 @@ struct ContactCollectiblesDeliveryTests {
         let bob = try await makeUser("Bob")
         defer { for m in [alice, bob] { m.lock() } }
         _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
-        await settle(alice, bob, seconds: 2)
+        await settle(alice, bob, seconds: 30) {
+            alice.visibleContacts.first?.devices.first?.session?.canSend == true && bob.visibleContacts.first?.name == "Alice"
+        }
         let aliceKey = try #require(alice.me(nil)?.card.signing)
 
         let real = try Collectible.make(.pumpkin, serial: 3, owner: aliceKey, signedBy: admin)
         let forged = try Collectible.make(.topHat, serial: 1, owner: aliceKey, signedBy: Curve25519.Signing.PrivateKey())
         let someoneElses = try Collectible.make(.partyHat, serial: 2, owner: Data(repeating: 9, count: 32), signedBy: admin)
         alice.updateProfile { $0.collectibles = [real, forged, someoneElses] }
-        await settle(alice, bob)
+        await settle(alice, bob, seconds: 30) { bob.contact(alice.fingerprint)?.collectibles != nil }
         #expect(bob.contact(alice.fingerprint)?.collectibles == [real])
     }
 }

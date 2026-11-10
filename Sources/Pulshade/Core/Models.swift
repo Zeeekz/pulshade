@@ -73,6 +73,12 @@ struct DeviceLink: Codable {
     var session: Ratchet?
     /// Our half of a handshake we started and are waiting on.
     var handshake: PendingHandshake?
+    /// Our asks for keys before the current one, a few, so an answer to one that a newer ask overtook still opens the
+    /// session. A phone asleep when the answer came would otherwise throw it away (see `AppModel.retryStaleHandshakes`).
+    var earlierAsks: [PendingHandshake]?
+    /// Its keys were dropped (an account recovery) and new ones are being fetched or asked for. Kept on disk, so an app
+    /// closed part way through asks again when it next runs instead of leaving the device with no keys at all.
+    var needsKeys: Bool?
     /// Things to say once the session can send. Lives in the encrypted vault.
     var pending: [PendingPayload] = []
     /// What the device calls itself (your own linked devices only).

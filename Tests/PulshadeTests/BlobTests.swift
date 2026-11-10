@@ -130,7 +130,13 @@ struct BlobRelayTests {
         #expect(head.complete && head.size == prepared.attachment.sealedSize)
         let back = try await BlobTransfer.download(prepared.attachment, from: relay) { _ in }
         #expect(back == original)
-        #expect(await BlobTransfer.erase(prepared.attachment, from: relay))
+        // Another test locking an app at the same moment drops every connection in the process, which can cut the
+        // erase off part way (and then whether it landed isn't known). Tried again until it says so or the file is gone.
+        var erased = await BlobTransfer.erase(prepared.attachment, from: relay)
+        for _ in 0..<2 where !erased {
+            erased = try await relay.blobHead(prepared.attachment.id) == nil ? true : await BlobTransfer.erase(prepared.attachment, from: relay)
+        }
+        #expect(erased)
         #expect(try await relay.blobHead(prepared.attachment.id) == nil, "gone from the relay once erased")
         await #expect(throws: BlobError.gone) { _ = try await BlobTransfer.download(prepared.attachment, from: relay) { _ in } }
     }

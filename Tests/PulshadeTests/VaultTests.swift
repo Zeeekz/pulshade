@@ -15,6 +15,8 @@ import Foundation
     private func makeModel(_ dir: URL) async throws -> AppModel {
         let model = AppModel(vault: Vault(directory: dir), watchSystem: false)
         model.trafficShaping = false
+        // Locking would otherwise drop every relay connection in the process, cutting off tests running alongside.
+        model.cutOffOnLock = false
         try await model.create(identity: .generate(), profile: Profile(name: "Real"), passcode: "real-pass")
         return model
     }

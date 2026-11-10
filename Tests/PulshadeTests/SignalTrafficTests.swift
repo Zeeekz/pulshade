@@ -89,16 +89,26 @@ struct SignalRelayTests {
     @Test func theRelayKeepsOneTaggedCopyAndLetsSignalsLapse() async throws {
         let relay = RelayClient(base: try #require(URL(string: ProcessInfo.processInfo.environment["PULSHADE_TEST_RELAY"] ?? "http://127.0.0.1:7890")),
                                 lane: "signal-test")
-        let mailbox = Mailbox.make()
-        let tag = AppModel.collapseTag("hello", sendID: mailbox.sendID, from: Data([1]))
-        for n in 1...3 { try await relay.deposit(Data("ask \(n)".utf8), to: mailbox.sendID, collapse: tag) }
-        try await relay.deposit(Data("typing".utf8), to: mailbox.sendID, life: 1)
-        try await relay.deposit(Data("message".utf8), to: mailbox.sendID, wake: true)
-        let first = try await relay.fetch([mailbox.receiveKey]).map { String(decoding: $0.blob, as: UTF8.self) }
-        #expect(first == ["ask 3", "typing", "message"])
-
-        try await Task.sleep(for: .milliseconds(1200))
-        let later = try await relay.fetch([mailbox.receiveKey]).map { String(decoding: $0.blob, as: UTF8.self) }
-        #expect(later == ["ask 3", "message"])
+        // Another test locking an app at the same moment drops every connection in the process, which cancels a
+        // request under way. Then the whole thing goes again on a new mailbox (a cancelled deposit may or may not have
+        // landed); anything the relay itself answers counts as it is.
+        func run() async throws -> (first: [String], later: [String]) {
+            let mailbox = Mailbox.make()
+            let tag = AppModel.collapseTag("hello", sendID: mailbox.sendID, from: Data([1]))
+            for n in 1...3 { try await relay.deposit(Data("ask \(n)".utf8), to: mailbox.sendID, collapse: tag) }
+            try await relay.deposit(Data("typing".utf8), to: mailbox.sendID, life: 1)
+            try await relay.deposit(Data("message".utf8), to: mailbox.sendID, wake: true)
+            let first = try await relay.fetch([mailbox.receiveKey]).map { String(decoding: $0.blob, as: UTF8.self) }
+            try await Task.sleep(for: .milliseconds(1200))
+            let later = try await relay.fetch([mailbox.receiveKey]).map { String(decoding: $0.blob, as: UTF8.self) }
+            return (first, later)
+        }
+        var result: (first: [String], later: [String])?
+        for _ in 0..<3 where result == nil {
+            do { result = try await run() } catch let error as URLError where error.code == .cancelled { continue }
+        }
+        let seen = try #require(result, "every try was cut off")
+        #expect(seen.first == ["ask 3", "typing", "message"])
+        #expect(seen.later == ["ask 3", "message"])
     }
 }

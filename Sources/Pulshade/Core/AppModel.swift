@@ -493,7 +493,7 @@ final class AppModel {
         lastMend[key] = Date()
         // Keep the keys this chat was using, in memory only, so a message that was sealed under them and arrives
         // while the new session is being set up can still be read. Dropped at lock with the other recovery keys.
-        if let old = data.contacts[i].devices[d].session { recoveredSessions[key] = old }
+        if let old = data.contacts[i].devices[d].session { keepRecovered(old, key) }
         startHandshake(contact: i, device: d)
     }
 
@@ -505,14 +505,41 @@ final class AppModel {
         for i in data.contacts.indices where !data.contacts[i].awaitingAcceptance {
             for d in data.contacts[i].devices.indices {
                 // The old keys are kept in memory only, to read what was sent to them while the phone was gone.
-                if let old = data.contacts[i].devices[d].session { recoveredSessions[sessionKey(contact: i, device: d)] = old }
+                if let old = data.contacts[i].devices[d].session { keepRecovered(old, sessionKey(contact: i, device: d)) }
                 data.contacts[i].devices[d].session = nil
                 data.contacts[i].devices[d].handshake = nil
+                data.contacts[i].devices[d].earlierAsks = nil
                 data.contacts[i].devices[d].awaitingHello = nil
                 data.contacts[i].devices[d].acceptedHello = nil
+                data.contacts[i].devices[d].needsKeys = true
                 if let target = spareTarget(contact: i, device: d) {
                     spareTargets.append(target)
                     sparesFetching.insert(sessionKey(contact: i, device: d))
+                } else {
+                    startHandshake(contact: i, device: d)
+                }
+            }
+        }
+        save()
+        guard !spareTargets.isEmpty else { return }
+        Task { await takeSpares(spareTargets) }
+    }
+
+    /// Devices left with no keys and nothing asked: the app was closed while their spares were being fetched after a
+    /// recovery. Fetched again (or asked, where there's no spare), as if the recovery had just happened.
+    private func resumeKeyFetch() {
+        var spareTargets: [SpareTarget] = []
+        for i in data.contacts.indices where !data.contacts[i].awaitingAcceptance {
+            for d in data.contacts[i].devices.indices {
+                let link = data.contacts[i].devices[d], key = sessionKey(contact: i, device: d)
+                guard link.needsKeys == true, !sparesFetching.contains(key) else { continue }
+                guard link.session == nil, link.handshake == nil, link.awaitingHello != true else {
+                    data.contacts[i].devices[d].needsKeys = nil
+                    continue
+                }
+                if let target = spareTarget(contact: i, device: d) {
+                    spareTargets.append(target)
+                    sparesFetching.insert(key)
                 } else {
                     startHandshake(contact: i, device: d)
                 }
@@ -609,7 +636,10 @@ final class AppModel {
                   let d = data.contacts[i].devices.firstIndex(where: { $0.id == target.device }) else { continue }
             sparesFetching.remove(sessionKey(contact: i, device: d))
             // Something else opened keys with them meanwhile (their own ask arrived): that's kept.
-            guard data.contacts[i].devices[d].session == nil, data.contacts[i].devices[d].handshake == nil else { continue }
+            guard data.contacts[i].devices[d].session == nil, data.contacts[i].devices[d].handshake == nil else {
+                data.contacts[i].devices[d].needsKeys = nil
+                continue
+            }
             if let card = found[index], Date().timeIntervalSince(card.madeAt) < Self.spareMaxAge,
                !answeredSpares.contains(card.request.ephemeral) {
                 answeredSpares.insert(card.request.ephemeral)
@@ -696,7 +726,23 @@ final class AppModel {
 
     /// Keys from before an account was recovered or a session was repaired, by contact and device. Held in memory
     /// only, and dropped at lock.
-    @ObservationIgnored private(set) var recoveredSessions: [String: Ratchet] = [:]
+    @ObservationIgnored private(set) var recoveredSessions: [String: [Ratchet]] = [:]
+
+    /// Keeps keys a device's session is replaced from, a few at a time (a recovery, then new keys straight after, say),
+    /// so what was sent under any of them and is still on its way can be read.
+    private func keepRecovered(_ session: Ratchet, _ key: String) {
+        recoveredSessions[key, default: []].append(session)
+        if recoveredSessions[key]!.count > 4 { recoveredSessions[key]!.removeFirst() }
+    }
+
+    /// The kept keys that open a message, newest first: which, its state after, and what it said.
+    private func openRecovered(_ message: RatchetMessage, _ key: String) -> (Int, Ratchet, Data)? {
+        for (n, session) in (recoveredSessions[key] ?? []).enumerated().reversed() {
+            var copy = session
+            if let opened = try? copy.decrypt(message) { return (n, copy, opened) }
+        }
+        return nil
+    }
 
     private func sessionKey(contact i: Int, device d: Int) -> String {
         "\(data.contacts[i].persona?.uuidString ?? "main")|\(data.contacts[i].fingerprint)|\(data.contacts[i].devices[d].id.hex)"
@@ -3397,7 +3443,10 @@ final class AppModel {
     /// Asks the relay what Pulshade has told everyone and shows anything new and signed by the admin key in the
     /// Announcements chat. One the admin app took back is removed. Every app asks the same question with no account
     /// attached, so this says nothing about who you are.
-    func refreshAnnouncements() async {
+    /// `waiting`: a check already under way may have asked before something new went up, so one asked for now waits for
+    /// it to finish and then asks itself (it used to do nothing). The regular check every minute just skips its turn.
+    func refreshAnnouncements(waiting: Bool = true) async {
+        while waiting, checkingAnnouncements, phase == .unlocked { try? await Task.sleep(for: .milliseconds(50)) }
         guard !checkingAnnouncements, let client = client(nil, lane: "announcements") else { return }
         checkingAnnouncements = true
         defer { checkingAnnouncements = false }
@@ -4055,10 +4104,29 @@ final class AppModel {
     /// Opens a session with one device, introducing this device at the same time.
     private func startHandshake(contact i: Int, device d: Int) {
         guard let (handshake, request) = try? Handshake.start() else { return }
+        if let earlier = data.contacts[i].devices[d].handshake { keepEarlierAsk(earlier, contact: i, device: d) }
         data.contacts[i].devices[d].handshake = handshake
+        data.contacts[i].devices[d].needsKeys = nil
         // Only the newest ask is any use (it carries the keys this device is waiting on), so it replaces the last one
         // on the relay: a device that never answers holds one, however often it's asked.
         seal(.deviceHello(myDevice(for: i), request), contact: i, device: d, collapse: "hello")
+    }
+
+    /// Keeps an ask for keys that a newer one replaces: its answer may already be on the relay, waiting for this phone
+    /// to wake. Only a few, and none older than the relay keeps anything.
+    private func keepEarlierAsk(_ ask: PendingHandshake, contact i: Int, device d: Int) {
+        var asks = (data.contacts[i].devices[d].earlierAsks ?? []) + [ask]
+        asks.removeAll { Date().timeIntervalSince($0.startedAt) > Self.replayWindow }
+        data.contacts[i].devices[d].earlierAsks = Array(asks.suffix(Self.earlierAsksKept))
+    }
+
+    /// How many asks for keys, before the current one, are still taken an answer for.
+    static let earlierAsksKept = 3
+
+    /// Takes back an ask for keys still waiting in the outbox: it was answered already, through an earlier one.
+    private func withdrawHello(contact i: Int, device d: Int) {
+        let tag = Self.collapseTag("hello", sendID: data.contacts[i].devices[d].sendID, from: deviceID(for: data.contacts[i].persona))
+        data.outbox.removeAll { $0.collapse == tag && !sendingIDs.contains($0.id) }
     }
 
     /// Answers a device's handshake. We speak first, so we say who we are straight away. `spare`: the ask is a spare key
@@ -4067,8 +4135,12 @@ final class AppModel {
         guard let me = me(data.contacts[i].persona),
               let (session, answer) = try? Handshake.accept(request, me: me,
                                                              initiatorAgreement: data.contacts[i].agreementKey) else { return }
+        // What they wrote on the keys this replaces, still on its way, stays readable for now.
+        if let old = data.contacts[i].devices[d].session { keepRecovered(old, sessionKey(contact: i, device: d)) }
         data.contacts[i].devices[d].session = session
         data.contacts[i].devices[d].handshake = nil
+        data.contacts[i].devices[d].earlierAsks = nil
+        data.contacts[i].devices[d].needsKeys = nil
         data.contacts[i].devices[d].awaitingHello = nil
         data.contacts[i].devices[d].answeredAt = nil
         data.contacts[i].devices[d].acceptedHello = request.ephemeral
@@ -4525,7 +4597,17 @@ final class AppModel {
         let now = Date()
         let cutoff = now.addingTimeInterval(-60)
         let patience = now.addingTimeInterval(-Self.keysPatience)
+        let awake = [resumedAt, unlockedAt].compactMap { $0 }.max() ?? unlockedAt
         for i in data.contacts.indices where !data.contacts[i].awaitingAcceptance {
+            // Never before the mailbox their answers come to has been looked in, since the ask and since this phone woke.
+            // Coming back to Pulshade, housekeeping runs before the first check, and asking again then made the
+            // answer already waiting there useless (it no longer matched): between two people who only share a group,
+            // who meet on the first message, whoever reopened Pulshade more than a minute after writing never got
+            // through.
+            func looked(since date: Date?) -> Bool {
+                guard let mailbox = data.contacts[i].receiveKey else { return true }
+                return (mailboxChecked[mailbox] ?? .distantPast) > max(date ?? .distantPast, awake)
+            }
             for d in data.contacts[i].devices.indices {
                 // A device known from before this was kept starts its silence clock now.
                 if data.contacts[i].devices[d].lastHeard == nil { data.contacts[i].devices[d].lastHeard = now }
@@ -4540,9 +4622,11 @@ final class AppModel {
                 let tries = handshakeTries[key] ?? 0
                 let backoff = now.addingTimeInterval(-Self.handshakeGaps[min(tries, Self.handshakeGaps.count - 1)])
                 if link.session == nil && !link.pending.isEmpty && (link.handshake?.startedAt ?? .distantPast) < min(cutoff, backoff) {
+                    guard looked(since: link.handshake?.startedAt) else { continue }
                     handshakeTries[key] = tries + 1
                     startHandshake(contact: i, device: d)
                 } else if link.session == nil, let started = link.handshake?.startedAt, started < patience, tries == 0 || started < backoff {
+                    guard looked(since: started) else { continue }
                     handshakeTries[key] = tries + 1
                     // Asked for new keys and never answered, with nothing waiting to send: the ask itself was lost
                     // (a relay restart, an app restart before it went). It used to wait forever, on "Setting up new
@@ -4554,14 +4638,17 @@ final class AppModel {
                     // They send it straight away; when it never comes (lost, or stuck on their phone) the chat sat on
                     // "Setting up new keys" for good. After a while we ask again. The keys we have stay readable.
                     guard let since = keysAnsweredAt[key] else { keysAnsweredAt[key] = now; continue }
-                    guard since < patience else { continue }
+                    guard since < patience, looked(since: since) else { continue }
                     keysAnsweredAt[key] = nil
-                    recoveredSessions[key] = session
+                    keepRecovered(session, key)
                     startHandshake(contact: i, device: d)
                 }
             }
         }
     }
+
+    /// When each mailbox was last fetched, as of the moment the fetch began. Memory only.
+    @ObservationIgnored private var mailboxChecked: [Data: Date] = [:]
 
     /// How long to wait before asking a silent device for keys again, after each ask in turn.
     static var handshakeGaps: [TimeInterval] = [60, 300, 900, 3600]
@@ -4612,9 +4699,10 @@ final class AppModel {
     /// would replace the session the answer opened with one they will drop.
     private func hello(_ sentAt: Date, crossedSpareOf link: DeviceLink) -> Bool {
         guard link.session != nil, let taken = link.spareTakenAt else { return false }
-        // Strictly before: clocks here are whole seconds, and their ask for new keys because our answer named a spare
-        // they no longer have can come in the very same second, and must be taken.
-        return sentAt < taken
+        // Strictly before, in whole seconds: the time a message says it was sent is cut to the second, and their ask
+        // for new keys because our answer named a spare they no longer have can come in the very same second, and must
+        // be taken. (Compared with the exact moment, an ask sent half a second after it read as sent before.)
+        return sentAt < Date(timeIntervalSince1970: taken.timeIntervalSince1970.rounded(.down))
     }
 
     /// When two devices start a handshake with each other at once, the lower (fingerprint, device) wins.
@@ -4663,7 +4751,7 @@ final class AppModel {
         }
         if Date() >= nextAnnouncementCheck {
             nextAnnouncementCheck = Date().addingTimeInterval(60)
-            Task { await refreshAnnouncements() }
+            Task { await refreshAnnouncements(waiting: false) }
         }
         #if os(macOS)
         if Date() >= nextUpdateCheck, Updater.enabled, let client = client(nil, lane: "update") {
@@ -4783,6 +4871,8 @@ final class AppModel {
                 let started = Date()
                 let envelopes = try await client.fetch(Array(mine), wait: wait)
                 if lane.relay == nil { noteRelay(reached: true) }
+                // Whatever is handled below comes before any housekeeping that reads this.
+                for key in mine { mailboxChecked[key] = started }
                 // Mail, or an empty answer after a real wait. An instant empty one means the relay doesn't wait.
                 let waited = wait > 0 && (!envelopes.isEmpty || Date().timeIntervalSince(started) > Double(wait) / 2)
                 guard identity?.fingerprint == owner, !envelopes.isEmpty else { return waited }
@@ -4835,6 +4925,7 @@ final class AppModel {
         refreshPush()
         watchTor()
         watchStall()
+        resumeKeyFetch()
         retryStaleHandshakes()
         retryUnreadable()
         tendSpares()
@@ -5488,6 +5579,8 @@ final class AppModel {
 
     /// Tests only: sees every envelope this device takes in, so one can be handed to `receive` again.
     @ObservationIgnored var envelopeTap: ((RelayEnvelope) -> Void)?
+    /// Tests only: mail this says yes to is left on the relay for now, as if it hadn't arrived yet.
+    @ObservationIgnored var holdMail: ((RelayEnvelope) -> Bool)?
 
     /// What became of an envelope taken from the relay.
     enum ReceiveResult: Equatable {
@@ -5501,6 +5594,7 @@ final class AppModel {
 
     @discardableResult
     func receive(_ envelope: RelayEnvelope) -> ReceiveResult {
+        if holdMail?(envelope) == true { return .retry }
         envelopeTap?(envelope)
         deposited = envelope.deposited
         if let offer = data.linkOffers.firstIndex(where: { $0.receiveKey == envelope.receiveKey }) {
@@ -5607,12 +5701,30 @@ final class AppModel {
             acceptSession(request, contact: i, device: d)
             return .handled
         case let .sessionAccept(answer):
-            guard let d = deviceIndex(i, device), let pending = data.contacts[i].devices[d].handshake,
-                  pending.publicEphemeral == answer.replyTo,
+            guard let d = deviceIndex(i, device) else { return .junk }
+            let link = data.contacts[i].devices[d]
+            // The answer may be to an ask this device has since made again: a phone that was asleep when it came
+            // asks again on waking, and the answer to the first ask is still the one they hold.
+            let asks = [link.handshake].compactMap { $0 } + (link.earlierAsks ?? [])
+            guard let pending = asks.first(where: { $0.publicEphemeral == answer.replyTo }),
                   let session = try? Handshake.complete(pending, answer, me: me,
                                                         responderAgreement: data.contacts[i].agreementKey) else { return .junk }
+            if link.handshake?.publicEphemeral != answer.replyTo {
+                // Never older than the answer behind the keys in use.
+                if link.session != nil, let answered = link.answeredAt, opened.sentAt < answered { return .junk }
+                // The newer ask isn't needed now: taken back if it hasn't gone, and its answer still counts if it has.
+                if let newer = link.handshake {
+                    keepEarlierAsk(newer, contact: i, device: d)
+                    withdrawHello(contact: i, device: d)
+                }
+            }
+            data.contacts[i].devices[d].earlierAsks?.removeAll { $0.publicEphemeral == answer.replyTo }
+            if data.contacts[i].devices[d].earlierAsks?.isEmpty == true { data.contacts[i].devices[d].earlierAsks = nil }
+            // What they wrote on the keys this replaces, still on its way, stays readable for now.
+            if let old = link.session { keepRecovered(old, sessionKey(contact: i, device: d)) }
             data.contacts[i].devices[d].session = session
             data.contacts[i].devices[d].handshake = nil
+            data.contacts[i].devices[d].needsKeys = nil
             heard(contact: i, device: d)
             // When they answered, by their clock: a hello of theirs sent before that crossed ours (see `hello(_:crossedOurs:)`).
             data.contacts[i].devices[d].answeredAt = opened.sentAt
@@ -5644,17 +5756,37 @@ final class AppModel {
             }
             data.contacts[i].oldSpares?.removeAll { $0.handshake.publicEphemeral == answer.replyTo }
             if data.contacts[i].oldSpares?.isEmpty == true { data.contacts[i].oldSpares = nil }
+            // Both recovered at about the same time: each took the other's spare, and each now hears that the other
+            // took theirs. Left alone, each would switch to the other's answer and the two would end up apart. The
+            // lower side's spare wins on both ends (as with crossed hellos): the higher side keeps the keys it opened
+            // by answering the lower side's spare, and the lower side switches to them on hearing the answer. Only
+            // while their answer could have crossed ours: once anything of theirs has opened on the keys we made from
+            // their spare (`spareTakenAt` is cleared then), or our answer is older than the relay keeps mail, this is
+            // a friend who recovered later, and their answer is the one to take.
+            let link = data.contacts[i].devices[d]
+            if link.session != nil, let taken = link.spareTakenAt, opened.sentAt.timeIntervalSince(taken) < Self.replayWindow,
+               !myHandshakeWins(me: me.fingerprint, persona: persona, them: fp, theirDevice: device) {
+                // What they wrote on it before hearing our answer stays readable.
+                keepRecovered(session, sessionKey(contact: i, device: d))
+                heard(contact: i, device: d)
+                return .handled
+            }
             // Mail already sent on the keys this replaces stays readable for now.
-            if let old = data.contacts[i].devices[d].session { recoveredSessions[sessionKey(contact: i, device: d)] = old }
+            if let old = data.contacts[i].devices[d].session { keepRecovered(old, sessionKey(contact: i, device: d)) }
             data.contacts[i].devices[d].spareTakenAt = nil
             data.contacts[i].devices[d].session = session
             data.contacts[i].devices[d].handshake = nil
+            data.contacts[i].devices[d].earlierAsks = nil
+            data.contacts[i].devices[d].needsKeys = nil
             data.contacts[i].devices[d].awaitingHello = nil
             data.contacts[i].devices[d].acceptedHello = nil
             heard(contact: i, device: d)
             data.contacts[i].devices[d].answeredAt = opened.sentAt
             unreadable[sessionKey(contact: i, device: d)] = nil
             keysAnsweredAt[sessionKey(contact: i, device: d)] = Date()
+            // Something small on these keys as soon as they can carry it, so their device knows this one has its
+            // answer (see the crossing above).
+            data.contacts[i].devices[d].pending.insert(PendingPayload(payload: .receipt(ids: []), message: nil), at: 0)
             return .handled
         case let .collected(digests):
             // A friend's phone has these envelopes of yours, said by its notification helper while it was locked
@@ -5676,10 +5808,12 @@ final class AppModel {
             if var session = data.contacts[i].devices[d].session, let opened = try? session.decrypt(message) {
                 data.contacts[i].devices[d].session = session
                 heard(contact: i, device: d)
+                // They're on the keys this device made from their spare: they have our answer.
+                if data.contacts[i].devices[d].spareTakenAt != nil { data.contacts[i].devices[d].spareTakenAt = nil }
                 plain = opened
-            } else if var old = recoveredSessions[keptKey], let opened = try? old.decrypt(message) {
+            } else if let (n, old, opened) = openRecovered(message, keptKey) {
                 // Sent to the keys this account had before it was recovered, while the phone was gone: still readable.
-                recoveredSessions[keptKey] = old
+                recoveredSessions[keptKey]?[n] = old
                 plain = opened
             }
             guard let plain else {
