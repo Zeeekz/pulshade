@@ -24,6 +24,18 @@ struct AppDataFormatTests {
         #expect(old.format == AppData.currentFormat, "and is saved at the current one from then on")
     }
 
+    /// A member of a group that shares one mailbox is kept as a contact with no devices. Saved, that was an empty list,
+    /// which loading took for data from before linked devices, so it looked for a `sendID` that wasn't there and the
+    /// whole account refused to open ("this account's data couldn't be read") for everyone in such a group.
+    @Test func aContactWithNoDevicesOpensAgain() throws {
+        var member = Contact(fingerprint: "f", signingKey: Data(), agreementKey: Data(), sendID: Data(), hidden: true)
+        member.devices = []
+        var data = AppData()
+        data.contacts = [member]
+        let opened = try JSONDecoder.pulshade.decode(AppData.self, from: JSONEncoder.pulshade.encode(data))
+        #expect(opened.contacts.count == 1 && opened.contacts[0].devices.isEmpty && opened.contacts[0].hidden)
+    }
+
     /// Fails when a field is added to what's saved without raising `AppData.currentFormat`. Change the lists below
     /// together with it.
     @Test func changingWhatIsSavedMeansRaisingTheFormat() throws {

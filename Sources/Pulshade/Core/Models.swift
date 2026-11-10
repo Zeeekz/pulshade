@@ -233,9 +233,13 @@ struct Contact: Codable, Identifiable {
         spare = try? c.decodeIfPresent(SpareKey.self, forKey: .spare)
         oldSpares = try? c.decodeIfPresent([SpareKey].self, forKey: .oldSpares)
         addedAt = try c.decodeIfPresent(Date.self, forKey: .addedAt) ?? Date()
-        // Your own entry has no devices once the last linked one leaves; anyone else always has one.
-        if let devices = try? c.decodeIfPresent([DeviceLink].self, forKey: .devices), !devices.isEmpty || isSelf {
+        // A saved list of devices is taken as it is, even an empty one: your own entry once the last linked device leaves,
+        // and the members of a group that shares one mailbox, who are never written to directly. (An empty list used to
+        // fall through to the old single-device form below and stop the whole account opening.)
+        if let devices = try? c.decodeIfPresent([DeviceLink].self, forKey: .devices) {
             self.devices = devices
+        } else if !c.contains(.sendID) {
+            devices = []
         } else {
             var link = DeviceLink(sendID: try c.decode(Data.self, forKey: .sendID))
             link.session = try? c.decodeIfPresent(Ratchet.self, forKey: .session)
