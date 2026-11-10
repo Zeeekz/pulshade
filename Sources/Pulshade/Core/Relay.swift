@@ -340,6 +340,65 @@ struct RelayClient {
         return all
     }
 
+    /// Group mail: one envelope from a group mailbox, numbered by the relay (`seq`) so a phone can ask for what came
+    /// after the last it saw. Nothing is acknowledged: the relay keeps it for every member until it expires.
+    struct GroupMail {
+        var receiveKey: Data
+        var seq: UInt64
+        var blob: Data
+        var deposited: Date?
+    }
+
+    /// Posts into a group mailbox (see docs/groups-design.md). Says the envelope's number, so the sender's own cursor
+    /// can move past it.
+    @discardableResult
+    func depositGroup(_ blob: Data, to sendID: Data, days: Int, wake: Bool) async throws -> UInt64? {
+        var request = URLRequest(url: base.appending(path: "v1/g/\(sendID.hex)"))
+        request.httpMethod = "PUT"
+        request.timeoutInterval = max(20, 20 + Double(blob.count) / 25_000)
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        request.setValue(wake ? "1" : "0", forHTTPHeaderField: "X-Pulshade-Wake")
+        request.setValue(String(min(max(days, 1), 7)), forHTTPHeaderField: "X-Pulshade-Days")
+        let (_, response) = try await load(request, body: blob)
+        let http = response as? HTTPURLResponse
+        if http?.statusCode == 507 { throw RelayMailboxFull() }
+        if http?.statusCode == 413 { throw RelayTooLarge() }
+        guard http?.statusCode == 202 else { throw RelayRefused(status: http?.statusCode ?? 0) }
+        return (http?.value(forHTTPHeaderField: "X-Pulshade-Seq")).flatMap { UInt64($0) }
+    }
+
+    /// A fetch that also reads group mailboxes, each from just after `after`. `more` says the relay had more group mail
+    /// than fitted: ask again straight away with the new cursors.
+    func fetch(_ receiveKeys: [Data], groups: [(key: Data, after: UInt64)], wait: Int = 0) async throws
+        -> (envelopes: [RelayEnvelope], groups: [GroupMail], more: Bool) {
+        guard !groups.isEmpty else { return (try await fetch(receiveKeys, wait: wait), [], false) }
+        struct Cursor: Encodable { var key: String; var after: UInt64 }
+        struct Request: Encodable { var keys: [String]; var wait: Int; var groups: [Cursor] }
+        struct Item: Decodable { var k: Int; var id: UInt64; var blob: String; var age: Double? }
+        struct GroupItem: Decodable { var g: Int; var seq: UInt64; var blob: String; var age: Double? }
+        struct Response: Decodable { var items: [Item]; var groups: [GroupItem]?; var more: Bool? }
+        // Group mailboxes take room in the same request, so only as many plain keys go with them as fit.
+        let groups = Array(groups.prefix(256))
+        let keys = Array(receiveKeys.prefix(max(0, 512 - groups.count)))
+        let rest = Array(receiveKeys.dropFirst(keys.count))
+        let body = try JSONEncoder().encode(Request(keys: keys.map(\.hex), wait: rest.isEmpty ? wait : 0,
+                                                   groups: groups.map { Cursor(key: $0.key.hex, after: $0.after) }))
+        let (data, raw) = try await post("v1/fetch", body, timeout: TimeInterval(20 + wait))
+        RelayClock.note(raw)
+        let response = try JSONDecoder().decode(Response.self, from: data)
+        let now = Date()
+        var envelopes = response.items.compactMap { item -> RelayEnvelope? in
+            guard keys.indices.contains(item.k), let blob = Data(base64Encoded: item.blob) else { return nil }
+            return RelayEnvelope(receiveKey: keys[item.k], id: item.id, blob: blob, deposited: item.age.map { now.addingTimeInterval(-max(0, $0)) })
+        }
+        if !rest.isEmpty { envelopes += try await fetch(rest) }
+        let mail = (response.groups ?? []).compactMap { item -> GroupMail? in
+            guard groups.indices.contains(item.g), let blob = Data(base64Encoded: item.blob) else { return nil }
+            return GroupMail(receiveKey: groups[item.g].key, seq: item.seq, blob: blob, deposited: item.age.map { now.addingTimeInterval(-max(0, $0)) })
+        }
+        return (envelopes, mail, response.more == true)
+    }
+
     func ack(_ envelopes: [RelayEnvelope]) async throws {
         struct Ack: Encodable { var key: String; var ids: [UInt64] }
         let grouped = Dictionary(grouping: envelopes, by: \.receiveKey)

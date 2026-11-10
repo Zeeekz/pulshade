@@ -216,6 +216,16 @@ sends its author a view through the ratchet like any message, so the server can'
 can't be switched off, except that one-time chats never send them. The author's app answers each view, and a view
 that gets no answer is sent again a few times over the next hours, so one lost on the way still arrives. A story whose time has run out, or that you delete, stops being sent: copies still waiting to go are dropped.
 
+**Groups that share one mailbox.** New groups, once everyone in them runs an app that can, post each message once into
+one mailbox on the server that every member reads, instead of a copy to each person: up to 5,000 people. Each member
+is known in the group by a key made for that group alone, so the group can't be tied to your profile or to your other
+groups, and members never get each other's mailboxes. The group's name, roles and member list are one signed document
+that only someone allowed can change, and nobody can change someone else's card. Taking someone out gives everyone
+else a new key that person never gets; someone added doesn't get what was said before. The server keeps group mail
+sealed for up to 7 days and can't tell who reads it over Tor. The owner of an older group can move it over in its
+details. The trade-off: a stolen group key reads that group until its key next changes, and group messages show
+"sent" rather than ticking per member.
+
 **Groups, channels and broadcasts.** Groups and channels fan out one envelope per member; members who aren't your
 contacts are kept as hidden peers, used only inside that group. Each has an owner, optional admins and a posting
 rule (everyone, admins, or owner only). Changes carry a version number and only count when they come from an admin.
@@ -359,8 +369,8 @@ kept in memory only.
 - **iPhone:** messages arrive while the app is open, unless **Wake when locked** is on, since waking a closed app needs
   Apple's push service (see [wake-up pushes](push-notifications.md)). Blank screenshots
   rely on iOS behaviour Apple doesn't document; if an update changes it, screenshots would show the app again.
-- **Groups cap out at 300 members.** Every message goes out as one envelope per member, so that's the most an owner can
-  add: fine for friends and communities, not for 10,000-person channels.
+- **Groups in the older format cap out at 300 members.** Every message goes out as one envelope per member. Groups that
+  share one mailbox take 5,000; channels still use the older format.
 - **A group's member list is only as trustworthy as its admins.** The keys and mailboxes in a group's details are
   asserted by whoever sent them. A poisoned card can't read your messages to that member (a session only opens on
   an answer signed by the member's own identity key), but it can stop you reaching them. Check the safety code

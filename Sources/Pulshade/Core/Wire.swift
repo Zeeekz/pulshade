@@ -145,6 +145,15 @@ enum Payload: Codable, Equatable {
     /// `read`, so a read receipt still counts as delivered there.
     case receipt(ids: [UUID], read: Bool? = nil)
     case group(GroupInfo)
+    /// Over a 1:1 chat: you're being added to a group that shares one mailbox (see `GroupInvite`). Only sent to apps
+    /// that said they take part in those.
+    case groupInvite(GroupInvite)
+    /// Over a 1:1 chat, the answer to an invite: the card the newcomer will use in that group.
+    case groupJoin(group: UUID, card: MemberCard)
+    /// In a group's mailbox: a new version of its settings.
+    case groupSettings(GroupSettings)
+    /// In a group's mailbox: the next epoch's key, sealed to each member who stays.
+    case groupRekey(GroupRekey)
     /// A story, or a new version of one already sent (same id, edited text or lifetime). `lasts` is in seconds;
     /// older apps leave it out, meaning a day.
     case story(id: UUID, style: StoryStyle, date: Date, lasts: TimeInterval? = nil)
@@ -375,6 +384,9 @@ struct ConversationCard: Codable, Equatable {
 enum SyncEvent: Codable, Equatable {
     /// The first message on a new session between two of your devices.
     case hello
+    /// A group that shares one mailbox, as this account is in it: its settings and the epochs' keys. Only between your
+    /// own devices, which share the group key (it comes from the account's seed), each with a chain of its own.
+    case sharedGroup(persona: UUID?, settings: GroupSettings, epochs: [GroupEpoch])
     case sent(ConvoRef, WireMessage)
     case reaction(message: UUID, emoji: String?)
     case unsend(ids: [UUID])

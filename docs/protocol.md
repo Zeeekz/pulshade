@@ -239,7 +239,50 @@ Groups, channels and broadcasts are made **between phones. The relay knows nothi
   the mailbox another member uses with the owner. After the first hello each pair moves to a mailbox of its own.
 - In a channel, followers learn who can post, not who else follows.
 
-Honest limits:
+### 7a. Groups that share one mailbox
+
+*Code: `GroupKeys.swift`, and the "Groups that share one mailbox" section of `AppModel.swift`. Design:
+`docs/groups-design.md`.*
+
+New groups use this format when every member's app takes part (bit 4 of the `caps` byte); the owner of an older group
+can move it over once everyone can. Channels still use the format above.
+
+- **One mailbox per epoch.** A member seals each message **once** and posts it into the group's mailbox on the relay;
+  every member reads it from there with a cursor ("everything after the last one I saw"). The relay keeps group mail
+  sealed on disk for the group's life (1 to 7 days) and does not let it go when it is read, because it must not learn
+  how many members there are or who has read what.
+- **Member keys made for each group.** Each account's key in a group comes from its seed and the group's id, so it is
+  the same on every device of the account and is linked to nothing outside the group. Members never hold each other's
+  mailboxes or identity keys: only a **member card** (name, picture, group signing and agreement keys), signed by the
+  member's own group key.
+- **Epoch keys and sending chains.** A random 32-byte epoch key gives the mailbox, an outer key that hides who sent
+  an envelope from the relay, and the start of each member device's sending chain. Each message takes the next chain key
+  (HMAC steps), so a used key is not kept. Each envelope is signed by the sender's group key, so one member cannot pass
+  a message off as another's. Each device of an account posts on its own chain, tagged with 8 random bytes it makes for
+  itself; backups and newly linked devices make their own.
+- **Settings.** Name, picture, roles, posting rule, timer and the member cards are one numbered document, signed by
+  whoever changed it. Every member checks each new version against the one it holds: the owner may change anything but
+  who the owner is; admins add and remove ordinary members and change the details and timer; mods only remove ordinary
+  members; a member may only replace their own card. Nobody can change anyone else's card.
+- **Joining.** An admin invites a contact over their 1:1 chat with the settings and the current epoch's key; the
+  newcomer answers with their card, and the admin posts settings that include it. If anything has been said in the
+  current epoch, the admin starts a new one first, so the newcomer cannot read it.
+- **Leaving and removal.** Removing someone starts a new epoch: its key is sealed to each remaining member's group
+  agreement key (X25519, a one-off key per hand-out) and posted in the old mailbox, followed by settings that move to the
+  new one. The person removed can still read the old mailbox, never the new. A member who leaves says so in the mailbox
+  and an admin's device takes them out the same way.
+
+What it changes, honestly:
+
+- **Healing.** A 1:1 chat heals at the next reply after a key is stolen. In a group, a stolen epoch key reads everything
+  in that epoch until the next one (a removal, or a newcomer after the group has talked).
+- **Receipts.** A group message shows "sent" once it is on the relay; members do not confirm it one by one.
+- **The relay** sees one mailbox that many devices read, and can count how often it is read. Over Tor it cannot tell the
+  readers apart; in Fast mode it sees their addresses and could estimate the group's size.
+- **Admins** can still leave someone out of the settings (but cannot alter a card), and a hostile admin can be a
+  nuisance until the owner removes them.
+
+Honest limits (the per-member format above):
 
 - A roster is only as trustworthy as the admins who sent it. A poisoned roster **cannot** let anyone read your messages
   to a member (a session only opens on an answer signed by that member's own identity), but it can stop you reaching

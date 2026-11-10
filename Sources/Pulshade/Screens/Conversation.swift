@@ -2016,7 +2016,41 @@ private struct ConversationInfo: View {
             }
         }
 
+        if c.kind == .group { mailboxSection(c) }
+
         membersSection(c)
+    }
+
+    /// How the group's messages travel: one shared mailbox, or a copy to each member. The owner of an older group can
+    /// move it over once everyone's app can.
+    @ViewBuilder
+    private func mailboxSection(_ c: Conversation) -> some View {
+        if let shared = c.shared {
+            if shared.joining || shared.gone {
+                Card(title: "Group") {
+                    Text(shared.gone ? "You're no longer in this group." : "Joining. You can post once an admin's phone has added you.")
+                        .font(.system(size: 12)).foregroundStyle(Ink.dim)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        } else if c.amOwner {
+            Card(title: "Group format") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("This group sends each member their own copy of every message, so it's limited to 300 people. The new format posts each message once, holds up to 5,000 people and gives each member a key used only in this group.")
+                        .font(.system(size: 12)).foregroundStyle(Ink.dim)
+                    if model.canUpgrade(c) {
+                        Button { model.upgradeToSharedMailbox(c.id) } label: {
+                            Text("Move to the new format").font(.system(size: 12, weight: .semibold))
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(theme.accent)
+                    } else {
+                        Text("Everyone here needs a newer Pulshade first.").font(.system(size: 12)).foregroundStyle(Ink.faint)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
     }
 
     private func inviteSection(_ c: Conversation) -> some View {
@@ -2267,8 +2301,9 @@ private struct AddPeopleSheet: View {
 
     var body: some View {
         if let c = model.conversation(id) {
+            let already = model.contactsIn(c)
             let candidates = model.data.contacts.filter {
-                !$0.hidden && !$0.awaitingAcceptance && $0.persona == c.persona && !c.members.contains($0.fingerprint)
+                !$0.hidden && !$0.awaitingAcceptance && $0.persona == c.persona && !already.contains($0.fingerprint)
             }
             SheetBody(width: 440) {
                 VStack(spacing: 16) {
@@ -2281,12 +2316,19 @@ private struct AddPeopleSheet: View {
                             VStack(spacing: 2) {
                                 ForEach(candidates) { person in
                                     let on = picked.contains(person.fingerprint)
+                                    // A group that shares one mailbox can only take people whose app can.
+                                    let able = c.shared == nil || model.takesSharedGroups(person)
                                     Button {
                                         if on { picked.remove(person.fingerprint) } else { picked.insert(person.fingerprint) }
                                     } label: {
                                         HStack(spacing: 10) {
                                             Avatar(image: person.avatar, seed: person.fingerprint, size: 30)
-                                            Text(person.displayName).font(.system(size: 13)).foregroundStyle(Ink.text)
+                                            VStack(alignment: .leading, spacing: 1) {
+                                                Text(person.displayName).font(.system(size: 13)).foregroundStyle(able ? Ink.text : Ink.faint)
+                                                if !able {
+                                                    Text("Needs a newer Pulshade").font(.system(size: 11)).foregroundStyle(Ink.faint)
+                                                }
+                                            }
                                             Spacer()
                                             Image(systemName: on ? "checkmark.circle.fill" : "circle")
                                                 .foregroundStyle(on ? AnyShapeStyle(theme.accent) : AnyShapeStyle(Ink.faint))
@@ -2296,6 +2338,7 @@ private struct AddPeopleSheet: View {
                                         .contentShape(Rectangle())
                                     }
                                     .buttonStyle(.plain)
+                                    .disabled(!able)
                                 }
                             }
                         }

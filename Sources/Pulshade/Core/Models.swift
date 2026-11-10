@@ -97,6 +97,8 @@ struct DeviceLink: Codable {
     var readsGroupReceipts: Bool?
     /// Their app takes spare keys (`SpareSlot`): this device leaves them one, and takes theirs. Nil for an app from before.
     var takesSpares: Bool?
+    /// Their app takes part in groups that share one mailbox. Nil for an app from before.
+    var readsSharedGroups: Bool?
     /// When this device answered that device's spare key, by the relay's clock: a hello of theirs sent before then was
     /// overtaken by the answer and isn't taken. Cleared once keys are opened any other way.
     var spareTakenAt: Date?
@@ -723,6 +725,9 @@ struct Conversation: Codable, Identifiable, Equatable {
     var introsMade: [String: [String: Data]] = [:]
     /// As a member: the introduction mailboxes made for this device, where other members first say hello.
     var introsMine: [IntroMailbox] = []
+    /// Set for a group that shares one mailbox on the relay (see docs/groups-design.md); nil for one that sends each
+    /// member their own copy.
+    var shared: SharedGroup?
 
     init(id: UUID = UUID(), kind: ConversationKind, title: String, avatar: Data? = nil, members: [String],
          messages: [Message] = [], pinned: Bool = false, unread: Int = 0, disappearAfter: TimeInterval? = nil) {
@@ -740,7 +745,7 @@ struct Conversation: Codable, Identifiable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case id, kind, title, avatar, members, messages, createdAt, pinned, muted, unread, disappearAfter, persona
-        case about, owner, admins, mods, postPolicy, version, isOwner, introsMade, introsMine
+        case about, owner, admins, mods, postPolicy, version, isOwner, introsMade, introsMine, shared
     }
 
     init(from decoder: Decoder) throws {
@@ -763,6 +768,7 @@ struct Conversation: Codable, Identifiable, Equatable {
         version = try c.decodeIfPresent(Int.self, forKey: .version) ?? 0
         introsMade = try c.decodeIfPresent([String: [String: Data]].self, forKey: .introsMade) ?? [:]
         introsMine = try c.decodeIfPresent([IntroMailbox].self, forKey: .introsMine) ?? []
+        shared = try c.decodeIfPresent(SharedGroup.self, forKey: .shared)
         if let owner = try c.decodeIfPresent(String.self, forKey: .owner) {
             self.owner = owner
             postPolicy = (try? c.decodeIfPresent(PostPolicy.self, forKey: .postPolicy)) ?? .everyone
@@ -796,6 +802,7 @@ struct Conversation: Codable, Identifiable, Equatable {
         try c.encode(version, forKey: .version)
         if !introsMade.isEmpty { try c.encode(introsMade, forKey: .introsMade) }
         if !introsMine.isEmpty { try c.encode(introsMine, forKey: .introsMine) }
+        try c.encodeIfPresent(shared, forKey: .shared)
     }
 
     var lastActivity: Date { messages.last?.date ?? createdAt }
