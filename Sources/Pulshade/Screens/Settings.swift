@@ -929,6 +929,9 @@ private struct MessagePrivacySettings: View {
             SettingsGroup("Presence", footer: "Off by default. Only contacts who show theirs see yours.") {
                 SecurityToggle(title: "Online status", key: \.onlineStatus)
             }
+            SettingsGroup("Forwarding", footer: "Off, people can't forward or copy what you send from now on. Forwarded messages never say who wrote them. Nothing can stop a screenshot.") {
+                SecurityToggle(title: "Let people forward my messages", key: \.allowForwarding)
+            }
             LearnMore(title: "Link previews",
                       text: "Fetched over Tor, so the site never sees your IP (with Tor off, it does).")
         }

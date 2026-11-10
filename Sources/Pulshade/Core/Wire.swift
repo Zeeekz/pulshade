@@ -58,6 +58,11 @@ struct WireMessage: Codable, Equatable {
     var mentions: [Mention]?
     /// A file on the relay (see `Attachment`). Apps from before it ignore it and show `text`, which names the file.
     var attachment: Attachment?
+    /// The sender asks that this isn't forwarded (their setting when they sent it). Pulshade apps don't offer Forward
+    /// or Copy on it; nothing can stop a screenshot. Nil means forwarding is fine.
+    var noForward: Bool? = nil
+    /// Forwarded from another chat. Says nothing about where from, or who wrote it first.
+    var forwarded: Bool? = nil
 }
 
 /// What a message says about the video that follows it.

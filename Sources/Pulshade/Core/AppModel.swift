@@ -1524,7 +1524,7 @@ final class AppModel {
 
     func send(_ text: String, image: Data? = nil, voice: VoiceNote? = nil, replyTo: Message? = nil,
               quote: ReplyRef? = nil, preview: LinkPreview? = nil, collectible: Collectible? = nil, note: NoteCard? = nil,
-              mentioning picks: [(fingerprint: String, name: String)] = [], in id: Conversation.ID) {
+              mentioning picks: [(fingerprint: String, name: String)] = [], forwarded: Bool = false, in id: Conversation.ID) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || image != nil || voice != nil || collectible != nil || note != nil, let i = index(of: id) else { return }
         let convo = data.conversations[i]
@@ -1538,6 +1538,8 @@ final class AppModel {
                               preview: preview)
         message.collectible = collectible
         message.note = note
+        message.noForward = noForwardFlag
+        message.forwarded = forwarded ? true : nil
         // Only people of this group that are your contacts can be mentioned.
         let allowed = Set(mentionable(in: convo).map(\.fingerprint))
         message.mentions = Mention.locate(picks.filter { allowed.contains($0.fingerprint) }, in: trimmed)
@@ -1546,12 +1548,14 @@ final class AppModel {
         if convo.kind == .group, convo.shared == nil { message.deliveredTo = [] }
         withAnimation(.snappy(duration: 0.4)) { data.conversations[i].messages.append(message) }
 
-        let wire = WireMessage(id: message.id, conversation: sharedID(convo), kind: convo.kind == .broadcast ? .direct : convo.kind,
+        var wire = WireMessage(id: message.id, conversation: sharedID(convo), kind: convo.kind == .broadcast ? .direct : convo.kind,
                                text: trimmed, image: image, voice: voice, date: RelayClock.relay(now), expiresIn: convo.disappearAfter,
                                reply: reply.map { ReplyRef(id: $0.id, author: $0.author == "me" ? (myFingerprint(in: convo) ?? "") : $0.author,
                                                            snippet: $0.snippet, picture: $0.picture) },
                                preview: preview, collectible: collectible, note: note,
                                mentions: message.mentions.isEmpty ? nil : message.mentions)
+        wire.noForward = message.noForward
+        wire.forwarded = message.forwarded
         if postIfShared(.message(wire), in: id, message: message.id) {
             sync(.sent(ref(convo), wire))
             lastTypingSent[id] = nil
@@ -1564,6 +1568,49 @@ final class AppModel {
         if recipients.isEmpty { setStatus(.sent, for: [message.id]) }
         lastTypingSent[id] = nil
         save()
+    }
+
+    // MARK: Forwarding
+
+    /// What goes on a message of yours about forwarding: nil unless you've said no in Privacy & Security.
+    private var noForwardFlag: Bool? { data.security.allowForwarding ? nil : true }
+
+    /// Whether a message can be forwarded from its chat. Not one its sender asked to keep where it is, not in a chat
+    /// with a timer (a copy would outlive it), and not what only means something from its sender (a collectible checked
+    /// against their key, a note of their profile) or a file kept on the relay that its sender can erase.
+    func canForward(_ message: Message, in convo: Conversation) -> Bool {
+        guard !message.isSystem, convo.disappearAfter == nil, message.expiresAt == nil,
+              message.collectible == nil, message.note == nil else { return false }
+        if !message.isMine, message.noForward == true { return false }
+        if message.isVideo { return message.video?.isEmpty == false }
+        guard message.attachment == nil else { return false }
+        return !message.text.isEmpty || message.image != nil || message.voice != nil
+    }
+
+    /// Whether Copy is offered on a message: not on someone's who asked that their messages aren't forwarded.
+    func canCopy(_ message: Message) -> Bool {
+        message.isMine || message.noForward != true
+    }
+
+    /// Chats a message from `source` can be forwarded to: this persona's, where you can write. Never another persona's,
+    /// which would tie the two together.
+    func forwardTargets(from source: Conversation.ID) -> [Conversation] {
+        guard let from = conversation(source) else { return [] }
+        return data.conversations.filter {
+            $0.persona == from.persona && !$0.isAnnouncements && canPost(in: $0)
+        }
+    }
+
+    /// Sends a copy of a message to another chat, as yours, marked only as forwarded: who wrote it first and where it
+    /// came from go nowhere. Quotes and mentions stay behind.
+    func forward(_ message: Message, from source: Conversation.ID, to target: Conversation.ID) {
+        guard let from = conversation(source), canForward(message, in: from),
+              forwardTargets(from: source).contains(where: { $0.id == target }) else { return }
+        if message.isVideo, let clip = message.video, !clip.isEmpty {
+            sendVideo(clip, poster: message.image, seconds: message.clipSeconds ?? 0, caption: message.text, forwarded: true, in: target)
+        } else {
+            send(message.text, image: message.image, voice: message.voice, preview: message.preview, forwarded: true, in: target)
+        }
     }
 
     // MARK: Video clips kept on the relay
@@ -1770,6 +1817,7 @@ final class AppModel {
         let reply = replyTo.map { ReplyRef(id: $0.id, author: $0.sender, snippet: Self.snippet(of: $0), picture: Self.quotePicture($0.image)) }
         var message = Message(sender: "me", text: "", date: now, expiresAt: convo.disappearAfter.map { now.addingTimeInterval($0) }, reply: reply)
         message.attachment = a
+        message.noForward = noForwardFlag
         if convo.kind == .group { message.deliveredTo = [] }
         withAnimation(.snappy(duration: 0.4)) { data.conversations[i].messages.append(message) }
         fileProgress[message.id] = 0
@@ -1814,7 +1862,7 @@ final class AppModel {
                                text: fallback, image: nil, voice: nil, date: RelayClock.relay(message.date), expiresIn: convo.disappearAfter,
                                reply: message.reply.map { ReplyRef(id: $0.id, author: $0.author == "me" ? (myFingerprint(in: convo) ?? "") : $0.author,
                                                                    snippet: $0.snippet, picture: $0.picture) },
-                               preview: nil, attachment: a)
+                               preview: nil, attachment: a, noForward: message.noForward)
         // A shared group gets one pointer, without tokens: the file stays until it's deleted or runs out.
         if postIfShared(.message(wire), in: id, message: message.id) { sync(.sent(ref(convo), wire)); save(); return }
         let recipients = audience(convo)
@@ -1939,7 +1987,8 @@ final class AppModel {
     /// Sends a video (already made ready by `ChatVideo.prepare`). The message goes first, with a still from the clip,
     /// and the clip follows in pieces under the message's id, the way a video story's does. An app from before chat
     /// videos shows the still as a photo.
-    func sendVideo(_ clip: Data, poster: Data?, seconds: Double, caption: String = "", replyTo: Message? = nil, in id: Conversation.ID) {
+    func sendVideo(_ clip: Data, poster: Data?, seconds: Double, caption: String = "", replyTo: Message? = nil, forwarded: Bool = false,
+                   in id: Conversation.ID) {
         guard !clip.isEmpty, clip.count <= ChatVideo.maxBytes + 500_000, let i = index(of: id) else { return }
         let convo = data.conversations[i]
         guard canPost(in: convo) else { return }
@@ -1950,12 +1999,16 @@ final class AppModel {
                               expiresAt: convo.disappearAfter.map { now.addingTimeInterval($0) }, reply: reply)
         message.video = clip
         message.clipSeconds = seconds
+        message.noForward = noForwardFlag
+        message.forwarded = forwarded ? true : nil
         withAnimation(.snappy(duration: 0.4)) { data.conversations[i].messages.append(message) }
-        let wire = WireMessage(id: message.id, conversation: sharedID(convo), kind: convo.kind == .broadcast ? .direct : convo.kind,
+        var wire = WireMessage(id: message.id, conversation: sharedID(convo), kind: convo.kind == .broadcast ? .direct : convo.kind,
                                text: words, image: poster, voice: nil, date: RelayClock.relay(now), expiresIn: convo.disappearAfter,
                                reply: reply.map { ReplyRef(id: $0.id, author: $0.author == "me" ? (myFingerprint(in: convo) ?? "") : $0.author,
                                                            snippet: $0.snippet, picture: $0.picture) },
                                preview: nil, clip: ClipInfo(seconds: seconds))
+        wire.noForward = message.noForward
+        wire.forwarded = message.forwarded
         if postIfShared(.message(wire), in: id, message: message.id) {
             sendSharedClip(clip, id: message.id, in: id)
             sync(.sent(ref(convo), wire))
@@ -4673,7 +4726,7 @@ final class AppModel {
                            expiresIn: message.expiresAt == nil ? nil : convo.disappearAfter,
                            reply: reply, preview: message.preview, collectible: message.collectible, note: message.note,
                            mentions: message.mentions.isEmpty ? nil : message.mentions,
-                           attachment: message.attachment)
+                           attachment: message.attachment, noForward: message.noForward, forwarded: message.forwarded)
     }
 
     /// Handshakes that got no answer (the other side didn't know us yet, say) are tried again. Not a request's: it
@@ -6339,6 +6392,8 @@ final class AppModel {
         // Shown only if it's really theirs: a collectible is checked against their key, a note card is just a title.
         message.collectible = wire.collectible.flatMap { $0.isGenuine(for: sender.signingKey) ? $0 : nil }
         message.note = wire.note.flatMap(NoteCard.cleaned)
+        message.noForward = wire.noForward == true ? true : nil
+        message.forwarded = wire.forwarded == true ? true : nil
         // A mention counts only in a group, and only as far as it fits the words; yours is stored as "me".
         if data.conversations[i].kind == .group {
             message.mentions = Mention.cleaned(wire.mentions, in: message.text).map {
@@ -6920,6 +6975,8 @@ extension AppModel {
                                   date: dated(wire.date), status: .sent,
                                   expiresAt: wire.expiresIn.map { dated(wire.date).addingTimeInterval($0) }, reply: reply,
                                   preview: wire.preview)
+            message.noForward = wire.noForward == true ? true : nil
+            message.forwarded = wire.forwarded == true ? true : nil
             if let clip = wire.clip {
                 message.video = Data()
                 message.clipSeconds = min(max(clip.seconds, 0), ChatVideo.maxSeconds)

@@ -12,6 +12,8 @@ struct ConversationView: View {
     @Environment(\.dismiss) private var dismiss
     let id: Conversation.ID
     @State private var draft = ""
+    /// The message being forwarded, while the chat picker is up.
+    @State private var forwarding: Message?
     @State private var attachments: [Data] = []
     /// A video for the next message, while it's made ready and once it is.
     @State private var videoDraft: VideoDraft?
@@ -84,6 +86,9 @@ struct ConversationView: View {
             }
             .onChange(of: c.messages.count) { model.markRead(id) }
             .sheet(isPresented: $showInfo) { ConversationInfo(id: id) }
+            .sheet(item: $forwarding) { m in
+                ForwardSheet(message: m, from: id).presentationDetents([.medium, .large])
+            }
             .sheet(isPresented: $quickSending) {
                 QuickSendSheet(conversation: id).presentationDetents([.medium, .large])
             }
@@ -230,7 +235,10 @@ struct ConversationView: View {
                                        jump: { target in jump(to: target, proxy: proxy) },
                                        hover: { inside in if inside { hovered = m.id } else if hovered == m.id { hovered = nil } },
                                        notSent: unsent.contains(m.id),
-                                       retry: { model.retrySend(m.id, in: id) })
+                                       retry: { model.retrySend(m.id, in: id) },
+                                       canForward: model.canForward(m, in: c),
+                                       canCopy: model.canCopy(m),
+                                       forward: { forwarding = m })
                                 .equatable()
                             }
                         }
@@ -795,6 +803,10 @@ fileprivate struct Bubble: View, Equatable {
     /// It never reached the relay: said under the bubble, with a tap to send it again.
     var notSent = false
     var retry: () -> Void = {}
+    /// Forward is offered (see `AppModel.canForward`), and Copy (not on the messages of someone who said no to both).
+    var canForward = false
+    var canCopy = true
+    var forward: () -> Void = {}
     @State private var hovering = false
     @State private var picking = false
     @State private var viewingImage = false
@@ -812,6 +824,7 @@ fileprivate struct Bubble: View, Equatable {
         a.message == b.message && a.kind == b.kind && a.senderName == b.senderName && a.senderAvatar == b.senderAvatar
             && a.tint == b.tint && a.quoteAuthor == b.quoteAuthor && a.first == b.first && a.last == b.last
             && a.canReact == b.canReact && a.highlighted == b.highlighted && a.swipe == b.swipe && a.notSent == b.notSent
+            && a.canForward == b.canForward && a.canCopy == b.canCopy
     }
 
     /// Message text: a size up from before, so chats read easily at a glance.
@@ -901,9 +914,10 @@ fileprivate struct Bubble: View, Equatable {
         .contextMenu {
             if notSent && mine { Button("Try sending again", action: retry) }
             Button("Reply", action: reply)
+            if canForward { Button("Forward", action: forward) }
             if let wallet {
                 Button("Copy address") { copyAddress(wallet) }
-            } else if !message.text.isEmpty {
+            } else if !message.text.isEmpty, canCopy {
                 Button("Copy") { copyToClipboard(message.text, clearAfter: 60) }
             }
             if canReact {
@@ -988,6 +1002,13 @@ fileprivate struct Bubble: View, Equatable {
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(tint)
         }
+        if message.forwarded == true {
+            // Only that it was forwarded: never from whom, or from where.
+            Label("Forwarded", systemImage: "arrowshape.turn.up.right")
+                .font(.system(size: 12).italic())
+                .foregroundStyle(mine ? Ink.onAccent.opacity(0.65) : Ink.dim)
+                .labelStyle(.titleAndIcon)
+        }
         if let quote = message.reply {
             Button { jump(quote.id) } label: {
                 HStack(spacing: 8) {
@@ -1020,7 +1041,7 @@ fileprivate struct Bubble: View, Equatable {
         }
     }
 
-    private var hasHeader: Bool { (showsSender && first && senderName != nil) || message.reply != nil }
+    private var hasHeader: Bool { (showsSender && first && senderName != nil) || message.reply != nil || message.forwarded == true }
 
     @ViewBuilder private var words: some View {
         let mine = message.isMine
@@ -1028,7 +1049,7 @@ fileprivate struct Bubble: View, Equatable {
             .font(.system(size: Self.textSize))
             .foregroundStyle(mine ? Ink.onAccent.opacity(0.88) : Ink.text)
             .tint(mine ? Ink.onAccent.opacity(0.85) : theme.accent)
-            .textSelection(.enabled)
+            .modifier(SelectableText(enabled: canCopy))
     }
 
     private var timeLine: some View {
@@ -2405,3 +2426,76 @@ private let messageTransition: AnyTransition = .asymmetric(
     // A short rise and fade, like other messengers: the bubble arrives without the rows around it jumping.
     insertion: .offset(y: 14).combined(with: .opacity),
     removal: AnyTransition(ZapTransition()))
+
+/// Text that can be selected (and so copied), unless its sender asked that it isn't passed on.
+private struct SelectableText: ViewModifier {
+    var enabled: Bool
+    func body(content: Content) -> some View {
+        if enabled { content.textSelection(.enabled) } else { content.textSelection(.disabled) }
+    }
+}
+
+/// Picks the chat to forward a message to: this persona's chats where you can write. Tapping one sends it there.
+struct ForwardSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    var message: Message
+    var from: Conversation.ID
+    @State private var query = ""
+
+    private var targets: [Conversation] {
+        let all = model.forwardTargets(from: from)
+        guard !query.isEmpty else { return all }
+        return all.filter { $0.title.localizedCaseInsensitiveContains(query) }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ZStack {
+                Text("Forward to").font(.system(size: 17, weight: .semibold)).foregroundStyle(Ink.text)
+                HStack {
+                    Spacer()
+                    Button("Cancel") { dismiss() }.buttonStyle(.plain).foregroundStyle(Ink.dim)
+                        .keyboardShortcut(.cancelAction)
+                }
+            }
+            .padding(.horizontal, 16).frame(height: 52)
+            TextField("Search", text: $query)
+                .textFieldStyle(.plain)
+                .padding(10)
+                .background(Ink.surface, in: .rect(cornerRadius: 10))
+                .padding(.horizontal, 16).padding(.bottom, 8)
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(targets) { c in
+                        Button {
+                            model.forward(message, from: from, to: c.id)
+                            Haptics.tick()
+                            dismiss()
+                        } label: {
+                            HStack(spacing: 12) {
+                                Avatar(image: c.avatar ?? (c.kind == .direct ? model.contact(c.members.first ?? "")?.avatar : nil),
+                                       seed: c.kind == .direct ? (c.members.first ?? c.id.uuidString) : c.id.uuidString,
+                                       size: 40, symbol: c.kind == .direct ? nil : c.kind.symbol, showsStory: false)
+                                Text(c.title).font(.system(size: 16)).foregroundStyle(Ink.text).lineLimit(1)
+                                Spacer()
+                                Image(systemName: "arrowshape.turn.up.right").foregroundStyle(Ink.faint)
+                            }
+                            .padding(.horizontal, 16).padding(.vertical, 8)
+                            .contentShape(.rect)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    if targets.isEmpty {
+                        Text(query.isEmpty ? "No chats to forward to" : "No chats match")
+                            .font(.system(size: 13)).foregroundStyle(Ink.faint).padding(.top, 30)
+                    }
+                }
+            }
+        }
+        .background(Ink.base)
+        #if os(macOS)
+        .frame(width: 380, height: 480)
+        #endif
+    }
+}

@@ -527,6 +527,10 @@ struct Message: Codable, Identifiable, Equatable {
     /// For one of your messages in a group: the members whose device has confirmed it. Nil for a direct chat or
     /// channel, where one receipt covers everyone, and for messages from before this, which confirmed once for all.
     var deliveredTo: [String]?
+    /// Its sender asked that it isn't forwarded (see `WireMessage.noForward`).
+    var noForward: Bool?
+    /// Forwarded from another chat; nothing says from where.
+    var forwarded: Bool?
 
     var isVideo: Bool { video != nil }
     /// Whether this message @-mentions you.
@@ -568,6 +572,8 @@ struct Message: Codable, Identifiable, Equatable {
         mentions = (try? c.decodeIfPresent([Mention].self, forKey: .mentions)) ?? []
         attachment = try? c.decodeIfPresent(Attachment.self, forKey: .attachment)
         deliveredTo = try? c.decodeIfPresent([String].self, forKey: .deliveredTo)
+        noForward = try? c.decodeIfPresent(Bool.self, forKey: .noForward)
+        forwarded = try? c.decodeIfPresent(Bool.self, forKey: .forwarded)
     }
 }
 
@@ -1161,6 +1167,8 @@ struct SecuritySettings: Codable, Equatable {
     var readReceipts = true
     /// Show people when you're typing, and see when they are.
     var typingIndicators = true
+    /// Let people forward your messages to other chats. Off, your messages ask their apps not to offer Forward or Copy.
+    var allowForwarding = true
     /// Show people when you have Pulshade open, and see when they do. Off by default: the relay can tell when
     /// the signals go out, even though it can't read them.
     var onlineStatus = false
@@ -1218,6 +1226,7 @@ struct SecuritySettings: Codable, Equatable {
         deliveryReceipts = try c.decodeIfPresent(Bool.self, forKey: .deliveryReceipts) ?? d.deliveryReceipts
         readReceipts = try c.decodeIfPresent(Bool.self, forKey: .readReceipts) ?? d.readReceipts
         typingIndicators = try c.decodeIfPresent(Bool.self, forKey: .typingIndicators) ?? d.typingIndicators
+        allowForwarding = try c.decodeIfPresent(Bool.self, forKey: .allowForwarding) ?? d.allowForwarding
         onlineStatus = try c.decodeIfPresent(Bool.self, forKey: .onlineStatus) ?? d.onlineStatus
         tor = try c.decodeIfPresent(Bool.self, forKey: .tor) ?? d.tor
         torSince = try c.decodeIfPresent(Date.self, forKey: .torSince)
