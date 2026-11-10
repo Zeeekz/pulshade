@@ -13,15 +13,15 @@ struct LeaveView: View {
                 Text("Burn").font(.system(size: 20, weight: .bold)).foregroundStyle(Ink.text)
                 VStack(spacing: 10) {
                     LeaveOption(symbol: "lock.fill", color: Ink.dim, title: "Lock",
-                                detail: "Close PULSHADE now. Your passcode opens it again.") { model.lock() }
+                                detail: "Close PULSHADE. Your passcode opens it.") { model.lock() }
                     LeaveOption(symbol: "person.crop.circle.badge.minus", color: .orange, title: "Detach",
-                                detail: "Wipes this device at once. \(model.hasOtherDevices ? "Your other devices keep the account." : "If you're online, your contacts are first told to clear their chat with you.") \(model.data.security.keepBackup ? "Your recovery code brings back your profile, contacts and groups (\(model.backupStatus.lowercased())), never chats." : "Backups are off, so nothing comes back.")") { Task { await model.detachNow() } }
+                                detail: detachDetail) { Task { await model.detachNow() } }
                     if model.activePersona != nil {
                         LeaveOption(symbol: "flame", color: .red, title: "Burn persona",
                                     detail: "Delete \(model.activeProfile.displayName) for good.") { burningPersona = true }
                     }
                     LeaveOption(symbol: "flame.fill", color: .red, title: "Burn",
-                                detail: "Delete your account everywhere. It can't be undone.") { burning = true }
+                                detail: "Delete your account everywhere, for good.") { burning = true }
                 }
             }
             .padding(.horizontal, 16)
@@ -35,6 +35,14 @@ struct LeaveView: View {
         .sheet(isPresented: $burningPersona) {
             if let id = model.activePersona { PersonaBurnSheet(persona: id) }
         }
+    }
+
+    /// What Detach does here, in one or two short lines.
+    private var detachDetail: String {
+        if model.hasOtherDevices { return "Wipe this device now. Your other devices keep the account." }
+        return model.data.security.keepBackup
+            ? "Wipe this device now. Your recovery code brings back contacts and groups, not chats."
+            : "Wipe this device now. Backups are off, so nothing comes back."
     }
 }
 
