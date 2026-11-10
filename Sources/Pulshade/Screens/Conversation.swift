@@ -796,6 +796,10 @@ fileprivate struct Bubble: View, Equatable {
     @State private var hovering = false
     @State private var picking = false
     @State private var viewingImage = false
+    /// Where an opened photo grows out of, and shrinks back into.
+    @Namespace private var zoomSpace
+    /// A wallet card's address was just copied: its pill says so for a moment.
+    @State private var copiedAddress = false
     /// Counts double-tap hearts, so each one plays the burst again.
     @State private var hearts = 0
 
@@ -895,7 +899,11 @@ fileprivate struct Bubble: View, Equatable {
         .contextMenu {
             if notSent && mine { Button("Try sending again", action: retry) }
             Button("Reply", action: reply)
-            if !message.text.isEmpty { Button("Copy") { copyToClipboard(message.text, clearAfter: 60) } }
+            if let wallet {
+                Button("Copy address") { copyAddress(wallet) }
+            } else if !message.text.isEmpty {
+                Button("Copy") { copyToClipboard(message.text, clearAfter: 60) }
+            }
             if canReact {
                 Divider()
                 ForEach(Self.quick, id: \.self) { e in Button(e) { react(e) } }
@@ -914,56 +922,193 @@ fileprivate struct Bubble: View, Equatable {
         Haptics.tick()
     }
 
-    private var bubble: some View {
+    @ViewBuilder private var bubble: some View {
+        if let wallet {
+            walletBubble(wallet)
+        } else if let natural = mediaSize {
+            mediaBubble(MediaFrame.size(for: natural))
+        } else {
+            textBubble
+        }
+    }
+
+    /// A wallet address sent from someone's pinned sheet: drawn as its card, whatever picture came with it.
+    private var wallet: WalletMessage? {
+        guard message.collectible == nil, message.note == nil, message.voice == nil, !message.isVideo else { return nil }
+        return WalletMessage(text: message.text)
+    }
+
+    /// The wallet card is the whole bubble. A tap copies the address.
+    private func walletBubble(_ wallet: WalletMessage) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if hasHeader {
+                VStack(alignment: .leading, spacing: 6) { header }
+                    .padding(.horizontal, 10).padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            WalletCard(wallet: wallet, width: MediaFrame.maxWidth, copied: copiedAddress,
+                       corner: AnyView(timeLine.foregroundStyle(.white.opacity(0.85))))
+                .contentShape(.rect)
+                .onTapGesture { copyAddress(wallet) }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(wallet.kind.title) address \(wallet.address)")
+                .accessibilityHint("Copies the address")
+                .accessibilityAddTraits(.isButton)
+                .accessibilityAction { copyAddress(wallet) }
+        }
+        .frame(width: MediaFrame.maxWidth)
+        .fixedSize(horizontal: false, vertical: true)
+        .background { shape }
+        .clipShape(corners)
+        .help("Click to copy the address")
+    }
+
+    private func copyAddress(_ wallet: WalletMessage) {
+        copyToClipboard(wallet.address, clearAfter: 120)
+        Haptics.tick()
+        withAnimation(.snappy) { copiedAddress = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) { withAnimation(.snappy) { copiedAddress = false } }
+    }
+
+    /// The shape of the photo or video this message shows, if it shows one.
+    private var mediaSize: CGSize? {
+        guard let data = message.image, let img = DecodedImages.image(data, fit: 1100) else {
+            return message.isVideo ? CGSize(width: 9, height: 16) : nil
+        }
+        return img.size.width > 0 && img.size.height > 0 ? img.size : CGSize(width: 1, height: 1)
+    }
+
+    /// The sender's name in a group, and the message answered: above everything else in the bubble.
+    @ViewBuilder private var header: some View {
+        let mine = message.isMine
+        if showsSender, first, let senderName {
+            Text(senderName)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(tint)
+        }
+        if let quote = message.reply {
+            Button { jump(quote.id) } label: {
+                HStack(spacing: 8) {
+                    Rectangle().fill(mine ? Ink.onAccent.opacity(0.35) : tint).frame(width: 2).clipShape(.capsule)
+                    if let data = quote.picture, let img = DecodedImages.image(data, fit: 200) {
+                        // A story's quote is tall, like the story; a photo's is a small square.
+                        let tall = img.size.height > img.size.width * 1.5
+                        Image(platformImage: img).resizable().scaledToFill()
+                            .frame(width: tall ? 36 : 44, height: tall ? 64 : 44)
+                            .clipShape(.rect(cornerRadius: 5))
+                            .accessibilityHidden(true)
+                    }
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(quoteAuthor ?? "")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(mine ? Ink.onAccent.opacity(0.7) : tint)
+                        Text(quote.snippet)
+                            .font(.system(size: 13))
+                            .foregroundStyle(mine ? Ink.onAccent.opacity(0.6) : Ink.dim)
+                            .lineLimit(2)
+                    }
+                }
+                .padding(.vertical, 4).padding(.horizontal, 6)
+                .frame(maxWidth: 320, alignment: .leading)
+                .fixedSize(horizontal: true, vertical: false)
+                .background(mine ? Ink.onAccent.opacity(0.08) : Ink.surface, in: .rect(cornerRadius: 6))
+            }
+            .buttonStyle(.plain)
+            .help("Show the original")
+        }
+    }
+
+    private var hasHeader: Bool { (showsSender && first && senderName != nil) || message.reply != nil }
+
+    @ViewBuilder private var words: some View {
+        let mine = message.isMine
+        Text(mentioned(LinkPreviews.linked(message.text)))
+            .font(.system(size: Self.textSize))
+            .foregroundStyle(mine ? Ink.onAccent.opacity(0.88) : Ink.text)
+            .tint(mine ? Ink.onAccent.opacity(0.85) : theme.accent)
+            .textSelection(.enabled)
+    }
+
+    private var timeLine: some View {
+        HStack(spacing: 4) {
+            if message.expiresAt != nil { Image(systemName: "timer") }
+            Text(message.date.formatted(date: .omitted, time: .shortened))
+            if message.isMine {
+                StatusTicks(status: message.status).animation(.snappy(duration: 0.2), value: message.status)
+            }
+        }
+        .font(.system(size: 11, weight: .medium))
+    }
+
+    /// A photo or video fills its bubble to the edges, as on Telegram. Words sent with it sit underneath; without
+    /// any, the time floats on the picture.
+    private func mediaBubble(_ size: CGSize) -> some View {
+        let mine = message.isMine
+        let caption = !message.text.isEmpty
+        let below = caption || message.preview != nil
+        return VStack(alignment: .leading, spacing: 0) {
+            if hasHeader {
+                VStack(alignment: .leading, spacing: 6) { header }
+                    .padding(.horizontal, 10).padding(.top, 8).padding(.bottom, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            media(size)
+                .overlay(alignment: .bottomTrailing) {
+                    if !below && (last || hovering) {
+                        timeLine
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 7).padding(.vertical, 3)
+                            .background(.black.opacity(0.45), in: .capsule)
+                            .padding(7)
+                            .transition(.opacity)
+                            .allowsHitTesting(false)
+                    }
+                }
+            if below {
+                VStack(alignment: .leading, spacing: 6) {
+                    if caption { words.frame(maxWidth: .infinity, alignment: .leading) }
+                    if let preview = message.preview { PreviewCard(preview: preview, mine: mine) }
+                    if last || hovering {
+                        timeLine
+                            .foregroundStyle(mine ? Ink.onAccent.opacity(0.5) : Ink.faint)
+                            .frame(maxWidth: .infinity, alignment: .trailing)
+                            .transition(.opacity)
+                    }
+                }
+                .padding(.horizontal, 12).padding(.top, 8).padding(.bottom, 9)
+            }
+        }
+        .frame(width: size.width)
+        .fixedSize(horizontal: false, vertical: true)
+        .background { shape }
+        .clipShape(corners)
+        .overlay { if !mine { corners.strokeBorder(tint.opacity(0.22)) } }
+        .help(message.status == .queued ? "Sealed, waiting for the relay" : "")
+    }
+
+    @ViewBuilder private func media(_ size: CGSize) -> some View {
+        if message.isVideo {
+            VideoBubble(message: message, fill: size)
+        } else if let data = message.image, let img = DecodedImages.image(data, fit: 1100) {
+            Image(platformImage: img).resizable().scaledToFill()
+                .frame(width: size.width, height: size.height)
+                .clipped()
+                .contentShape(.rect)
+                .matchedTransitionSource(id: message.id, in: zoomSpace)
+                .onTapGesture { viewingImage = true }
+                .modifier(ImageViewerCover(isPresented: $viewingImage, data: data,
+                                           title: message.isMine ? "You" : senderName, date: message.date,
+                                           caption: message.text.isEmpty ? nil : message.text,
+                                           source: (message.id, zoomSpace)))
+                .accessibilityLabel("Photo")
+                .accessibilityAddTraits(.isButton)
+        }
+    }
+
+    private var textBubble: some View {
         let mine = message.isMine
         return VStack(alignment: mine ? .trailing : .leading, spacing: 6) {
-            if showsSender, first, let senderName {
-                Text(senderName)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(tint)
-            }
-            if let quote = message.reply {
-                Button { jump(quote.id) } label: {
-                    HStack(spacing: 8) {
-                        Rectangle().fill(mine ? Ink.onAccent.opacity(0.35) : tint).frame(width: 2).clipShape(.capsule)
-                        if let data = quote.picture, let img = DecodedImages.image(data, fit: 200) {
-                            // A story's quote is tall, like the story; a photo's is a small square.
-                            let tall = img.size.height > img.size.width * 1.5
-                            Image(platformImage: img).resizable().scaledToFill()
-                                .frame(width: tall ? 36 : 44, height: tall ? 64 : 44)
-                                .clipShape(.rect(cornerRadius: 5))
-                                .accessibilityHidden(true)
-                        }
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(quoteAuthor ?? "")
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundStyle(mine ? Ink.onAccent.opacity(0.7) : tint)
-                            Text(quote.snippet)
-                                .font(.system(size: 13))
-                                .foregroundStyle(mine ? Ink.onAccent.opacity(0.6) : Ink.dim)
-                                .lineLimit(2)
-                        }
-                    }
-                    .padding(.vertical, 4).padding(.horizontal, 6)
-                    .frame(maxWidth: 320, alignment: .leading)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .background(mine ? Ink.onAccent.opacity(0.08) : Ink.surface, in: .rect(cornerRadius: 6))
-                }
-                .buttonStyle(.plain)
-                .help("Show the original")
-            }
-            if message.isVideo {
-                VideoBubble(message: message)
-            } else if let data = message.image, let img = DecodedImages.image(data, fit: 1100) {
-                Image(platformImage: img).resizable().scaledToFit()
-                    .frame(maxWidth: Platform.isPhone ? 250 : 320, maxHeight: 340)
-                    .clipShape(.rect(cornerRadius: 10))
-                    .contentShape(.rect(cornerRadius: 10))
-                    .onTapGesture { viewingImage = true }
-                    .modifier(ImageViewerCover(isPresented: $viewingImage, data: data))
-                    .accessibilityLabel("Photo")
-                    .accessibilityAddTraits(.isButton)
-            }
+            header
             if let voice = message.voice {
                 VoiceBubble(note: voice, id: message.id, mine: mine)
             }
@@ -981,26 +1126,15 @@ fileprivate struct Bubble: View, Equatable {
             } else if bare {
                 BigEmoji(text: message.text, fresh: Date().timeIntervalSince(message.date) < 6)
             } else if !message.text.isEmpty {
-                Text(mentioned(LinkPreviews.linked(message.text)))
-                    .font(.system(size: Self.textSize))
-                    .foregroundStyle(mine ? Ink.onAccent.opacity(0.88) : Ink.text)
-                    .tint(mine ? Ink.onAccent.opacity(0.85) : theme.accent)
-                    .textSelection(.enabled)
+                words
             }
             if let preview = message.preview {
                 PreviewCard(preview: preview, mine: mine)
             }
             if last || hovering {
-                HStack(spacing: 4) {
-                    if message.expiresAt != nil { Image(systemName: "timer") }
-                    Text(message.date.formatted(date: .omitted, time: .shortened))
-                    if mine {
-                        StatusTicks(status: message.status).animation(.snappy(duration: 0.2), value: message.status)
-                    }
-                }
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(mine && !bare ? Ink.onAccent.opacity(0.5) : Ink.faint)
-                .transition(.opacity)
+                timeLine
+                    .foregroundStyle(mine && !bare ? Ink.onAccent.opacity(0.5) : Ink.faint)
+                    .transition(.opacity)
             }
         }
         .fixedSize(horizontal: false, vertical: true)
@@ -1017,20 +1151,21 @@ fileprivate struct Bubble: View, Equatable {
         message.image == nil && message.voice == nil && message.reply == nil && message.text.isOnlyEmoji
     }
 
-    private var shape: some View {
+    /// The bubble's outline: rounder on the outside, tighter where it joins the one above or below.
+    private var corners: UnevenRoundedRectangle {
         let mine = message.isMine
         let r: CGFloat = 18, tight: CGFloat = 6
         return UnevenRoundedRectangle(cornerRadii: .init(
             topLeading: !mine && !first ? tight : r, bottomLeading: !mine && !last ? tight : r,
             bottomTrailing: mine && !last ? tight : r, topTrailing: mine && !first ? tight : r))
+    }
+
+    private var shape: some View {
+        let mine = message.isMine
+        return corners
             .fill(mine ? AnyShapeStyle(theme.gradient) : AnyShapeStyle(Ink.raised))
             .overlay {
-                if !mine {
-                    UnevenRoundedRectangle(cornerRadii: .init(
-                        topLeading: !first ? tight : r, bottomLeading: !last ? tight : r,
-                        bottomTrailing: r, topTrailing: r))
-                        .strokeBorder(tint.opacity(0.22))
-                }
+                if !mine { corners.strokeBorder(tint.opacity(0.22)) }
             }
     }
 

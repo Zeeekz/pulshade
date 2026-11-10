@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import CoreImage
 @testable import PulshadeShared
 @testable import Pulshade
 
@@ -188,4 +189,34 @@ struct ProfileLinksTests {
     }
 
     private func hex(_ bytes: [UInt8]) -> String { bytes.map { String(format: "%02x", $0) }.joined() }
+
+    /// A wallet sent from the pinned sheet goes as a card whose QR code scans back to it: a `bitcoin:` link for
+    /// Bitcoin. The chat reads the card back from the words, and nothing else looks like one.
+    @MainActor @Test func walletCardScansBack() throws {
+        let wallet = WalletMessage(kind: .bitcoin, address: btcSegwit)
+        #expect(wallet.qrText == "bitcoin:\(btcSegwit)")
+        #expect(WalletMessage(text: wallet.text) == wallet)
+        #expect(WalletMessage(text: "My Bitcoin address:\nnot-an-address") == nil)
+        #expect(WalletMessage(text: "Hello\n\(btcSegwit)") == nil)
+        #expect(WalletMessage(kind: .monero, address: xmr).qrText == xmr)
+        for w in [wallet, WalletMessage(kind: .monero, address: xmr), WalletMessage(kind: .ethereum, address: ethChecksummed)] {
+            let jpeg = try #require(WalletCard.picture(w))
+            #expect(jpeg.count < 400_000)
+            let image = try #require(CIImage(data: jpeg))
+            let detector = try #require(CIDetector(ofType: CIDetectorTypeQRCode, context: nil, options: [CIDetectorAccuracy: CIDetectorAccuracyHigh]))
+            let read = detector.features(in: image).compactMap { ($0 as? CIQRCodeFeature)?.messageString }
+            #expect(read == [w.qrText])
+        }
+    }
+
+    /// Photos fill their bubble at its full width, and odd shapes are cropped instead of shrunk to a sliver.
+    @Test func mediaFrameKeepsBubblesSensible() {
+        let wide = MediaFrame.size(for: CGSize(width: 4000, height: 3000))
+        #expect(wide.width == MediaFrame.maxWidth)
+        #expect(abs(wide.height - (MediaFrame.maxWidth * 0.75).rounded()) <= 1)
+        let tall = MediaFrame.size(for: CGSize(width: 100, height: 2000))
+        #expect(tall.height == MediaFrame.maxHeight && tall.width == MediaFrame.minWidth)
+        let strip = MediaFrame.size(for: CGSize(width: 3000, height: 100))
+        #expect(strip.height == MediaFrame.minHeight)
+    }
 }

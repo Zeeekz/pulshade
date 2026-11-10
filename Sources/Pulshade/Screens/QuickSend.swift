@@ -4,7 +4,7 @@ import PulshadeShared
 #endif
 
 /// What you've pinned to your profile (links, wallets, notes) and your collectibles, one tap from sending in the chat
-/// you're in. Links and wallets go as ordinary messages. A note goes as a card with no words in it: they open it from
+/// you're in. Links go as ordinary messages, wallets as a card with their QR code. A note goes as a card with no words in it: they open it from
 /// your profile, behind its password or the access you gave. A collectible goes as a card with its picture.
 struct QuickSendSheet: View {
     @Environment(AppModel.self) private var model
@@ -52,7 +52,7 @@ struct QuickSendSheet: View {
                              detail: link.value, send: { sendText(Self.text(for: link)) })
                     })
                     section("Wallets", links.filter(\.kind.isWallet).map { link in
-                        Item(id: "w" + link.id, symbol: link.kind.symbol, title: link.kind.title, detail: link.value, send: { sendText(Self.text(for: link)) })
+                        Item(id: "w" + link.id, symbol: link.kind.symbol, title: link.kind.title, detail: link.value, send: { sendWallet(link) })
                     })
                     section("Notes", notes.map { note in
                         Item(id: "n" + note.id, symbol: note.isLocked ? "lock.fill" : note.isRestricted ? "person.fill.checkmark" : "doc.text",
@@ -98,6 +98,14 @@ struct QuickSendSheet: View {
 
     private func sendText(_ text: String) {
         model.send(text, in: conversation)
+        finish()
+    }
+
+    /// A wallet goes as its card (QR code and address) with the address written under it, for apps from before cards.
+    private func sendWallet(_ link: ProfileLink) {
+        let wallet = WalletMessage(kind: link.kind, address: link.value)
+        guard let card = WalletCard.picture(wallet) else { sendText(wallet.text); return }
+        model.send(wallet.text, image: card, in: conversation)
         finish()
     }
 

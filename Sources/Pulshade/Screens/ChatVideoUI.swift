@@ -65,6 +65,8 @@ struct VideoBadge: View {
 struct VideoBubble: View {
     @Environment(AppModel.self) private var model
     var message: Message
+    /// The size it fills inside a media bubble, edge to edge; without one it sits in its own rounded frame.
+    var fill: CGSize? = nil
     @State private var playing = false
 
     private var ready: Bool { message.video?.isEmpty == false }
@@ -76,8 +78,14 @@ struct VideoBubble: View {
 
     var body: some View {
         ZStack {
-            if let data = message.image, let img = PlatformImage(data: data) {
-                Image(platformImage: img).resizable().scaledToFit()
+            if let data = message.image, let img = DecodedImages.image(data, fit: 1100) {
+                if let fill {
+                    Image(platformImage: img).resizable().scaledToFill().frame(width: fill.width, height: fill.height).clipped()
+                } else {
+                    Image(platformImage: img).resizable().scaledToFit()
+                }
+            } else if let fill {
+                Rectangle().fill(.black).frame(width: fill.width, height: fill.height)
             } else {
                 Rectangle().fill(.black).aspectRatio(9 / 16, contentMode: .fit)
             }
@@ -100,9 +108,10 @@ struct VideoBubble: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading).padding(8)
             }
         }
-        .frame(maxWidth: Platform.isPhone ? 250 : 320, maxHeight: 340)
-        .clipShape(.rect(cornerRadius: 10))
-        .contentShape(.rect(cornerRadius: 10))
+        .frame(width: fill?.width, height: fill?.height)
+        .frame(maxWidth: fill == nil ? (Platform.isPhone ? 250 : 320) : nil, maxHeight: fill == nil ? 340 : nil)
+        .clipShape(.rect(cornerRadius: fill == nil ? 10 : 0))
+        .contentShape(.rect)
         .onTapGesture { if ready { playing = true } }
         .modifier(VideoPlayerCover(isPresented: $playing, clip: message.video ?? Data()))
         .accessibilityElement(children: .ignore)
