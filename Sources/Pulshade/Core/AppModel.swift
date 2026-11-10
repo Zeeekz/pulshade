@@ -3007,6 +3007,19 @@ final class AppModel {
         save()
     }
 
+    /// Before a chat is shown: switches to the persona it belongs to, so the screen never shows one identity while the
+    /// chat sends as another (a notification, the menu bar or a link can open any persona's chat).
+    func becomeOwner(of id: Conversation.ID) {
+        guard let convo = conversation(id), !belongsHere(convo) else { return }
+        switchPersona(convo.persona)
+    }
+
+    /// Whether a chat may be shown while the active persona is in use: its own chats, and the ones every persona lists
+    /// (burners', which carry their own name and timer, and Announcements).
+    func belongsHere(_ convo: Conversation) -> Bool {
+        convo.persona == data.activePersona || isBurner(convo.persona) || convo.isAnnouncements
+    }
+
     /// Moves to the next everyday persona, going round through your main account. Does nothing with only one account.
     func switchToNextPersona() {
         let order: [UUID?] = [nil] + personas.map { $0.id }

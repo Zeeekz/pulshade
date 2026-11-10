@@ -167,9 +167,15 @@ private struct PhoneMainView: View {
         .onChange(of: selection.map { model.conversation($0) == nil } ?? false) { _, gone in
             if gone { selection = nil }
         }
+        // Switching persona closes a chat that belongs to another: what's on screen must always be the persona that
+        // sends.
+        .onChange(of: model.activePersona) {
+            if let open = selection, let c = model.conversation(open), !model.belongsHere(c) { selection = nil }
+        }
     }
 
     private func open(_ id: Conversation.ID) {
+        model.becomeOwner(of: id)
         section = .chats
         selection = id
         model.markRead(id)
@@ -365,12 +371,18 @@ private struct DesktopMainView: View {
         #endif
         .onChange(of: model.requestedConversation, initial: true) { _, id in
             guard let id, model.conversation(id) != nil else { return }
+            model.becomeOwner(of: id)
             withAnimation(.smooth) {
                 section = .chats
                 selection = id
             }
             model.markRead(id)
             model.requestedConversation = nil
+        }
+        // Switching persona closes a chat that belongs to another: what's on screen must always be the persona that
+        // sends.
+        .onChange(of: model.activePersona) {
+            if let open = selection, let c = model.conversation(open), !model.belongsHere(c) { selection = nil }
         }
         .onChange(of: model.openedHandle, initial: true) { _, handle in
             if handle != nil { withAnimation(.smooth) { section = .contacts } }

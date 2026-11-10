@@ -49,7 +49,9 @@ struct ConversationView: View {
     private let replyThreshold: CGFloat = 56
 
     var body: some View {
-        if let c = model.conversation(id) {
+        // Only a chat of the persona you're using now: never show one identity's chat (and its composer) while another
+        // is active, or what you write would go out as someone you don't think you are.
+        if let c = model.conversation(id), model.belongsHere(c) {
             VStack(spacing: 0) {
                 header(c)
                 messages(c)
