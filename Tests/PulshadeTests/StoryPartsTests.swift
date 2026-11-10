@@ -9,6 +9,7 @@ struct StoryPartsTests {
         #expect(StoryVideo.parts(of: 3) == 1)
         #expect(StoryVideo.parts(of: 15) == 1)
         #expect(StoryVideo.parts(of: 15.5) == 2)
+        #expect(StoryVideo.parts(of: 15.2) == 1, "a sliver left over is not a story of its own")
         #expect(StoryVideo.parts(of: 61) == 5)
         #expect(StoryVideo.parts(of: 300) == 20)
         #expect(StoryVideo.parts(of: 3_000) == 20, "past five minutes the rest is left out")
@@ -80,6 +81,42 @@ struct StoryPartsTests {
         #expect(abs(reds[0] - 0) < 25, "part 1 starts at the start: \(reds)")
         #expect(abs(reds[1] - 90) < 25, "part 2 starts at 15 s: \(reds)")
         #expect(abs(reds[2] - 180) < 25, "part 3 starts at 30 s: \(reds)")
+    }
+
+    @Test func trimmingKeepsAPartBetweenASecondAndFiveMinutes() {
+        let duration = 400.0
+        let whole = StoryTrim.whole(duration)
+        #expect(whole.start == 0 && whole.end == StoryVideo.longestSeconds)
+        #expect(StoryTrim.whole(.nan).length == 0)
+        let later = whole.movingStart(to: 299.9, duration: duration)
+        #expect(abs(later.length - StoryTrim.shortest) < 0.0001, "the start stops a second short of the end")
+        let pulled = StoryTrim(start: 150, end: 160).movingEnd(to: 900, duration: duration)
+        #expect(pulled.end == duration, "the end stops at the clip's end")
+        let far = StoryTrim(start: 0, end: 60).movingEnd(to: 380, duration: duration)
+        #expect(far.length == StoryVideo.longestSeconds, "and at five minutes")
+        let slid = StoryTrim(start: 10, end: 40).sliding(by: 1000, duration: duration)
+        #expect(slid.end == duration && slid.length == 30, "sliding keeps the length: \(slid)")
+        #expect(StoryTrim(start: 10, end: 40).sliding(by: -1000, duration: duration).start == 0)
+        let tiny = StoryTrim(start: 0, end: 0.6).movingEnd(to: 0.1, duration: 0.6)
+        #expect(tiny.end == 0.6, "a clip shorter than a second is kept whole")
+    }
+
+    @Test func aTrimmedPartIsCutIntoStoriesFromItsStart() {
+        let parts = StoryTrim(start: 3, end: 34).parts
+        #expect(parts.count == 3)
+        #expect(parts.map(\.start) == [3, 18, 33])
+        #expect(parts.map(\.seconds) == [15, 15, 1])
+        #expect(StoryTrim(start: 2, end: 17.1).parts.map(\.seconds) == [15], "a sliver at the end is dropped")
+    }
+
+    @Test func aTrimmedClipExportsOnlyTheKeptPart() async throws {
+        let source = try await Self.rampClip(seconds: 20)
+        let piece = try #require(StoryTrim(start: 10, end: 14).parts.first)
+        let data = try await StoryVideo.export(from: source, filter: .none, maxSeconds: piece.seconds, from: piece.start)
+        let length = try await MemoryClip(data).makeAsset().load(.duration).seconds
+        #expect(abs(length - 4) < 0.6, "four seconds kept: \(length)")
+        let red = await Self.red(of: MemoryClip(data))
+        #expect(abs(red - 60) < 25, "starting ten seconds in: \(red)")
     }
 }
 

@@ -293,6 +293,49 @@ final class FramingBox: @unchecked Sendable {
     }
 }
 
+/// The part of a picked clip that becomes stories: from `start` to `end`, in seconds. It is at least a second long
+/// (or the whole clip, if that is shorter) and at most five minutes, which go up as stories of 15 seconds each.
+struct StoryTrim: Equatable, Sendable {
+    var start: Double = 0
+    var end: Double = 0
+    static let shortest: Double = 1
+
+    var length: Double { max(end - start, 0) }
+
+    /// All of a clip, up to five minutes.
+    static func whole(_ duration: Double) -> StoryTrim {
+        StoryTrim(start: 0, end: min(max(duration.isFinite ? duration : 0, 0), StoryVideo.longestSeconds))
+    }
+
+    private static func shortest(in duration: Double) -> Double { min(shortest, max(duration, 0)) }
+
+    /// With the start moved to `time`, kept short of the end and within five minutes of it.
+    func movingStart(to time: Double, duration: Double) -> StoryTrim {
+        let low = max(0, end - StoryVideo.longestSeconds), high = end - Self.shortest(in: duration)
+        return StoryTrim(start: min(max(time.isFinite ? time : start, low), max(high, low)), end: end)
+    }
+
+    /// With the end moved to `time`, kept past the start, within the clip and within five minutes of the start.
+    func movingEnd(to time: Double, duration: Double) -> StoryTrim {
+        let low = start + Self.shortest(in: duration), high = min(duration, start + StoryVideo.longestSeconds)
+        return StoryTrim(start: start, end: min(max(time.isFinite ? time : end, min(low, high)), high))
+    }
+
+    /// Moved along whole, keeping its length, within the clip.
+    func sliding(by seconds: Double, duration: Double) -> StoryTrim {
+        let shift = min(max(seconds.isFinite ? seconds : 0, -start), max(duration - end, 0))
+        return StoryTrim(start: start + shift, end: end + shift)
+    }
+
+    /// Where each story cut from it starts, and how long it is.
+    var parts: [(start: Double, seconds: Double)] {
+        (0..<StoryVideo.parts(of: length)).map { i in
+            let from = start + Double(i) * StoryVideo.maxSeconds
+            return (from, min(StoryVideo.maxSeconds, end - from))
+        }
+    }
+}
+
 enum StoryVideo {
     static let maxSeconds: Double = 15
     /// The longest video that can be turned into stories: it is cut into parts of `maxSeconds`, like Instagram does.
@@ -303,7 +346,8 @@ enum StoryVideo {
     /// How many stories a video of this length becomes.
     static func parts(of seconds: Double) -> Int {
         guard seconds.isFinite, seconds > 0 else { return 1 }
-        return max(1, Int((min(seconds, longestSeconds) / maxSeconds).rounded(.up)))
+        // A sliver left over (a quarter of a second or less) is dropped rather than posted as a story of its own.
+        return max(1, Int(((min(seconds, longestSeconds) - 0.25) / maxSeconds).rounded(.up)))
     }
 
     /// The size each part may be, when a video comes in `parts`.
@@ -353,11 +397,15 @@ enum StoryVideo {
             var image = flat.transformed(by: CGAffineTransform(scaleX: scale, y: scale)).transformed(by: moved)
             // Smaller than the frame, or moved off an edge: a soft, darkened copy of the picture fills what's left.
             if !image.extent.contains(frame.insetBy(dx: 0.5, dy: 0.5)) {
-                let back = flat.transformed(by: CGAffineTransform(scaleX: fillScale, y: fillScale))
-                    .transformed(by: CGAffineTransform(translationX: (size.width - e.width * fillScale) / 2,
-                                                       y: (size.height - e.height * fillScale) / 2))
+                // Blurred at a quarter of the size and scaled back up: it looks the same, and costs a sixteenth,
+                // which keeps the live preview smooth.
+                let q: CGFloat = 0.25
+                let back = flat.transformed(by: CGAffineTransform(scaleX: fillScale * q, y: fillScale * q))
+                    .transformed(by: CGAffineTransform(translationX: (size.width - e.width * fillScale) / 2 * q,
+                                                       y: (size.height - e.height * fillScale) / 2 * q))
                     .clampedToExtent()
-                    .applyingGaussianBlur(sigma: size.width / 14)
+                    .applyingGaussianBlur(sigma: size.width / 14 * q)
+                    .transformed(by: CGAffineTransform(scaleX: 1 / q, y: 1 / q))
                     .cropped(to: frame)
                 let dim = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0.3)).cropped(to: frame)
                 image = image.composited(over: dim.composited(over: back))

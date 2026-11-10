@@ -47,4 +47,36 @@ struct StoryEditorTests {
         #expect(StoryInk.readable(on: 0) == .black)   // white block, dark words
         #expect(StoryInk.readable(on: 1) == .white)   // black block, light words
     }
+
+    @Test func touchesFindTextWhereItIsDrawnScaledAndTurned() {
+        let centre = CGPoint(x: 200, y: 300), size = CGSize(width: 100, height: 40)
+        #expect(StoryOverlayCanvas.hits(CGPoint(x: 240, y: 300), center: centre, size: size, scale: 1, rotation: 0))
+        #expect(!StoryOverlayCanvas.hits(CGPoint(x: 300, y: 300), center: centre, size: size, scale: 1, rotation: 0))
+        // Scaled up three times, the far end of the words is still theirs.
+        #expect(StoryOverlayCanvas.hits(CGPoint(x: 340, y: 300), center: centre, size: size, scale: 3, rotation: 0))
+        // Turned a quarter, the words run up and down: along their length is a hit, across it is not.
+        #expect(StoryOverlayCanvas.hits(CGPoint(x: 200, y: 245), center: centre, size: size, scale: 1, rotation: .pi / 2))
+        #expect(!StoryOverlayCanvas.hits(CGPoint(x: 250, y: 300), center: centre, size: size, scale: 1, rotation: .pi / 2))
+        // Tiny text still takes a finger.
+        #expect(StoryOverlayCanvas.hits(CGPoint(x: 220, y: 300), center: centre, size: CGSize(width: 8, height: 8), scale: 0.3, rotation: 0))
+    }
+
+    @Test func turnsClickUprightAndSizesStretchPastTheirLimits() {
+        #expect(StoryOverlayCanvas.snapTurn(0.04) == (0, true))
+        #expect(StoryOverlayCanvas.snapTurn(.pi / 2 - 0.05).1)
+        #expect(StoryOverlayCanvas.snapTurn(0.3) == (0.3, false))
+        #expect(StoryOverlayCanvas.softScale(2) == 2)
+        let big = StoryOverlayCanvas.softScale(40)
+        #expect(big > 6 && big < 9, "past the largest size it stretches only a little: \(big)")
+        let small = StoryOverlayCanvas.softScale(0.01)
+        #expect(small < 0.3 && small > 0.2, "and the same at the smallest: \(small)")
+    }
+
+    @Test func rubberBandingGivesWayLessAndLess() {
+        #expect(RubberBand.clamp(5, 0...10, span: 4) == 5)
+        let a = RubberBand.clamp(12, 0...10, span: 4), b = RubberBand.clamp(30, 0...10, span: 4)
+        #expect(a > 10 && b > a && b < 14, "\(a) \(b)")
+        #expect(RubberBand.clamp(-1000, 0...10, span: 4) > -4)
+        #expect(RubberBand.clamp(12, 0...10, span: 0) == 10)
+    }
 }

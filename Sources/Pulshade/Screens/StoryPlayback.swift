@@ -90,7 +90,9 @@ struct StoryPoster: View {
 
 // MARK: - Previewing a clip in the composer
 
-/// Plays a clip you picked or recorded, on a loop, with the chosen look applied live.
+/// Plays a clip you picked or recorded, on a loop, with the chosen look applied live. It plays only the part that
+/// is kept, and can be scrubbed: seeks are made one at a time, the newest waiting while one is under way, so dragging
+/// a handle shows frames as fast as they can be decoded instead of queueing up and lagging behind the finger.
 @MainActor
 @Observable
 final class ClipPreview {
@@ -100,21 +102,43 @@ final class ClipPreview {
     @ObservationIgnored private let zoom: ZoomTrack
     @ObservationIgnored private let framing: FramingBox?
     @ObservationIgnored private var end: NSObjectProtocol?
+    @ObservationIgnored private var ticker: Any?
+    @ObservationIgnored private var range: StoryTrim?
+    @ObservationIgnored private var seeking = false
+    @ObservationIgnored private var nextSeek: (time: CMTime, exact: Bool)?
+    @ObservationIgnored private var scrubbing = false
+    /// Where playback is, in seconds into the clip. Only the playhead reads it, so its 30 changes a second redraw
+    /// nothing else.
+    private(set) var time: Double = 0
 
-    init(clip: MemoryClip, filter: StoryFilter, zoom: ZoomTrack = .none, framing: FramingBox? = nil) {
+    init(clip: MemoryClip, filter: StoryFilter, zoom: ZoomTrack = .none, framing: FramingBox? = nil, trim: StoryTrim? = nil) {
         asset = clip.makeAsset()
         self.zoom = zoom
         self.framing = framing
         let item = AVPlayerItem(asset: asset)
         item.videoComposition = StoryVideo.composition(for: asset, filter: filter, zoom: zoom, framing: framing)
-        // Only the first 15 seconds are kept.
-        item.forwardPlaybackEndTime = CMTime(seconds: StoryVideo.maxSeconds, preferredTimescale: 600)
+        // Until the kept part is known, the first 15 seconds.
+        item.forwardPlaybackEndTime = CMTime(seconds: trim?.end ?? StoryVideo.maxSeconds, preferredTimescale: 600)
+        range = trim
         player.replaceCurrentItem(with: item)
         layer = AVPlayerLayer(player: player)
         layer.videoGravity = .resizeAspectFill
         end = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.player.seek(to: .zero); self?.player.play() }
+            MainActor.assumeIsolated { self?.loop() }
         }
+        ticker = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 30), queue: .main) { [weak self] now in
+            MainActor.assumeIsolated {
+                guard let self, now.seconds.isFinite else { return }
+                self.time = now.seconds
+            }
+        }
+        if let trim, trim.start > 0 { player.seek(to: CMTime(seconds: trim.start, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) }
+        player.play()
+    }
+
+    private func loop() {
+        guard !scrubbing else { return }
+        player.seek(to: CMTime(seconds: range?.start ?? 0, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
         player.play()
     }
 
@@ -122,10 +146,48 @@ final class ClipPreview {
         player.currentItem?.videoComposition = StoryVideo.composition(for: asset, filter: filter, zoom: zoom, framing: framing)
     }
 
+    /// Plays only `trim`, from its start.
+    func play(_ trim: StoryTrim) {
+        range = trim
+        scrubbing = false
+        player.currentItem?.forwardPlaybackEndTime = CMTime(seconds: trim.end, preferredTimescale: 600)
+        seek(to: trim.start, exact: true)
+        player.play()
+    }
+
+    /// Holds the picture at `seconds` while a handle is dragged. Close enough is good enough while moving; the
+    /// last one asked for is exact.
+    func scrub(to seconds: Double, exact: Bool = false) {
+        if !scrubbing {
+            scrubbing = true
+            player.pause()
+            // Past the old end the player would refuse to show anything.
+            player.currentItem?.forwardPlaybackEndTime = .invalid
+        }
+        seek(to: seconds, exact: exact)
+    }
+
+    private func seek(to seconds: Double, exact: Bool) {
+        nextSeek = (CMTime(seconds: max(seconds, 0), preferredTimescale: 600), exact)
+        if !seeking { seekNext() }
+    }
+
+    private func seekNext() {
+        guard let (time, exact) = nextSeek else { seeking = false; return }
+        nextSeek = nil
+        seeking = true
+        let slack = exact ? CMTime.zero : CMTime(value: 1, timescale: 10)
+        player.seek(to: time, toleranceBefore: slack, toleranceAfter: slack) { [weak self] _ in
+            Task { @MainActor in self?.seekNext() }
+        }
+    }
+
     func close() {
         player.pause()
         if let end { NotificationCenter.default.removeObserver(end) }
         end = nil
+        if let ticker { player.removeTimeObserver(ticker) }
+        ticker = nil
         player.replaceCurrentItem(with: nil)
     }
 }
@@ -133,6 +195,7 @@ final class ClipPreview {
 // MARK: - Swiping between looks
 
 enum Haptics {
+    /// The lightest tick, for stepping through choices.
     @MainActor static func tick() {
         #if os(iOS)
         UISelectionFeedbackGenerator().selectionChanged()

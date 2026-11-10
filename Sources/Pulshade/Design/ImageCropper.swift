@@ -68,31 +68,25 @@ struct ImageCropper: View {
                 }
                 .frame(width: geo.size.width, height: geo.size.height)
                 .clipped()
-                .contentShape(.rect)
-                .gesture(
-                    DragGesture()
-                        .onChanged { g in
-                            dragging = true
-                            drag = g.translation
+                // One recogniser for the move and the pinch, so adding or lifting a finger never jolts the picture.
+                .overlay {
+                    TransformSurface(
+                        began: { _ in dragging = true; snapped = false },
+                        changed: { value in
+                            drag = value.translation
+                            pinch = value.scale
+                            pinching = value.fingers > 1
+                            // The spot the fingers started on, from the middle, stays under them.
+                            pinchAnchor = CGPoint(x: value.location.x - value.translation.width - geo.size.width / 2,
+                                                  y: value.location.y - value.translation.height - geo.size.height / 2)
                             apply(geo.size, box: box)
-                        }
-                        .onEnded { _ in
+                        },
+                        ended: { _ in
                             dragging = false
-                            commitIfIdle()
-                        }
-                        .simultaneously(with: MagnifyGesture()
-                            .onChanged { g in
-                                pinching = true
-                                pinch = g.magnification
-                                pinchAnchor = CGPoint(x: g.startAnchor.x * geo.size.width - geo.size.width / 2,
-                                                      y: g.startAnchor.y * geo.size.height - geo.size.height / 2)
-                                apply(geo.size, box: box)
-                            }
-                            .onEnded { _ in
-                                pinching = false
-                                commitIfIdle()
-                            })
-                )
+                            pinching = false
+                            settle(box: box)
+                        })
+                }
                 .onAppear { boxCache = box; startFitted() }
                 .onChange(of: geo.size) {
                     boxCache = boxSize(in: geo.size)
@@ -133,6 +127,8 @@ struct ImageCropper: View {
         .frame(minWidth: Platform.isPhone ? nil : 460, minHeight: Platform.isPhone ? nil : 560)
         .background(Theme.dark.ink.base)
         .preferredColorScheme(.dark)
+        // Pulling the picture down moved the sheet too; Cancel closes it instead.
+        .interactiveDismissDisabled()
     }
 
     @State private var boxCache: CGSize = .zero
@@ -141,6 +137,7 @@ struct ImageCropper: View {
     @State private var pinchAnchor: CGPoint = .zero
     @State private var dragging = false
     @State private var pinching = false
+    @State private var snapped = false
     private static let maxZoom: CGFloat = 8
     @State private var started = false
 
@@ -161,23 +158,40 @@ struct ImageCropper: View {
         settledOffset = .zero
     }
 
-    /// Moves and zooms from where the last gesture left off. A pinch holds the spot under your fingers still.
+    /// Moves and zooms from where the last gesture left off. A pinch holds the spot under your fingers still. Past
+    /// the edges and the zoom limits the picture stretches a little, and settles back on letting go.
     private func apply(_ area: CGSize, box: CGSize) {
         guard let picture else { return }
-        let target = min(Self.maxZoom, max(minZoom, settledZoom * pinch))
+        var wanted = settledZoom * pinch
+        // Filling the frame exactly clicks into place, for a story picture that can also be fitted.
+        if frame.allowsFit, minZoom < 0.999, abs(wanted - 1) < 0.03 {
+            if !snapped { Haptics.snap() }
+            snapped = true
+            wanted = 1
+        } else {
+            snapped = false
+        }
+        let target = exp(RubberBand.clamp(log(max(wanted, 0.01)), log(minZoom)...log(Self.maxZoom), span: 0.2))
         let k = target / settledZoom
         let p = pinchAnchor
         let moved = CGSize(width: p.x - (p.x - settledOffset.width) * k + drag.width,
                            height: p.y - (p.y - settledOffset.height) * k + drag.height)
         zoom = target
-        offset = clamp(moved, picture, box: box, zoom: target)
+        let edge = clamp(CGSize(width: 1e6, height: 1e6), picture, box: box, zoom: target)
+        offset = CGSize(width: RubberBand.clamp(moved.width, -edge.width...edge.width, span: 60),
+                        height: RubberBand.clamp(moved.height, -edge.height...edge.height, span: 60))
     }
 
-    /// Locks the result in once both fingers-and-thumbs gestures are over.
-    private func commitIfIdle() {
-        guard !dragging, !pinching else { return }
-        settledZoom = zoom
-        settledOffset = offset
+    /// Locks the result in once the fingers lift, easing back inside the limits if it was stretched past them.
+    private func settle(box: CGSize) {
+        guard let picture else { return }
+        let z = min(max(zoom, minZoom), Self.maxZoom)
+        withAnimation(.spring(duration: 0.3, bounce: 0.12)) {
+            zoom = z
+            offset = clamp(offset, picture, box: box, zoom: z)
+        }
+        settledZoom = z
+        settledOffset = clamp(offset, picture, box: box, zoom: z)
         drag = .zero
         pinch = 1
     }
