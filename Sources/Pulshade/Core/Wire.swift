@@ -154,6 +154,8 @@ enum Payload: Codable, Equatable {
     case groupSettings(GroupSettings)
     /// In a group's mailbox: the next epoch's key, sealed to each member who stays.
     case groupRekey(GroupRekey)
+    /// In a group's mailbox: a member's own card with their picture (the settings carry it without).
+    case memberCard(MemberCard)
     /// A story, or a new version of one already sent (same id, edited text or lifetime). `lasts` is in seconds;
     /// older apps leave it out, meaning a day.
     case story(id: UUID, style: StoryStyle, date: Date, lasts: TimeInterval? = nil)

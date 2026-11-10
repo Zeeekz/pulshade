@@ -60,6 +60,9 @@ struct GroupEpoch: Codable, Equatable {
 
     /// The mailbox this epoch's mail goes to. A new epoch means a new mailbox, so the relay can't line the two up by it.
     var receiveKey: Data { derive(key, "pulshade.group.mailbox.v1") }
+    /// A check of the key that the signed settings carry, so a key handed over (in an invite, a new epoch, or from
+    /// another of your devices) is only used if it is the one the group's settings name.
+    var check: Data { derive(key, "pulshade.group.epoch-check.v1") }
     var sendID: Data { Mailbox.sendID(for: receiveKey) }
     fileprivate var outerKey: SymmetricKey { SymmetricKey(data: derive(key, "pulshade.group.outer.v1")) }
 
@@ -88,37 +91,56 @@ struct MemberCard: Codable, Equatable {
     var signingKey: Data
     var agreementKey: Data
     var name: String
+    /// The picture itself travels only in the member's own card posts; the settings carry the card without it, and
+    /// the hash (which is signed) says which picture belongs.
     var avatar: Data?
+    var avatarHash: Data?
     var color: Int?
     var signature: Data
 
     var fingerprint: String { Identity.fingerprint(of: signingKey) }
 
-    private static func signable(group: UUID, signingKey: Data, agreementKey: Data, name: String, avatar: Data?, color: Int?) -> Data {
-        var d = Data("pulshade.group.card.v1".utf8)
+    private static func signable(group: UUID, signingKey: Data, agreementKey: Data, name: String, avatarHash: Data?, color: Int?) -> Data {
+        var d = Data("pulshade.group.card.v2".utf8)
         d += bytes(group) + signingKey + agreementKey
-        d += Data(SHA256.hash(data: Data(name.utf8))) + Data(SHA256.hash(data: avatar ?? Data()))
+        d += Data(SHA256.hash(data: Data(name.utf8))) + (avatarHash ?? Data(count: 32))
         d += be32(UInt32(truncatingIfNeeded: color ?? -1))
         return d
     }
 
-    /// A card's picture is a small thumbnail: every card travels in every version of the settings.
+    /// A card's picture is a small thumbnail.
     static let maxAvatar = 16 * 1024
+
+    /// The card as the settings carry it: everything but the picture.
+    var withoutAvatar: MemberCard {
+        var c = self
+        c.avatar = nil
+        return c
+    }
+
+    /// The same card, picture and signature aside (signatures differ each time a card is signed).
+    func sameCard(as other: MemberCard) -> Bool {
+        signingKey == other.signingKey && agreementKey == other.agreementKey && name == other.name
+            && avatarHash == other.avatarHash && color == other.color
+    }
 
     static func make(_ keys: GroupMemberKeys, group: UUID, name: String, avatar: Data?, color: Int?) -> MemberCard {
         let name = String(name.prefix(64))
         let avatar = avatar.flatMap { $0.count <= maxAvatar ? $0 : nil }
+        let hash = avatar.map { Data(SHA256.hash(data: $0)) }
         let message = signable(group: group, signingKey: keys.publicKey, agreementKey: keys.agreement.publicKey.rawRepresentation,
-                               name: name, avatar: avatar, color: color)
+                               name: name, avatarHash: hash, color: color)
         return MemberCard(signingKey: keys.publicKey, agreementKey: keys.agreement.publicKey.rawRepresentation, name: name,
-                          avatar: avatar, color: color, signature: (try? keys.signing.signature(for: message)) ?? Data())
+                          avatar: avatar, avatarHash: hash, color: color, signature: (try? keys.signing.signature(for: message)) ?? Data())
     }
 
     func verified(group: UUID) -> Bool {
         guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: signingKey), agreementKey.count == 32,
-              name.count <= 64, (avatar?.count ?? 0) <= Self.maxAvatar else { return false }
+              name.count <= 64, (avatar?.count ?? 0) <= Self.maxAvatar, avatarHash.map({ $0.count == 32 }) ?? true else { return false }
+        // A picture, when it comes, must be the one the signed hash names.
+        if let avatar, avatarHash != Data(SHA256.hash(data: avatar)) { return false }
         return key.isValidSignature(signature, for: Self.signable(group: group, signingKey: signingKey, agreementKey: agreementKey,
-                                                                  name: name, avatar: avatar, color: color))
+                                                                  name: name, avatarHash: avatarHash, color: color))
     }
 }
 
@@ -139,6 +161,8 @@ struct GroupSettings: Codable, Equatable {
     var postPolicy: PostPolicy = .everyone
     var disappearAfter: TimeInterval?
     var members: [MemberCard]
+    /// The check of the current epoch's key (`GroupEpoch.check`).
+    var epochCheck: Data?
     /// Who signed this version, and the signature.
     var signer = Data()
     var signature = Data()
@@ -178,13 +202,30 @@ struct GroupSettings: Codable, Equatable {
     /// Whether every card is genuine, the roles name members, and there's no more than one card per key.
     func wellFormed() -> Bool {
         let keys = members.map(\.signingKey)
-        guard groupNumberRange.contains(version), groupNumberRange.contains(epoch), (avatar?.count ?? 0) <= 64 * 1024 else { return false }
+        guard groupNumberRange.contains(version), groupNumberRange.contains(epoch), (avatar?.count ?? 0) <= 64 * 1024,
+              epochCheck?.count == 32, members.allSatisfy({ $0.avatar == nil }) else { return false }
         return Set(keys).count == keys.count && keys.contains(owner) && members.allSatisfy { $0.verified(group: group) }
             && admins.allSatisfy(keys.contains) && mods.allSatisfy(keys.contains) && members.count <= Self.maxMembers
             && title.count <= 100 && (about?.count ?? 0) <= 500
     }
 
     static let maxMembers = 5_000
+
+    /// Orders two versions with the same number that compete (two admins changed the group at once): every member
+    /// keeps the one with the lower hash, so they all end up on the same one.
+    var tieBreak: Data { Data(SHA256.hash(data: signable())) }
+
+    /// The biggest settings that fit in one group envelope, with room for the sealing around them.
+    static let maxEncoded = 440 * 1024
+
+    var fitsInMailbox: Bool { ((try? JSONEncoder().encode(self))?.count ?? .max) <= Self.maxEncoded }
+
+    /// A version further on than the next, signed by the owner: the owner may change anything (but who owns it), so a
+    /// member who missed versions in between can catch up on it.
+    func acceptsJump(_ next: GroupSettings) -> Bool {
+        groupNumberRange.contains(next.version) && next.group == group && next.kind == kind && next.version > version
+            && next.signer == owner && next.owner == owner && next.epoch >= epoch && next.signatureIsValid && next.wellFormed()
+    }
 
     /// Whether `next` may replace this version: signed by its signer, numbered one on, well-formed, for the same group,
     /// and every change in it is one its signer may make.
@@ -335,13 +376,19 @@ struct GroupReader: Codable, Equatable {
     var skipped: [String: Data] = [:]
 
     static let maxSkip: UInt32 = 2_000
-    static let maxSkipped = 5_000
+    /// Most keys kept for one sender's skipped messages, and in all.
+    static let maxSkippedPerSender = 1_000
+    static let maxSkipped = 20_000
+    /// Most devices (chains) one member may post from in one epoch.
+    static let maxDevicesPerSender = 16
 
     /// The key for `index` of `sender`'s chain in `epoch`, used up (it can't be had twice). Nil for a message already
     /// opened, or one too far ahead.
     mutating func messageKey(epoch: GroupEpoch, sender: Data, device: Data, index: UInt32) -> Data? {
         let id = "\(epoch.number)|\(sender.hex)|\(device.hex)"
         if let key = skipped.removeValue(forKey: "\(id)|\(index)") { return key }
+        let senderPrefix = "\(epoch.number)|\(sender.hex)|"
+        if chains[id] == nil, chains.keys.count(where: { $0.hasPrefix(senderPrefix) }) >= Self.maxDevicesPerSender { return nil }
         var chain = chains[id] ?? epoch.chainStart(for: sender, device: device)
         guard index >= chain.index, index - chain.index <= Self.maxSkip else { return nil }
         while chain.index < index {
@@ -351,14 +398,24 @@ struct GroupReader: Codable, Equatable {
         }
         let (key, next) = chain.step()
         chains[id] = next
-        if skipped.count > Self.maxSkipped {
-            // The oldest gaps are least likely ever to fill.
-            for k in skipped.keys.sorted().prefix(skipped.count - Self.maxSkipped) { skipped[k] = nil }
+        // A sender who skips a lot only pushes out their own oldest gaps, never anyone else's.
+        let theirs = skipped.keys.filter { $0.hasPrefix(senderPrefix) }
+        let cap = skipped.count > Self.maxSkipped ? 0 : Self.maxSkippedPerSender
+        if theirs.count > cap {
+            let oldest = theirs.sorted { (UInt32($0.split(separator: "|").last ?? "") ?? 0) < (UInt32($1.split(separator: "|").last ?? "") ?? 0) }
+            for k in oldest.prefix(theirs.count - cap) { skipped[k] = nil }
         }
         return key
     }
 
-    /// Forgets everything about epochs before `epoch`.
+    /// Forgets everything about one epoch (its key was replaced by the one the group settled on).
+    mutating func forget(epoch: Int) {
+        chains = chains.filter { !$0.key.hasPrefix("\(epoch)|") }
+        skipped = skipped.filter { !$0.key.hasPrefix("\(epoch)|") }
+    }
+
+    /// Forgets everything about epochs before `epoch`. Only for epochs no longer read: while one is, what was opened in
+    /// it must be remembered, so an old envelope posted again isn't taken a second time.
     mutating func drop(before epoch: Int) {
         let keep = { (k: String) in (Int(k.split(separator: "|").first ?? "") ?? 0) >= epoch }
         chains = chains.filter { keep($0.key) }
@@ -415,6 +472,23 @@ struct SharedGroup: Codable, Equatable {
     /// Someone has said something in the current epoch (as far as this device has read). A newcomer is then given a
     /// new epoch, so they can't read it; several joining in a quiet spell share one.
     var chatInEpoch = false
+    /// Epoch keys handed out (a new epoch's) but not yet named by settings this device took. Kept until settings with
+    /// the matching check arrive; two admins starting one at once leave two here, and the settings decide.
+    var candidates: [GroupEpoch] = []
+    /// The version before the one held, to judge a competing version of the same number against.
+    var previous: GroupSettings?
+    /// As an admin: people this device took out (by group key, in hex), and when; watched for ten minutes, and done
+    /// again if another admin's competing change won and they're back in.
+    var wantRemoved: [String: Date] = [:]
+    /// As an admin: the epoch each invite went out in, by account fingerprint.
+    var invitedEpoch: [String: Int] = [:]
+    /// A new epoch's key never reached this device (it was away longer than the relay keeps mail): it needs adding
+    /// again.
+    var missedKey = false
+    /// The epoch this device last posted its card (with its picture) in.
+    var cardPostedEpoch: Int?
+    /// Settings that name an epoch whose key hasn't arrived yet, taken once it does.
+    var pendingSettings: GroupSettings?
 
     var current: GroupEpoch? { epochs.last }
 

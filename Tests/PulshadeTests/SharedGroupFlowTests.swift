@@ -251,4 +251,112 @@ struct SharedGroupFlowTests {
         bob.acceptGroupInvite(GroupInvite(settings: wild, epoch: GroupEpoch(number: -1, key: .random(32), started: Date())), from: aliceAsBobSees)
         #expect(bob.conversation(group.id)?.shared?.settings == held.settings)
     }
+
+    /// Alice owns a group with Bob as an admin and Cara and Dan in it; Bob takes Cara out at the same moment Alice takes
+    /// Dan out. Every device ends up on the same settings and key, and both removals stick.
+    @Test func twoAdminsRemovingAtOnceEndUpAgreeing() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        let dan = try await makeUser("Dan")
+        defer { for m in [alice, bob, cara, dan] { m.lock() } }
+        _ = try #require(dan.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, dan)
+        let danFP = try #require(alice.visibleContacts.first { $0.name == "Dan" }).fingerprint
+        let chat = alice.startConversation(kind: .direct, title: "", members: [danFP])
+        alice.send("hi", in: chat.id)
+        await settle(alice, dan)
+        if let back = dan.data.conversations.first(where: { $0.kind == .direct }) { dan.send("hey", in: back.id) }
+        await settle(alice, dan)
+        let group = alice.startConversation(kind: .group, title: "Crew", members: [bobFP, caraFP, danFP])
+        let everyone = [alice, bob, cara, dan]
+        await until(everyone) { everyone.dropFirst().allSatisfy { $0.conversation(group.id)?.members.count == 3 } }
+        let bobMember = try #require(alice.conversation(group.id)?.members.first { alice.displayName($0) == "Bob" })
+        alice.setAdmin(group.id, bobMember, true)
+        await until(everyone) { bob.conversation(group.id)?.amAdmin == true }
+        let caraMember = try #require(bob.conversation(group.id)?.members.first { bob.displayName($0) == "Cara" })
+        let danMember = try #require(alice.conversation(group.id)?.members.first { alice.displayName($0) == "Dan" })
+
+        // At once: neither has seen the other's change.
+        bob.removeMember(group.id, caraMember)
+        alice.removeMember(group.id, danMember)
+        let stayers = [alice, bob]
+        await until(everyone, seconds: 30) {
+            let views = stayers.compactMap { $0.conversation(group.id)?.shared }
+            return views.count == 2 && views[0].settings == views[1].settings && views[0].current?.key == views[1].current?.key
+                && views[0].settings.members.count == 2
+        }
+        let a = try #require(alice.conversation(group.id)?.shared), b = try #require(bob.conversation(group.id)?.shared)
+        #expect(a.settings == b.settings, "the same settings everywhere")
+        #expect(a.current?.key == b.current?.key, "the same key everywhere")
+        #expect(a.settings.members.count == 2, "both removals stuck")
+        #expect(cara.conversation(group.id)?.shared?.gone == true && dan.conversation(group.id)?.shared?.gone == true)
+        bob.send("just us", in: group.id)
+        await until(everyone) { alice.conversation(group.id)?.messages.contains { $0.text == "just us" } == true }
+        #expect(alice.conversation(group.id)?.messages.contains { $0.text == "just us" } == true)
+        await settle(alice, bob, cara, dan)
+        #expect(cara.conversation(group.id)?.messages.contains { $0.text == "just us" } != true)
+        #expect(dan.conversation(group.id)?.messages.contains { $0.text == "just us" } != true)
+    }
+
+    /// An invite that's taken back (or runs out) moves the group to a new key, so whoever was invited and never joined
+    /// stops reading.
+    @Test func aTakenBackInviteStopsTheInviteeReading() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let group = alice.startConversation(kind: .group, title: "Crew", members: [bobFP])
+        await until([alice, bob]) { bob.conversation(group.id)?.shared?.joining == false }
+        // Cara's app gets the invite but never answers (she's left out of syncing on purpose here).
+        cara.sharedGroupsEnabled = false
+        alice.addMembers(group.id, [caraFP])
+        await until([alice, bob, cara]) { alice.conversation(group.id)?.shared?.invited[caraFP] != nil }
+        let given = try #require(alice.conversation(group.id)?.shared?.current?.number)
+        alice.cancelInvite(caraFP, in: group.id)
+        #expect(alice.conversation(group.id)?.shared?.invited.isEmpty == true)
+        #expect(alice.conversation(group.id)?.shared?.current?.number == given + 1, "a new key")
+        await until([alice, bob]) { bob.conversation(group.id)?.shared?.current?.number == given + 1 }
+        #expect(bob.conversation(group.id)?.shared?.current?.number == given + 1)
+    }
+
+    /// Pictures aren't in the settings but still reach everyone, and only the one the member's card names is shown.
+    @Test func membersPicturesArrive() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        cara.updateProfile { $0.avatar = Data(repeating: 1, count: 3_000) }
+        let group = alice.startConversation(kind: .group, title: "Crew", members: [bobFP, caraFP])
+        await until([alice, bob, cara]) {
+            bob.data.contacts.first { $0.name == "Cara" && $0.hidden }?.avatar != nil
+        }
+        let caraForBob = try #require(bob.data.contacts.first { $0.name == "Cara" && $0.hidden })
+        #expect(caraForBob.avatar != nil)
+        #expect(bob.conversation(group.id)?.shared?.settings.members.allSatisfy { $0.avatar == nil } == true)
+    }
+
+    /// A member who missed several versions catches up on the newest the owner signed.
+    @Test func aMemberWhoMissedVersionsCatchesUpOnTheOwners() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let group = alice.startConversation(kind: .group, title: "Crew", members: [bobFP, caraFP])
+        await until([alice, bob, cara]) { cara.conversation(group.id)?.members.count == 2 && bob.conversation(group.id)?.members.count == 2 }
+        // Cara is away while two changes are made: her cursor is moved past them (seq numbers are microseconds).
+        alice.updateDetails(group.id, title: "One", about: "", avatar: nil)
+        alice.updateDetails(group.id, title: "Two", about: "", avatar: nil)
+        await settle(alice, bob)
+        #expect(bob.conversation(group.id)?.title == "Two")
+        if let i = cara.data.conversations.firstIndex(where: { $0.id == group.id }), let n = cara.data.conversations[i].shared?.current?.number {
+            cara.data.conversations[i].shared?.cursors[String(n)] = UInt64(Date().timeIntervalSince1970 * 1_000_000)
+        }
+        // Bob, an admin now, makes a change Cara can't take without the ones she missed; the owner's device signs it
+        // again, and that one she can.
+        let bobMember = try #require(alice.conversation(group.id)?.members.first { alice.displayName($0) == "Bob" })
+        alice.setAdmin(group.id, bobMember, true)
+        await until([alice, bob]) { bob.conversation(group.id)?.amAdmin == true }
+        if let i = cara.data.conversations.firstIndex(where: { $0.id == group.id }), let n = cara.data.conversations[i].shared?.current?.number {
+            cara.data.conversations[i].shared?.cursors[String(n)] = UInt64(Date().timeIntervalSince1970 * 1_000_000)
+        }
+        #expect(cara.conversation(group.id)?.title == "Crew")
+        bob.updateDetails(group.id, title: "Three", about: "", avatar: nil)
+        await until([alice, bob, cara]) { cara.conversation(group.id)?.title == "Three" }
+        #expect(cara.conversation(group.id)?.title == "Three")
+        #expect(cara.conversation(group.id)?.shared?.settings.signer == alice.memberKeys(nil, group: group.id)?.publicKey,
+                "caught up on the owner's copy")
+    }
 }

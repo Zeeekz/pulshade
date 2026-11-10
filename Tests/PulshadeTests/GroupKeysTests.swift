@@ -14,7 +14,8 @@ struct GroupKeysTests {
                           mods: [GroupMemberKeys] = []) -> GroupSettings {
         var s = GroupSettings(group: group, kind: .group, version: 1, epoch: 1, title: "Crew", owner: owner.publicKey,
                               admins: admins.map(\.publicKey), mods: mods.map(\.publicKey),
-                              members: ([owner] + members).map { MemberCard.make($0, group: group, name: "m", avatar: nil, color: nil) })
+                              members: ([owner] + members).map { MemberCard.make($0, group: group, name: "m", avatar: nil, color: nil) },
+                              epochCheck: GroupEpoch.fresh(number: 1).check)
         s.sign(with: owner)
         return s
     }
@@ -190,13 +191,75 @@ struct GroupKeysTests {
             #expect(!s.accepts(v) && !s.accepts(e))
             #expect(!GroupEpoch(number: bad, key: .random(32), started: Date()).isValid)
         }
-        var big = MemberCard.make(owner, group: group, name: "m", avatar: Data(count: 17_000), color: nil)
-        #expect(big.avatar == nil && big.verified(group: group), "a picture too big is left off when the card is made")
-        big.avatar = Data(count: 17_000)
-        #expect(!big.verified(group: group))
+        let big = MemberCard.make(owner, group: group, name: "m", avatar: Data(count: 17_000), color: nil)
+        #expect(big.avatar == nil && big.avatarHash == nil && big.verified(group: group), "a picture too big is left off when the card is made")
         // Sealing with any epoch number never traps.
         var chain = SenderChain(key: .random(32), index: 0)
         #expect((try? GroupSeal.seal(Data("x".utf8), group: group, epoch: GroupEpoch(number: -5, key: .random(32), started: Date()),
                                      keys: owner, device: dev, chain: &chain)) != nil)
+    }
+
+    @Test func picturesTravelApartButOnlyTheSignedOneIsTaken() {
+        let me = keys(.random(32))
+        let picture = Data(repeating: 7, count: 2_000)
+        let card = MemberCard.make(me, group: group, name: "Sam", avatar: picture, color: 1)
+        #expect(card.verified(group: group) && card.withoutAvatar.verified(group: group))
+        #expect(card.sameCard(as: card.withoutAvatar))
+        var swapped = card
+        swapped.avatar = Data(repeating: 8, count: 2_000)
+        #expect(!swapped.verified(group: group), "another picture under the same card is refused")
+        // Settings carry cards without pictures.
+        var s = settings(owner: me, members: [])
+        s.members = [card]
+        s.sign(with: me)
+        #expect(!s.wellFormed())
+    }
+
+    @Test func competingVersionsSettleTheSameWayEverywhereAndTheOwnerCanCatchPeopleUp() {
+        let owner = keys(.random(32)), a = keys(.random(32)), b = keys(.random(32)), x = keys(.random(32)), y = keys(.random(32))
+        let base = settings(owner: owner, members: [a, b, x, y], admins: [a, b])
+        func change(_ f: (inout GroupSettings) -> Void, by signer: GroupMemberKeys, version: Int? = nil) -> GroupSettings {
+            var n = base
+            f(&n)
+            n.version = version ?? base.version + 1
+            n.sign(with: signer)
+            return n
+        }
+        let fromA = change({ $0.members.removeAll { $0.signingKey == x.publicKey } }, by: a)
+        let fromB = change({ $0.members.removeAll { $0.signingKey == y.publicKey } }, by: b)
+        #expect(base.accepts(fromA) && base.accepts(fromB))
+        // Whichever arrives first, the lower tie-break wins: the same everywhere.
+        let winner = fromA.tieBreak.lexicographicallyPrecedes(fromB.tieBreak) ? fromA : fromB
+        let loser = winner == fromA ? fromB : fromA
+        #expect(winner.tieBreak.lexicographicallyPrecedes(loser.tieBreak) && !loser.tieBreak.lexicographicallyPrecedes(winner.tieBreak))
+        // Only the owner may skip versions.
+        let jump = change({ $0.title = "Later" }, by: owner, version: base.version + 5)
+        #expect(base.acceptsJump(jump) && !base.accepts(jump))
+        #expect(!base.acceptsJump(change({ $0.title = "Later" }, by: a, version: base.version + 5)))
+        var back = change({ $0.title = "Back" }, by: owner, version: base.version + 5)
+        back.epoch = base.epoch - 1 == 0 ? base.epoch : base.epoch - 1
+        back.sign(with: owner)
+        #expect(base.acceptsJump(back) == (back.epoch >= base.epoch))
+    }
+
+    @Test func oneSenderCantCrowdOutOthersOrOpenEndlessChains() {
+        let epoch = GroupEpoch.fresh(number: 1)
+        var reader = GroupReader()
+        let noisy = keys(.random(32)).publicKey, quiet = keys(.random(32)).publicKey
+        let quietDevice = GroupSeal.deviceTag(.random(8))
+        _ = reader.messageKey(epoch: epoch, sender: quiet, device: quietDevice, index: 3)
+        #expect(reader.skipped.count == 3)
+        let noisyDevice = GroupSeal.deviceTag(.random(8))
+        var at: UInt32 = 0
+        for _ in 0..<5 { at += 1_900; _ = reader.messageKey(epoch: epoch, sender: noisy, device: noisyDevice, index: at) }
+        #expect(reader.skipped.keys.filter { $0.contains(noisy.hex) }.count <= GroupReader.maxSkippedPerSender)
+        #expect(reader.skipped.keys.filter { $0.contains(quiet.hex) }.count == 3, "the quiet member's gaps are kept")
+        for _ in 0..<GroupReader.maxDevicesPerSender { _ = reader.messageKey(epoch: epoch, sender: noisy, device: .random(8), index: 0) }
+        #expect(reader.messageKey(epoch: epoch, sender: noisy, device: .random(8), index: 0) == nil, "no more devices")
+    }
+
+    @Test func eachEpochKeyCarriesACheckTheSettingsName() {
+        let one = GroupEpoch.fresh(number: 2), other = GroupEpoch.fresh(number: 2)
+        #expect(one.check.count == 32 && one.check != other.check && one.check != one.key)
     }
 }

@@ -267,6 +267,12 @@ can move it over once everyone can. Channels still use the format above.
 - **Joining.** An admin invites a contact over their 1:1 chat with the settings and the current epoch's key; the
   newcomer answers with their card, and the admin posts settings that include it. If anything has been said in the
   current epoch, the admin starts a new one first, so the newcomer cannot read it.
+- **Settling and catching up.** Settings carry a check of the current epoch's key; a key handed over (by an invite, a
+  new epoch, or another of your devices) is used only if the settings name it. Two versions with the same number
+  (two admins at once) are settled by the lower hash, everywhere alike. The owner's device signs every change made by
+  someone else over again, and an owner-signed version may skip numbers, so a member who missed some catches up.
+- **Pictures** are not in the settings: a card signs a hash of its picture, and each member posts their card with the
+  picture into the mailbox.
 - **Leaving and removal.** Removing someone starts a new epoch: its key is sealed to each remaining member's group
   agreement key (X25519, a one-off key per hand-out) and posted in the old mailbox, followed by settings that move to the
   new one. The person removed can still read the old mailbox, never the new. A member who leaves says so in the mailbox
