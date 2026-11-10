@@ -256,19 +256,24 @@ struct SharedGroupFlowTests {
     /// Dan out. Every device ends up on the same settings and key, and both removals stick.
     @Test func twoAdminsRemovingAtOnceEndUpAgreeing() async throws {
         let (alice, bob, cara, bobFP, caraFP) = try await trio()
-        let dan = try await makeUser("Dan")
-        defer { for m in [alice, bob, cara, dan] { m.lock() } }
-        _ = try #require(dan.addContact(code: alice.makeInviteCode(), nickname: ""))
-        await settle(alice, dan)
-        let danFP = try #require(alice.visibleContacts.first { $0.name == "Dan" }).fingerprint
-        let chat = alice.startConversation(kind: .direct, title: "", members: [danFP])
-        alice.send("hi", in: chat.id)
-        await settle(alice, dan)
-        if let back = dan.data.conversations.first(where: { $0.kind == .direct }) { dan.send("hey", in: back.id) }
-        await settle(alice, dan)
-        let group = alice.startConversation(kind: .group, title: "Crew", members: [bobFP, caraFP, danFP])
-        let everyone = [alice, bob, cara, dan]
-        await until(everyone) { everyone.dropFirst().allSatisfy { $0.conversation(group.id)?.members.count == 3 } }
+        let dan = try await makeUser("Dan"), eve = try await makeUser("Eve")
+        defer { for m in [alice, bob, cara, dan, eve] { m.lock() } }
+        var fps: [String] = []
+        for (m, name) in [(dan, "Dan"), (eve, "Eve")] {
+            _ = try #require(m.addContact(code: alice.makeInviteCode(), nickname: ""))
+            await settle(alice, m)
+            let fp = try #require(alice.visibleContacts.first { $0.name == name }).fingerprint
+            let chat = alice.startConversation(kind: .direct, title: "", members: [fp])
+            alice.send("hi", in: chat.id)
+            await settle(alice, m)
+            if let back = m.data.conversations.first(where: { $0.kind == .direct }) { m.send("hey", in: back.id) }
+            await settle(alice, m)
+            fps.append(fp)
+        }
+        let danFP = fps[0], eveFP = fps[1]
+        let group = alice.startConversation(kind: .group, title: "Crew", members: [bobFP, caraFP, danFP, eveFP])
+        let everyone = [alice, bob, cara, dan, eve]
+        await until(everyone) { everyone.dropFirst().allSatisfy { $0.conversation(group.id)?.members.count == 4 } }
         let bobMember = try #require(alice.conversation(group.id)?.members.first { alice.displayName($0) == "Bob" })
         alice.setAdmin(group.id, bobMember, true)
         await until(everyone) { bob.conversation(group.id)?.amAdmin == true }
@@ -278,19 +283,23 @@ struct SharedGroupFlowTests {
         // At once: neither has seen the other's change.
         bob.removeMember(group.id, caraMember)
         alice.removeMember(group.id, danMember)
-        let stayers = [alice, bob]
+        let stayers = [alice, bob, eve]
         await until(everyone, seconds: 30) {
             let views = stayers.compactMap { $0.conversation(group.id)?.shared }
-            return views.count == 2 && views[0].settings == views[1].settings && views[0].current?.key == views[1].current?.key
-                && views[0].settings.members.count == 2
+            return views.count == 3 && views.allSatisfy { $0.settings == views[0].settings && $0.current?.key == views[0].current?.key }
+                && views[0].settings.members.count == 3
         }
+        let e = try #require(eve.conversation(group.id)?.shared)
         let a = try #require(alice.conversation(group.id)?.shared), b = try #require(bob.conversation(group.id)?.shared)
         #expect(a.settings == b.settings, "the same settings everywhere")
         #expect(a.current?.key == b.current?.key, "the same key everywhere")
-        #expect(a.settings.members.count == 2, "both removals stuck")
+        #expect(e.settings == a.settings && e.current?.key == a.current?.key, "an ordinary member who stays agrees too")
+        #expect(a.settings.members.count == 3, "both removals stuck")
         #expect(cara.conversation(group.id)?.shared?.gone == true && dan.conversation(group.id)?.shared?.gone == true)
         bob.send("just us", in: group.id)
-        await until(everyone) { alice.conversation(group.id)?.messages.contains { $0.text == "just us" } == true }
+        await until(everyone) { alice.conversation(group.id)?.messages.contains { $0.text == "just us" } == true
+            && eve.conversation(group.id)?.messages.contains { $0.text == "just us" } == true }
+        #expect(eve.conversation(group.id)?.messages.contains { $0.text == "just us" } == true)
         #expect(alice.conversation(group.id)?.messages.contains { $0.text == "just us" } == true)
         await settle(alice, bob, cara, dan)
         #expect(cara.conversation(group.id)?.messages.contains { $0.text == "just us" } != true)

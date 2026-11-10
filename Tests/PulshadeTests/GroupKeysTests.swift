@@ -262,4 +262,46 @@ struct GroupKeysTests {
         let one = GroupEpoch.fresh(number: 2), other = GroupEpoch.fresh(number: 2)
         #expect(one.check.count == 32 && one.check != other.check && one.check != one.key)
     }
+
+    @Test func theOwnersVersionBeatsAnAdminsAndModsCanRemoveWithANewKey() {
+        let owner = keys(.random(32)), admin = keys(.random(32)), mod = keys(.random(32)), plain = keys(.random(32))
+        let base = settings(owner: owner, members: [admin, mod, plain], admins: [admin], mods: [mod])
+        var fromOwner = base, fromAdmin = base
+        fromOwner.admins = []
+        fromOwner.version += 1
+        fromOwner.sign(with: owner)
+        for n in 0..<20 {
+            fromAdmin.title = "try \(n)"
+            fromAdmin.version = base.version + 1
+            fromAdmin.sign(with: admin)
+            #expect(fromOwner.winsOver(fromAdmin) && !fromAdmin.winsOver(fromOwner), "however often the admin tries")
+        }
+        // A mod's removal comes with a new epoch, and is taken.
+        let next = GroupEpoch.fresh(number: base.epoch + 1)
+        var removal = base
+        removal.members.removeAll { $0.signingKey == plain.publicKey }
+        removal.version += 1
+        removal.epoch = next.number
+        removal.epochCheck = next.check
+        removal.sign(with: mod)
+        #expect(base.accepts(removal))
+    }
+
+    @Test func theSizeCheckMatchesWhatTheRelayTakes() {
+        let owner = keys(.random(32))
+        var s = settings(owner: owner, members: [])
+        for _ in 0..<1_000 { s.members.append(MemberCard.make(keys(.random(32)), group: group, name: "Member", avatar: nil, color: 2).withoutAvatar) }
+        s.sign(with: owner)
+        #expect(s.fitsInMailbox, "a thousand members fit")
+        let bytes = try! Payload.groupSettings(s).wire(framed: false).count
+        #expect(GroupSeal.fits(payload: bytes) && !GroupSeal.fits(payload: 2_100_000))
+        // What the check passes really does seal under the relay's limit (2 MiB and a little).
+        var chain = SenderChain(key: .random(32), index: 0)
+        let sealed = try! GroupSeal.seal(Data(count: bytes), group: group, epoch: .fresh(number: 1), keys: owner, device: dev, chain: &chain)
+        #expect(sealed.count <= 2 * 1024 * 1024 + 1024)
+        var long = s
+        long.title = String(repeating: "\u{0301}", count: 300)
+        long.sign(with: owner)
+        #expect(!long.wellFormed(), "few characters but many bytes")
+    }
 }

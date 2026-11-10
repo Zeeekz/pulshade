@@ -50,6 +50,8 @@ struct GroupEpoch: Codable, Equatable {
     /// How long the relay keeps the group's mail, in days (1 to 7).
     var days: Int = 7
     var started: Date
+    /// Whose new-epoch hand-out this came in (a candidate's), so one member can't crowd out another's.
+    var from: Data? = nil
 
     /// Well-formed as received: a number in range and a whole key.
     var isValid: Bool { groupNumberRange.contains(number) && key.count == 32 && (1...7).contains(days) }
@@ -136,7 +138,7 @@ struct MemberCard: Codable, Equatable {
 
     func verified(group: UUID) -> Bool {
         guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: signingKey), agreementKey.count == 32,
-              name.count <= 64, (avatar?.count ?? 0) <= Self.maxAvatar, avatarHash.map({ $0.count == 32 }) ?? true else { return false }
+              name.count <= 64, name.utf8.count <= 256, (avatar?.count ?? 0) <= Self.maxAvatar, avatarHash.map({ $0.count == 32 }) ?? true else { return false }
         // A picture, when it comes, must be the one the signed hash names.
         if let avatar, avatarHash != Data(SHA256.hash(data: avatar)) { return false }
         return key.isValidSignature(signature, for: Self.signable(group: group, signingKey: signingKey, agreementKey: agreementKey,
@@ -206,7 +208,7 @@ struct GroupSettings: Codable, Equatable {
               epochCheck?.count == 32, members.allSatisfy({ $0.avatar == nil }) else { return false }
         return Set(keys).count == keys.count && keys.contains(owner) && members.allSatisfy { $0.verified(group: group) }
             && admins.allSatisfy(keys.contains) && mods.allSatisfy(keys.contains) && members.count <= Self.maxMembers
-            && title.count <= 100 && (about?.count ?? 0) <= 500
+            && title.count <= 100 && (about?.count ?? 0) <= 500 && title.utf8.count <= 400 && (about?.utf8.count ?? 0) <= 2_000
     }
 
     static let maxMembers = 5_000
@@ -215,10 +217,20 @@ struct GroupSettings: Codable, Equatable {
     /// keeps the one with the lower hash, so they all end up on the same one.
     var tieBreak: Data { Data(SHA256.hash(data: signable())) }
 
-    /// The biggest settings that fit in one group envelope, with room for the sealing around them.
-    static let maxEncoded = 440 * 1024
+    /// Which of two competing versions with the same number every member keeps: one the owner signed beats one anyone
+    /// else signed (so an admin can't overturn the owner by trying until their hash comes out lower); otherwise the
+    /// lower hash.
+    func winsOver(_ other: GroupSettings) -> Bool {
+        let mine = signer == owner, theirs = other.signer == other.owner
+        if mine != theirs { return mine }
+        return tieBreak.lexicographicallyPrecedes(other.tieBreak)
+    }
 
-    var fitsInMailbox: Bool { ((try? JSONEncoder().encode(self))?.count ?? .max) <= Self.maxEncoded }
+    /// Whether these settings, posted to the mailbox, fit the relay's largest group envelope once sealed and padded.
+    var fitsInMailbox: Bool {
+        guard let payload = try? Payload.groupSettings(self).wire(framed: false) else { return false }
+        return GroupSeal.fits(payload: payload.count)
+    }
 
     /// A version further on than the next, signed by the owner: the owner may change anything (but who owns it), so a
     /// member who missed versions in between can catch up on it.
@@ -251,6 +263,7 @@ struct GroupSettings: Codable, Equatable {
             expected.members.removeAll { removed.contains($0.signingKey) }
             expected.version = next.version
             expected.epoch = next.epoch
+            expected.epochCheck = next.epochCheck
             expected.signer = next.signer
             expected.signature = next.signature
             return added.isEmpty && !removed.isEmpty && removed.allSatisfy { !isAdmin($0) && !mods.contains($0) } && expected == next
@@ -321,6 +334,16 @@ enum GroupSeal {
     }
 
     static let deviceLength = 8
+
+    /// The largest padded body a group envelope may have: the relay takes up to 2 MiB plus a little for the seal.
+    static let maxPadded = 2_097_152
+
+    /// Whether a payload this many bytes long fits one group envelope once sealed, signed and padded.
+    static func fits(payload: Int) -> Bool {
+        let body = 32 + deviceLength + 4 + 64 + payload + 28
+        let padded = EnvelopeCore.paddedSize(of: body)
+        return padded > 0 && padded <= maxPadded
+    }
 
     /// The tag a device signs its group messages with: the first bytes of its id, or zeros for an empty id.
     static func deviceTag(_ id: Data) -> Data {
@@ -487,10 +510,13 @@ struct SharedGroup: Codable, Equatable {
     var missedKey = false
     /// The epoch this device last posted its card (with its picture) in.
     var cardPostedEpoch: Int?
+    /// Mailboxes this device has posted to (hex send ids), so only its first post to each carries a proof of work.
+    var postedTo: Set<String> = []
     /// Settings that name an epoch whose key hasn't arrived yet, taken once it does.
     var pendingSettings: GroupSettings?
 
-    var current: GroupEpoch? { epochs.last }
+    /// The epoch the settings name (the one everything is posted in).
+    var current: GroupEpoch? { epochs.last { $0.number == settings.epoch && $0.check == settings.epochCheck } ?? epochs.last }
 
     func epoch(_ number: Int) -> GroupEpoch? { epochs.last { $0.number == number } }
 

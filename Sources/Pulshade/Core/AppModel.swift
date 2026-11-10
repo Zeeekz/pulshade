@@ -1581,6 +1581,7 @@ final class AppModel {
     @ObservationIgnored var groupFlushing: Set<UUID> = []
     /// When a removal that didn't stick was last tried again, by group.
     @ObservationIgnored var lastGroupRetry: [UUID: Date] = [:]
+    @ObservationIgnored var groupRetries: [UUID: Int] = [:]
 
     /// Gets a clip to one contact: as a pointer to the one sealed copy on the relay if their app reads those, otherwise in
     /// pieces as before. The clip is uploaded once, however many people are waiting for it. `known` is the copy already
@@ -8153,9 +8154,12 @@ extension AppModel {
             shared.cursors[n] = nil
             shared.reader.forget(epoch: epoch.number)
         }
+        var epoch = epoch
+        epoch.from = nil
         shared.epochs.append(epoch)
         shared.epochs.sort { $0.number < $1.number }
-        shared.candidates.removeAll { $0.number <= epoch.number }
+        // Earlier hand-outs are done with; another key for this same epoch is kept, in case its settings win.
+        shared.candidates.removeAll { $0.number < epoch.number || $0.key == epoch.key }
     }
 
     /// A newcomer's card, back from someone this device invited: in it goes, for everyone.
@@ -8375,8 +8379,18 @@ extension AppModel {
                     if let i = index(of: id) { data.conversations[i].shared?.outbox.removeAll { $0.id == next.id } }
                     continue
                 }
+                // The first post this device makes to a mailbox may be the one that starts it: that carries a proof of
+                // work over Tor, so nobody can start endless mailboxes for free.
+                let first = !(convo.shared?.postedTo.contains(next.sendID.hex) ?? false)
+                    && !(index(of: id).flatMap { data.conversations[$0].shared?.postedTo.contains(next.sendID.hex) } ?? false)
                 do {
-                    try await client.depositGroup(next.blob, to: next.sendID, days: next.days, wake: next.wake)
+                    do {
+                        try await client.depositGroup(next.blob, to: next.sendID, days: next.days, wake: next.wake, prove: first)
+                    } catch let refused as RelayRefused where refused.status == 429 && !first {
+                        // The mailbox may have run out on the relay (or it lost it): starting it again needs the proof.
+                        try await client.depositGroup(next.blob, to: next.sendID, days: next.days, wake: next.wake, prove: true)
+                    }
+                    if let i = index(of: id) { data.conversations[i].shared?.postedTo.insert(next.sendID.hex) }
                 } catch is RelayTooLarge {
                     // Never going to fit: drop it rather than hold up everything behind it.
                 } catch {
@@ -8431,6 +8445,11 @@ extension AppModel {
                 shared.reader.drop(before: oldest)
                 data.conversations[i].shared = shared
             }
+            let readableBoxes = Set(shared.readable.map { $0.sendID.hex })
+            if !shared.postedTo.isSubset(of: readableBoxes) {
+                shared.postedTo.formIntersection(readableBoxes)
+                data.conversations[i].shared?.postedTo = shared.postedTo
+            }
             let staff = shared.settings.isAdmin(keys.publicKey) || shared.settings.mods.contains(keys.publicKey)
             // Taken out by this device, but a competing change won and they're back in: done again. Watched for a while
             // after it seemed to work, since the competing change can arrive later.
@@ -8439,12 +8458,17 @@ extension AppModel {
             }
             for key in settled.keys { shared.wantRemoved[key] = nil }
             data.conversations[i].shared?.wantRemoved = shared.wantRemoved
+            let id = data.conversations[i].id
+            let tries = groupRetries[id] ?? 0
+            // Backs off to every ten minutes, and keeps going until the removal sticks.
             if staff, let target = shared.settings.members.first(where: { shared.wantRemoved[$0.signingKey.hex] != nil })?.signingKey,
-               now.timeIntervalSince(lastGroupRetry[data.conversations[i].id] ?? .distantPast) > 5 {
-                lastGroupRetry[data.conversations[i].id] = now
+               now.timeIntervalSince(lastGroupRetry[id] ?? .distantPast) > min(600, 5 * pow(2, Double(min(tries, 10)))) {
+                lastGroupRetry[id] = now
+                groupRetries[id] = tries + 1
                 startEpoch(at: i, without: [target])
                 continue
             }
+            if shared.wantRemoved.isEmpty { groupRetries[id] = nil }
             for (fp, at) in shared.invited where now.timeIntervalSince(at) > Self.inviteLife {
                 cancelInvite(fp, in: data.conversations[i].id)
             }
@@ -8495,10 +8519,15 @@ extension AppModel {
             // Kept as a candidate; the settings that follow say which key the group moves to.
             guard rekey.group == id, groupNumberRange.contains(rekey.epoch), (1...7).contains(rekey.days),
                   shared.settings.isAdmin(outer.sender) || shared.settings.mods.contains(outer.sender),
-                  rekey.epoch > (shared.current?.number ?? 0) - 1, let opened = rekey.open(with: keys),
+                  rekey.epoch > (shared.current?.number ?? 0) - 1, var opened = rekey.open(with: keys),
                   !shared.candidates.contains(where: { $0.key == opened.key }) else { return }
-            var candidates = shared.candidates + [opened]
-            if candidates.count > 8 { candidates.removeFirst(candidates.count - 8) }
+            opened.from = outer.sender
+            // Two at most from each member, sixteen in all: nobody can push out someone else's.
+            var candidates = shared.candidates
+            let theirs = candidates.filter { $0.from == outer.sender }
+            if theirs.count >= 2, let oldest = theirs.first { candidates.removeAll { $0.key == oldest.key } }
+            candidates.append(opened)
+            if candidates.count > 16 { candidates.removeFirst(candidates.count - 16) }
             data.conversations[i].shared?.candidates = candidates
             // Settings naming it may have come first (a competing change read out of order).
             if let pending = data.conversations[i].shared?.pendingSettings { adoptSettings(pending, at: i) }
@@ -8538,7 +8567,7 @@ extension AppModel {
         let competing = next.version == held.version && next != held
         if competing {
             guard let previous = shared.previous, previous.accepts(next) || previous.acceptsJump(next),
-                  next.tieBreak.lexicographicallyPrecedes(held.tieBreak) else { return }
+                  next.winsOver(held) else { return }
         } else {
             guard next.version > held.version, held.accepts(next) || held.acceptsJump(next) else { return }
         }
@@ -8560,6 +8589,18 @@ extension AppModel {
         }
         if !competing { shared.previous = held }
         shared.settings = next
+        // Epochs past the one these settings name (from a change that lost) go back to being candidates.
+        let later = shared.epochs.filter { $0.number > next.epoch }
+        if !later.isEmpty {
+            shared.epochs.removeAll { $0.number > next.epoch }
+            shared.candidates += later.filter { e in !shared.candidates.contains { $0.key == e.key } }
+            // Nothing made with those keys is used again: a later key under the same number starts afresh.
+            for e in later {
+                shared.chains[String(e.number)] = nil
+                shared.cursors[String(e.number)] = nil
+                shared.reader.forget(epoch: e.number)
+            }
+        }
         shared.pendingSettings = nil
         shared.missedKey = false
         data.conversations[i].shared = shared

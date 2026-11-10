@@ -352,13 +352,14 @@ struct RelayClient {
     /// Posts into a group mailbox (see docs/groups-design.md). Says the envelope's number, so the sender's own cursor
     /// can move past it.
     @discardableResult
-    func depositGroup(_ blob: Data, to sendID: Data, days: Int, wake: Bool) async throws -> UInt64? {
+    func depositGroup(_ blob: Data, to sendID: Data, days: Int, wake: Bool, prove first: Bool = false) async throws -> UInt64? {
         var request = URLRequest(url: base.appending(path: "v1/g/\(sendID.hex)"))
         request.httpMethod = "PUT"
         request.timeoutInterval = max(20, 20 + Double(blob.count) / 25_000)
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         request.setValue(wake ? "1" : "0", forHTTPHeaderField: "X-Pulshade-Wake")
         request.setValue(String(min(max(days, 1), 7)), forHTTPHeaderField: "X-Pulshade-Days")
+        if first { await prove(&request, "group|\(sendID.hex)") }
         let (_, response) = try await load(request, body: blob)
         let http = response as? HTTPURLResponse
         if http?.statusCode == 507 { throw RelayMailboxFull() }
