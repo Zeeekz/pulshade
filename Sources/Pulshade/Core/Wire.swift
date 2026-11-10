@@ -220,6 +220,16 @@ enum Payload: Codable, Equatable {
         }
     }
 
+    /// For a signal, the kind the relay may replace with the next one like it: only the newest "typing" or "I'm here"
+    /// is worth holding for a device that isn't collecting.
+    var collapseKind: String? {
+        switch self {
+        case .typing: "typing"
+        case .presence: "presence"
+        default: nil
+        }
+    }
+
     /// Whether this starts a call, which rings the other phone like a phone call.
     var rings: Bool {
         if case .callOffer = self { true } else { false }

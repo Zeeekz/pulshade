@@ -92,6 +92,9 @@ struct DeviceLink: Codable {
     /// When this device answered a handshake of ours, by its own clock. A hello of theirs sent no later than this
     /// crossed ours on the way and is not taken (it would replace the session this answer opened).
     var answeredAt: Date?
+    /// When something last arrived from this device. One that has been silent for a month while another of the same
+    /// person's devices still talks is left out of sending (see `AppModel.isDormant`) until it's heard from again.
+    var lastHeard: Date?
 
     init(id: Data = Data(), sendID: Data) {
         self.id = id
@@ -1015,6 +1018,13 @@ struct Outgoing: Codable, Identifiable {
     /// The stamp that lets a Burn take this envelope back from the relay (see `Recall`). Nil for a signal, or one made before.
     var recallN: UInt64?
     var recallHash: Data?
+    /// Seconds the relay keeps it if nobody collects it, for a signal that means nothing late (typing, "I'm here").
+    /// Nil is the relay's usual seven days. Relays from before this ignore it.
+    var life: Int?
+    /// A tag (16 bytes) the relay uses to replace this sender's older copy of the same kind of thing in the same
+    /// mailbox (a key request asked again, the latest "I'm here"). Made from this device and the mailbox, so it says
+    /// nothing the relay can't already see. Nil for anything that must arrive in full.
+    var collapse: Data?
 
     /// The sending lane for a persona (nil is the main one).
     static func lane(for persona: UUID?) -> String {

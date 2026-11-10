@@ -1877,7 +1877,8 @@ final class AppModel {
     @discardableResult
     private func sendIfReady(_ payload: Payload, contact i: Int) -> Bool {
         var sent = false
-        for d in data.contacts[i].devices.indices where data.contacts[i].devices[d].session?.canSend == true {
+        for d in data.contacts[i].devices.indices where data.contacts[i].devices[d].session?.canSend == true
+            && !isDormant(contact: i, device: d) {
             data.contacts[i].devices[d].pending.append(PendingPayload(payload: payload, message: nil))
             sent = true
         }
@@ -3819,7 +3820,12 @@ final class AppModel {
     /// Every one of their devices gets its own copy.
     private func enqueue(_ payload: Payload, to contact: Contact, message: UUID? = nil) {
         guard let i = contactIndex(contact.fingerprint, contact.persona) else { return }
-        for d in data.contacts[i].devices.indices {
+        for d in data.contacts[i].devices.indices where !isDormant(contact: i, device: d) {
+            // A signal waiting for keys is only worth its newest copy: a device that never answers would otherwise
+            // collect every "typing" sent to it, here and then on the relay.
+            if payload.isEphemeral, data.contacts[i].devices[d].session?.canSend != true {
+                data.contacts[i].devices[d].pending.removeAll { $0.payload.isEphemeral }
+            }
             data.contacts[i].devices[d].pending.append(PendingPayload(payload: payload, message: message))
             if data.contacts[i].devices[d].session == nil && data.contacts[i].devices[d].handshake == nil
                 && data.contacts[i].devices[d].awaitingHello != true {
@@ -3847,6 +3853,7 @@ final class AppModel {
                     continue
                 }
                 seal(.ratchet(message), contact: i, device: d, message: item.message, ephemeral: item.payload.isEphemeral,
+                     collapse: item.payload.collapseKind,
                      story: item.payload.storyID, viewReport: item.payload.storyViewID, rings: item.payload.rings,
                      framed: frames && message.ciphertext.count > Self.smallEnvelope)
             }
@@ -3864,7 +3871,9 @@ final class AppModel {
     private func startHandshake(contact i: Int, device d: Int) {
         guard let (handshake, request) = try? Handshake.start() else { return }
         data.contacts[i].devices[d].handshake = handshake
-        seal(.deviceHello(myDevice(for: i), request), contact: i, device: d)
+        // Only the newest ask is any use (it carries the keys this device is waiting on), so it replaces the last one
+        // on the relay: a device that never answers holds one, however often it's asked.
+        seal(.deviceHello(myDevice(for: i), request), contact: i, device: d, collapse: "hello")
     }
 
     /// Answers a device's handshake. We speak first, so we say who we are straight away.
@@ -3887,7 +3896,7 @@ final class AppModel {
 
     /// Seals a payload to one of a contact's devices, as the persona that knows them, and queues it.
     private func seal(_ payload: Payload, contact i: Int, device d: Int, message: UUID? = nil, ephemeral: Bool = false,
-                      story: UUID? = nil, viewReport: UUID? = nil, rings: Bool = false, framed: Bool = false) {
+                      collapse: String? = nil, story: UUID? = nil, viewReport: UUID? = nil, rings: Bool = false, framed: Bool = false) {
         let c = data.contacts[i]
         guard c.devices.indices.contains(d), let me = me(c.persona),
               let blob = try? Envelope.seal(payload, from: me, device: deviceID(for: c.persona), to: c.agreementKey, framed: framed) else { return }
@@ -3901,6 +3910,10 @@ final class AppModel {
         var outgoing = Outgoing(sendID: sendID, blob: blob, relay: c.relay, message: message, ephemeral: ephemeral ? true : nil,
                                 story: story, viewReport: viewReport, lane: c.persona == nil ? nil : Outgoing.lane(for: c.persona), rings: rings ? true : nil,
                                 wakes: asksToWake ? true : nil)
+        // A signal is let go by the relay if it isn't collected soon, so a device that's away doesn't come back to a
+        // pile of "typing" and "I'm here"; the newest of a kind replaces the one before.
+        if ephemeral { outgoing.life = Self.signalLife }
+        if let collapse { outgoing.collapse = Self.collapseTag(collapse, sendID: sendID, from: deviceID(for: c.persona)) }
         // Stamped so a Burn can take it back from the relay while it waits. Not signals, and not the Burn's own farewells.
         if !ephemeral && !burning {
             let stamp = Recall.stamp(me.recallKey)
@@ -3909,6 +3922,40 @@ final class AppModel {
         }
         data.outbox.append(outgoing)
         kick()
+    }
+
+    /// How long the relay keeps a signal nobody collects: long enough to cross a slow Tor circuit, short enough that
+    /// it means something when it lands.
+    static let signalLife = 120
+
+    /// The relay's tag for "the same kind of thing from the same sender": a hash of the kind, this device's id and the
+    /// mailbox, so it's stable for one sender and one mailbox and tells the relay nothing else.
+    nonisolated static func collapseTag(_ kind: String, sendID: Data, from device: Data) -> Data {
+        var hasher = SHA256()
+        hasher.update(data: Data("pulshade.collapse.\(kind)".utf8))
+        hasher.update(data: sendID)
+        hasher.update(data: device)
+        return Data(hasher.finalize().prefix(16))
+    }
+
+    /// How long a device can stay silent, while another of the same person's devices still talks, before it's left
+    /// out of what's sent (an old phone, a reinstall, a laptop put away). Heard from again, it's back at once.
+    static var dormantAfter: TimeInterval = 30 * 24 * 3600
+
+    /// A device left out of sending: silent for `dormantAfter` while another device of the same contact was heard
+    /// from more recently. A contact's only device is never dormant, so nobody is cut off for being away.
+    func isDormant(contact i: Int, device d: Int) -> Bool {
+        let devices = data.contacts[i].devices
+        guard devices.indices.contains(d), let heard = devices[d].lastHeard,
+              Date().timeIntervalSince(heard) > Self.dormantAfter else { return false }
+        return devices.indices.contains { $0 != d && (devices[$0].lastHeard ?? .distantPast) > heard }
+    }
+
+    /// Notes that a device was heard from: at most once an hour, so a busy chat doesn't rewrite it on every message.
+    private func heard(contact i: Int, device d: Int) {
+        guard data.contacts[i].devices.indices.contains(d) else { return }
+        if let last = data.contacts[i].devices[d].lastHeard, Date().timeIntervalSince(last) < 3600 { return }
+        data.contacts[i].devices[d].lastHeard = Date()
     }
 
     /// Seals a payload to a contact's first device, for introductions.
@@ -3940,6 +3987,24 @@ final class AppModel {
     @ObservationIgnored private var lastDueCheck = Date.distantPast
 
     private func resendIsDue(_ message: Message) -> Bool {
+        if resentAt[message.id] == nil {
+            // Older than a first resend could be while this app has been open: it was sent before this launch. Picked
+            // up where its timetable has got to, not started again from the top (which sent every unconfirmed message
+            // several more times each time the app was opened).
+            let age = Date().timeIntervalSince(message.date)
+            if Self.resendGaps[0] > 0, age > Self.resendGaps[0] * 2 {
+                var passed = 0, elapsed: TimeInterval = 0
+                // Bounded: a gap of nothing (as a test may set) would otherwise never end.
+                while passed < 64 {
+                    let gap = Self.resendGaps[min(passed, Self.resendGaps.count - 1)]
+                    guard gap > 0, elapsed + gap <= age else { break }
+                    elapsed += gap
+                    passed += 1
+                }
+                resentAt[message.id] = (Date(), passed)
+                return false
+            }
+        }
         let tried = resentAt[message.id]
         let wait = Self.resendGaps[min(tried?.count ?? 0, Self.resendGaps.count - 1)]
         return Date().timeIntervalSince(tried?.at ?? message.date) >= wait
@@ -4275,12 +4340,21 @@ final class AppModel {
         let patience = now.addingTimeInterval(-Self.keysPatience)
         for i in data.contacts.indices where !data.contacts[i].awaitingAcceptance {
             for d in data.contacts[i].devices.indices {
+                // A device known from before this was kept starts its silence clock now.
+                if data.contacts[i].devices[d].lastHeard == nil { data.contacts[i].devices[d].lastHeard = now }
                 let link = data.contacts[i].devices[d]
-                guard link.awaitingHello != true else { continue }
+                guard link.awaitingHello != true, !isDormant(contact: i, device: d) else { continue }
                 let key = sessionKey(contact: i, device: d)
-                if link.session == nil && !link.pending.isEmpty && (link.handshake?.startedAt ?? .distantPast) < cutoff {
+                if link.session?.canSend == true { handshakeTries[key] = nil }
+                // Asked and never answered: asked again less and less often (a minute, 5, 15, then hourly), so a
+                // device that's gone isn't asked every minute for as long as this app is open.
+                let tries = handshakeTries[key] ?? 0
+                let backoff = now.addingTimeInterval(-Self.handshakeGaps[min(tries, Self.handshakeGaps.count - 1)])
+                if link.session == nil && !link.pending.isEmpty && (link.handshake?.startedAt ?? .distantPast) < min(cutoff, backoff) {
+                    handshakeTries[key] = tries + 1
                     startHandshake(contact: i, device: d)
-                } else if link.session == nil, let started = link.handshake?.startedAt, started < patience {
+                } else if link.session == nil, let started = link.handshake?.startedAt, started < patience, tries == 0 || started < backoff {
+                    handshakeTries[key] = tries + 1
                     // Asked for new keys and never answered, with nothing waiting to send: the ask itself was lost
                     // (a relay restart, an app restart before it went). It used to wait forever, on "Setting up new
                     // keys", until you happened to write to them. Asked again, rarely, so a slow answer to the last
@@ -4299,6 +4373,11 @@ final class AppModel {
             }
         }
     }
+
+    /// How long to wait before asking a silent device for keys again, after each ask in turn.
+    static var handshakeGaps: [TimeInterval] = [60, 300, 900, 3600]
+    /// How many times each device has been asked for keys without answering, while the app is open.
+    @ObservationIgnored private var handshakeTries: [String: Int] = [:]
 
     /// How long new keys wait for the other side before asking again. Long enough that an answer on its way over a
     /// slow Tor circuit isn't overtaken by a second ask (which would leave it with nothing to open it).
@@ -5036,7 +5115,8 @@ final class AppModel {
                         if findsRoute { _ = await Self.reach(client) }
                         do {
                             try await client.deposit(item.blob, to: item.sendID, wake: item.message != nil || item.rings == true || item.wakes == true, ring: item.rings == true,
-                                                     recall: item.recallN.flatMap { n in item.recallHash.map { (n, $0) } })
+                                                     recall: item.recallN.flatMap { n in item.recallHash.map { (n, $0) } },
+                                                     life: item.life, collapse: item.collapse)
                             return (item, lane, nil)
                         } catch { return (item, lane, error) }
                     }
@@ -5331,6 +5411,7 @@ final class AppModel {
                                                         responderAgreement: data.contacts[i].agreementKey) else { return .junk }
             data.contacts[i].devices[d].session = session
             data.contacts[i].devices[d].handshake = nil
+            heard(contact: i, device: d)
             // When they answered, by their clock: a hello of theirs sent before that crossed ours (see `hello(_:crossedOurs:)`).
             data.contacts[i].devices[d].answeredAt = opened.sentAt
             // New keys are in place: no more asking for them because of messages that were read with the old ones.
@@ -5357,6 +5438,7 @@ final class AppModel {
             var plain: Data?
             if var session = data.contacts[i].devices[d].session, let opened = try? session.decrypt(message) {
                 data.contacts[i].devices[d].session = session
+                heard(contact: i, device: d)
                 plain = opened
             } else if var old = recoveredSessions[keptKey], let opened = try? old.decrypt(message) {
                 // Sent to the keys this account had before it was recovered, while the phone was gone: still readable.

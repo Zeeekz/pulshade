@@ -291,7 +291,10 @@ struct RelayClient {
     /// `wake` says whether this is a real message, which may wake a locked iPhone; typing signals, receipts and
     /// the rest say no, so they don't make a banner. A relay from before this ignores it.
     /// `recall` stamps the envelope so a Burn can take it back (see docs/burn-order.md).
-    func deposit(_ blob: Data, to sendID: Data, wake: Bool = false, ring: Bool = false, recall: (n: UInt64, hash: Data)? = nil) async throws {
+    /// `life` and `collapse` mark a signal: kept only that many seconds, and replacing this sender's older copy with
+    /// the same tag (see `Outgoing.life`, `Outgoing.collapse`).
+    func deposit(_ blob: Data, to sendID: Data, wake: Bool = false, ring: Bool = false, recall: (n: UInt64, hash: Data)? = nil,
+                 life: Int? = nil, collapse: Data? = nil) async throws {
         var request = URLRequest(url: base.appending(path: "v1/q/\(sendID.hex)"))
         request.httpMethod = "PUT"
         // A send stuck on a slow circuit gives up sooner and is tried again on the next beat. A big one is
@@ -304,6 +307,8 @@ struct RelayClient {
             request.setValue(recall.hash.hex, forHTTPHeaderField: "X-Pulshade-Recall")
             request.setValue(String(recall.n), forHTTPHeaderField: "X-Pulshade-Recall-N")
         }
+        if let life { request.setValue(String(life), forHTTPHeaderField: "X-Pulshade-Life") }
+        if let collapse, collapse.count == 16 { request.setValue(collapse.hex, forHTTPHeaderField: "X-Pulshade-Collapse") }
         let (_, response) = try await load(request, body: blob)
         let status = (response as? HTTPURLResponse)?.statusCode
         if status == 507 { throw RelayMailboxFull() }
