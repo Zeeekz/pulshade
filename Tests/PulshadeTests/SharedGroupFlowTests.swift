@@ -145,6 +145,96 @@ struct SharedGroupFlowTests {
         #expect(bob.conversation(group.id)?.shared?.current?.number == epoch + 1)
     }
 
+    /// Someone added after the group was made, and people already in it, see each other's messages both ways,
+    /// including a member who isn't the owner and a newcomer who isn't anyone's friend but the owner's.
+    @Test func membersAddedLaterAndEarlierHearEachOther() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let group = alice.startConversation(kind: .group, title: "Crew", members: [bobFP])
+        await until([alice, bob]) { bob.conversation(group.id)?.shared?.joining == false }
+
+        alice.addMembers(group.id, [caraFP])
+        await until([alice, bob, cara]) { cara.conversation(group.id)?.shared?.joining == false && bob.conversation(group.id)?.members.count == 2 }
+        cara.send("hi from cara", in: group.id)
+        await until([alice, bob, cara]) { bob.conversation(group.id)?.messages.contains { $0.text == "hi from cara" } == true
+            && alice.conversation(group.id)?.messages.contains { $0.text == "hi from cara" } == true }
+        #expect(bob.conversation(group.id)?.messages.contains { $0.text == "hi from cara" } == true, "Bob sees the newcomer")
+        #expect(alice.conversation(group.id)?.messages.contains { $0.text == "hi from cara" } == true, "the owner sees the newcomer")
+        bob.send("hi from bob", in: group.id)
+        await until([alice, bob, cara]) { cara.conversation(group.id)?.messages.contains { $0.text == "hi from bob" } == true }
+        #expect(cara.conversation(group.id)?.messages.contains { $0.text == "hi from bob" } == true, "the newcomer sees Bob")
+        alice.send("hi from alice", in: group.id)
+        await until([alice, bob, cara]) { cara.conversation(group.id)?.messages.contains { $0.text == "hi from alice" } == true
+            && bob.conversation(group.id)?.messages.contains { $0.text == "hi from alice" } == true }
+        #expect(cara.conversation(group.id)?.messages.contains { $0.text == "hi from alice" } == true)
+        if let fromCara = bob.conversation(group.id)?.messages.first(where: { $0.text == "hi from cara" }) {
+            #expect(bob.displayName(fromCara.sender) == "Cara")
+        }
+    }
+
+    /// The same with groups in the old form (one copy per member), for people whose app can't share a mailbox.
+    @Test func oldStyleMembersAddedLaterHearEachOther() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        for m in [alice, bob, cara] { m.sharedGroupsEnabled = false }
+        let group = alice.startConversation(kind: .group, title: "Old crew", members: [bobFP])
+        #expect(group.shared == nil)
+        await until([alice, bob]) { bob.conversation(group.id) != nil }
+        alice.addMembers(group.id, [caraFP])
+        await until([alice, bob, cara]) { cara.conversation(group.id)?.members.count == 2 && bob.conversation(group.id)?.members.count == 2 }
+        cara.send("old hi from cara", in: group.id)
+        await until([alice, bob, cara], seconds: 25) { bob.conversation(group.id)?.messages.contains { $0.text == "old hi from cara" } == true }
+        #expect(bob.conversation(group.id)?.messages.contains { $0.text == "old hi from cara" } == true, "Bob sees the newcomer")
+        bob.send("old hi from bob", in: group.id)
+        await until([alice, bob, cara], seconds: 25) { cara.conversation(group.id)?.messages.contains { $0.text == "old hi from bob" } == true }
+        #expect(cara.conversation(group.id)?.messages.contains { $0.text == "old hi from bob" } == true, "the newcomer sees Bob")
+    }
+
+    /// Friends who have only just been added, with no chat yet, then a third added to the group afterwards.
+    @Test func freshFriendsAddedLaterHearEachOther() async throws {
+        let alice = try await makeUser("Alice"), bob = try await makeUser("Bob"), cara = try await makeUser("Cara")
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        _ = try #require(cara.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, bob, cara)
+        let bobFP = try #require(alice.visibleContacts.first { $0.name == "Bob" }).fingerprint
+        let caraFP = try #require(alice.visibleContacts.first { $0.name == "Cara" }).fingerprint
+        let group = alice.startConversation(kind: .group, title: "Crew", members: [bobFP])
+        await until([alice, bob]) { bob.conversation(group.id) != nil && bob.conversation(group.id)?.shared?.joining != true }
+        alice.addMembers(group.id, [caraFP])
+        await until([alice, bob, cara]) { cara.conversation(group.id) != nil && cara.conversation(group.id)?.shared?.joining != true
+            && bob.conversation(group.id)?.members.count == 2 }
+        #expect(cara.conversation(group.id) != nil, "Cara is in the group (shared: \(group.shared != nil))")
+        cara.send("fresh hi from cara", in: group.id)
+        await until([alice, bob, cara], seconds: 25) { bob.conversation(group.id)?.messages.contains { $0.text == "fresh hi from cara" } == true }
+        #expect(bob.conversation(group.id)?.messages.contains { $0.text == "fresh hi from cara" } == true, "Bob sees the newcomer")
+        bob.send("fresh hi from bob", in: group.id)
+        await until([alice, bob, cara], seconds: 25) { cara.conversation(group.id)?.messages.contains { $0.text == "fresh hi from bob" } == true }
+        #expect(cara.conversation(group.id)?.messages.contains { $0.text == "fresh hi from bob" } == true, "the newcomer sees Bob")
+    }
+
+    /// Locking and reopening between adding someone and talking changes nothing.
+    @Test func addedLaterStillHearEachOtherAfterReopening() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let group = alice.startConversation(kind: .group, title: "Crew", members: [bobFP])
+        await until([alice, bob]) { bob.conversation(group.id)?.shared?.joining == false }
+        bob.send("first", in: group.id)
+        await until([alice, bob]) { alice.conversation(group.id)?.messages.count == 1 }
+        alice.addMembers(group.id, [caraFP])
+        await until([alice, bob, cara]) { cara.conversation(group.id)?.shared?.joining == false && bob.conversation(group.id)?.members.count == 2 }
+        for m in [alice, bob, cara] {
+            m.lock()
+            #expect(await m.unlock(passcode: "test-passcode"))
+        }
+        cara.send("after reopening", in: group.id)
+        await until([alice, bob, cara]) { bob.conversation(group.id)?.messages.contains { $0.text == "after reopening" } == true }
+        #expect(bob.conversation(group.id)?.messages.contains { $0.text == "after reopening" } == true, "Bob sees the newcomer")
+        bob.send("back at you", in: group.id)
+        await until([alice, bob, cara]) { cara.conversation(group.id)?.messages.contains { $0.text == "back at you" } == true }
+        #expect(cara.conversation(group.id)?.messages.contains { $0.text == "back at you" } == true, "the newcomer sees Bob")
+    }
+
     @Test func theOwnerMovesAnOldGroupOver() async throws {
         let (alice, bob, cara, bobFP, caraFP) = try await trio()
         defer { for m in [alice, bob, cara] { m.lock() } }
