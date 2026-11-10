@@ -34,7 +34,8 @@ enum MediaFrame {
 }
 
 /// A picture from a chat at full size. It grows out of its bubble and shrinks back into it. Pinch or double-tap to
-/// zoom (where you tapped), drag to look around, tap once to hide everything but the picture, swipe down to close.
+/// zoom (where you tapped), drag to look around, tap once to hide everything but the picture, swipe up or down to
+/// throw it away.
 struct ImageViewer: View {
     var data: Data
     /// Who sent it ("You" for your own) and when, shown along the top.
@@ -42,17 +43,14 @@ struct ImageViewer: View {
     var date: Date?
     /// The words sent with it.
     var caption: String?
-    /// Whether this viewer closes itself on a downward swipe. On iPhone the zoom transition already does that when
-    /// it opened from a bubble.
-    var swipeToClose = true
 
     @Environment(\.dismiss) private var dismiss
     @State private var zoom: CGFloat = 1
     @State private var settledZoom: CGFloat = 1
     @State private var pan: CGSize = .zero
     @State private var settledPan: CGSize = .zero
-    /// How far it's been dragged down on its way to closing (only while not zoomed in).
-    @State private var dragY: CGFloat = 0
+    /// How far it's been swiped on its way to closing (only while not zoomed in), 0 to 1.
+    @State private var swiped: CGFloat = 0
     @State private var chrome = true
     @State private var captionOpen = false
     @State private var notice: (text: String, symbol: String)?
@@ -62,28 +60,30 @@ struct ImageViewer: View {
 
     private var image: PlatformImage? { DecodedImages.image(data) }
     private var zoomed: Bool { zoom > 1.02 }
-    private var dragProgress: CGFloat { min(dragY / 400, 1) }
 
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                Color.black.opacity(1 - Double(dragProgress) * 0.9).ignoresSafeArea()
                 if let image {
                     Image(platformImage: image)
                         .resizable().scaledToFit()
                         .frame(width: geo.size.width, height: geo.size.height)
-                        .scaleEffect(zoom * (1 - dragProgress * 0.25))
-                        .offset(x: pan.width, y: pan.height + dragY)
+                        .scaleEffect(zoom)
+                        .offset(x: pan.width, y: pan.height)
                         .gesture(magnify(in: geo.size, image: image.size))
-                        // Unzoomed after opening from a bubble, the swipe down belongs to the zoom transition.
-                        .simultaneousGesture(drag(in: geo.size, image: image.size), including: zoomed || swipeToClose ? .all : .subviews)
+                        // Zoomed in, a drag looks around; otherwise it's the swipe that throws the picture away.
+                        .simultaneousGesture(pan(in: geo.size, image: image.size), including: zoomed ? .all : .subviews)
                         .onTapGesture(count: 2, coordinateSpace: .local) { toggleZoom(at: $0, in: geo.size, image: image.size) }
                         .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { chrome.toggle() } }
                         .accessibilityLabel(caption.map { "Photo. \($0)" } ?? "Photo")
                         .accessibilityAction(named: "Close") { dismiss() }
+                        .swipeToClose(enabled: !zoomed, moved: { swiped = $0 }) { dismiss() }
+                } else {
+                    Color.black.ignoresSafeArea()
                 }
                 overlayChrome
-                    .opacity(chrome && dragY < 10 ? 1 : 0)
+                    .opacity(chrome && swiped < 0.03 ? 1 : 0)
+                    .animation(.easeOut(duration: 0.15), value: swiped < 0.03)
                     .allowsHitTesting(chrome)
                 if let notice {
                     Label(notice.text, systemImage: notice.symbol)
@@ -209,30 +209,21 @@ struct ImageViewer: View {
             }
     }
 
-    /// Zoomed in, a drag moves the picture; at normal size, dragging down closes it.
-    private func drag(in box: CGSize, image: CGSize) -> some Gesture {
+    /// Zoomed in, a drag moves the picture around.
+    private func pan(in box: CGSize, image: CGSize) -> some Gesture {
         DragGesture(minimumDistance: 8)
             .onChanged { value in
-                if zoomed {
-                    pan = CGSize(width: settledPan.width + value.translation.width, height: settledPan.height + value.translation.height)
-                } else if swipeToClose {
-                    dragY = value.translation.height > abs(value.translation.width) ? max(value.translation.height, 0) : 0
-                }
+                guard zoomed else { return }
+                pan = CGSize(width: settledPan.width + value.translation.width, height: settledPan.height + value.translation.height)
             }
             .onEnded { value in
-                if zoomed {
-                    withAnimation(.smooth(duration: 0.35)) {
-                        pan = clamp(CGSize(width: settledPan.width + value.predictedEndTranslation.width * 0.6,
-                                           height: settledPan.height + value.predictedEndTranslation.height * 0.6),
-                                    zoom: zoom, in: box, image: image)
-                    }
-                    settledPan = pan
-                } else if swipeToClose, value.translation.height > abs(value.translation.width),
-                          value.translation.height > 110 || value.predictedEndTranslation.height > 380 {
-                    dismiss()
-                } else {
-                    withAnimation(.smooth(duration: 0.25)) { dragY = 0 }
+                guard zoomed else { return }
+                withAnimation(.smooth(duration: 0.35)) {
+                    pan = clamp(CGSize(width: settledPan.width + value.predictedEndTranslation.width * 0.6,
+                                       height: settledPan.height + value.predictedEndTranslation.height * 0.6),
+                                zoom: zoom, in: box, image: image)
                 }
+                settledPan = pan
             }
     }
 
@@ -310,11 +301,13 @@ struct ImageViewerCover: ViewModifier {
         #if os(iOS)
         content.fullScreenCover(isPresented: $isPresented) {
             if let source {
-                ImageViewer(data: data, title: title, date: date, caption: caption, swipeToClose: false)
+                // It grows out of its bubble and, closed with the button, shrinks back into it. The swipe is the
+                // viewer's own, so the transition's pull-down is turned off rather than fighting it.
+                ImageViewer(data: data, title: title, date: date, caption: caption)
                     .navigationTransition(.zoom(sourceID: source.id, in: source.space))
+                    .interactiveDismissDisabled()
             } else {
                 ImageViewer(data: data, title: title, date: date, caption: caption)
-                    .presentationBackground(.clear)
             }
         }
         #else

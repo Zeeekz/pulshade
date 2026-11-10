@@ -1549,8 +1549,10 @@ struct StoryViewer: View {
     @State private var editing: Story?
     @State private var showingViewers: Story?
     @State private var confirmDelete = false
-    /// How far the story has been dragged down, on its way to closing.
-    @State private var dragY: CGFloat = 0
+    /// Where the story has been pulled to on its way to being thrown away.
+    @State private var dragOffset: CGSize = .zero
+    /// Decided as a drag starts: whether it's the swipe that throws the story away.
+    @State private var swipingAway: Bool?
     /// Stories deleted while the viewer is open.
     @State private var gone: Set<Story.ID> = []
     /// The video of the story on screen, if it is one.
@@ -1671,12 +1673,16 @@ struct StoryViewer: View {
                 .transition(reduceMotion ? .opacity : .turning(forward: turnsForward))
         }
         .clipped()
-        .scaleEffect(1 - min(dragY, 400) / 2000, anchor: .top)
-        .offset(y: dragY)
+        .scaleEffect(SwipeAway.scale(dragOffset))
+        .offset(dragOffset)
         // A video has no size of its own, so on the Mac the window is given the story's shape outright.
         .frame(minWidth: Platform.isPhone ? nil : 400, maxWidth: Platform.isPhone ? .infinity : 400,
                minHeight: Platform.isPhone ? nil : 680, maxHeight: Platform.isPhone ? .infinity : 680)
-        .background(.black.opacity(1 - Double(min(dragY, 300)) / 600))
+        .background(Color.black.opacity(1 - Double(SwipeAway.progress(dragOffset)) * 0.95).ignoresSafeArea())
+        #if os(iOS)
+        // What's behind shows through as the story is pulled away.
+        .presentationBackground(.clear)
+        #endif
         .onAppear { index = min(start, max(stories.count - 1, 0)) }
         .onChange(of: index, initial: true) { markSeenIfReady(); prefetchAround(index) }
         .onChange(of: loading) { _, now in
@@ -1746,10 +1752,14 @@ struct StoryViewer: View {
         }
     }
 
-    /// A drag that is mostly downward pulls the story down with the finger.
+    /// A drag that starts out up or down carries the story with the finger, to be thrown away. Upward on your own
+    /// story is the one exception: that shows who has seen it.
     private func dragMoved(_ drag: DragGesture.Value) {
-        let down = drag.translation.height
-        dragY = down > abs(drag.translation.width) ? max(down, 0) : 0
+        if swipingAway == nil, abs(drag.translation.height) > 10 || abs(drag.translation.width) > 10 {
+            let own = current.indices.contains(index) && current[index].author == "me"
+            swipingAway = SwipeAway.starts(drag.translation) && !(own && drag.translation.height < 0)
+        }
+        if swipingAway == true { dragOffset = drag.translation }
     }
 
     private func touchEnded(_ drag: DragGesture.Value, width: Double) {
@@ -1757,12 +1767,17 @@ struct StoryViewer: View {
         touching = false
         let wasHolding = holding
         holding = false
-        // Pulled down far enough, or flicked: close it. Otherwise it springs back.
-        if drag.translation.height > abs(drag.translation.width), drag.translation.height > 120 || drag.predictedEndTranslation.height > 400 {
-            dismiss()
+        let wasSwiping = swipingAway == true
+        swipingAway = nil
+        // Pulled far enough up or down, or flicked: thrown away. Otherwise it springs back.
+        if wasSwiping {
+            if SwipeAway.closes(drag.translation, predicted: drag.predictedEndTranslation) {
+                SwipeAway.fling($dragOffset, predicted: drag.predictedEndTranslation, height: 900) { dismiss() }
+            } else {
+                withAnimation(.smooth(duration: 0.25)) { dragOffset = .zero }
+            }
             return
         }
-        withAnimation(.smooth(duration: 0.25)) { dragY = 0 }
         // Swiping up on your own story shows who has seen it.
         if drag.translation.height < -70, abs(drag.translation.height) > abs(drag.translation.width) * 1.5,
            current.indices.contains(index), current[index].author == "me" {
