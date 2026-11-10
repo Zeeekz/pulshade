@@ -29,6 +29,7 @@ is never written to its disk. Here is every kind of thing, in plain words:
 | **Files and chat videos you send** (files up to 100 MB; videos a few MB) | The server's disk, in pieces | Erased the moment the other person's phone has downloaded it, or when you delete the message, or after 7 days at most | No. Sealed on your phone with a key that travels only inside the encrypted message, and sealed a second time by the server with a key of its own. Its name and type are inside the encrypted message, so we don't even know those. |
 | **Video stories** (a few MB) | The server's disk, one copy for everyone | Until the story's timer runs out (then overwritten and erased), or sooner if you delete the story | No. The same two layers of encryption. |
 | **Sealed backup** (profile, contacts, groups, settings; never chats) | The server's disk | Until you switch it off, Burn, or 180 days without an update | No. Sealed with a key only your recovery code makes. |
+| **Spare keys** (one per friend, so a friend who logs back in can write to you straight away) | The server's disk, in the sealed-backup store | Erased by your friend when they use it, or by you when you remove them; otherwise replaced every 5 to 10 days, and 180 days without an update at most | No. Only you and that friend can work out where it is or open it, and it holds no message. |
 | **Public @handle and profile** (only if you choose one) | The server's disk | Until you let it go | Yes, it is public by your choice. |
 | **Collectibles you own** | The server's disk | While they exist | They're not secret: the item, its number and a hash of its code. |
 | **The server's own records and keys** (handle directory, held handles, moderation lists, collectible records, announcements; its push, pet-signing and onion keys) | The server's disk | While the service runs | Only the server, which needs them to work. Sealed with its storage key, which is held in memory only and never written to the disk; after a reboot the server stays locked until we unlock it. The admin password is kept only as a hash. |
@@ -78,6 +79,16 @@ after they change, so your recovery code can restore it. We can't open it, and i
 server. It is deleted when you switch the backup off or Burn, and 180 days after it was last saved if the app never
 saves it again (for instance after a Detach). Chats are never included. The server sees when it was saved and its
 rough size, and, if you connect without Tor, your IP address during the upload, as with any connection.
+
+**Spare keys.** After you log back in (Detach and your recovery code), the app needs new keys with each friend. So
+that you don't have to wait for every friend to open Pulshade, each friend's app leaves a spare key for you on the
+server ahead of time, and yours leaves one for each of them. It's kept in the sealed-backup store, at a place only the
+two of you can work out, sealed with a key only the two of you can make, and every spare is the same size. The server
+can't open it or tell whose it is. Each one is written and read on its own connection, at random times, so the server
+can't easily tie the spares of one person together, but it does see when a spare is written, read or erased, and if
+you connect without Tor, your IP address during that request. A spare is used once: the friend who uses it erases
+it. Removing a friend erases yours for them. Otherwise each is replaced every 5 to 10 days, and one nobody updates
+(after a Burn, say) is erased after 180 days; it is no use to anyone without your keys.
 
 **Collectibles.** If you are given a collectible, the server keeps what it needs to show it and let its owner claim it
 again with a backup code: the item, its number and a hash of the code.

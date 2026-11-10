@@ -448,6 +448,7 @@ final class AppModel {
         guard let c = contact(fingerprint, in: activePersona), !c.awaitingAcceptance, !c.devices.isEmpty else { return false }
         // Their messages couldn't be opened and new keys are being asked for: said in the chat, not left as silence.
         if unreadable.values.contains(where: { $0.fingerprint == fingerprint && $0.persona == activePersona }) { return true }
+        if c.devices.contains(where: { sparesFetching.contains("\(c.persona?.uuidString ?? "main")|\(c.fingerprint)|\($0.id.hex)") }) { return true }
         let ready = c.devices.contains { $0.session?.canSend == true }
         return !ready && c.devices.contains { $0.handshake != nil || $0.session != nil }
     }
@@ -487,6 +488,7 @@ final class AppModel {
         guard !data.contacts[i].awaitingAcceptance, data.contacts[i].devices[d].handshake == nil,
               data.contacts[i].devices[d].awaitingHello != true else { return }
         let key = sessionKey(contact: i, device: d)
+        if sparesFetching.contains(key) { return }
         if let last = lastMend[key], Date().timeIntervalSince(last) < 120 { return }
         lastMend[key] = Date()
         // Keep the keys this chat was using, in memory only, so a message that was sealed under them and arrives
@@ -496,8 +498,10 @@ final class AppModel {
     }
 
     /// Drops the saved keys of every chat and opens new ones, with each device of each contact. Their messages are
-    /// held until the new session is ready, as always.
+    /// held until the new session is ready, as always. A device that left a spare key for this account (see
+    /// `SpareSlot`) is answered on it, so the chat can go on at once; any other is asked, and answers when its app runs.
     private func startFreshSessions() {
+        var spareTargets: [SpareTarget] = []
         for i in data.contacts.indices where !data.contacts[i].awaitingAcceptance {
             for d in data.contacts[i].devices.indices {
                 // The old keys are kept in memory only, to read what was sent to them while the phone was gone.
@@ -506,9 +510,188 @@ final class AppModel {
                 data.contacts[i].devices[d].handshake = nil
                 data.contacts[i].devices[d].awaitingHello = nil
                 data.contacts[i].devices[d].acceptedHello = nil
+                if let target = spareTarget(contact: i, device: d) {
+                    spareTargets.append(target)
+                    sparesFetching.insert(sessionKey(contact: i, device: d))
+                } else {
+                    startHandshake(contact: i, device: d)
+                }
+            }
+        }
+        guard !spareTargets.isEmpty else { return }
+        Task { await takeSpares(spareTargets) }
+    }
+
+    // MARK: Spare keys
+
+    /// A friend's device whose spare key might be waiting: who they are, and the slot's keys.
+    struct SpareTarget {
+        var fingerprint: String
+        var persona: UUID?
+        var device: Data
+        var relay: String?
+        var keys: SpareSlot.Keys
+    }
+
+    /// Devices whose spare key is being fetched, by `sessionKey`. Memory only: the chat says keys are on their way.
+    @ObservationIgnored private var sparesFetching: Set<String> = []
+    /// When this device next looks after the spares it leaves for friends. One at a time, minutes apart, so the
+    /// relay never sees a run of them come from one place together.
+    @ObservationIgnored private var nextSpareWork = Date().addingTimeInterval(.random(in: 20...120))
+    /// How long apart spares are left on the relay, and how long one stays before it's replaced. For the tests.
+    static var spareSpacing: ClosedRange<TimeInterval> = 240...720
+    static var spareLifetime: ClosedRange<TimeInterval> = 5 * 86_400...10 * 86_400
+    /// How long a replaced spare is still honoured, and the oldest one a friend's device will take.
+    /// A replaced spare only matters while an answer to it could still arrive (the relay keeps mail a week), so
+    /// it's kept a little longer than that and no more. A friend's device takes none older than a spare is ever up,
+    /// plus that.
+    static let spareGrace: TimeInterval = replayWindow + 2 * 86_400
+    static var spareMaxAge: TimeInterval { spareLifetime.upperBound + spareGrace }
+
+    /// Which friends this device leaves spares for: people in your contacts whose app takes them, on the main
+    /// identity only (never a decoy, which must not look busy on the relay). Not your own linked devices, whose keys
+    /// come back another way, nor people known only from a group.
+    private func leavesSpare(for c: Contact) -> Bool {
+        isPrimary && !c.isSelf && !c.hidden && !c.awaitingAcceptance && c.devices.contains { $0.takesSpares == true }
+    }
+
+    private func spareTarget(contact i: Int, device d: Int) -> SpareTarget? {
+        let c = data.contacts[i], link = c.devices[d]
+        guard isPrimary, !c.isSelf, !c.hidden, link.takesSpares == true, let me = me(c.persona),
+              let keys = SpareSlot.keys(mine: me.agreementKey, theirs: c.agreementKey, issuer: c.signingKey, device: link.id)
+        else { return nil }
+        return SpareTarget(fingerprint: c.fingerprint, persona: c.persona, device: link.id, relay: c.relay, keys: keys)
+    }
+
+    /// The slot this device's spare for contact `i` goes in.
+    private func mySpareKeys(contact i: Int) -> SpareSlot.Keys? {
+        let c = data.contacts[i]
+        guard let me = me(c.persona) else { return nil }
+        return SpareSlot.keys(mine: me.agreementKey, theirs: c.agreementKey,
+                              issuer: me.signingKey.publicKey.rawRepresentation, device: deviceID(for: c.persona))
+    }
+
+    /// Fetches each friend's spare and answers it; a device with none waiting (or that can't be reached) is asked
+    /// for new keys the ordinary way. A few at a time, on each persona's own connection for spares.
+    private func takeSpares(_ targets: [SpareTarget]) async {
+        var found: [Int: SpareSlot.Card] = [:]
+        // Each slot on its own connection (over Tor, its own circuit), and spread out over a few seconds: the relay
+        // must not see one connection, or one moment, read the spares of all your friends.
+        let clients = targets.map { client($0.relay, lane: Self.spareLane($0.keys)) }
+        let spread = trafficShaping ? Self.spareSpread : 0
+        await withTaskGroup(of: (Int, SpareSlot.Card?).self) { group in
+            var next = 0
+            func add() {
+                guard next < targets.count else { return }
+                let index = next, target = targets[index], client = clients[index]
+                next += 1
+                group.addTask {
+                    guard let client else { return (index, nil) }
+                    if spread > 0 { try? await Task.sleep(for: .seconds(Double.random(in: 0...spread))) }
+                    let (key, sig, ts) = SpareSlot.proof("pulshade.backup.get.v1", target.keys)
+                    guard let blob = try? await client.backup(key: key, sig: sig, ts: ts),
+                          let card = SpareSlot.open(blob, with: target.keys) else { return (index, nil) }
+                    // Taken: it's erased from the relay (both sides hold the slot's key), so it can't be taken twice
+                    // and doesn't sit in the backup store. Its maker leaves a new one when their app next runs.
+                    let (dkey, dsig, dts) = SpareSlot.proof("pulshade.backup.del.v1", target.keys)
+                    try? await client.deleteBackup(key: dkey, sig: dsig, ts: dts)
+                    return (index, card)
+                }
+            }
+            for _ in 0..<4 { add() }
+            while let (index, card) = await group.next() {
+                if let card { found[index] = card }
+                add()
+            }
+        }
+        for (index, target) in targets.enumerated() {
+            guard let i = contactIndex(target.fingerprint, target.persona),
+                  let d = data.contacts[i].devices.firstIndex(where: { $0.id == target.device }) else { continue }
+            sparesFetching.remove(sessionKey(contact: i, device: d))
+            // Something else opened keys with them meanwhile (their own ask arrived): that's kept.
+            guard data.contacts[i].devices[d].session == nil, data.contacts[i].devices[d].handshake == nil else { continue }
+            if let card = found[index], Date().timeIntervalSince(card.madeAt) < Self.spareMaxAge,
+               !answeredSpares.contains(card.request.ephemeral) {
+                answeredSpares.insert(card.request.ephemeral)
+                acceptSession(card.request, contact: i, device: d, spare: true)
+                // A hello of theirs sent before now crossed this answer: it isn't taken (see `.deviceHello`).
+                data.contacts[i].devices[d].spareTakenAt = RelayClock.now
+            } else {
                 startHandshake(contact: i, device: d)
             }
         }
+        save()
+    }
+
+    /// Each slot has its own connection, so the relay can't tie together the slots one device reads or writes.
+    static func spareLane(_ keys: SpareSlot.Keys) -> String { "spare|" + keys.name.prefix(8).hex }
+    /// Spares already answered on this run, so the same one is never answered twice (a second "Renew keys", say).
+    @ObservationIgnored private var answeredSpares: Set<Data> = []
+    /// Devices that answered a spare this device no longer had, by `sessionKey`, and when. Memory only.
+    @ObservationIgnored private var deadSpareFrom: [String: Date] = [:]
+    /// Over how many seconds a recovered device spreads its reads of friends' spares.
+    static var spareSpread: Double = 20
+
+    /// Looks after one friend's spare, if one needs it: makes a first one, offers again one the relay didn't take,
+    /// or replaces one that has been up long enough. Then waits a few minutes before the next.
+    private func tendSpares() {
+        guard isPrimary, phase == .unlocked, Date() >= nextSpareWork else { return }
+        nextSpareWork = Date().addingTimeInterval(.random(in: Self.spareSpacing))
+        // Replaced spares are honoured for a while, then forgotten.
+        let grace = Date().addingTimeInterval(-Self.spareGrace)
+        for i in data.contacts.indices where data.contacts[i].oldSpares?.contains(where: { ($0.retiredAt ?? .distantPast) <= grace }) == true {
+            data.contacts[i].oldSpares?.removeAll { ($0.retiredAt ?? .distantPast) <= grace }
+            if data.contacts[i].oldSpares?.isEmpty == true { data.contacts[i].oldSpares = nil }
+        }
+        let now = Date()
+        func due(_ c: Contact) -> Int? {
+            guard leavesSpare(for: c) else { return nil }
+            guard let spare = c.spare else { return 0 }
+            if spare.publishedAt == nil { return 1 }
+            if (spare.replaceAt ?? .distantPast) <= now { return 2 }
+            return nil
+        }
+        // Friends with no spare up first, then ones the relay didn't take, then the oldest.
+        guard let i = data.contacts.indices.compactMap({ i in due(data.contacts[i]).map { (i, $0) } }).min(by: { $0.1 < $1.1 })?.0
+        else { return }
+        if let old = data.contacts[i].spare, old.publishedAt != nil {
+            var retired = old
+            retired.retiredAt = now
+            data.contacts[i].oldSpares = (data.contacts[i].oldSpares ?? []) + [retired]
+            data.contacts[i].spare = nil
+        }
+        if data.contacts[i].spare == nil { data.contacts[i].spare = SpareKey.make() }
+        guard let spare = data.contacts[i].spare, let card = spare.card, let keys = mySpareKeys(contact: i),
+              let sealed = SpareSlot.seal(card, with: keys),
+              let client = client(data.contacts[i].relay, lane: Self.spareLane(keys)) else { return }
+        let fp = data.contacts[i].fingerprint, persona = data.contacts[i].persona, ephemeral = spare.handshake.ephemeral
+        save()
+        Task { [weak self] in
+            let (key, sig, ts) = SpareSlot.proof("pulshade.backup.put.v1", keys, body: sealed)
+            guard (try? await client.putBackup(sealed, key: key, sig: sig, ts: ts)) != nil, let self,
+                  let i = self.contactIndex(fp, persona), self.data.contacts[i].spare?.handshake.ephemeral == ephemeral else { return }
+            self.data.contacts[i].spare?.publishedAt = Date()
+            self.data.contacts[i].spare?.replaceAt = Date().addingTimeInterval(.random(in: Self.spareLifetime))
+            self.save()
+        }
+    }
+
+    /// Erases the spare this device left for someone it no longer knows as a friend.
+    private func withdrawSpare(for c: Contact) {
+        guard c.spare != nil || c.oldSpares != nil, let i = contactIndex(c.fingerprint, c.persona),
+              let keys = mySpareKeys(contact: i), let client = client(c.relay, lane: Self.spareLane(keys)) else { return }
+        data.contacts[i].spare = nil
+        data.contacts[i].oldSpares = nil
+        Task {
+            let (key, sig, ts) = SpareSlot.proof("pulshade.backup.del.v1", keys)
+            try? await client.deleteBackup(key: key, sig: sig, ts: ts)
+        }
+    }
+
+    /// Tests: look after the next spare now.
+    func tendSparesNow() {
+        nextSpareWork = .distantPast
+        tendSpares()
     }
 
     /// Keys from before an account was recovered or a session was repaired, by contact and device. Held in memory
@@ -3554,6 +3737,7 @@ final class AppModel {
     /// Forgets someone and your chat with them: they burned, or one of you removed the other.
     private func forget(_ contact: Contact) {
         let (fp, persona) = (contact.fingerprint, contact.persona)
+        withdrawSpare(for: contact)
         if let chat = directConversation(with: fp, persona: persona) { removeLocally(chat.id) }
         withAnimation(.snappy) {
             data.stories.removeAll { $0.author == fp && $0.persona == persona }
@@ -3827,8 +4011,9 @@ final class AppModel {
                 data.contacts[i].devices[d].pending.removeAll { $0.payload.isEphemeral }
             }
             data.contacts[i].devices[d].pending.append(PendingPayload(payload: payload, message: message))
+            // A device whose spare key is being fetched gets its keys from that, and what waits goes then.
             if data.contacts[i].devices[d].session == nil && data.contacts[i].devices[d].handshake == nil
-                && data.contacts[i].devices[d].awaitingHello != true {
+                && data.contacts[i].devices[d].awaitingHello != true && !sparesFetching.contains(sessionKey(contact: i, device: d)) {
                 startHandshake(contact: i, device: d)
             }
         }
@@ -3876,8 +4061,9 @@ final class AppModel {
         seal(.deviceHello(myDevice(for: i), request), contact: i, device: d, collapse: "hello")
     }
 
-    /// Answers a device's handshake. We speak first, so we say who we are straight away.
-    private func acceptSession(_ request: SessionInit, contact i: Int, device d: Int) {
+    /// Answers a device's handshake. We speak first, so we say who we are straight away. `spare`: the ask is a spare key
+    /// they left for us (see `SpareSlot`), so the answer also says which device this is, since they may not know it yet.
+    private func acceptSession(_ request: SessionInit, contact i: Int, device d: Int, spare: Bool = false) {
         guard let me = me(data.contacts[i].persona),
               let (session, answer) = try? Handshake.accept(request, me: me,
                                                              initiatorAgreement: data.contacts[i].agreementKey) else { return }
@@ -3886,9 +4072,10 @@ final class AppModel {
         data.contacts[i].devices[d].awaitingHello = nil
         data.contacts[i].devices[d].answeredAt = nil
         data.contacts[i].devices[d].acceptedHello = request.ephemeral
+        data.contacts[i].devices[d].spareTakenAt = nil
         // New keys are in place: no more asking for them because of messages that were read with the old ones.
         unreadable[sessionKey(contact: i, device: d)] = nil
-        seal(.sessionAccept(answer), contact: i, device: d)
+        seal(spare ? .spareAccept(myDevice(for: i), answer) : .sessionAccept(answer), contact: i, device: d)
         let first: Payload = data.contacts[i].isSelf ? .sync(.hello) : profilePayload(data.contacts[i].persona, for: data.contacts[i].fingerprint)
         data.contacts[i].devices[d].pending.insert(PendingPayload(payload: first, message: nil), at: 0)
         sendPending(contact: i)
@@ -4345,6 +4532,8 @@ final class AppModel {
                 let link = data.contacts[i].devices[d]
                 guard link.awaitingHello != true, !isDormant(contact: i, device: d) else { continue }
                 let key = sessionKey(contact: i, device: d)
+                // Its spare key is being fetched: asking for new keys now would cross it.
+                if sparesFetching.contains(key) { continue }
                 if link.session?.canSend == true { handshakeTries[key] = nil }
                 // Asked and never answered: asked again less and less often (a minute, 5, 15, then hourly), so a
                 // device that's gone isn't asked every minute for as long as this app is open.
@@ -4417,6 +4606,15 @@ final class AppModel {
     private func hello(_ sentAt: Date, crossedOurs link: DeviceLink) -> Bool {
         guard link.session != nil, let answered = link.answeredAt else { return false }
         return sentAt <= answered
+    }
+
+    /// Whether a hello was sent before this device answered that device's spare key: it was overtaken, and taking it
+    /// would replace the session the answer opened with one they will drop.
+    private func hello(_ sentAt: Date, crossedSpareOf link: DeviceLink) -> Bool {
+        guard link.session != nil, let taken = link.spareTakenAt else { return false }
+        // Strictly before: clocks here are whole seconds, and their ask for new keys because our answer named a spare
+        // they no longer have can come in the very same second, and must be taken.
+        return sentAt < taken
     }
 
     /// When two devices start a handshake with each other at once, the lower (fingerprint, device) wins.
@@ -4639,6 +4837,7 @@ final class AppModel {
         watchStall()
         retryStaleHandshakes()
         retryUnreadable()
+        tendSpares()
         // An app left open for days would otherwise keep every envelope digest it ever saw. Only assign when
         // something has actually aged out: writing redraws every view that reads the data.
         let stale = Date().addingTimeInterval(-Self.replayWindow)
@@ -5388,10 +5587,13 @@ final class AppModel {
                 && myHandshakeWins(me: me.fingerprint, persona: persona, them: fp, theirDevice: device) {
                 return .handled
             }
+            // Sent before this device answered their spare: they drop that ask when the answer reaches them.
+            if hello(opened.sentAt, crossedSpareOf: data.contacts[i].devices[d]) { return .handled }
             acceptSession(request, contact: i, device: d)
             return .handled
         case let .sessionInit(request):
             guard let d = deviceIndex(i, device) else { return .junk }
+            if hello(opened.sentAt, crossedSpareOf: data.contacts[i].devices[d]) { return .handled }
             if data.contacts[i].devices[d].session != nil && data.contacts[i].devices[d].acceptedHello == request.ephemeral {
                 return .handled
             }
@@ -5417,6 +5619,41 @@ final class AppModel {
             // New keys are in place: no more asking for them because of messages that were read with the old ones.
             unreadable[sessionKey(contact: i, device: d)] = nil
             // We can write on these keys once their first message arrives; they send it straight after answering.
+            keysAnsweredAt[sessionKey(contact: i, device: d)] = Date()
+            return .handled
+        case let .spareAccept(card, answer):
+            // A device of theirs took the spare key this device left for them (see `SpareSlot`) and is already
+            // writing on the session it opens. Signed by the account, so it's theirs.
+            guard card.id == device, !card.id.isEmpty else { return .junk }
+            let d = upsertDevice(i, id: card.id, sendID: card.sendID)
+            let spares = [data.contacts[i].spare].compactMap { $0 } + (data.contacts[i].oldSpares ?? [])
+            guard let used = spares.first(where: { $0.handshake.publicEphemeral == answer.replyTo }),
+                  let session = try? Handshake.complete(used.handshake, answer, me: me,
+                                                        responderAgreement: data.contacts[i].agreementKey) else {
+                // A spare this device no longer has (it was used already, or the account was recovered from a backup
+                // older than it): what they write on it can't be read here. Ask them for new keys instead, and expect
+                // what they already wrote on it to be unreadable for a while, without asking again over each one.
+                deadSpareFrom[sessionKey(contact: i, device: d)] = Date()
+                if data.contacts[i].devices[d].handshake == nil { startHandshake(contact: i, device: d) }
+                return .handled
+            }
+            // Each spare opens one session. The next one is made and left on the relay soon after.
+            if data.contacts[i].spare?.handshake.publicEphemeral == answer.replyTo {
+                data.contacts[i].spare = nil
+                nextSpareWork = min(nextSpareWork, Date().addingTimeInterval(.random(in: 30...180)))
+            }
+            data.contacts[i].oldSpares?.removeAll { $0.handshake.publicEphemeral == answer.replyTo }
+            if data.contacts[i].oldSpares?.isEmpty == true { data.contacts[i].oldSpares = nil }
+            // Mail already sent on the keys this replaces stays readable for now.
+            if let old = data.contacts[i].devices[d].session { recoveredSessions[sessionKey(contact: i, device: d)] = old }
+            data.contacts[i].devices[d].spareTakenAt = nil
+            data.contacts[i].devices[d].session = session
+            data.contacts[i].devices[d].handshake = nil
+            data.contacts[i].devices[d].awaitingHello = nil
+            data.contacts[i].devices[d].acceptedHello = nil
+            heard(contact: i, device: d)
+            data.contacts[i].devices[d].answeredAt = opened.sentAt
+            unreadable[sessionKey(contact: i, device: d)] = nil
             keysAnsweredAt[sessionKey(contact: i, device: d)] = Date()
             return .handled
         case let .collected(digests):
@@ -5446,6 +5683,8 @@ final class AppModel {
                 plain = opened
             }
             guard let plain else {
+                // Written on a spare this device no longer had: expected, and new keys are already on their way.
+                if let since = deadSpareFrom[keptKey], Date().timeIntervalSince(since) < 600 { return .handled }
                 // Signed by their account, yet this device's keys can't open it: the two are out of step (a backup that
                 // was a little behind, say). Said once in a while, so a new session is opened with them, which they
                 // accept; until then what they sent can't be read, and what's sent to them can't be either.
@@ -5458,6 +5697,7 @@ final class AppModel {
             // The keys were kept above, before reading what it says, so a message this version can't read (one from a
             // newer app) still counts and doesn't leave the session behind.
             unreadable[keptKey] = nil
+            deadSpareFrom[keptKey] = nil
             data.seenEnvelopes[readBefore] = Date()
             guard let inner = try? Payload.fromWire(plain), !inner.isSetup else { return .handled }
             handle(inner, from: fp, persona: persona, device: device)
@@ -5483,6 +5723,9 @@ final class AppModel {
         if (data.contacts[i].devices[d].readsGroupReceipts == true) != opened.readsGroupReceipts {
             data.contacts[i].devices[d].readsGroupReceipts = opened.readsGroupReceipts ? true : nil
         }
+        if (data.contacts[i].devices[d].takesSpares == true) != opened.takesSpares {
+            data.contacts[i].devices[d].takesSpares = opened.takesSpares ? true : nil
+        }
     }
 
     static let maxAvatarBytes = 512 * 1024
@@ -5503,7 +5746,7 @@ final class AppModel {
             data.contacts[i].devices.removeAll { $0.id == device }
         case .erased:
             eraseTraces(of: fp)
-        case .hello, .request, .sessionInit, .deviceHello, .sessionAccept, .ratchet, .collected:
+        case .hello, .request, .sessionInit, .deviceHello, .sessionAccept, .spareAccept, .ratchet, .collected:
             break
         case let .sync(event):
             // Only your own devices may tell this one what you did.
@@ -7097,7 +7340,13 @@ extension AppModel {
         encoder.dateEncodingStrategy = .secondsSince1970
         encoder.outputFormatting = .sortedKeys
         guard let plain = try? encoder.encode(Self.backupContents(of: data)) else { return false }
-        let digest = Data(SHA256.hash(data: plain))
+        // Spares change every few days per friend: on their own they don't ask for an upload (that would be one every
+        // few minutes while they're first made, and a timing link between spares and this backup on the relay). They
+        // go with the next save that happens anyway; one made since is simply not in it, and its friend falls back.
+        var withoutSpares = Self.backupContents(of: data)
+        for c in withoutSpares.contacts.indices { withoutSpares.contacts[c].spare = nil; withoutSpares.contacts[c].oldSpares = nil }
+        guard let digestPlain = try? encoder.encode(withoutSpares) else { return false }
+        let digest = Data(SHA256.hash(data: digestPlain))
         let week = data.backupSavedAt.map { Date().timeIntervalSince($0) > 7 * 24 * 3600 } ?? true
         if digest == data.backupDigest, !week { return true }
         guard let sealed = try? AES.GCM.seal(Self.padded(plain), using: identity.backupKey).combined else { return false }

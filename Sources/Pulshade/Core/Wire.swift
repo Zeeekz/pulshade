@@ -130,6 +130,9 @@ enum Payload: Codable, Equatable {
     /// A device introducing itself and opening a session: "I'm this device of the account you know; reach me here".
     case deviceHello(DeviceCard, SessionInit)
     case sessionAccept(SessionAccept)
+    /// "I took the spare key you left for me (see `SpareSlot`), and here's my answer; I'm this device, reach me here."
+    /// The answer opens the session on your side: the sender is already writing on it. Older apps can't read it.
+    case spareAccept(DeviceCard, SessionAccept)
     case ratchet(RatchetMessage)
 
     /// `handle` is only a claim: the receiver checks it against the directory before showing it.
@@ -253,7 +256,7 @@ enum Payload: Codable, Equatable {
     /// Setup messages are sealed to the identity key directly; the rest need a session.
     var isSetup: Bool {
         switch self {
-        case .hello, .request, .sessionInit, .deviceHello, .sessionAccept, .ratchet: true
+        case .hello, .request, .sessionInit, .deviceHello, .sessionAccept, .spareAccept, .ratchet: true
         default: false
         }
     }

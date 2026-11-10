@@ -14,8 +14,9 @@ import CryptoKit
 enum Envelope {
     /// What this app tells everyone it can read. Bit 0: framed messages (`Frame`), which carry big fields raw.
     /// Bit 1: files kept on the relay (`Attachment`). Bit 2: it answers group messages with a receipt, so a group
-    /// tick can wait for it. Builds from before that never do, and aren't waited on.
-    static let reads: UInt8 = 7
+    /// tick can wait for it. Builds from before that never do, and aren't waited on. Bit 3: it takes and answers
+    /// spare keys (`SpareSlot`), so its friends leave it one.
+    static let reads: UInt8 = 15
 
     /// Opened envelope: the payload, who sent it, from which of their devices, and when.
     struct Opened {
@@ -31,6 +32,7 @@ enum Envelope {
         var readsFrames: Bool { caps & 1 == 1 }
         var readsAttachments: Bool { caps & 2 == 2 }
         var readsGroupReceipts: Bool { caps & 4 == 4 }
+        var takesSpares: Bool { caps & 8 == 8 }
     }
 
     /// `framed` sends the payload and the inside of the envelope in frames, without the base64 that makes a big

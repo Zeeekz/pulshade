@@ -89,6 +89,11 @@ struct DeviceLink: Codable {
     /// Their app answers group messages with a receipt, so a group's tick can wait for this device. Nil for an app
     /// from before, which neither sends nor expects one.
     var readsGroupReceipts: Bool?
+    /// Their app takes spare keys (`SpareSlot`): this device leaves them one, and takes theirs. Nil for an app from before.
+    var takesSpares: Bool?
+    /// When this device answered that device's spare key, by the relay's clock: a hello of theirs sent before then was
+    /// overtaken by the answer and isn't taken. Cleared once keys are opened any other way.
+    var spareTakenAt: Date?
     /// When this device answered a handshake of ours, by its own clock. A hello of theirs sent no later than this
     /// crossed ours on the way and is not taken (it would replace the session this answer opened).
     var answeredAt: Date?
@@ -151,6 +156,10 @@ struct Contact: Codable, Identifiable {
     var addedAt = Date()
     /// Which of your personas knows them. Nil is your main identity.
     var persona: UUID?
+    /// The spare key this device has left for them on the relay (see `SpareSlot`), and ones it replaced lately,
+    /// still honoured for a while.
+    var spare: SpareKey?
+    var oldSpares: [SpareKey]?
 
     /// Where a new contact starts: their first device's mailbox.
     var sendID: Data {
@@ -175,7 +184,7 @@ struct Contact: Codable, Identifiable {
 
     private enum CodingKeys: String, CodingKey {
         case fingerprint, name, nickname, avatar, banner, color, bio, links, walletChangedAt, notes, handle, verified, badge, collectibles, signingKey, agreementKey, devices, receiveKey, relay
-        case hidden, isSelf, awaitingAcceptance, addedAt, persona, wantsMyPresence, toldPresence
+        case hidden, isSelf, awaitingAcceptance, addedAt, persona, wantsMyPresence, toldPresence, spare, oldSpares
         // Single-device fields from before linked devices.
         case sendID, session, handshake, pending
     }
@@ -207,6 +216,8 @@ struct Contact: Codable, Identifiable {
         persona = try c.decodeIfPresent(UUID.self, forKey: .persona)
         wantsMyPresence = try c.decodeIfPresent(Bool.self, forKey: .wantsMyPresence)
         toldPresence = try c.decodeIfPresent(Bool.self, forKey: .toldPresence)
+        spare = try? c.decodeIfPresent(SpareKey.self, forKey: .spare)
+        oldSpares = try? c.decodeIfPresent([SpareKey].self, forKey: .oldSpares)
         addedAt = try c.decodeIfPresent(Date.self, forKey: .addedAt) ?? Date()
         // Your own entry has no devices once the last linked one leaves; anyone else always has one.
         if let devices = try? c.decodeIfPresent([DeviceLink].self, forKey: .devices), !devices.isEmpty || isSelf {
@@ -248,6 +259,8 @@ struct Contact: Codable, Identifiable {
         try c.encodeIfPresent(persona, forKey: .persona)
         try c.encodeIfPresent(wantsMyPresence, forKey: .wantsMyPresence)
         try c.encodeIfPresent(toldPresence, forKey: .toldPresence)
+        try c.encodeIfPresent(spare, forKey: .spare)
+        try c.encodeIfPresent(oldSpares, forKey: .oldSpares)
     }
 
     var displayName: String {
@@ -1211,7 +1224,8 @@ struct AppData: Codable {
     /// 10: a waiting envelope can carry a recall stamp.
     /// 11: when the account was made on this device, for a fresh-start order to tell old accounts from new ones.
     /// 12: your sent envelopes by digest, so a friend's locked phone can confirm delivery (`Payload.collected`).
-    static let currentFormat = 12
+    /// 13: the spare keys a device leaves for each friend (`SpareSlot`), and which friends' apps take them.
+    static let currentFormat = 13
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []
