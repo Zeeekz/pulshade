@@ -1261,7 +1261,8 @@ struct AppData: Codable {
     /// 11: when the account was made on this device, for a fresh-start order to tell old accounts from new ones.
     /// 12: your sent envelopes by digest, so a friend's locked phone can confirm delivery (`Payload.collected`).
     /// 13: the spare keys a device leaves for each friend (`SpareSlot`), and which friends' apps take them.
-    static let currentFormat = 13
+    /// 14: a chat background, built in or a photo of your own.
+    static let currentFormat = 14
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []
@@ -1269,6 +1270,8 @@ struct AppData: Codable {
     var stories: [Story] = []
     var outbox: [Outgoing] = []
     var theme: String = Theme.dark.id
+    /// What sits behind the messages in every chat.
+    var chatBackground = ChatBackground()
     var relay = AppData.defaultRelay
     /// A relay to put in new invites, from builds that had crew relays. Only ever used if it's an allowed one.
     var inviteRelay: String?
@@ -1362,6 +1365,7 @@ struct AppData: Codable {
         stories = try c.decodeIfPresent([Story].self, forKey: .stories) ?? []
         outbox = try c.decodeIfPresent([Outgoing].self, forKey: .outbox) ?? []
         theme = try c.decodeIfPresent(String.self, forKey: .theme) ?? Theme.dark.id
+        chatBackground = (try? c.decodeIfPresent(ChatBackground.self, forKey: .chatBackground)) ?? ChatBackground()
         relay = try c.decodeIfPresent(String.self, forKey: .relay) ?? AppData.defaultRelay
         inviteRelay = try c.decodeIfPresent(String.self, forKey: .inviteRelay)
         security = try c.decodeIfPresent(SecuritySettings.self, forKey: .security) ?? SecuritySettings()

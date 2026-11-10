@@ -59,7 +59,8 @@ struct ConversationView: View {
                 messages(c)
                 if model.canPost(in: c) { composer(c) } else { ReadOnlyBar(kind: c.kind, announcements: c.isAnnouncements) }
             }
-            .background(Ink.base)
+            // Fills the whole screen, keyboard or not, so the background doesn't jump when it opens.
+            .background { ChatBackdrop(background: model.data.chatBackground, theme: model.theme).equatable().ignoresSafeArea() }
             .onAppear {
                 focused = !Platform.isPhone
                 model.openConversation = id

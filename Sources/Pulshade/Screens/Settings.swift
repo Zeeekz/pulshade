@@ -1127,8 +1127,131 @@ private struct AppearanceSettings: View {
                 }
                 .padding(14)
             }
+            ChatBackgroundSettings()
         }
     }
+}
+
+/// The built-in chat backgrounds, the theme's own marked, and a photo of your own you can move, zoom, fade and blur.
+private struct ChatBackgroundSettings: View {
+    @Environment(AppModel.self) private var model
+    @State private var editing: EditingPhoto?
+    /// The pattern size while the slider is held, saved when it's let go.
+    @State private var patternSize: Double?
+
+    private var current: ChatBackground { model.data.chatBackground }
+
+    var body: some View {
+        let theme = model.theme
+        let shown = current.shown(in: theme)
+        SettingsGroup("Chat background", footer: "Your photo is kept sealed on this device and isn't part of your backup.") {
+            let columns = [GridItem(.adaptive(minimum: 92), spacing: 12)]
+            LazyVGrid(columns: columns, spacing: 12) {
+                ForEach(ChatBackground.Style.builtIn) { style in
+                    BackdropTile(background: with(style), theme: theme, label: style.name,
+                                 note: style == theme.backdrop ? "Default" : nil, selected: shown == style) {
+                        model.setChatBackground(with(style))
+                    }
+                }
+                ImagePickButton(maxSide: ChatBackground.photoSide, picked: { data in
+                    var next = current
+                    next.photo = data
+                    next.zoom = 1
+                    next.focusX = 0.5
+                    next.focusY = 0.5
+                    next.blur = 0
+                    next.style = .photo
+                    editing = EditingPhoto(background: next)
+                }) {
+                    photoTile(theme: theme, selected: shown == .photo)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(14)
+            if shown == .dots || shown == .waves {
+                RowDivider()
+                SettingRow("Pattern size") {
+                    Slider(value: Binding(get: { patternSize ?? current.patternSize }, set: { patternSize = $0 }),
+                           in: ChatBackground.patternRange) { held in
+                        guard !held, let size = patternSize else { return }
+                        var next = current
+                        next.patternSize = size
+                        model.setChatBackground(next)
+                        patternSize = nil
+                    }
+                    .tint(theme.accent)
+                    .frame(maxWidth: 200)
+                }
+            }
+            if current.photo != nil {
+                RowDivider()
+                ActionRow(title: shown == .photo ? "Move and scale photo" : "Use your photo") {
+                    var next = current
+                    next.style = .photo
+                    if shown == .photo { editing = EditingPhoto(background: next) } else { model.setChatBackground(next) }
+                }
+                RowDivider()
+                ActionRow(title: "Remove photo", destructive: true) {
+                    var next = current
+                    next.photo = nil
+                    if next.style == .photo { next.style = .theme }
+                    model.setChatBackground(next)
+                }
+            }
+        }
+        .sheet(item: $editing) { item in
+            PhotoBackdropEditor(start: item.background, theme: theme) { result in
+                editing = nil
+                if let result { model.setChatBackground(result) }
+            }
+        }
+    }
+
+    /// The current settings with another look picked, for its tile and when it's chosen.
+    private func with(_ style: ChatBackground.Style) -> ChatBackground {
+        var next = current
+        next.style = style
+        if let patternSize { next.patternSize = patternSize }
+        return next
+    }
+
+    private func photoTile(theme: Theme, selected: Bool) -> some View {
+        VStack(spacing: 8) {
+            ZStack {
+                if current.photo != nil {
+                    ChatBackdrop(background: with(.photo), theme: theme)
+                } else {
+                    theme.ink.raised
+                    Image(systemName: "photo.badge.plus")
+                        .font(.system(size: 24, weight: .medium))
+                        .foregroundStyle(theme.accent)
+                }
+            }
+            .frame(height: 128)
+            .clipShape(.rect(cornerRadius: 12))
+            .overlay(RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(selected ? AnyShapeStyle(theme.accent) : AnyShapeStyle(Ink.line),
+                              style: StrokeStyle(lineWidth: selected ? 2 : 1, dash: current.photo == nil ? [5, 4] : [])))
+            VStack(spacing: 1) {
+                HStack(spacing: 4) {
+                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 12))
+                        .foregroundStyle(selected ? AnyShapeStyle(theme.accent) : AnyShapeStyle(Ink.faint))
+                    Text("Your photo").font(.system(size: 13, weight: .medium)).foregroundStyle(selected ? Ink.text : Ink.dim)
+                }
+                Text(current.photo == nil ? "Choose…" : "Change…").font(.system(size: 11)).foregroundStyle(Ink.faint)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .contentShape(.rect)
+        .accessibilityLabel(current.photo == nil ? "Choose your own photo" : "Change your photo")
+    }
+}
+
+/// A photo background being placed, as a sheet item.
+private struct EditingPhoto: Identifiable {
+    let id = UUID()
+    let background: ChatBackground
 }
 
 // MARK: - Devices

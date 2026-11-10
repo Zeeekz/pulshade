@@ -3970,6 +3970,16 @@ final class AppModel {
         save()
     }
 
+    /// Changes what sits behind the messages. Picking the theme's own look saves it as "the theme's", so it follows
+    /// the theme when that changes.
+    func setChatBackground(_ background: ChatBackground) {
+        var background = background
+        if background.style == theme.backdrop { background.style = .theme }
+        guard background != data.chatBackground else { return }
+        withAnimation(.smooth(duration: 0.35)) { data.chatBackground = background }
+        save()
+    }
+
     // MARK: Security settings
 
     /// Lock-screen settings live outside the vault so the locked window can honour them too.
@@ -7653,6 +7663,8 @@ extension AppModel {
         // Nor story video still arriving, or the decoy and panic identities, which live only on the device
         // they were set up on.
         kept.clipParts = [:]
+        // Nor your own chat background photo: it's big, and the look falls back to the theme's until you set it again.
+        kept.chatBackground.photo = nil
         kept.decoySeed = nil
         kept.panicSeed = nil
         kept.pendingBackupForget = nil
