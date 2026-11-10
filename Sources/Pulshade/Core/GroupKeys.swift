@@ -421,7 +421,9 @@ struct GroupReader: Codable, Equatable {
         }
         let (key, next) = chain.step()
         chains[id] = next
-        // A sender who skips a lot only pushes out their own oldest gaps, never anyone else's.
+        // A sender who skips a lot only pushes out their own oldest gaps, never anyone else's. Only looked at when this
+        // message skipped some and there could be too many: an ordinary message costs nothing here.
+        guard skipped.count > Self.maxSkippedPerSender, index > 0, skipped["\(id)|\(index - 1)"] != nil else { return key }
         let theirs = skipped.keys.filter { $0.hasPrefix(senderPrefix) }
         let cap = skipped.count > Self.maxSkipped ? 0 : Self.maxSkippedPerSender
         if theirs.count > cap {

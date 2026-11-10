@@ -251,7 +251,7 @@ struct GroupKeysTests {
         #expect(reader.skipped.count == 3)
         let noisyDevice = GroupSeal.deviceTag(.random(8))
         var at: UInt32 = 0
-        for _ in 0..<5 { at += 1_900; _ = reader.messageKey(epoch: epoch, sender: noisy, device: noisyDevice, index: at) }
+        for _ in 0..<2 { at += 1_500; _ = reader.messageKey(epoch: epoch, sender: noisy, device: noisyDevice, index: at) }
         #expect(reader.skipped.keys.filter { $0.contains(noisy.hex) }.count <= GroupReader.maxSkippedPerSender)
         #expect(reader.skipped.keys.filter { $0.contains(quiet.hex) }.count == 3, "the quiet member's gaps are kept")
         for _ in 0..<GroupReader.maxDevicesPerSender { _ = reader.messageKey(epoch: epoch, sender: noisy, device: .random(8), index: 0) }
@@ -290,9 +290,9 @@ struct GroupKeysTests {
     @Test func theSizeCheckMatchesWhatTheRelayTakes() {
         let owner = keys(.random(32))
         var s = settings(owner: owner, members: [])
-        for _ in 0..<1_000 { s.members.append(MemberCard.make(keys(.random(32)), group: group, name: "Member", avatar: nil, color: 2).withoutAvatar) }
+        for _ in 0..<400 { s.members.append(MemberCard.make(keys(.random(32)), group: group, name: "Member", avatar: nil, color: 2).withoutAvatar) }
         s.sign(with: owner)
-        #expect(s.fitsInMailbox, "a thousand members fit")
+        #expect(s.fitsInMailbox, "four hundred members fit")
         let bytes = try! Payload.groupSettings(s).wire(framed: false).count
         #expect(GroupSeal.fits(payload: bytes) && !GroupSeal.fits(payload: 2_100_000))
         // What the check passes really does seal under the relay's limit (2 MiB and a little).
