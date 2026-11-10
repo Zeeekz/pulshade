@@ -46,7 +46,8 @@ file of about that size was uploaded and collected, and when.
 
 **The sealed backup.** So that Detach can be instant, the app keeps one backup of your profile, @handles, contacts,
 groups, personas and settings (never chats, stories or requests, nor a message still waiting to be sent, nor
-a decoy or panic identity) on the relay. It is sealed on the device with a key
+a decoy or panic identity) on the relay. It does hold each contact's session keys, so mail sent to you while you were
+detached can still be opened. It is sealed on the device with a key
 only the recovery code makes, filed under a throwaway public key derived from the recovery code and from nothing
 else, so the relay can't read it or tie it to your account. It is padded to a power of two (at least 64 KB), so its
 size says little. A few minutes after something in it changes (a random 1.5 to 10 minutes, so an upload can't be
@@ -296,7 +297,9 @@ and every lane (each persona, each public inbox, sending, linking, reports, each
 so each gets its own circuits and none can be linked to another by address. If a lane's circuit is slow to connect,
 a fresh one races it; if a request fails, the lane gets new circuits. Fetches, deposits, the directory, backups and
 call audio all go through it, and nothing falls back to a direct connection: if Tor can't start or can't reach the
-server, requests fail. Tor is on from the first launch, before there's even an account.
+server, requests fail (with Tor on; the one exception is the locked-phone helper, if you turn it on: it can't run Tor and
+reaches the server directly for a moment, so it is off by default on Tor). A fresh install, a Detach or a Burn first asks how to connect, Fast or Tor, and nothing
+connects until that is answered.
 
 **Bridges.** For networks that block Tor or watch for it, Settings → Network → Bridges sends Tor's first hop to a
 bridge instead of a public relay, disguised by a pluggable transport: Snowflake (through volunteers, looks like a
