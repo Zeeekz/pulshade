@@ -4062,10 +4062,11 @@ final class AppModel {
 
     // MARK: Two ticks while locked
 
-    /// Whether the notification helper may confirm delivery while this iPhone is locked (see `LockedDelivery`).
+    /// Whether the notification helper runs while this iPhone is locked: it collects short mail, and confirms
+    /// delivery only when delivery receipts are on (see `LockedDelivery`).
     var lockedDeliveryOn: Bool {
         let s = data.security
-        guard pushWanted, s.deliveryReceipts, s.lockedDeliveryChosen, !hasDecoy, !hasPanic, AppData.directRelay != nil
+        guard pushWanted, s.lockedDeliveryChosen, !hasDecoy, !hasPanic, AppData.directRelay != nil
         else { return false }
         return true
     }
@@ -4082,7 +4083,8 @@ final class AppModel {
                                                          devices: c.devices.map { .init(id: $0.id, sendID: $0.sendID) })
         }
         return HelperBundle(signing: me.signingKey.rawRepresentation, agreement: me.agreementKey.rawRepresentation,
-                            device: deviceID(for: nil), relay: relay, friends: friends)
+                            device: deviceID(for: nil), relay: relay, friends: friends,
+                            confirms: data.security.deliveryReceipts)
     }
 
     /// The helper's bundle for this account as it stands, pointed at `relay` (tests use their own relay).

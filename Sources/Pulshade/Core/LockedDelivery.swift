@@ -34,6 +34,9 @@ struct HelperBundle: Codable, Equatable {
     var relay: String
     /// Friends by fingerprint.
     var friends: [String: Friend]
+    /// Whether to send friends their second tick: off when delivery receipts are off, and then the helper only
+    /// collects short mail. Nil (a bundle written before this was added) means yes.
+    var confirms: Bool? = nil
 
     var receiveKeys: [Data] { friends.values.map(\.receiveKey) }
 }
@@ -88,7 +91,7 @@ enum LockedDelivery {
     /// The notes to send for this mail: one per friend's device that sent chat messages here and hasn't heard about
     /// them yet. Anything else (an unknown sender, a key setup, something already confirmed) is left alone.
     static func notes(for mail: [Mail], bundle: HelperBundle, confirmed: Set<Data>, now: Date = Date()) -> [Note] {
-        guard let agreement = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: bundle.agreement),
+        guard bundle.confirms != false, let agreement = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: bundle.agreement),
               let signing = try? Curve25519.Signing.PrivateKey(rawRepresentation: bundle.signing) else { return [] }
         var byDevice: [Data: (friend: HelperBundle.Friend, digests: [Data])] = [:]
         var order: [Data] = []

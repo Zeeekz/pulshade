@@ -598,13 +598,6 @@ private struct ProfileSettings: View {
                 RowDivider(inset: 54)
                 MenuRow(page: .pinned, symbol: "pin.fill", color: .hex(0xFF9F0A), title: "Pinned",
                         value: pinnedCount == 0 ? nil : "\(pinnedCount)")
-                if Platform.isPhone {
-                    RowDivider(inset: 54)
-                    MenuRow(page: .collectibles, symbol: "crown.fill", color: .hex(0xE5383B), title: "Collectibles",
-                            value: model.activeProfile.badge?.kind?.name)
-                    RowDivider(inset: 54)
-                    MenuRow(page: .pets, symbol: "pawprint.fill", color: .hex(0xBF5AF2), title: "Pets")
-                }
             }
             if let id = model.activePersona {
                 SettingsGroup(footer: "Burning this persona deletes it for good.") {
@@ -871,10 +864,6 @@ private struct PrivacySettings: View {
             SettingsGroup {
                 MenuRow(page: .privacyBackup, symbol: "externaldrive.fill.badge.checkmark", color: .hex(0x30D158), title: "Backup & keys",
                         value: model.data.security.keepBackup ? "On" : "Off")
-                RowDivider(inset: 54)
-                MenuRow(page: .anonymity, symbol: "eye.slash.fill", color: .hex(0x64D2FF), title: "Anonymity Report")
-                RowDivider(inset: 54)
-                MenuRow(page: .network, symbol: "antenna.radiowaves.left.and.right", color: .hex(0x30D158), title: "Network & Tor")
             }
         }
     }
@@ -1069,10 +1058,8 @@ private struct NotificationSettings: View {
                     if security.pushWake {
                         RowDivider()
                         SecurityToggle(title: "Friend request alerts when locked", key: \.pushRequests)
-                        if security.deliveryReceipts {
-                            RowDivider()
-                            SecurityToggle(title: "Confirm delivery when locked", key: \.lockedDeliveryChosen)
-                        }
+                        RowDivider()
+                        SecurityToggle(title: "Collect messages when locked", key: \.lockedDeliveryChosen)
                     }
                     #endif
                 }
@@ -1086,15 +1073,15 @@ private struct NotificationSettings: View {
                     .padding(.horizontal, 14)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if on, security.pushWake, security.deliveryReceipts, security.tor, security.lockedDeliveryChosen {
-                Text("Confirming while locked connects directly for a moment, so the server sees your IP.")
+            if on, security.pushWake, security.tor, security.lockedDeliveryChosen {
+                Text("Collecting while locked connects directly for a moment, so the server sees your IP.")
                     .font(.system(size: 12)).foregroundStyle(Ink.faint)
                     .padding(.horizontal, 14)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if on {
                 LearnMore(title: "Waking a locked iPhone",
-                          text: "Apple wakes your iPhone with a note that only says \"New message\". Apple learns when, and the relay keeps your push token. Off, you only hear about messages while PULSHADE is open. Confirm delivery when locked lets friends see their second tick before you open PULSHADE: a small helper checks which messages arrived without opening them, using keys kept on this iPhone after you first unlock it.")
+                          text: "Apple wakes your iPhone with a note that only says \"New message\". Apple learns when, and the relay keeps your push token. Off, you only hear about messages while PULSHADE is open. Collect messages when locked lets a small helper take short messages off the server into a sealed inbox on this iPhone, without opening them, so they don't wait on the server until you open PULSHADE. Photos and videos still wait there. With delivery receipts on, friends also get their second tick. It uses keys kept on this iPhone after you first unlock it.")
             }
             #endif
             #if os(macOS)
@@ -1140,26 +1127,8 @@ private struct AppearanceSettings: View {
 // MARK: - Devices
 
 private struct DevicesSettings: View {
-    @Environment(AppModel.self) private var model
-    @Environment(\.theme) private var theme
-
     var body: some View {
         SettingsScreen(title: "Devices") {
-            SettingsGroup("Account",
-                          footer: "Every device here is this one account.") {
-                HStack(spacing: 12) {
-                    Avatar(image: model.data.profile.avatar, seed: model.fingerprint, size: 40)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(model.data.profile.displayName).font(.system(size: 15, weight: .medium)).foregroundStyle(Ink.text)
-                        Text(model.data.profile.handle.map { "@\($0)" } ?? "Private profile")
-                            .font(.system(size: 13))
-                            .foregroundStyle(model.data.profile.handle == nil ? Ink.faint : theme.accent)
-                    }
-                    Spacer()
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-            }
             LinkedDevicesCard()
         }
     }
@@ -1218,12 +1187,14 @@ private struct NetworkSettings: View {
                 RowDivider()
                 ActionRow(title: model.retryingRelay ? "Checking…" : "Check connection") { Task { await model.retryRelay() } }
             }
-            SettingsGroup("Relay", footer: "Passes on your encrypted messages. It can't read them.") {
-                SettingRow("Server") {
-                    // The built-in relay's address isn't shown; a development build may be pointed at another.
-                    Text(branded: model.data.relay == AppData.defaultRelay ? "PULSHADE" : relayURL?.host() ?? model.data.relay)
-                        .font(.system(size: 14, design: .monospaced)).foregroundStyle(Ink.dim)
-                        .lineLimit(1).truncationMode(.middle)
+            // Only a relay other than the built-in one is worth naming (a development build pointed elsewhere).
+            if model.data.relay != AppData.defaultRelay {
+                SettingsGroup("Relay", footer: "Passes on your encrypted messages. It can't read them.") {
+                    SettingRow("Server") {
+                        Text(relayURL?.host() ?? model.data.relay)
+                            .font(.system(size: 14, design: .monospaced)).foregroundStyle(Ink.dim)
+                            .lineLimit(1).truncationMode(.middle)
+                    }
                 }
             }
             SettingsGroup("Tor", footer: torFooter) {
@@ -1714,7 +1685,3 @@ private struct DisguiseSetup: View {
         }
     }
 }
-
-// MARK: - Log out & erase
-
-/// Takes the account off this device. On your only device, the recovery code is asked for first.
