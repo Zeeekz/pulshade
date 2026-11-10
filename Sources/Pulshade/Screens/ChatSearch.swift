@@ -20,6 +20,7 @@ struct ChatSearchResults: View {
     @State private var found: DirectoryProfile?
     @State private var lookedUp: String?
     @State private var problem: String?
+    @State private var showing: DirectoryProfile?
 
     private var text: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
     /// Without a leading @, so "@nova" still finds a contact called Nova.
@@ -100,6 +101,7 @@ struct ChatSearchResults: View {
         .padding(.bottom, 12)
         .onChange(of: query) { found = nil; lookedUp = nil; problem = nil }
         .onChange(of: submitted) { if let handle { lookUp(handle) } }
+        .sheet(item: $showing) { FoundProfileSheet(profile: $0, openChat: open) }
     }
 
     // MARK: Global
@@ -150,6 +152,10 @@ struct ChatSearchResults: View {
             do {
                 found = try await model.findProfile(handle)
                 problem = nil
+                // Straight to their profile, where one tap adds them.
+                if let found, query.trimmingCharacters(in: .whitespaces).lowercased().replacingOccurrences(of: "@", with: "") == handle {
+                    showing = found
+                }
             } catch AppModel.DirectoryError.unreachable {
                 found = nil; problem = "Can't reach the relay"
             } catch {
@@ -160,13 +166,9 @@ struct ChatSearchResults: View {
         }
     }
 
-    /// A contact's chat opens; anyone else's profile opens in Contacts, where a request can be sent.
+    /// Their profile, with Add friend or Message on it.
     private func openProfile(_ profile: DirectoryProfile) {
-        if let known = model.visibleContacts.first(where: { $0.fingerprint == profile.fingerprint }) {
-            message(known)
-        } else {
-            model.openedHandle = profile.handle
-        }
+        showing = profile
     }
 
     private func message(_ contact: Contact) {

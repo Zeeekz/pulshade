@@ -752,7 +752,6 @@ private struct FilterChips: View {
             chip(.direct, label: "Direct")
             chip(.group, label: "Groups")
             chip(.channel, label: "Channels")
-            chip(.broadcast, label: "Lists")
             Spacer(minLength: 0)
         }
     }

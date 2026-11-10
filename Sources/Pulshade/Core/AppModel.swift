@@ -3729,8 +3729,16 @@ final class AppModel {
         syncContact(peer.fingerprint, peer.persona)
         let convo = startConversation(kind: .direct, title: peer.displayName, members: [peer.fingerprint],
                                       persona: .some(request.persona))
+        noteConnected(convo.id)
         save()
         return convo
+    }
+
+    /// Opens a new friend's chat with a line saying you're connected, so it's ready to use without either of you
+    /// having to send anything first. Only on a chat with nothing in it yet.
+    private func noteConnected(_ id: Conversation.ID) {
+        guard let i = index(of: id), data.conversations[i].messages.isEmpty else { return }
+        data.conversations[i].messages.append(Message(sender: "system", text: "You're now connected. Say hi 👋", status: .delivered))
     }
 
     /// Accepts a request from someone who's already a contact, keeping what you'd set for them.
@@ -6295,7 +6303,8 @@ final class AppModel {
             sender.awaitingAcceptance = false
             upsert(sender)
             syncContact(fp, persona)
-            _ = startConversation(kind: .direct, title: sender.displayName, members: [fp], persona: .some(persona))
+            let convo = startConversation(kind: .direct, title: sender.displayName, members: [fp], persona: .some(persona))
+            noteConnected(convo.id)
             shareStories(with: sender)
         }
     }

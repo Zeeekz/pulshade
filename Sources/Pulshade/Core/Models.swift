@@ -365,8 +365,12 @@ struct FriendRequest: Codable, Identifiable, Equatable {
 }
 
 enum ConversationKind: String, Codable, CaseIterable, Identifiable {
+    /// `broadcast` lists can no longer be made (channels do the same job); ones made before still open and work.
     case direct, group, channel, broadcast
     var id: String { rawValue }
+
+    /// What New offers.
+    static let creatable: [ConversationKind] = [.direct, .group, .channel]
 
     var symbol: String {
         switch self {

@@ -14,7 +14,7 @@ struct ContactCollectibles: View {
     var body: some View {
         let shown = items.filter { $0.kind != nil }
         if !shown.isEmpty {
-            ExpandableCard(title: "Collectibles", symbol: "sparkles", count: shown.count) {
+            ExpandableCard(title: "Collectibles", symbol: "sparkles", count: shown.count, startsOpen: true) {
                 HStack(spacing: -4) {
                     ForEach(shown.prefix(4)) { item in
                         if let kind = item.kind { CollectibleIcon(item: kind, size: 26) }

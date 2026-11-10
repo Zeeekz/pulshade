@@ -14,8 +14,6 @@ struct ContactsView: View {
     @State private var found: DirectoryProfile?
     @State private var notFound = false
     @State private var problem: String?
-    @State private var note = ""
-    @State private var sent = false
     @State private var reporting: ReportSubject?
     @State private var reportingSomeone = false
     @State private var removing: Contact?
@@ -92,7 +90,7 @@ struct ContactsView: View {
                     #endif
                     .onSubmit(search)
                     .onChange(of: query) {
-                        found = nil; notFound = false; problem = nil; sent = false; safety = false
+                        found = nil; notFound = false; problem = nil; safety = false
                         if lookUpWhenFilled { lookUpWhenFilled = false; search() }
                     }
                 if searching { ProgressView().controlSize(.small) }
@@ -131,61 +129,9 @@ struct ContactsView: View {
 
     @ViewBuilder private var lookupResult: some View {
         if let found {
-            VStack(spacing: 14) {
-                ProfileCard(profile: found)
-                if let earlier = model.earlierOwner(of: found) {
-                    Label("@\(found.handle) used to be \(earlier.displayName). This is a different account.",
-                          systemImage: "exclamationmark.triangle.fill")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                if model.isMine(found.fingerprint) {
-                    Label("That's you", systemImage: "person.crop.circle.badge.checkmark")
-                        .font(.system(size: 13, weight: .bold))
-                        .foregroundStyle(Ink.dim)
-                } else if let known = model.visibleContacts.first(where: { $0.fingerprint == found.fingerprint }) {
-                    Button { message(known) } label: { Label("Message", systemImage: "bubble.left.fill") }
-                        .buttonStyle(PrimaryButtonStyle())
-                } else if sent || model.sentRequests.contains(where: { $0.fingerprint == found.fingerprint }) {
-                    Label("Request sent", systemImage: "paperplane.fill")
-                        .font(.system(size: 13, weight: .bold))
-                        .foregroundStyle(theme.accent)
-                    // A request can go missing (a relay restart), or they may still think you're friends:
-                    // sending it again gets it there, and an existing friend reconnects straight away.
-                    HStack(spacing: 18) {
-                        if !sent {
-                            Button("Send again", action: request)
-                                .buttonStyle(.plain)
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(Ink.dim)
-                        }
-                        Button("Cancel request") {
-                            model.cancelRequest(to: found.fingerprint)
-                            withAnimation(.snappy) { sent = false }
-                        }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(Ink.dim)
-                    }
-                } else {
-                    TextField("", text: $note, prompt: Text("Add a note (optional)").foregroundStyle(Ink.faint))
-                        .textFieldStyle(LargeFieldStyle())
-                        .onSubmit(request)
-                    Button(action: request) { Label("Send request", systemImage: "person.crop.circle.badge.plus") }
-                        .buttonStyle(PrimaryButtonStyle())
-                }
-                if !model.isMine(found.fingerprint) {
-                    Button("Report @\(found.handle)") {
-                        reporting = ReportSubject(key: found.signingKey, handle: found.handle, name: found.name)
-                    }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(Ink.faint)
-                }
-            }
-            .frame(maxWidth: .infinity)
-            .transition(.opacity.combined(with: .scale(scale: 0.97)))
+            FoundProfileView(profile: found, openChat: openChat)
+                .padding(.horizontal, -16)
+                .transition(.opacity.combined(with: .scale(scale: 0.97)))
         } else if notFound {
             Text("No one has @\(handle ?? query). Handles are exact, so check the spelling.")
                 .font(.system(size: 13)).foregroundStyle(Ink.dim)
@@ -246,12 +192,6 @@ struct ContactsView: View {
             }
             searching = false
         }
-    }
-
-    private func request() {
-        guard let found, model.sendRequest(to: found, note: note) != nil else { return }
-        note = ""
-        withAnimation(.snappy) { sent = true }
     }
 
     // MARK: Lists
@@ -374,57 +314,6 @@ private struct ContactRow: View {
         .padding(.horizontal, 14)
         .frame(minHeight: 58)
         .contentShape(.rect)
-    }
-}
-
-/// Someone's public profile: art, name, bio and handle.
-private struct ProfileCard: View {
-    @Environment(\.theme) private var theme
-    var profile: DirectoryProfile
-
-    var body: some View {
-        let tint = Signature.color(profile.color, seed: profile.fingerprint)
-        VStack(spacing: 12) {
-            VStack(spacing: -48) {
-                Banner(image: profile.banner, seed: profile.fingerprint, height: 110)
-                Avatar(image: profile.avatar, seed: profile.fingerprint, size: 96)
-                    .overlay(Circle().strokeBorder(tint, lineWidth: 3).padding(-5))
-                    .shadow(color: tint.opacity(0.6), radius: 24)
-            }
-            HStack(spacing: 6) {
-                Text(profile.name.isEmpty ? "Anonymous" : profile.name)
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(Ink.text)
-                BadgeMark(badge: profile.badge, size: 20)
-            }
-            HStack(spacing: 6) {
-                Text("@\(profile.handle)")
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(tint)
-                if profile.isCreator {
-                    Label("Creator", systemImage: "checkmark.seal.fill")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(Ink.onAccent.opacity(0.85))
-                        .padding(.horizontal, 7).padding(.vertical, 3)
-                        .background(theme.gradient, in: .capsule)
-                        .help("This handle can only belong to PULSHADE's creator")
-                }
-            }
-            if profile.badge.isModerator { ModeratorTag() }
-            if !profile.bio.isEmpty {
-                Text(LinkPreviews.linked(profile.bio))
-                    .font(.system(size: 13))
-                    .foregroundStyle(Ink.dim)
-                    .tint(tint)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 300)
-            }
-            ProfileLinkList(links: profile.links ?? [], tint: tint)
-            ProfileNoteList(notes: profile.notes ?? [], tint: tint)
-        }
-        .padding(24)
-        .frame(maxWidth: Platform.isPhone ? .infinity : 340)
-        .glass(14)
     }
 }
 

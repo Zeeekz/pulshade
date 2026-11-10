@@ -16,7 +16,7 @@ struct ProfileNoteList: View {
     var body: some View {
         let shown = ProfileNote.cleaned(notes)
         if !shown.isEmpty {
-            ExpandableCard(title: "Notes", symbol: "doc.text", count: shown.count) {
+            ExpandableCard(title: "Notes", symbol: "doc.text", count: shown.count, startsOpen: true) {
                 HStack(spacing: 6) {
                     ForEach(shown.prefix(3)) { note in
                         Image(systemName: Self.symbol(note))

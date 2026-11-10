@@ -14,14 +14,17 @@ struct ExpandableCard<Preview: View, Content: View>: View {
     var title: String
     var symbol: String
     var count: Int
+    /// Profiles show what's pinned straight away; it can still be folded away.
+    var startsOpen = false
     @ViewBuilder var preview: Preview
     @ViewBuilder var content: Content
-    @State private var open = false
+    @State private var folded: Bool?
+    private var open: Bool { !(folded ?? !startsOpen) }
 
     var body: some View {
         VStack(spacing: 0) {
             Button {
-                withAnimation(.snappy(duration: 0.32)) { open.toggle() }
+                withAnimation(.snappy(duration: 0.32)) { folded = open }
             } label: {
                 HStack(spacing: 10) {
                     Image(systemName: symbol).font(.system(size: 14, weight: .semibold)).foregroundStyle(theme.accent).frame(width: 22)
@@ -71,7 +74,7 @@ struct ProfileLinkList: View {
         let socials = shown.filter { !$0.kind.isWallet }, wallets = shown.filter(\.kind.isWallet)
         if !shown.isEmpty {
             VStack(spacing: 16) {
-                if !socials.isEmpty { card("Links", socials) }
+                if !socials.isEmpty { linkTiles(socials) }
                 if !wallets.isEmpty { card("Wallets", wallets) }
             }
             .frame(maxWidth: 340)
@@ -88,8 +91,38 @@ struct ProfileLinkList: View {
         }
     }
 
+    /// Links as a grid of logos with their names, all in view, like a link page.
+    private func linkTiles(_ items: [ProfileLink]) -> some View {
+        ExpandableCard(title: "Links", symbol: "link", count: items.count, startsOpen: true) {
+            HStack(spacing: -7) {
+                ForEach(items.prefix(5)) { BrandTile(kind: $0.kind, size: 24) }
+            }
+        } content: {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 74, maximum: 100), spacing: 8)], spacing: 12) {
+                ForEach(items) { link in
+                    Button { asking = link } label: {
+                        VStack(spacing: 7) {
+                            BrandTile(kind: link.kind, size: 46)
+                                .shadow(color: tint.opacity(0.18), radius: 8, y: 3)
+                            Text(link.displayTitle)
+                                .font(.system(size: 11.5, weight: .medium))
+                                .foregroundStyle(Ink.dim)
+                                .lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .contentShape(.rect)
+                    }
+                    .buttonStyle(PressScale())
+                    .accessibilityLabel("\(link.displayTitle), \(link.subtitle)")
+                    .accessibilityHint("Opens in your browser after asking")
+                }
+            }
+            .padding(.horizontal, 10).padding(.vertical, 14)
+        }
+    }
+
     private func card(_ title: String, _ items: [ProfileLink]) -> some View {
-        ExpandableCard(title: title, symbol: title == "Wallets" ? "wallet.bifold" : "link", count: items.count) {
+        ExpandableCard(title: title, symbol: title == "Wallets" ? "wallet.bifold" : "link", count: items.count, startsOpen: true) {
             HStack(spacing: -7) {
                 ForEach(items.prefix(5)) { BrandTile(kind: $0.kind, size: 24) }
             }
@@ -309,5 +342,14 @@ struct AddLinkSheet: View {
             #endif
             .padding(.horizontal, 16)
             .frame(minHeight: 50)
+    }
+}
+
+/// Shrinks a little under the finger.
+struct PressScale: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.94 : 1)
+            .animation(.snappy(duration: 0.18), value: configuration.isPressed)
     }
 }

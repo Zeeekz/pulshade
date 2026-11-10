@@ -34,11 +34,11 @@ struct NewConversationSheet: View {
     private var chooser: some View {
         VStack(spacing: 14) {
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 14), GridItem(.flexible(), spacing: 14)], spacing: 14) {
-                ForEach(ConversationKind.allCases) { k in
+                ForEach(ConversationKind.creatable) { k in
                     KindTile(symbol: k.symbol, label: k.label) { kind = k }
                 }
+                KindTile(symbol: "link", label: "One-time link", hot: true) { burner = true }
             }
-            KindTile(symbol: "link", label: "One-time chat link", hot: true) { burner = true }
         }
     }
 
@@ -110,7 +110,7 @@ private struct KindTile: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(Ink.dim)
             }
-            .frame(maxWidth: .infinity).frame(height: hot ? 84 : 110)
+            .frame(maxWidth: .infinity).frame(height: 110)
             .glass(14)
             .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(theme.gradient.opacity(hover ? 0.7 : 0), lineWidth: 1.5))
             .scaleEffect(hover ? 1.03 : 1)
