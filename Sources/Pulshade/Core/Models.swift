@@ -87,6 +87,12 @@ struct DeviceLink: Codable {
     var awaitingHello: Bool?
     /// The handshake behind the current session, so a redelivered copy is recognised and ignored.
     var acceptedHello: Data?
+    /// When they sent that handshake, by their clock: an ask of theirs sent before it was overtaken by it and is ignored if
+    /// it turns up late, instead of replacing newer keys with ones they've moved on from.
+    var acceptedHelloAt: Date?
+    /// When this device made the ask behind the current session: an answer to an older ask that turns up afterwards is
+    /// ignored, for the same reason.
+    var sessionAskAt: Date?
     /// Their app reads framed messages (it said so on what it last sent), so big ones go to it without the base64
     /// bloat. Nil for an app from before, which gets everything the old way.
     var readsFrames: Bool?

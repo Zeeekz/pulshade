@@ -511,6 +511,8 @@ final class AppModel {
                 data.contacts[i].devices[d].earlierAsks = nil
                 data.contacts[i].devices[d].awaitingHello = nil
                 data.contacts[i].devices[d].acceptedHello = nil
+                data.contacts[i].devices[d].acceptedHelloAt = nil
+                data.contacts[i].devices[d].sessionAskAt = nil
                 data.contacts[i].devices[d].needsKeys = true
                 if let target = spareTarget(contact: i, device: d) {
                     spareTargets.append(target)
@@ -4194,14 +4196,19 @@ final class AppModel {
     static let earlierAsksKept = 3
 
     /// Takes back an ask for keys still waiting in the outbox: it was answered already, through an earlier one.
-    private func withdrawHello(contact i: Int, device d: Int) {
+    /// Whether it was: false when it has gone, or is going.
+    @discardableResult
+    private func withdrawHello(contact i: Int, device d: Int) -> Bool {
         let tag = Self.collapseTag("hello", sendID: data.contacts[i].devices[d].sendID, from: deviceID(for: data.contacts[i].persona))
+        let before = data.outbox.count
         data.outbox.removeAll { $0.collapse == tag && !sendingIDs.contains($0.id) }
+        return data.outbox.count < before
     }
 
     /// Answers a device's handshake. We speak first, so we say who we are straight away. `spare`: the ask is a spare key
     /// they left for us (see `SpareSlot`), so the answer also says which device this is, since they may not know it yet.
-    private func acceptSession(_ request: SessionInit, contact i: Int, device d: Int, spare: Bool = false) {
+    /// `sentAt`: when they sent the ask, by their clock, where it's known.
+    private func acceptSession(_ request: SessionInit, contact i: Int, device d: Int, spare: Bool = false, sentAt: Date? = nil) {
         guard let me = me(data.contacts[i].persona),
               let (session, answer) = try? Handshake.accept(request, me: me,
                                                              initiatorAgreement: data.contacts[i].agreementKey) else { return }
@@ -4214,6 +4221,8 @@ final class AppModel {
         data.contacts[i].devices[d].awaitingHello = nil
         data.contacts[i].devices[d].answeredAt = nil
         data.contacts[i].devices[d].acceptedHello = request.ephemeral
+        data.contacts[i].devices[d].acceptedHelloAt = sentAt
+        data.contacts[i].devices[d].sessionAskAt = nil
         data.contacts[i].devices[d].spareTakenAt = nil
         // New keys are in place: no more asking for them because of messages that were read with the old ones.
         unreadable[sessionKey(contact: i, device: d)] = nil
@@ -4770,6 +4779,17 @@ final class AppModel {
     private func hello(_ sentAt: Date, crossedOurs link: DeviceLink) -> Bool {
         guard link.session != nil, let answered = link.answeredAt else { return false }
         return sentAt <= answered
+    }
+
+    /// Whether a hello was sent before the one behind the keys in use: the same device asked again since (a phone that
+    /// woke and asked anew), and both asks got here, the older one last (held back on the way, or kept to read later).
+    /// Taking it would leave this side on keys the other has moved on from, and what each then wrote couldn't be read by
+    /// the other: between two people who only share a group, each saw only their own messages. Clocks here are whole
+    /// seconds, so only strictly earlier counts, and only within the time the relay keeps mail (a phone whose clock was
+    /// set back can still start over).
+    private func hello(_ sentAt: Date, overtakenIn link: DeviceLink) -> Bool {
+        guard link.session != nil, let accepted = link.acceptedHelloAt else { return false }
+        return sentAt < accepted && accepted.timeIntervalSince(sentAt) < Self.replayWindow
     }
 
     /// Whether a hello was sent before this device answered that device's spare key: it was overtaken, and taking it
@@ -5784,7 +5804,8 @@ final class AppModel {
             }
             // Sent before this device answered their spare: they drop that ask when the answer reaches them.
             if hello(opened.sentAt, crossedSpareOf: data.contacts[i].devices[d]) { return .handled }
-            acceptSession(request, contact: i, device: d)
+            if hello(opened.sentAt, overtakenIn: data.contacts[i].devices[d]) { return .handled }
+            acceptSession(request, contact: i, device: d, sentAt: opened.sentAt)
             return .handled
         case let .sessionInit(request):
             guard let d = deviceIndex(i, device) else { return .junk }
@@ -5799,7 +5820,8 @@ final class AppModel {
                 && myHandshakeWins(me: me.fingerprint, persona: persona, them: fp, theirDevice: device) {
                 return .handled
             }
-            acceptSession(request, contact: i, device: d)
+            if hello(opened.sentAt, overtakenIn: data.contacts[i].devices[d]) { return .handled }
+            acceptSession(request, contact: i, device: d, sentAt: opened.sentAt)
             return .handled
         case let .sessionAccept(answer):
             guard let d = deviceIndex(i, device) else { return .junk }
@@ -5813,10 +5835,20 @@ final class AppModel {
             if link.handshake?.publicEphemeral != answer.replyTo {
                 // Never older than the answer behind the keys in use.
                 if link.session != nil, let answered = link.answeredAt, opened.sentAt < answered { return .junk }
-                // The newer ask isn't needed now: taken back if it hasn't gone, and its answer still counts if it has.
-                if let newer = link.handshake {
-                    keepEarlierAsk(newer, contact: i, device: d)
-                    withdrawHello(contact: i, device: d)
+                // Nor to an ask older than the one behind them: their side took the newer ask (see `hello(_:overtakenIn:)`),
+                // and these keys would be ones they've moved on from. The two answers can arrive either way round.
+                if link.session != nil, let askAt = link.sessionAskAt, pending.startedAt < askAt { return .junk }
+                // The newer ask isn't needed now if it hasn't gone: taken back.
+                if link.handshake != nil, !withdrawHello(contact: i, device: d) {
+                    // It has gone, so they'll answer it too and move to the keys it opens, dropping these. Anything
+                    // written on these meanwhile would reach them after they'd moved (and, with Pulshade closed in
+                    // between, could never be read). So these are only read from, for what they wrote on them, and
+                    // what this device has to say waits for the answer to the newer ask.
+                    keepRecovered(session, sessionKey(contact: i, device: d))
+                    data.contacts[i].devices[d].earlierAsks?.removeAll { $0.publicEphemeral == answer.replyTo }
+                    if data.contacts[i].devices[d].earlierAsks?.isEmpty == true { data.contacts[i].devices[d].earlierAsks = nil }
+                    heard(contact: i, device: d)
+                    return .handled
                 }
             }
             data.contacts[i].devices[d].earlierAsks?.removeAll { $0.publicEphemeral == answer.replyTo }
@@ -5826,6 +5858,8 @@ final class AppModel {
             data.contacts[i].devices[d].session = session
             data.contacts[i].devices[d].handshake = nil
             data.contacts[i].devices[d].needsKeys = nil
+            data.contacts[i].devices[d].sessionAskAt = pending.startedAt
+            data.contacts[i].devices[d].acceptedHelloAt = nil
             heard(contact: i, device: d)
             // When they answered, by their clock: a hello of theirs sent before that crossed ours (see `hello(_:crossedOurs:)`).
             data.contacts[i].devices[d].answeredAt = opened.sentAt
@@ -5876,6 +5910,8 @@ final class AppModel {
             if let old = data.contacts[i].devices[d].session { keepRecovered(old, sessionKey(contact: i, device: d)) }
             data.contacts[i].devices[d].spareTakenAt = nil
             data.contacts[i].devices[d].session = session
+            data.contacts[i].devices[d].sessionAskAt = nil
+            data.contacts[i].devices[d].acceptedHelloAt = nil
             data.contacts[i].devices[d].handshake = nil
             data.contacts[i].devices[d].earlierAsks = nil
             data.contacts[i].devices[d].needsKeys = nil
