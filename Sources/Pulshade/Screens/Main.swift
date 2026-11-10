@@ -479,6 +479,10 @@ private struct ChatList: View {
     @Binding var section: Section
     @State private var filter: ConversationKind?
     @State private var search = ""
+    /// Bumped by Return in the search field, which looks the typed @handle up.
+    @State private var searchSubmitted = 0
+    @FocusState private var searchFocused: Bool
+    private var searching: Bool { !search.trimmingCharacters(in: .whitespaces).isEmpty }
     @State private var composing = false
     /// The story camera and viewer are shown from here, not from the story strip: it sits in a lazy list whose rows
     /// SwiftUI throws away and rebuilds, and whatever they were showing went with them.
@@ -553,18 +557,29 @@ private struct ChatList: View {
                 LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
                     VStack(spacing: 0) {
                         searchField
-                        StoryStrip(composing: $composingStory, viewing: $viewingStory)
-                            .padding(.vertical, 12)
-                            .onGeometryChange(for: CGRect.self) { $0.frame(in: .named("chatlist")) } action: { stripBox.rect = $0 }
+                        // While searching, the results take the place of stories and filters, as in Telegram.
+                        if !searching {
+                            StoryStrip(composing: $composingStory, viewing: $viewingStory)
+                                .padding(.vertical, 12)
+                                .onGeometryChange(for: CGRect.self) { $0.frame(in: .named("chatlist")) } action: { stripBox.rect = $0 }
+                        }
                     }
-                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { storiesHeight = $0 }
-                    SwiftUI.Section {
-                        rows
-                    } header: {
-                        FilterChips(filter: $filter)
-                            .padding(.horizontal, 16)
-                            .padding(.bottom, 8)
-                            .background(Ink.base)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { storiesHeight = searching ? 0 : $0 }
+                    if searching {
+                        ChatSearchResults(query: search, submitted: searchSubmitted) { id in
+                            selection = id
+                            if Platform.isPhone { search = ""; searchFocused = false }
+                        }
+                        .padding(.top, 4)
+                    } else {
+                        SwiftUI.Section {
+                            rows
+                        } header: {
+                            FilterChips(filter: $filter)
+                                .padding(.horizontal, 16)
+                                .padding(.bottom, 8)
+                                .background(Ink.base)
+                        }
                     }
                 }
             }
@@ -629,16 +644,49 @@ private struct ChatList: View {
         }
     }
 
+    /// A rounded bar, as in Telegram. It searches chats, contacts and messages, and finds anyone by @handle.
     private var searchField: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass").font(.system(size: 12)).foregroundStyle(Ink.faint)
-            TextField("", text: $search, prompt: Text("Search").foregroundStyle(Ink.faint))
-                .textFieldStyle(.plain)
-                .font(.system(size: 13))
+        HStack(spacing: 10) {
+            HStack(spacing: 7) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: Platform.isPhone ? 15 : 12, weight: .medium))
+                    .foregroundStyle(Ink.faint)
+                TextField("", text: $search, prompt: Text("Search chats, people or @handle").foregroundStyle(Ink.faint))
+                    .textFieldStyle(.plain)
+                    .font(.system(size: Platform.isPhone ? 16 : 13))
+                    .foregroundStyle(Ink.text)
+                    .focused($searchFocused)
+                    .submitLabel(.search)
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    #endif
+                    .onSubmit { searchSubmitted += 1 }
+                if !search.isEmpty {
+                    Button { search = "" } label: {
+                        Image(systemName: "xmark.circle.fill").font(.system(size: Platform.isPhone ? 15 : 12))
+                            .foregroundStyle(Ink.faint)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Clear search")
+                }
+            }
+            .padding(.horizontal, 12)
+            .frame(height: Platform.isPhone ? 38 : 30)
+            .background(Ink.raised, in: .capsule)
+            .contentShape(.capsule)
+            .onTapGesture { searchFocused = true }
+            if Platform.isPhone && (searchFocused || searching) {
+                Button("Cancel") {
+                    withAnimation(.snappy(duration: 0.25)) { search = ""; searchFocused = false }
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 16))
+                .foregroundStyle(theme.accent)
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
         }
-        .padding(.horizontal, 10)
-        .frame(height: 30)
-        .background(Ink.raised, in: .rect(cornerRadius: 8))
+        .animation(.snappy(duration: 0.25), value: searchFocused)
         .padding(.horizontal, 16)
     }
 
@@ -722,7 +770,7 @@ private struct FilterChips: View {
     }
 }
 
-private struct ChatRow: View {
+struct ChatRow: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     var conversation: Conversation
