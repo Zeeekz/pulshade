@@ -972,7 +972,7 @@ private struct BackupSettings: View {
 
     var body: some View {
         SettingsScreen(title: "Backup & keys", back: "Privacy") {
-            SettingsGroup("Backup", footer: "A sealed copy of your profile, contacts, groups and settings (never chats) on the relay. Only your recovery code opens it. Off erases it.") {
+            SettingsGroup("Backup", footer: "A sealed copy of your profile, contacts, groups, settings and chat keys (never messages) on the relay. Only your recovery code opens it. Off erases it.") {
                 SettingRow("Keep a sealed backup") {
                     Toggle("Keep a sealed backup", isOn: Binding(get: { model.data.security.keepBackup },
                                              set: { v in withAnimation(.snappy) { model.setKeepBackup(v) } }))

@@ -1005,7 +1005,7 @@ struct PrivacyChoice: View {
                 }
                 group("Links & backup") {
                     toggle("Link previews", $s.linkPreviews, "Builds a preview when you send a link, which visits the website from your connection.")
-                    toggle("Sealed backup", $s.keepBackup, "A sealed copy of your profile, contacts and groups (never chats) that only your recovery code opens.")
+                    toggle("Sealed backup", $s.keepBackup, "A sealed copy of your profile, contacts, groups and chat keys (never messages) that only your recovery code opens.")
                 }
                 group("Notifications") {
                     toggle("Notifications", $s.notifications, "Banners for new messages.")

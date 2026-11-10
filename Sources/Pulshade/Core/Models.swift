@@ -1156,7 +1156,7 @@ struct SecuritySettings: Codable, Equatable {
     /// about switching it off can truthfully say.
     var torSince: Date?
     var torFromStart = false
-    /// Keep a sealed copy of your profile, contacts, groups, handles and settings (never chats) on the relay, so Detach
+    /// Keep a sealed copy of your profile, contacts, groups, handles, settings and chat keys (never messages) on the relay, so Detach
     /// can be an instant wipe and your recovery code still brings them back. The relay can't open it.
     var keepBackup = true
     /// Let the notification helper take short mail off the relay while this iPhone is locked, and give friends their
