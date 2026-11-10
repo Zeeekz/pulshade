@@ -120,6 +120,10 @@ enum EnvelopeCore {
     static func paddedSize(of count: Int) -> Int {
         buckets.first { $0 >= count + 4 } ?? 0
     }
+
+    /// The same padding, for group envelopes (see `GroupSeal`).
+    static func padded(_ data: Data) -> Data { pad(data) }
+    static func unpadded(_ data: Data) -> Data? { try? unpad(data) }
 }
 
 /// A short description followed by raw bytes: `0`, the description's length (4 bytes, big-endian), the description,
