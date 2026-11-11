@@ -5,6 +5,18 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 config=${1:-release}
+
+# A release build must name its relay. Without one the app would fall back to this Mac and leave Tor off by default,
+# which is the anonymity failure the setting exists to prevent.
+relay=""
+[[ -f relay/pulshade-onion/hostname ]] && relay="http://$(cat relay/pulshade-onion/hostname)"
+if [[ "$config" != "debug" ]]; then
+  case "$relay" in
+    http://?*|https://?*) ;;
+    *) echo "No usable relay: relay/pulshade-onion/hostname is missing. A release build would have no relay." >&2; exit 1 ;;
+  esac
+fi
+
 [[ -n ${PULSHADE_SKIP_TOR_BUILD:-} ]] || # PULSHADE_SKIP_TOR_BUILD=1 uses Tor as last built, when tor/ hasn't changed since.
 [[ -n ${PULSHADE_SKIP_TOR_BUILD:-} ]] || ./scripts/build-tor.sh
 swift build -c "$config"
@@ -49,7 +61,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
     <key>NSMicrophoneUsageDescription</key><string>Record voice notes, videos and make calls. Audio is encrypted before it leaves your Mac.</string>
     <key>NSRequiresAquaSystemAppearance</key><false/>
     <key>LSApplicationCategoryType</key><string>public.app-category.social-networking</string>
-    <key>PulshadeRelay</key><string>$(sed 's|^|http://|' relay/pulshade-onion/hostname 2>/dev/null)</string>
+    <key>PulshadeRelay</key><string>${relay}</string>
     <key>PulshadeRelayDirect</key><string>${PULSHADE_RELAY_DIRECT:-$(cat relay/direct-address 2>/dev/null)}</string>
     <key>PulshadeRelayPin</key><string>${PULSHADE_RELAY_PIN:-$(cat relay/relay-pin 2>/dev/null)}</string>
     <key>PulshadeAdminKey</key><string>$(cat relay/admin-key.pub 2>/dev/null)</string>

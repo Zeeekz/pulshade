@@ -46,12 +46,17 @@ enum RelayClock {
     /// A time by the relay's clock, as this device's clock shows it.
     static func local(_ date: Date) -> Date { date.addingTimeInterval(-lock.withLock { offset }) }
 
+    /// A relay can correct a clock that is wrong, but not by an unbounded amount: a hostile relay must not be able
+    /// to date messages months away, expiring everything or bringing old disappearing messages back.
+    private static let maxSkew: TimeInterval = 7 * 86_400
+
     /// Notes the relay's time from a response. The header is to the second, so small differences are left alone.
     static func note(_ response: URLResponse) {
         guard let header = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Date"),
               let theirs = lock.withLock({ format.date(from: header) }) else { return }
         let measured = theirs.timeIntervalSinceNow
-        lock.withLock { if abs(measured - offset) > 2 { offset = abs(measured) > 2 ? measured : 0 } }
+        let bounded = min(max(measured, -maxSkew), maxSkew)
+        lock.withLock { if abs(bounded - offset) > 2 { offset = abs(bounded) > 2 ? bounded : 0 } }
     }
 }
 

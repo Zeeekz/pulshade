@@ -167,7 +167,17 @@ enum Tor {
         let files = FileManager.default
         let (state, cache) = paths()
         for var dir in [state, cache] {
-            try? files.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            var attributes: [FileAttributeKey: Any] = [.posixPermissions: 0o700]
+            #if os(iOS)
+            // Tor runs while the phone is locked, but only after its first unlock since boot. Its guard state and
+            // relay lists are network metadata, and shouldn't be readable before that.
+            attributes[.protectionKey] = FileProtectionType.completeUntilFirstUserAuthentication
+            #endif
+            try? files.createDirectory(at: dir, withIntermediateDirectories: true, attributes: attributes)
+            #if os(iOS)
+            try? files.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                                     ofItemAtPath: dir.path)
+            #endif
             var values = URLResourceValues()
             values.isExcludedFromBackup = true
             try? dir.setResourceValues(values)

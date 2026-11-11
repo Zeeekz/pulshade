@@ -2,6 +2,7 @@
 import AppKit
 import CryptoKit
 import Foundation
+import Security
 
 /// A Mac release published on the relay by the operator.
 struct Release: Decodable, Equatable, Sendable {
@@ -149,7 +150,46 @@ final class Updater {
               info["CFBundleVersion"] as? String == String(release.build) else {
             throw CocoaError(.fileReadCorruptFile)
         }
+        try verifySignature(of: app)
         return app
+    }
+
+    /// The release key and its signed SHA-256 prove the archive came from the operator. This proves the app inside
+    /// is a validly signed app with this app's bundle identifier, and (when this build carries a Developer ID team)
+    /// that it is anchored in Apple's trust store and signed by the same team: not something repackaged on the way.
+    /// A build that is only ad hoc signed has no team to anchor to, so there the signature and identifier are what
+    /// can be checked without breaking self-updates. (Notarization is left to Gatekeeper when the replacement opens.)
+    nonisolated private static func verifySignature(of app: URL) throws {
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(app as CFURL, [], &code) == errSecSuccess, let code else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        var clauses: [String] = []
+        if let team = signingTeam {
+            clauses.append("anchor apple generic")
+            clauses.append("certificate leaf[subject.OU] = \"\(team)\"")
+        }
+        if let identifier = Bundle.main.bundleIdentifier {
+            clauses.append("identifier \"\(identifier)\"")
+        }
+        guard !clauses.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
+        var requirement: SecRequirement?
+        guard SecRequirementCreateWithString(clauses.joined(separator: " and ") as CFString, [], &requirement) == errSecSuccess,
+              let requirement,
+              SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSCheckAllArchitectures), requirement) == errSecSuccess else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+    }
+
+    /// This app's Developer ID team, when it is signed with one. A build signed ad hoc has none, and the update is
+    /// then checked for a valid signature and the same bundle identifier, but no team or Apple anchor is compared.
+    nonisolated private static var signingTeam: String? {
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(Bundle.main.bundleURL as CFURL, [], &code) == errSecSuccess, let code else { return nil }
+        var information: CFDictionary?
+        guard SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
+              let info = information as? [String: Any] else { return nil }
+        return info[kSecCodeInfoTeamIdentifier as String] as? String
     }
 
     /// Quits, and opens the new app once this one has gone.

@@ -1417,7 +1417,18 @@ struct AppData: Codable {
         if let test = Invite.validRelay(ProcessInfo.processInfo.environment["PULSHADE_TEST_RELAY"]) { return test }
         #endif
         let configured = Bundle.main.object(forInfoDictionaryKey: "PulshadeRelay") as? String
+        #if DEBUG
         return Invite.validRelay(configured) ?? "http://127.0.0.1:7878"
+        #else
+        if let relay = Invite.validRelay(configured) { return relay }
+        // A release app bundle with no usable relay would fall back to this Mac and leave Tor off by default: the
+        // exact anonymity failure this setting exists to prevent. Stop rather than quietly connect direct. (A test
+        // run or a command-line binary has no `.app` bundle; it keeps the local fallback.)
+        guard Bundle.main.bundleURL.pathExtension != "app" else {
+            preconditionFailure("PulshadeRelay is missing or invalid in this build")
+        }
+        return "http://127.0.0.1:7878"
+        #endif
     }
 
     /// Tolerates fields added after a vault was written.

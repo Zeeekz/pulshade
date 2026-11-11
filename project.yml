@@ -35,6 +35,19 @@ targets:
       - sdk: libresolv.tbd
       # The notification helper (two ticks while the phone is locked), carried inside the app.
       - target: PulshadeNotify
+    # A Release build with no relay would fall back to this Mac and leave Tor off by default. Fail before compiling.
+    preBuildScripts:
+      - name: Check relay
+        basedOnDependencyAnalysis: false
+        script: |
+          if [ "$CONFIGURATION" = "Release" ] && [ -z "$PULSHADE_RELAY" ]; then
+            echo "error: PULSHADE_RELAY is empty; a release build must name its relay."
+            exit 1
+          fi
+          case "$PULSHADE_RELAY" in
+            ""|http://?*|https://?*) ;;
+            *) echo "error: PULSHADE_RELAY must be an http(s) URL: $PULSHADE_RELAY"; exit 1 ;;
+          esac
     # Push: Xcode swaps "development" for "production" when it signs a build for TestFlight or the App Store.
     entitlements:
       path: ios/Pulshade.entitlements
