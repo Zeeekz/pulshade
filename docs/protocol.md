@@ -103,7 +103,9 @@ After the handshake, each pair of devices talks through a Double Ratchet, as Sig
 - Primitives: HKDF-SHA256 for the root step, HMAC-SHA256 for the chain, ChaCha20-Poly1305 for the message. Each message
   key is stretched into a cipher key and nonce, and used for exactly one message. The session's fixed data (both
   long-term agreement keys) and the message header (ratchet public key, chain length, position) are authenticated, so a
-  message cannot be moved into another pair's session or have its header altered.
+  message cannot be moved into another pair's session or have its header altered. Once both sides are on a build that
+  says so (a version number in the header), the ML-KEM offer and answer a message carries are authenticated too; until
+  then they are protected only by being mixed into the root key, and a conversation with an older build stays that way.
 - **Out of order:** up to 1,000 missed messages can be skipped over, and up to 2,000 spare keys are kept to open late
   arrivals. A message that fails to open never changes the saved state (it is tried on a copy).
 - **Post-quantum refresh:** the handshake gives quantum resistance at the start. After **50 messages or 24 hours** a side

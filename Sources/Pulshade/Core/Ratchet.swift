@@ -16,9 +16,24 @@ struct RatchetHeader: Codable, Equatable {
     /// whose root it was mixed into.
     var kemCiphertext: Data? = nil
 
-    /// The ML-KEM fields stay out of this, so builds from before them still read every message. They're
-    /// bound anyway: both go into the root key, so a changed one leaves nothing that opens.
+    /// What this message's sender understands. Nil: a build from before the binding. 1: it reads messages whose
+    /// ML-KEM fields are authenticated, and this one is still sealed the old way, because the other side may not.
+    /// 2: this message is sealed with the ML-KEM fields (and this number) authenticated.
+    var v: UInt8? = nil
+
+    /// The old form: the ML-KEM fields stay out of this, so builds from before them still read every message.
+    /// An answer is still bound through the root key, so a changed one leaves nothing that opens.
     var bytes: Data { dh + n32(pn) + n32(n) }
+
+    /// The form for `v == 2`: everything above, plus the version and both ML-KEM fields, so a changed offer or
+    /// answer fails right here rather than being mixed into the session.
+    var boundBytes: Data {
+        Data("pulshade.ratchet.bound".utf8) + bytes + Data([v ?? 0])
+            + Data(SHA256.hash(data: kem ?? Data())) + Data(SHA256.hash(data: kemCiphertext ?? Data()))
+    }
+
+    /// What goes into the message's AEAD, for the form it says it is in.
+    var authenticated: Data { (v ?? 0) >= 2 ? boundBytes : bytes }
 }
 
 struct RatchetMessage: Codable, Equatable {
@@ -64,6 +79,10 @@ struct Ratchet: Codable {
     /// When a post-quantum secret last went into the root, and messages since.
     private var pqAt: Date?
     private var pqMessages: UInt32?
+    /// Whether the other side's latest message said it reads authenticated ML-KEM fields (`RatchetHeader.v`).
+    /// Until it has, everything is sealed the old way; after it, the new way. Sessions saved before this load
+    /// as nil and start the old way.
+    private var peerBinds: Bool?
 
     private struct Skipped: Codable {
         var dh: Data
@@ -120,10 +139,11 @@ struct Ratchet: Codable {
         }
         let (next, mk) = Self.kdfChain(ck)
         cks = next
-        let header = RatchetHeader(dh: try Self.publicKey(dhs), pn: pn, n: ns, kem: kemPublic, kemCiphertext: kemCiphertextOut)
+        let header = RatchetHeader(dh: try Self.publicKey(dhs), pn: pn, n: ns, kem: kemPublic, kemCiphertext: kemCiphertextOut,
+                                   v: peerBinds == true ? 2 : 1)
         ns += 1
         pqMessages = (pqMessages ?? 0) + 1
-        return RatchetMessage(header: header, ciphertext: try Self.seal(plaintext, key: mk, ad: ad + header.bytes))
+        return RatchetMessage(header: header, ciphertext: try Self.seal(plaintext, key: mk, ad: ad + header.authenticated))
     }
 
     /// Works on a copy, so a forged or garbled message never damages the real state.
@@ -149,7 +169,10 @@ struct Ratchet: Codable {
         s.ckr = next
         s.nr += 1
         s.pqMessages = (s.pqMessages ?? 0) + 1
-        let plain = try Self.open(message.ciphertext, key: mk, ad: ad + message.header.bytes)
+        let plain = try Self.open(message.ciphertext, key: mk, ad: ad + message.header.authenticated)
+        // Only a message that opened counts, and only the newest chain's: a late one from before the other side
+        // updated says nothing about it now.
+        s.peerBinds = (message.header.v ?? 0) >= 1
         self = s
         return plain
     }
@@ -159,7 +182,7 @@ struct Ratchet: Codable {
     private mutating func openSkipped(_ message: RatchetMessage) throws -> Data? {
         guard let i = skipped.firstIndex(where: { $0.dh == message.header.dh && $0.n == message.header.n }) else { return nil }
         let key = skipped.remove(at: i).key
-        return try Self.open(message.ciphertext, key: key, ad: ad + message.header.bytes)
+        return try Self.open(message.ciphertext, key: key, ad: ad + message.header.authenticated)
     }
 
     /// Keeps keys for messages that haven't arrived yet, so they can still be read out of order.
