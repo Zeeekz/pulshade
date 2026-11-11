@@ -331,7 +331,8 @@ struct GroupKeysTests {
         let staff = [owner, admin].map { MemberCard.make($0, group: group, name: "s", avatar: nil, color: nil) }
         let a = MemberCard.make(follower, group: group, name: "", avatar: nil, color: nil)
         let b = MemberCard.make(other, group: group, name: "", avatar: nil, color: nil)
-        let t0 = Date()
+        // Whole seconds: dates are written to the millisecond, so a finer one wouldn't come back equal.
+        let t0 = Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down))
         let one = GroupRoster.Body(entries: [.init(card: a, added: t0)], removed: [])
         let two = GroupRoster.Body(entries: [.init(card: b, added: t0.addingTimeInterval(1))], removed: [])
         let roster = try #require(GroupRoster.make(one, group: group, epoch: 1, staff: staff, keys: owner))
