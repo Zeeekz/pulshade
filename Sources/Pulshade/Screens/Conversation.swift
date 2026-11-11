@@ -2097,22 +2097,13 @@ private struct ConversationInfo: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
-        } else if c.amOwner {
-            Card(title: "Group format") {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("This group sends each member their own copy of every message, so it's limited to 300 people. The new format posts each message once, holds up to 5,000 people and gives each member a key used only in this group.")
-                        .font(.system(size: 12)).foregroundStyle(Ink.dim)
-                    if model.canUpgrade(c) {
-                        Button { model.upgradeToSharedMailbox(c.id) } label: {
-                            Text("Move to the new format").font(.system(size: 12, weight: .semibold))
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(theme.accent)
-                    } else {
-                        Text("Everyone here needs a newer Pulshade first.").font(.system(size: 12)).foregroundStyle(Ink.faint)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+        } else if c.amOwner, !model.holdingBackNewFormat(c).isEmpty {
+            // Older-style groups move to the new format by themselves once everyone's app can take part.
+            let names = model.holdingBackNewFormat(c).map { model.displayName($0) }
+            Card(title: "Group") {
+                Text("Moves to the new format when \(AppModel.list(names)) \(names.count == 1 ? "updates" : "update") Pulshade.")
+                    .font(.system(size: 12)).foregroundStyle(Ink.dim)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
     }
@@ -2164,6 +2155,18 @@ private struct ConversationInfo: View {
             }
             ForEach(people, id: \.self) { fp in
                 personRow(name: model.displayName(fp), fp: fp, c: c, avatar: model.contact(fp, in: c.persona)?.avatar, seed: fp)
+            }
+            // Added, but their app is too old to take part yet: invited as soon as it can.
+            ForEach(model.contactsAwaitingUpdate(in: c), id: \.self) { fp in
+                HStack(spacing: 10) {
+                    Avatar(image: model.contact(fp, in: c.persona)?.avatar, seed: fp, size: 28)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(model.displayName(fp)).font(.system(size: 13)).foregroundStyle(Ink.text).lineLimit(1)
+                        Text("Added · joins once they update Pulshade").font(.system(size: 10)).foregroundStyle(Ink.faint)
+                    }
+                    Spacer()
+                }
+                .padding(.vertical, 3)
             }
             // Added, but their app hasn't answered yet: in the group already as far as you're concerned.
             ForEach(model.contactsInvited(to: c), id: \.self) { fp in

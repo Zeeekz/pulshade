@@ -1543,7 +1543,8 @@ final class AppModel {
             return existing
         }
         let name = kind == .direct ? (contact(members.first ?? "", in: owner)?.displayName ?? displayName(members.first ?? "")) : title
-        if canShareMailbox(members, persona: owner, kind: kind), let shared = startSharedGroup(title: name, members: members, avatar: avatar, persona: owner) {
+        // Groups always share one mailbox now. Anyone whose app can't take part yet is invited once it can.
+        if kind == .group, sharedGroupsEnabled, let shared = startSharedGroup(title: name, members: members, avatar: avatar, persona: owner) {
             return shared
         }
         var convo = Conversation(kind: kind, title: name, avatar: avatar, members: members)
@@ -5363,6 +5364,7 @@ final class AppModel {
     private func housekeep() async {
         drainHelperInbox()
         tendSharedGroups()
+        moveGroupsOver()
         tendJoinLinks()
         tendStoryUpload()
         refreshPush()
@@ -8437,6 +8439,25 @@ extension AppModel {
         !contact.devices.isEmpty && contact.devices.allSatisfy { $0.readsSharedGroups == true }
     }
 
+    /// Your contacts added to a shared group whose app is too old to take part yet.
+    func contactsAwaitingUpdate(in convo: Conversation) -> [String] {
+        guard let waiting = convo.shared?.awaitingUpdate, convo.shared?.gone == false else { return [] }
+        return waiting.sorted { $0.value < $1.value }.map(\.key).filter { contact($0, in: convo.persona) != nil }
+    }
+
+    /// In an older-style group you own: the members whose app can't take part in the new format yet, so it can't move.
+    func holdingBackNewFormat(_ convo: Conversation) -> [String] {
+        guard convo.kind == .group, convo.amOwner, convo.shared == nil else { return [] }
+        return convo.members.filter { fp in contact(fp, in: convo.persona).map(takesSharedGroups) != true }
+    }
+
+    /// The owner's phone moves its older-style groups to the new format by itself, one at a time, as soon as everyone
+    /// in each one can take part.
+    func moveGroupsOver() {
+        guard sharedGroupsEnabled else { return }
+        if let convo = data.conversations.first(where: { canUpgrade($0) }) { upgradeToSharedMailbox(convo.id) }
+    }
+
     /// Your contacts invited to a shared group whose app hasn't answered yet, oldest first.
     func contactsInvited(to convo: Conversation) -> [String] {
         guard let shared = convo.shared, !shared.gone else { return [] }
@@ -8504,8 +8525,17 @@ extension AppModel {
         guard var shared = data.conversations[i].shared, !shared.gone, let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID),
               shared.settings.isAdmin(keys.publicKey) else { return }
         let persona = data.conversations[i].persona
-        let people = fingerprints.compactMap { contact($0, in: persona) }.filter(takesSharedGroups)
-        guard !people.isEmpty else { return }
+        let everyone = fingerprints.compactMap { contact($0, in: persona) }
+        let people = everyone.filter(takesSharedGroups)
+        // Their app can't take part yet: invited as soon as it can.
+        let later = everyone.filter { !takesSharedGroups($0) && shared.invited[$0.fingerprint] == nil }
+        if !later.isEmpty {
+            var waiting = shared.awaitingUpdate ?? [:]
+            for person in later { waiting[person.fingerprint] = waiting[person.fingerprint] ?? Date() }
+            shared.awaitingUpdate = waiting
+            data.conversations[i].shared = shared
+        }
+        guard !people.isEmpty else { save(); return }
         let room = GroupSettings.maxMembers - shared.settings.members.count - shared.invited.count
         guard room > 0 else { return }
         if shared.chatInEpoch {
@@ -8516,6 +8546,7 @@ extension AppModel {
         guard let epoch = shared.current else { return }
         let added = Array(people.prefix(room))
         for person in added {
+            shared.awaitingUpdate?[person.fingerprint] = nil
             shared.invited[person.fingerprint] = Date()
             shared.invitedEpoch[person.fingerprint] = epoch.number
             enqueue(.groupInvite(GroupInvite(settings: shared.settings, epoch: epoch)), to: person)
@@ -8941,6 +8972,14 @@ extension AppModel {
             }
             for (fp, at) in shared.invited where now.timeIntervalSince(at) > Self.inviteLife {
                 cancelInvite(fp, in: data.conversations[i].id)
+            }
+            // Someone added before their app could take part: invited now that it can (or let go after a month).
+            if let waiting = shared.awaitingUpdate, !waiting.isEmpty, shared.settings.isAdmin(keys.publicKey) {
+                let persona = data.conversations[i].persona
+                let ready = waiting.keys.filter { fp in contact(fp, in: persona).map(takesSharedGroups) == true }
+                let stale = waiting.filter { now.timeIntervalSince($0.value) > 30 * 86_400 }.map(\.key)
+                for fp in stale { data.conversations[i].shared?.awaitingUpdate?[fp] = nil }
+                if !ready.isEmpty { invite(ready, at: i) }
             }
             // Once in, and in each new epoch while the group is small, this device posts its card with its picture, so
             // members (and newcomers) can show it. In a big group only when the picture changes.

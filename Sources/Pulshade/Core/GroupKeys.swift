@@ -498,6 +498,9 @@ struct SharedGroup: Codable, Equatable {
     var gone = false
     /// As an admin: people invited over a 1:1 chat whose card hasn't come back yet, by account fingerprint.
     var invited: [String: Date] = [:]
+    /// As an admin: people added whose app is too old to take part yet, by account fingerprint, with when. Each is
+    /// invited as soon as their app says it can.
+    var awaitingUpdate: [String: Date]?
     /// As an admin: who joined through this device, by account fingerprint, as which member. Only on this device:
     /// nobody else in the group learns who a member is outside it.
     var knownAs: [String: String] = [:]

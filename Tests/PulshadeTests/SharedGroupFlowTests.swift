@@ -234,6 +234,48 @@ struct SharedGroupFlowTests {
         #expect(alice.conversation(group.id).map { alice.contactsInvited(to: $0) }?.isEmpty == true)
     }
 
+    /// An older-style group moves to the new format on its own once everyone in it can take part: no button, same chat.
+    @Test func anOlderGroupMovesOverByItself() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        alice.sharedGroupsEnabled = false
+        let group = alice.startConversation(kind: .group, title: "Old", members: [bobFP, caraFP])
+        #expect(group.shared == nil)
+        await until([alice, bob, cara]) { bob.conversation(group.id)?.members.count == 2 && cara.conversation(group.id)?.members.count == 2 }
+        alice.send("before", in: group.id)
+        await until([alice, bob, cara]) { cara.conversation(group.id)?.messages.contains { $0.text == "before" } == true }
+        alice.sharedGroupsEnabled = true
+        await until([alice, bob, cara]) {
+            alice.conversation(group.id)?.shared != nil && bob.conversation(group.id)?.shared?.joining == false
+                && cara.conversation(group.id)?.shared?.joining == false
+        }
+        #expect(alice.conversation(group.id)?.shared != nil, "moved without anyone pressing anything")
+        #expect(cara.conversation(group.id)?.messages.contains { $0.text == "before" } == true, "the chat is kept")
+        bob.send("after", in: group.id)
+        await until([alice, bob, cara]) { cara.conversation(group.id)?.messages.contains { $0.text == "after" } == true }
+        #expect(cara.conversation(group.id)?.messages.contains { $0.text == "after" } == true)
+    }
+
+    /// A new group is always the new format. Someone whose app can't take part yet is added once it can.
+    @Test func someoneOnAnOlderAppIsAddedOnceTheyUpdate() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        // Alice's phone thinks Cara's app is from before groups that share a mailbox.
+        let ci = try #require(alice.data.contacts.firstIndex { $0.fingerprint == caraFP })
+        for d in alice.data.contacts[ci].devices.indices { alice.data.contacts[ci].devices[d].readsSharedGroups = nil }
+        let group = alice.startConversation(kind: .group, title: "New", members: [bobFP, caraFP])
+        #expect(group.shared != nil, "new format whatever")
+        let aliceGroup = try #require(alice.conversation(group.id))
+        #expect(alice.contactsAwaitingUpdate(in: aliceGroup) == [caraFP])
+        #expect(alice.contactsInvited(to: aliceGroup) == [bobFP])
+        // Cara "updates": her app's next message says it can.
+        let caraChat = try #require(cara.data.conversations.first { $0.kind == .direct })
+        cara.send("updated", in: caraChat.id)
+        await until([alice, bob, cara]) { cara.conversation(group.id)?.shared?.joining == false && bob.conversation(group.id)?.shared?.joining == false }
+        #expect(cara.conversation(group.id)?.shared?.joining == false, "in once her app could")
+        #expect(alice.conversation(group.id).map { alice.contactsAwaitingUpdate(in: $0) }?.isEmpty == true)
+    }
+
     @Test func someoneTakenOutCantReadWhatFollows() async throws {
         let (alice, bob, cara, bobFP, caraFP) = try await trio()
         defer { for m in [alice, bob, cara] { m.lock() } }
