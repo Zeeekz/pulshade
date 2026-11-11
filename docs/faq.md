@@ -127,6 +127,17 @@ several people individually. All of them are sent as sealed envelopes, one per m
 Only the audience you choose, for the length you choose. You can edit it after posting, see who viewed it (the views
 are encrypted like messages) and delete it. A story you delete or that expires is gone from every unmodified app.
 
+**Do I keep my friends' stories if I Detach and log back in?**
+Yes, for the ones still up, as long as your friend's app is on a recent version. Stories live only on your device, like
+chats: a friend's story reaches you once, as an encrypted message, and Detach wipes it with the rest of the device. The
+sealed backup never holds stories, so nothing is kept on the relay for you. Instead, when you log back in your app asks
+each friend to send you the stories they still have up, to the people each one is shared with, and they arrive again as
+soon as the new chat keys are ready. A friend on an older version ignores the request, so you see only what they post
+next. Your own stories are cleared by Detach, and ones that have run out are gone for good.
+
+A story a friend posts *while you are logged out* arrives the same way after you are back, because it is sent again; you
+don't lose it. Other mail sent in that time is lost, since the backup holds no chat keys.
+
 ## Files and media
 
 **How big can a file be?**

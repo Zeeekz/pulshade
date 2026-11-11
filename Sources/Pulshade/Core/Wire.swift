@@ -185,6 +185,10 @@ enum Payload: Codable, Equatable {
     /// Every story the sender had up is taken back, when their device was wiped (Detach) and doesn't remember which
     /// they were. Builds from before can't read it and leave it, so their copies run out with the day.
     case storiesCleared
+    /// The sender's account was recovered on a device that has none of the stories it had seen (Detach wipes them, and a
+    /// backup never holds stories): send the ones you still have up for them again, to the people each is shared with.
+    /// Apps from before ignore it, and the stories then come only as their authors post new ones.
+    case storiesWanted
     /// The sender viewed this story of yours. The author's app answers every one with `storyViewedAck`, so a
     /// viewer that gets no answer can try again.
     case storyViewed(id: UUID)

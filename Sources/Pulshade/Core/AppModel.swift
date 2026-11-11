@@ -460,6 +460,11 @@ final class AppModel {
         // Recovered from the sealed backup, with no chats: anyone still holding their side of one is told to clear
         // it, in case the device this came from was wiped (Detach) before it could say so. Contacts stay.
         if backup != nil, !hasOtherDevices { clearChatsForContacts() }
+        // The stories your friends have up were on the device that was wiped, and no backup holds them: they're asked to
+        // send the ones still up again (a friend on an older build ignores it, and you see only what they post next).
+        if backup != nil {
+            for c in data.contacts where !c.isSelf && !c.hidden && !c.awaitingAcceptance { enqueue(.storiesWanted, to: c) }
+        }
         // It's on this device now. It stays on the relay and is saved over as things change, unless backups are off.
         if backup != nil, !data.security.keepBackup { Task { try? await deleteBackup(of: identity) } }
     }
@@ -1210,6 +1215,9 @@ final class AppModel {
     /// every story you have up (by name, and as a sweep for any this device no longer remembers), and what you said in
     /// groups and channels. They keep you as a contact. Detach does this before it wipes, and recovering an account does
     /// it again in case the device was wiped before it could.
+    /// When each friend last asked for the stories you have up again, so one can't make you send a video over and over.
+    @ObservationIgnored private var storiesWantedAt: [String: Date] = [:]
+
     private func clearChatsForContacts() {
         for c in data.contacts where !c.isSelf && !c.hidden && !c.awaitingAcceptance {
             enqueue(.chatDeleted(conversation: nil), to: c)
@@ -6604,6 +6612,14 @@ final class AppModel {
             if data.clipParts[ClipKey(id, persona).stored]?.author == fp { data.clipParts[ClipKey(id, persona).stored] = nil }
             noteRemoved("\(fp)|\(id)")
             withAnimation { data.stories.removeAll { $0.id == id && $0.author == fp && $0.persona == persona } }
+        case .storiesWanted:
+            // A friend's account was recovered and has no stories: theirs are sent again, by the audience each one has
+            // (so only what they could already see). Asked at most once in ten minutes, since a story can be a big video.
+            let key = "\(fp)|\(persona?.uuidString ?? "main")"
+            guard !sender.isSelf, !sender.hidden, !sender.awaitingAcceptance, !data.blocked.contains(fp),
+                  Date().timeIntervalSince(storiesWantedAt[key] ?? .distantPast) > 600 else { break }
+            storiesWantedAt[key] = Date()
+            shareStories(with: sender)
         case .storiesCleared:
             // Only theirs: whoever sends this can take back their own stories and nobody else's.
             for story in data.stories where story.author == fp && story.persona == persona { noteRemoved("\(fp)|\(story.id)") }
