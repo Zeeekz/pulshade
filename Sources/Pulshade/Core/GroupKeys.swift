@@ -368,8 +368,8 @@ struct GroupRoster: Codable, Equatable {
         var entries: [Entry]
         var removed: [Gone]
 
-        static let maxEntries = 5_000
-        static let maxRemoved = 5_000
+        static let maxEntries = 1_500
+        static let maxRemoved = 1_500
 
         /// The people in it now: added, and not taken out since.
         var live: [MemberCard] {
@@ -390,9 +390,9 @@ struct GroupRoster: Codable, Equatable {
                 gone[g.key] = g
             }
             let keptGone = gone.values.filter { g in byKey[g.key].map { g.at >= $0.added } ?? true }
-                .sorted { $0.at > $1.at }
-            return Body(entries: Array(byKey.values.sorted { $0.added < $1.added }.suffix(Self.maxEntries)),
-                        removed: Array(keptGone.prefix(Self.maxRemoved)))
+                .sorted { ($0.at, $0.key.hex) > ($1.at, $1.key.hex) }
+            let ordered = byKey.values.sorted { ($0.added, $0.card.signingKey.hex) < ($1.added, $1.card.signingKey.hex) }
+            return Body(entries: Array(ordered.suffix(Self.maxEntries)), removed: Array(keptGone.prefix(Self.maxRemoved)))
         }
     }
 
@@ -611,6 +611,9 @@ struct GroupReader: Codable, Equatable {
 struct GroupInvite: Codable, Equatable {
     var settings: GroupSettings
     var epoch: GroupEpoch
+    /// In a channel: the owner wants this follower as staff, so they answer with a card with their name instead of the
+    /// nameless one a follower gives. Apps from before ignore it.
+    var staff: Bool?
 }
 
 /// A post waiting to go into a group's mailbox, already sealed (its chain has moved on, so it must go as it is).
@@ -653,6 +656,15 @@ struct SharedGroup: Codable, Equatable {
     var joining = false
     /// Taken out (or the group was ended): nothing more is read or sent.
     var gone = false
+    /// In a channel, as staff: the people following it, as this device last knew them (merged from what the other staff
+    /// post). Never on a follower's device, and never in the channel's settings.
+    var roster: GroupRoster.Body?
+    /// The epoch this device last posted the roster in, so each new epoch's mailbox has one for staff who join late.
+    var rosterEpoch: Int?
+    /// As the owner of a channel: followers asked to become staff, by account fingerprint, until they answer.
+    var staffInvited: [String: Date]?
+    /// The staff the roster was last sealed to, so a new admin gets a copy.
+    var rosterStaff: [Data]?
     /// As an admin: people invited over a 1:1 chat whose card hasn't come back yet, by account fingerprint.
     var invited: [String: Date] = [:]
     /// As an admin: people added whose app is too old to take part yet, by account fingerprint, with when. Each is

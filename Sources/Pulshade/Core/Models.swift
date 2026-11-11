@@ -107,6 +107,8 @@ struct DeviceLink: Codable {
     var readsSharedGroups: Bool?
     /// Their app takes photos, voice notes and photo stories as a pointer to a copy on the relay. Nil for an app from before.
     var readsMediaBlobs: Bool?
+    /// Their app takes part in channels that share one mailbox. Nil for an app from before.
+    var readsChannels: Bool?
     /// When this device answered that device's spare key, by the relay's clock: a hello of theirs sent before then was
     /// overtaken by the answer and isn't taken. Cleared once keys are opened any other way.
     var spareTakenAt: Date?

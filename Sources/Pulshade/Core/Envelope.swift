@@ -19,7 +19,9 @@ enum Envelope {
     /// (`GroupSettings`), so a group can be made that way only once everyone in it says so. Bit 5: photos, voice notes
     /// and photo stories can come as a pointer to a sealed copy on the relay (`Payload.clipBlob`), after a message or
     /// story that holds only a tiny preview. Builds from before get them inside the message, as always.
-    static let reads: UInt8 = 63
+    /// Bit 6: it takes part in channels that share one mailbox, as a follower (hidden from the other followers) or as staff
+    /// (`GroupRoster`, a tagged `GroupRekey`).
+    static let reads: UInt8 = 127
 
     /// Opened envelope: the payload, who sent it, from which of their devices, and when.
     struct Opened {
@@ -38,6 +40,7 @@ enum Envelope {
         var takesSpares: Bool { caps & 8 == 8 }
         var readsSharedGroups: Bool { caps & 16 == 16 }
         var readsMediaBlobs: Bool { caps & 32 == 32 }
+        var readsChannels: Bool { caps & 64 == 64 }
     }
 
     /// `framed` sends the payload and the inside of the envelope in frames, without the base64 that makes a big

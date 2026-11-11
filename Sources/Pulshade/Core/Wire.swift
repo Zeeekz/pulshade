@@ -165,6 +165,9 @@ enum Payload: Codable, Equatable {
     case groupRekey(GroupRekey)
     /// In a group's mailbox: the group's join links and bans, signed by an admin. Apps from before links don't read it.
     case groupLinks(GroupLinks)
+    /// In a channel's mailbox: the people following it, sealed so only staff can open it (see `GroupRoster`). Apps from
+    /// before channels shared a mailbox don't read it.
+    case groupRoster(GroupRoster)
     /// In a group's mailbox: "this device never got epoch `epoch`'s key", posted on a key it has, so an admin's phone
     /// sends it again, sealed to that member alone. Apps from before ignore it.
     case groupKeyWanted(group: UUID, epoch: Int)
