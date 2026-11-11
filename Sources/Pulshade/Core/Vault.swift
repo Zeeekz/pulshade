@@ -4,7 +4,7 @@ import CommonCrypto
 import LocalAuthentication
 
 enum VaultError: Error {
-    case wrongPasscode, corrupt, missing
+    case wrongPasscode, corrupt, missing, alreadyExists
     case keychain(OSStatus)
 }
 
@@ -32,6 +32,8 @@ struct Vault {
     private func prepareDirectory() {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                  attributes: [.posixPermissions: 0o700])
+        // A folder left by an older build, or created with a looser umask, is tightened on every open.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         // Backups would carry the sealed files somewhere they could be guessed at for ever.
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
@@ -101,8 +103,11 @@ struct Vault {
 
     // MARK: Identity
 
-    /// A fresh vault: the identity in slot 0, filler in the rest, bound to this device.
-    func create(_ identity: Identity, passcode: String) throws {
+    /// A fresh vault: the identity in slot 0, filler in the rest, bound to this device. Refuses to replace an
+    /// existing one unless the caller says so, so a restore or a link can never quietly shred the account already
+    /// on this device. (`replacing` is only for adding the Secure Enclave binding to an older lock file.)
+    func create(_ identity: Identity, passcode: String, replacing: Bool = false) throws {
+        guard replacing || !exists else { throw VaultError.alreadyExists }
         let device = Self.makeBinding()
         let secret = try device.map(Self.deviceSecret)
         var slots = (0..<Self.slotCount).map { _ in Self.filler() }
@@ -220,11 +225,9 @@ struct Vault {
         do {
             try keys.store(old + [fresh])
         } catch {
-            // No Keychain to be had: the file goes down as it did before, unless it has been sealed
-            // here, since an unsealed one would then be refused.
-            guard !keys.inUse else { throw error }
-            try write(plain, to: url)
-            return
+            // Never write a lock file without its Keychain seal. An unsealed copy is exactly what this key exists
+            // to stop, and failing here is better than quietly weakening every copy on the disk.
+            throw error
         }
         let sealed = try AES.GCM.seal(plain, using: fresh).combined!
         try write(Self.encoder.encode(SealedFile(sealed: sealed)), to: url)
@@ -467,13 +470,10 @@ struct Vault {
         let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
         for url in files where ["lock", "vault", "bio"].contains(url.pathExtension) { shred(url) }
         if leavingNoTrace {
-            for url in files where !["lock", "vault", "bio"].contains(url.pathExtension) && url.lastPathComponent != "profiles" {
-                try? FileManager.default.removeItem(at: url)
-            }
-            // Other profiles (PULSHADE_PROFILE) live inside the main folder, so it only goes when empty.
-            if ((try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []).isEmpty {
-                try? FileManager.default.removeItem(at: directory)
-            }
+            // Everything left, other profiles (PULSHADE_PROFILE) included, is overwritten and removed, then the
+            // folder itself. A Burn has to leave nothing that says an account was ever here.
+            Self.scrub(folder: directory)
+            try? FileManager.default.removeItem(at: directory)
         }
     }
 
@@ -495,6 +495,8 @@ struct Vault {
         if let caches, let id = Bundle.main.bundleIdentifier, !id.hasPrefix("com.apple.") {
             items.append(caches.appendingPathComponent(id, isDirectory: true))
         }
+        // Tor's relay lists and bridge descriptors live here, separate from the bundle's own cache folder.
+        if let caches { items.append(caches.appendingPathComponent("Pulshade", isDirectory: true)) }
         items += contents(of: files.temporaryDirectory).filter { TempFiles.isOurs($0.lastPathComponent) }
         #endif
         Task.detached(priority: .userInitiated) { for item in items { scrub(item: item) } }
@@ -544,6 +546,7 @@ struct Vault {
     private func write(_ data: Data, to url: URL) throws {
         // Burn removes the folder; the next account brings it back.
         if !FileManager.default.fileExists(atPath: directory.path) { prepareDirectory() }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
         // Contents are already sealed by us (and the disk by FileVault). Data Protection classes add
         // little on a Mac and some setups refuse them outright, which would stop Pulshade saving. On iPhone
         // the files also can't be read while the phone is locked, except while open (a call in a pocket).

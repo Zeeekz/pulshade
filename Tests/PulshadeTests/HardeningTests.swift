@@ -98,6 +98,24 @@ import PulshadeShared
         #expect(counted(12, "contact") == "12 contacts")
     }
 
+    @Test func anExistingAccountIsNeverOverwrittenByALinkOrRestore() throws {
+        let vault = Vault(directory: testDirectory("pulshade-hardening"))
+        try vault.create(.generate(), passcode: "real-pass")
+        #expect(throws: VaultError.self) { try vault.create(.generate(), passcode: "other-pass") }
+        #expect(throws: Never.self) { try vault.create(.generate(), passcode: "other-pass", replacing: true) }
+    }
+
+    @Test func aNoTraceWipeTakesEveryProfileWithIt() throws {
+        let dir = testDirectory("pulshade-hardening")
+        let vault = Vault(directory: dir)
+        try vault.create(.generate(), passcode: "real-pass")
+        let nested = dir.appendingPathComponent("profiles/second", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try Data("left behind".utf8).write(to: nested.appendingPathComponent("data-abc.vault"))
+        vault.destroy(leavingNoTrace: true)
+        #expect(!FileManager.default.fileExists(atPath: dir.path))
+    }
+
     @Test func maximumPrivacyTurnsOffEveryOutboundLever() {
         let s = SecuritySettings.strictest
         #expect(!s.notifications && !s.pushWake && !s.pushRequests && !s.deliveryReceipts && !s.readReceipts)

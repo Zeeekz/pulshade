@@ -886,7 +886,7 @@ final class AppModel {
     private func bindToDevice(passcode: String) async {
         guard isPrimary, data.decoySeed == nil, data.panicSeed == nil, let identity, !vault.isDeviceBound else { return }
         let vault = vault
-        try? await Task.detached { try vault.create(identity, passcode: passcode) }.value
+        try? await Task.detached { try vault.create(identity, passcode: passcode, replacing: true) }.value
     }
 
     #if DEBUG
