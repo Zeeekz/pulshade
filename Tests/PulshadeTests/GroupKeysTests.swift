@@ -357,4 +357,25 @@ struct GroupKeysTests {
         let few = GroupRoster.Body(entries: (0..<3).map { _ in .init(card: a, added: t0) }, removed: [])
         #expect(GroupRoster.make(few, group: group, epoch: 1, staff: staff, keys: owner)!.box.count == small.box.count)
     }
+
+    @Test func aRosterCantBeMadeUnbeatableOrFilledWithTheDead() throws {
+        let one = keys(.random(32)), two = keys(.random(32))
+        let a = MemberCard.make(one, group: group, name: "", avatar: nil, color: nil)
+        let b = MemberCard.make(two, group: group, name: "", avatar: nil, color: nil)
+        let now = Date()
+        let empty = GroupRoster.Body(entries: [], removed: [])
+        // A removal dated far ahead is only as good as a few minutes ahead: someone added after that gets back in.
+        let forever = GroupRoster.Body(entries: [], removed: [.init(key: a.signingKey, at: now.addingTimeInterval(86_400 * 3_650))])
+        let later = GroupRoster.Body(entries: [.init(card: a, added: now.addingTimeInterval(900))], removed: [])
+        #expect(empty.merged(with: forever, group: group).merged(with: later, group: group).live.map(\.signingKey) == [a.signingKey])
+        // An entry dated far ahead can't make someone impossible to remove: a removal now beats it.
+        let pinned = GroupRoster.Body(entries: [.init(card: a, added: now.addingTimeInterval(86_400 * 3_650))], removed: [])
+        let out = GroupRoster.Body(entries: [], removed: [.init(key: a.signingKey, at: now.addingTimeInterval(600))])
+        #expect(pinned.merged(with: out, group: group).live.isEmpty)
+        // Someone taken out isn't kept as an entry, so the cap counts only people who are in.
+        let merged = GroupRoster.Body(entries: [.init(card: a, added: now), .init(card: b, added: now)], removed: [])
+            .merged(with: .init(entries: [], removed: [.init(key: a.signingKey, at: now.addingTimeInterval(1))]), group: group)
+        #expect(merged.entries.map(\.card.signingKey) == [b.signingKey])
+        #expect(merged.removed.map(\.key) == [a.signingKey], "but the removal is kept against older copies")
+    }
 }

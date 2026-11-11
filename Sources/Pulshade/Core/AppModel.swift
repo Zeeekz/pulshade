@@ -7242,12 +7242,15 @@ final class AppModel {
             promoteFollower(fingerprint, at: i)
             return
         }
+        let wasAdmin = data.conversations[i].admins.contains(fingerprint)
         data.conversations[i].admins.removeAll { $0 == fingerprint }
         if on {
             data.conversations[i].admins.append(fingerprint)
             data.conversations[i].mods.removeAll { $0 == fingerprint }
         }
         publishChange(i)
+        // An admin let go no longer has the staff mailbox.
+        if !on, wasAdmin, data.conversations[i].shared?.settings.kind == .channel { rotateStaffKey(at: i) }
     }
 
     /// Only the owner appoints or removes mods, and only in groups. An admin is already more than a mod.
@@ -7334,7 +7337,7 @@ extension AppModel {
     func syncConversation(_ id: Conversation.ID) {
         guard let c = conversation(id), c.kind != .direct else { return }
         if let shared = c.shared {
-            sync(.sharedGroup(persona: c.persona, settings: shared.settings, epochs: shared.readable))
+            sync(.sharedGroup(persona: c.persona, settings: shared.settings, epochs: shared.readable, staffKey: shared.staffKey))
             return
         }
         sync(.conversation(card(of: c)))
@@ -7492,8 +7495,12 @@ extension AppModel {
             guard (card.kind == .direct ? conversation(card.id) : groupIndex(card.group ?? card.id, persona: card.persona)
                     .map { data.conversations[$0] })?.shared == nil else { break }
             adopt(card)
-        case let .sharedGroup(persona, settings, epochs):
+        case let .sharedGroup(persona, settings, epochs, staffKey):
             adoptSharedGroup(persona: persona, settings: settings, epochs: epochs)
+            if let key = staffKey, key.count == 32, let i = groupIndex(settings.group, persona: persona), data.conversations[i].shared?.staffKey != key,
+               data.conversations[i].shared?.settings.kind == .channel {
+                data.conversations[i].shared?.staffKey = key
+            }
         case let .profile(persona, incoming):
             // Newest wins, so devices that drifted apart settle on the same profile. But not one from a device that
             // knows fewer fields than this one (it would wipe the rest), and one from a newer device can't be read in
@@ -8708,7 +8715,9 @@ extension AppModel {
                                      avatar: Self.thumbnail(avatar, side: 320), owner: keys.publicKey, postPolicy: postPolicy,
                                      disappearAfter: disappearAfter, members: [card.withoutAvatar], epochCheck: epoch.check)
         settings.sign(with: keys)
-        return SharedGroup(settings: settings, epochs: [epoch])
+        var group = SharedGroup(settings: settings, epochs: [epoch])
+        if kind == .channel { group.staffKey = .random(32) }
+        return group
     }
 
     /// Sends each of `fingerprints` (contacts of the group's persona whose apps take part) what they need to join.
@@ -8804,6 +8813,7 @@ extension AppModel {
                 // Moving an old-style group over: only its owner can, and only a group.
                 guard data.conversations[i].kind == s.kind, data.conversations[i].owner == sender.fingerprint else { return }
                 data.conversations[i].shared = SharedGroup(settings: s, epochs: [invite.epoch], joining: !s.isMember(keys.publicKey))
+                data.conversations[i].shared?.ownerAccount = sender.fingerprint
                 data.conversations[i].introsMine = []
                 data.conversations[i].introsMade = [:]
             }
@@ -8814,8 +8824,19 @@ extension AppModel {
             convo.groupID = place.groupID
             convo.persona = sender.persona
             convo.shared = SharedGroup(settings: s, epochs: [invite.epoch], joining: !s.isMember(keys.publicKey))
+            convo.shared?.ownerAccount = sender.fingerprint
             withAnimation(.snappy) { data.conversations.insert(convo, at: 0) }
             if let i = groupIndex(s.group, persona: sender.persona) { applySharedSettings(at: i) }
+        }
+        // The staff mailbox's key, from the account the channel first came from and nobody else: a follower can't hand
+        // someone a key of their own and cut them off from the roster.
+        if invite.staff == true, s.kind == .channel, s.signer == s.owner, let key = invite.staffKey, key.count == 32,
+           let i = groupIndex(s.group, persona: sender.persona), data.conversations[i].shared?.ownerAccount == sender.fingerprint,
+           data.conversations[i].shared?.staffKey != key {
+            data.conversations[i].shared?.staffKey = key
+            data.conversations[i].shared?.chains["0"] = nil
+            data.conversations[i].shared?.cursors["0"] = nil
+            data.conversations[i].shared?.reader.forget(epoch: 0)
         }
         if !s.isMember(keys.publicKey) { enqueue(.groupJoin(group: s.group, card: card), to: sender) }
         if let i = groupIndex(s.group, persona: sender.persona) { syncConversation(data.conversations[i].id) }
@@ -8847,13 +8868,16 @@ extension AppModel {
               let asked = shared.invited[sender.fingerprint] ?? shared.staffInvited?[sender.fingerprint],
               Date().timeIntervalSince(asked) < Self.inviteLife, card.verified(group: group),
               let keys = memberKeys(sender.persona, group: group), shared.settings.isAdmin(keys.publicKey) else { return }
+        let wasStaffInvite = shared.invited[sender.fingerprint] == nil
+        let previousKnown = shared.knownAs[sender.fingerprint]
         shared.invited[sender.fingerprint] = nil
         shared.invitedEpoch[sender.fingerprint] = nil
         shared.knownAs[sender.fingerprint] = card.fingerprint
         data.conversations[i].shared = shared
         // A follower the owner asked to join the staff: their named card goes in the settings, as an admin, and they
-        // leave the roster (they are staff now).
-        if shared.settings.kind == .channel, shared.staffInvited?[sender.fingerprint] != nil, shared.settings.owner == keys.publicKey {
+        // leave the roster (they are staff now). Only for an answer to that ask, with a name.
+        if shared.settings.kind == .channel, wasStaffInvite, shared.staffInvited?[sender.fingerprint] != nil, !card.name.isEmpty,
+           shared.settings.owner == keys.publicKey {
             shared.staffInvited?[sender.fingerprint] = nil
             data.conversations[i].shared = shared
             guard !shared.settings.isMember(card.signingKey), shared.settings.members.count < GroupSettings.maxMembers else { save(); return }
@@ -8872,8 +8896,12 @@ extension AppModel {
         }
         // A follower of a channel goes in the staff's roster, never in the settings every follower holds.
         if shared.settings.kind == .channel {
-            guard !shared.settings.isMember(card.signingKey), card.name.isEmpty, card.avatarHash == nil else { save(); return }
-            addFollower(card, at: i)
+            guard !shared.settings.isMember(card.signingKey), card.name.isEmpty, card.avatarHash == nil else {
+                data.conversations[i].shared?.knownAs[sender.fingerprint] = previousKnown
+                save()
+                return
+            }
+            addFollower(card, replacing: previousKnown, at: i)
             return
         }
         guard !shared.settings.isMember(card.signingKey), shared.settings.members.count < GroupSettings.maxMembers else { save(); return }
@@ -8885,12 +8913,16 @@ extension AppModel {
     // MARK: A channel's followers
 
     /// Puts a follower in the staff's roster and tells the other staff. The channel's own settings never name them.
-    private func addFollower(_ card: MemberCard, at i: Int) {
+    private func addFollower(_ card: MemberCard, replacing previous: String?, at i: Int) {
         guard var shared = data.conversations[i].shared, shared.settings.kind == .channel else { return }
         let gid = data.conversations[i].wireID
         let body = shared.roster ?? GroupRoster.Body(entries: [], removed: [])
-        let next = body.merged(with: .init(entries: [.init(card: card.withoutAvatar, added: Date())], removed: []), group: gid)
-        guard next.live.count <= GroupRoster.Body.maxEntries else { save(); return }
+        // The same account again under another key: the older key is taken out, so one account is one follower and
+        // taking them out takes out every key they had.
+        let older = body.live.filter { Identity.fingerprint(of: $0.signingKey) == previous && $0.signingKey != card.signingKey }
+        let cleared = body.merged(with: .init(entries: [], removed: older.map { .init(key: $0.signingKey, at: Date()) }), group: gid)
+        let next = cleared.merged(with: .init(entries: [.init(card: card.withoutAvatar, added: Date())], removed: []), group: gid)
+        guard next.entries.count <= GroupRoster.Body.maxEntries, next.live.count > cleared.live.count || !older.isEmpty else { save(); return }
         shared.roster = next
         data.conversations[i].shared = shared
         publishRoster(at: i)
@@ -8902,12 +8934,15 @@ extension AppModel {
     private func publishRoster(at i: Int) {
         guard let shared = data.conversations[i].shared, shared.settings.kind == .channel, let body = shared.roster,
               let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID),
-              shared.settings.isAdmin(keys.publicKey), let epoch = shared.current,
-              let roster = GroupRoster.make(body, group: shared.settings.group, epoch: epoch.number, staff: shared.settings.members, keys: keys),
+              shared.settings.isAdmin(keys.publicKey), let epoch = shared.current, shared.staffEpoch != nil else { return }
+        // Sealed to the admins only (a plain member of a channel mustn't be able to open it).
+        let admins = shared.settings.members.filter { shared.settings.isAdmin($0.signingKey) }
+        guard let roster = GroupRoster.make(body, group: shared.settings.group, epoch: epoch.number, staff: admins, keys: keys),
               roster.isReasonable, GroupSeal.fits(payload: (try? Payload.groupRoster(roster).wire(framed: false).count) ?? Int.max) else { return }
-        post(.groupRoster(roster), at: i)
-        data.conversations[i].shared?.rosterEpoch = epoch.number
-        data.conversations[i].shared?.rosterStaff = shared.settings.members.map(\.signingKey).sorted { $0.hex < $1.hex }
+        // In the staff mailbox, not the channel's own: followers would see each change as it happens.
+        post(.groupRoster(roster), at: i, inEpoch: 0)
+        data.conversations[i].shared?.rosterEpoch = Int(Date().timeIntervalSince1970)
+        data.conversations[i].shared?.rosterStaff = admins.map(\.signingKey).sorted { $0.hex < $1.hex }
     }
 
     /// What another staff member's roster adds to this one. If this device knows more than they did, the fuller one is
@@ -8930,7 +8965,27 @@ extension AppModel {
               let target = contact(fingerprint, in: data.conversations[i].persona), takesChannels(target) else { return }
         shared.staffInvited = (shared.staffInvited ?? [:]).merging([fingerprint: Date()]) { _, new in new }
         data.conversations[i].shared = shared
-        enqueue(.groupInvite(GroupInvite(settings: shared.settings, epoch: epoch, staff: true)), to: target)
+        enqueue(.groupInvite(GroupInvite(settings: shared.settings, epoch: epoch, staff: true, staffKey: shared.staffKey)), to: target)
+        save()
+    }
+
+    /// A new staff mailbox key, after an admin was taken out or let go: the old key opens nothing from now on. The owner
+    /// gives the new one to each admin who is left, over the chat they were asked in.
+    private func rotateStaffKey(at i: Int) {
+        guard var shared = data.conversations[i].shared, shared.settings.kind == .channel,
+              let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID),
+              shared.settings.owner == keys.publicKey, let epoch = shared.current else { return }
+        shared.staffKey = .random(32)
+        shared.chains["0"] = nil
+        shared.cursors["0"] = nil
+        shared.reader.forget(epoch: 0)
+        data.conversations[i].shared = shared
+        let adminKeys = Set(shared.settings.admins).subtracting([shared.settings.owner])
+        for (account, fingerprint) in shared.knownAs where adminKeys.contains(where: { Identity.fingerprint(of: $0) == fingerprint }) {
+            guard let contact = contact(account, in: data.conversations[i].persona) else { continue }
+            enqueue(.groupInvite(GroupInvite(settings: shared.settings, epoch: epoch, staff: true, staffKey: shared.staffKey)), to: contact)
+        }
+        publishRoster(at: i)
         save()
     }
 
@@ -8946,8 +9001,10 @@ extension AppModel {
               shared.settings.isAdmin(me.publicKey), shared.roster?.live.contains(where: { $0.signingKey == key }) == true else { return }
         shared.roster = (shared.roster ?? .init(entries: [], removed: [])).merged(
             with: .init(entries: [], removed: [.init(key: key, at: Date())]), group: data.conversations[i].wireID)
+        shared.rekeyAfter = shared.settings.epoch
         data.conversations[i].shared = shared
         startEpoch(at: i, without: [])
+        publishRoster(at: i)
     }
 
     // MARK: Settings
@@ -9078,7 +9135,6 @@ extension AppModel {
         shared.chatInEpoch = false
         data.conversations[i].shared = shared
         applySharedSettings(at: i)
-        publishRoster(at: i)
         syncConversation(data.conversations[i].id)
         save()
     }
@@ -9104,13 +9160,16 @@ extension AppModel {
         // A channel's follower is known to staff only by the account that was invited, and held in the roster.
         if let shared = data.conversations[i].shared, shared.settings.kind == .channel,
            let key = shared.roster?.live.first(where: { Identity.fingerprint(of: $0.signingKey) == shared.knownAs[fingerprint] })?.signingKey {
+            data.conversations[i].shared?.staffInvited?[fingerprint] = nil
             removeFollower(key, at: i)
             return
         }
         guard let shared = data.conversations[i].shared, let target = contact(fingerprint, in: data.conversations[i].persona),
               shared.settings.isMember(target.signingKey) else { return }
+        let wasAdmin = shared.settings.isAdmin(target.signingKey)
         data.conversations[i].shared?.wantRemoved[target.signingKey.hex] = Date()
         startEpoch(at: i, without: [target.signingKey])
+        if wasAdmin, shared.settings.kind == .channel { rotateStaffKey(at: i) }
     }
 
     // MARK: Moving an old group over
@@ -9128,12 +9187,15 @@ extension AppModel {
         let convo = data.conversations[i]
         guard let shared = freshSharedGroup(id: id, persona: convo.persona, title: convo.title, about: convo.about, avatar: convo.avatar,
                                             postPolicy: convo.postPolicy, disappearAfter: convo.disappearAfter, kind: convo.kind) else { return }
-        let members = convo.members
+        // The channel's admins are asked to join its staff; everyone else follows.
+        let staff = convo.kind == .channel ? convo.admins.filter { $0 != "me" } : []
+        let members = convo.members.filter { !staff.contains($0) }
         data.conversations[i].shared = shared
         data.conversations[i].introsMade = [:]
         data.conversations[i].introsMine = []
         applySharedSettings(at: i)
         invite(members, at: i)
+        for admin in staff { promoteFollower(admin, at: i) }
         syncConversation(id)
         save()
     }
@@ -9260,6 +9322,10 @@ extension AppModel {
             for epoch in shared.readable {
                 out.append((epoch.receiveKey, shared.cursors[String(epoch.number)] ?? 0, convo.id, epoch.number))
             }
+            // A channel's staff also read their own mailbox, where the follower roster is.
+            if let staff = shared.staffEpoch, let me = memberKeys(convo.persona, group: convo.wireID), shared.settings.isAdmin(me.publicKey) {
+                out.append((staff.receiveKey, shared.cursors["0"] ?? 0, convo.id, 0))
+            }
         }
         return out
     }
@@ -9301,10 +9367,24 @@ extension AppModel {
                 continue
             }
             if shared.wantRemoved.isEmpty { groupRetries[id] = nil }
-            // The owner's phone keeps a copy of the follower roster in each epoch's mailbox, and for each new staff member.
+            // A follower taken out whose new key didn't get made (settings it couldn't make yet, say): tried again until it is.
+            if staff, let after = shared.rekeyAfter {
+                if shared.settings.epoch > after {
+                    data.conversations[i].shared?.rekeyAfter = nil
+                } else if now.timeIntervalSince(shared.rekeyTried ?? .distantPast) > 30 {
+                    data.conversations[i].shared?.rekeyTried = now
+                    startEpoch(at: i, without: [])
+                }
+            }
+            // Asks to join the staff that nobody answered run out, like invites.
+            if let asks = shared.staffInvited, asks.contains(where: { now.timeIntervalSince($0.value) > Self.inviteLife }) {
+                data.conversations[i].shared?.staffInvited = asks.filter { now.timeIntervalSince($0.value) <= Self.inviteLife }
+            }
+            // The owner's phone puts the follower roster in the staff mailbox again every few days (the relay keeps mail a
+            // week) and whenever the admins change.
             if shared.settings.kind == .channel, shared.settings.owner == keys.publicKey, shared.roster != nil,
-               let current = shared.current?.number,
-               shared.rosterEpoch != current || shared.rosterStaff != shared.settings.members.map(\.signingKey).sorted(by: { $0.hex < $1.hex }) {
+               now.timeIntervalSince1970 - Double(shared.rosterEpoch ?? 0) > 3 * 86_400
+                || shared.rosterStaff != shared.settings.members.filter({ shared.settings.isAdmin($0.signingKey) }).map(\.signingKey).sorted(by: { $0.hex < $1.hex }) {
                 publishRoster(at: i)
             }
             // Settings name a key this device never got: ask for it again, on the key it has, every ten minutes.
@@ -9352,11 +9432,22 @@ extension AppModel {
         // messages themselves reach this device as its own through sync).
         let ours = outer.sender == keys.publicKey
         if ours, outer.device == shared.myTag { return }
+        // The staff mailbox carries rosters and nothing else, and rosters are read nowhere else.
+        if number == 0 {
+            guard shared.settings.isAdmin(outer.sender) || ours else { return }
+        } else if !shared.settings.isMember(outer.sender) && !ours && shared.settings.kind == .channel {
+            // A channel's followers hold its key but may say nothing in it: whatever is posted by anyone else is dropped,
+            // not kept (anyone following could fill a phone with it).
+            return
+        }
         if !shared.settings.isMember(outer.sender) && !ours {
             // Not listed yet: the settings that add them may still be on the way. Kept for a while, and read again then.
             var held = (shared.heldMail ?? []).filter { Date().timeIntervalSince($0.at) < 8 * 86_400 && $0.seq != mail.seq }
             held.append(HeldGroupMail(epoch: number, seq: mail.seq, blob: mail.blob, at: Date()))
-            shared.heldMail = Array(held.suffix(HeldGroupMail.max))
+            held = Array(held.suffix(HeldGroupMail.max))
+            // And no more than a few megabytes of it, newest kept.
+            while held.count > 1, held.reduce(0, { $0 + $1.blob.count }) > HeldGroupMail.maxBytes { held.removeFirst() }
+            shared.heldMail = held
             data.conversations[i].shared = shared
             return
         }
@@ -9365,6 +9456,9 @@ extension AppModel {
               let payload = try? Payload.fromWire(plain) else {
             data.conversations[i].shared = shared
             return
+        }
+        if number == 0 {
+            guard case .groupRoster = payload else { return }
         }
         if payload.isChat, number == shared.current?.number { shared.chatInEpoch = true }
         data.conversations[i].shared = shared
@@ -9398,7 +9492,7 @@ extension AppModel {
             adoptLinks(links, from: outer.sender, at: i)
         case let .groupRoster(roster):
             // Only staff can open it, and only staff may have made it.
-            guard roster.group == gid, shared.settings.kind == .channel, roster.signer == outer.sender, roster.signatureIsValid,
+            guard number == 0, roster.group == gid, shared.settings.kind == .channel, roster.signer == outer.sender, roster.signatureIsValid,
                   shared.settings.isAdmin(outer.sender), shared.settings.isAdmin(keys.publicKey),
                   let body = roster.open(with: keys) else { return }
             adoptRoster(body, at: i)

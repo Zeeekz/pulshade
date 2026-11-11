@@ -379,20 +379,27 @@ struct GroupRoster: Codable, Equatable {
         /// This and `other`, together: the newest entry for each person, and every removal; removals older than the entry
         /// they name are let go, and so are the oldest when there are too many.
         func merged(with other: Body, group: UUID) -> Body {
+            // Nothing is dated further on than a few minutes from now, so no one can make an entry or a removal that nothing
+            // later could ever beat.
+            let latest = Date().addingTimeInterval(300)
             var byKey: [Data: Entry] = [:]
-            for entry in entries + other.entries where entry.card.verified(group: group) {
+            for var entry in entries + other.entries where entry.card.verified(group: group) {
+                entry.added = min(entry.added, latest)
                 if let held = byKey[entry.card.signingKey], held.added >= entry.added { continue }
                 byKey[entry.card.signingKey] = entry
             }
             var gone: [Data: Gone] = [:]
-            for g in removed + other.removed {
+            for var g in removed + other.removed {
+                g.at = min(g.at, latest)
                 if let held = gone[g.key], held.at >= g.at { continue }
                 gone[g.key] = g
             }
-            let keptGone = gone.values.filter { g in byKey[g.key].map { g.at >= $0.added } ?? true }
-                .sorted { ($0.at, $0.key.hex) > ($1.at, $1.key.hex) }
-            let ordered = byKey.values.sorted { ($0.added, $0.card.signingKey.hex) < ($1.added, $1.card.signingKey.hex) }
-            return Body(entries: Array(ordered.suffix(Self.maxEntries)), removed: Array(keptGone.prefix(Self.maxRemoved)))
+            // Someone taken out stays out (their removal is kept against older copies) but isn't kept as an entry, so the
+            // cap counts only people who are in; the oldest stay if there are too many.
+            let live = byKey.values.filter { entry in !(gone[entry.card.signingKey].map { $0.at >= entry.added } ?? false) }
+            let keptGone = gone.values.sorted { ($0.at, $0.key.hex) > ($1.at, $1.key.hex) }
+            let ordered = live.sorted { ($0.added, $0.card.signingKey.hex) < ($1.added, $1.card.signingKey.hex) }
+            return Body(entries: Array(ordered.prefix(Self.maxEntries)), removed: Array(keptGone.prefix(Self.maxRemoved)))
         }
     }
 
@@ -614,6 +621,8 @@ struct GroupInvite: Codable, Equatable {
     /// In a channel: the owner wants this follower as staff, so they answer with a card with their name instead of the
     /// nameless one a follower gives. Apps from before ignore it.
     var staff: Bool?
+    /// With `staff`: the key of the staff-only mailbox the follower roster is kept in (see `SharedGroup.staffEpoch`).
+    var staffKey: Data?
 }
 
 /// A post waiting to go into a group's mailbox, already sealed (its chain has moved on, so it must go as it is).
@@ -639,6 +648,8 @@ struct HeldGroupMail: Codable, Equatable {
     var at: Date
 
     static let max = 100
+    /// All that is kept for one group, in bytes.
+    static let maxBytes = 4 * 1024 * 1024
 }
 
 /// What this device keeps about a group that shares one mailbox.
@@ -661,6 +672,15 @@ struct SharedGroup: Codable, Equatable {
     var roster: GroupRoster.Body?
     /// The epoch this device last posted the roster in, so each new epoch's mailbox has one for staff who join late.
     var rosterEpoch: Int?
+    /// In a channel, the key of its staff-only mailbox: the owner makes it, and gives it to each admin over the chat they
+    /// were asked in. Followers never have it, so the roster is posted where they can't read, and not in the channel's own
+    /// mailbox where they would see every join and leave happen.
+    var staffKey: Data?
+    /// The account the channel's first invite came from: the only one whose later invites may give or change `staffKey`.
+    var ownerAccount: String?
+    /// After a follower was taken out: the epoch then, until a newer one exists without them (tried again until it does).
+    var rekeyAfter: Int?
+    var rekeyTried: Date?
     /// As the owner of a channel: followers asked to become staff, by account fingerprint, until they answer.
     var staffInvited: [String: Date]?
     /// The staff the roster was last sealed to, so a new admin gets a copy.
@@ -723,7 +743,14 @@ struct SharedGroup: Codable, Equatable {
     /// The epoch the settings name (the one everything is posted in).
     var current: GroupEpoch? { epochs.last { $0.number == settings.epoch && $0.check == settings.epochCheck } ?? epochs.last }
 
-    func epoch(_ number: Int) -> GroupEpoch? { epochs.last { $0.number == number } }
+    func epoch(_ number: Int) -> GroupEpoch? { number == 0 ? staffEpoch : epochs.last { $0.number == number } }
+
+    /// The staff-only mailbox as an epoch of its own (number 0, which no real epoch has): nothing in a channel's mailbox
+    /// can be told from the key alone, so it is a mailbox no follower can find. Never in `epochs` or `readable`.
+    var staffEpoch: GroupEpoch? {
+        guard settings.kind == .channel, let key = staffKey, key.count == 32 else { return nil }
+        return GroupEpoch(number: 0, key: key, days: 7, started: .distantPast)
+    }
 
     /// Epochs still worth reading: the current one, and each earlier one until a week after the next began (the relay
     /// keeps nothing longer).

@@ -419,7 +419,7 @@ enum SyncEvent: Codable, Equatable {
     case hello
     /// A group that shares one mailbox, as this account is in it: its settings and the epochs' keys. Only between your
     /// own devices, which share the group key (it comes from the account's seed), each with a chain of its own.
-    case sharedGroup(persona: UUID?, settings: GroupSettings, epochs: [GroupEpoch])
+    case sharedGroup(persona: UUID?, settings: GroupSettings, epochs: [GroupEpoch], staffKey: Data? = nil)
     case sent(ConvoRef, WireMessage)
     case reaction(message: UUID, emoji: String?)
     case unsend(ids: [UUID])

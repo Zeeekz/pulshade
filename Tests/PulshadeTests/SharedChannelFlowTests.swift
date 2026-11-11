@@ -79,6 +79,12 @@ struct SharedChannelFlowTests {
         #expect(alice.conversation(channel.id)?.messages.contains { $0.text == "sneaky" } == false)
         #expect(cara.conversation(channel.id)?.messages.contains { $0.text == "sneaky" } == false)
 
+        // The roster lives in a mailbox only staff have the key to: a follower has no such key, and so no way to read or
+        // even find it, and sees nothing of followers joining.
+        #expect(alice.conversation(channel.id)?.shared?.staffEpoch != nil)
+        #expect(bob.conversation(channel.id)?.shared?.staffKey == nil && bob.conversation(channel.id)?.shared?.staffEpoch == nil)
+        #expect(bob.conversation(channel.id)?.shared?.heldMail?.isEmpty ?? true)
+
         // The owner sees the followers she invited, by the accounts she knows them as.
         #expect(Set(alice.conversation(channel.id)?.members ?? []) == [bobFP, caraFP])
     }
@@ -161,5 +167,26 @@ struct SharedChannelFlowTests {
         }
         #expect(bob.conversation(channel.id)?.messages.last?.text == "new drop")
         #expect(cara.conversation(channel.id)?.messages.last?.text == "new drop")
+    }
+
+    @Test func anAdminLetGoLosesTheRosterMailbox() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let channel = alice.startConversation(kind: .channel, title: "Drops", members: [bobFP])
+        await until([alice, bob]) { joined(channel.id, bob) && alice.conversation(channel.id)?.shared?.roster?.live.count == 1 }
+        alice.setAdmin(channel.id, bobFP, true)
+        await until([alice, bob]) { bob.conversation(channel.id)?.shared?.staffKey != nil && bob.conversation(channel.id).map(bob.canPost(in:)) == true }
+        let before = try #require(alice.conversation(channel.id)?.shared?.staffKey)
+        #expect(bob.conversation(channel.id)?.shared?.staffKey == before, "the owner gave him the key with the ask")
+
+        // Once he's staff, Alice's list shows him by his card for the channel.
+        let bobAsStaff = try #require(alice.conversation(channel.id)?.admins.first)
+        alice.setAdmin(channel.id, bobAsStaff, false)
+        let after = try #require(alice.conversation(channel.id)?.shared?.staffKey)
+        #expect(after != before, "a new key, so the old one opens nothing")
+        alice.addMembers(channel.id, [caraFP])
+        await until([alice, bob, cara]) { joined(channel.id, cara) && alice.conversation(channel.id)?.shared?.roster?.live.count == 1 }
+        await settle(alice, bob, cara)
+        #expect(bob.conversation(channel.id)?.shared?.roster?.live.isEmpty ?? true, "he never hears of the follower who came after")
     }
 }
