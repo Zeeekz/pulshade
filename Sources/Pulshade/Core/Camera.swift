@@ -50,6 +50,21 @@ final class Camera: NSObject {
     override init() {
         super.init()
         preview.videoGravity = .resizeAspectFill
+        #if os(iOS)
+        // The capture session would otherwise take over the sound and stop music playing in the background.
+        session.automaticallyConfiguresApplicationAudioSession = false
+        #endif
+    }
+
+    /// Lets music or a podcast from another app carry on while the camera is open and while a clip is recorded, the
+    /// way Instagram does: the microphone hears it from the speaker, and headphones keep playing in full quality.
+    private func mixWithOtherAudio() {
+        #if os(iOS)
+        let audio = AVAudioSession.sharedInstance()
+        try? audio.setCategory(.playAndRecord, mode: .videoRecording,
+                               options: [.mixWithOthers, .defaultToSpeaker, .allowBluetoothA2DP])
+        try? audio.setActive(true)
+        #endif
     }
 
     /// False when there's no camera, or Pulshade isn't allowed to use it.
@@ -59,6 +74,7 @@ final class Camera: NSObject {
         if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized { micAllowed = true }
         // A stop still under way finishes first.
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in queue.async { done.resume() } }
+        mixWithOtherAudio()
         guard !running, configure() else { return running }
         running = true
         // Waits for the session to be running: setting it up again while it's still starting throws, and
@@ -75,7 +91,13 @@ final class Camera: NSObject {
         guard running else { return }
         running = false
         let session = session
-        queue.async { session.stopRunning() }
+        queue.async {
+            session.stopRunning()
+            #if os(iOS)
+            // Hands the sound back, so anything that was paused for the camera carries on.
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            #endif
+        }
     }
 
     /// Switches between the front and back camera, also while a clip is being recorded: the clip carries on from the
