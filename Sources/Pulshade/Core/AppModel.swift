@@ -4053,6 +4053,7 @@ final class AppModel {
             data.blocked.removeAll { $0 == fingerprint }
             data.blockedNames[fingerprint] = nil
         }
+        sync(.unblocked(fingerprint))
         save()
     }
 
@@ -7550,6 +7551,9 @@ extension AppModel {
                 if data.blockedNames[fp] == nil { data.blockedNames[fp] = c.displayName }
                 forget(c)
             }
+        case let .unblocked(fp):
+            data.blocked.removeAll { $0 == fp }
+            data.blockedNames[fp] = nil
         case let .read(ref):
             if let i = conversationIndex(for: ref, create: false) { data.conversations[i].unread = 0 }
         case let .publicInvite(persona, receiveKey, relay):

@@ -435,6 +435,8 @@ enum SyncEvent: Codable, Equatable {
     /// A contact was removed on another device: forget them here too.
     case contactRemoved(fingerprint: String, persona: UUID?)
     case blocked(String)
+    /// Someone was unblocked on another device: let them through here too.
+    case unblocked(String)
     case read(ConvoRef)
     /// The mailbox behind a persona's public @handle, shared so every device receives requests. Nil when unlisted.
     case publicInvite(persona: UUID?, receiveKey: Data?, relay: String?)
