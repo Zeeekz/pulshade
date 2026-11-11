@@ -253,7 +253,7 @@ any group or channel with someone on an older app still uses the format above.
 
 - **One mailbox per epoch.** A member seals each message **once** and posts it into the group's mailbox on the relay;
   every member reads it from there with a cursor ("everything after the last one I saw"). The relay keeps group mail
-  sealed on disk for the group's life (1 to 7 days) and does not let it go when it is read, because it must not learn
+  sealed on disk for the epoch's life (3 days since build 14, 1 to 7 allowed) and does not let it go when it is read, because it must not learn
   how many members there are or who has read what.
 - **Member keys made for each group.** Each account's key in a group comes from its seed and the group's id, so it is
   the same on every device of the account and is linked to nothing outside the group. Members never hold each other's
@@ -275,6 +275,16 @@ any group or channel with someone on an older app still uses the format above.
   new epoch, or another of your devices) is used only if the settings name it. Two versions with the same number
   (two admins at once) are settled by the lower hash, everywhere alike. The owner's device signs every change made by
   someone else over again, and an owner-signed version may skip numbers, so a member who missed some catches up.
+- **Posts that must not get lost.** The relay keeps group mail for 3 days (new epochs; 1 to 7 is allowed). A device
+  keeps each post it makes, sealed as posted, until it reads that post back from the mailbox, which shows the relay holds
+  it for every member. If it doesn't come back (the relay lost mail), after 2 minutes and then at growing gaps the same
+  bytes are posted again, up to six times; readers already remember what they read, so a copy someone has is ignored.
+  A post goes when its message does (unsent, or its timer ran out), and is kept at most 14 days (a day if it was
+  housekeeping), up to 200 posts or 2 MB per group, in the device's own encrypted data.
+- **Catching up.** A member whose device was away longer than the relay keeps mail posts `groupCatchUp(since)`; members'
+  devices post again what they said since then and still hold. Only members can ask, a member is answered once an hour, and
+  a group's devices answer at most six requests an hour, so nobody can make everyone post over and over. Not in
+  channels (a follower says nothing in one): there a follower who was away longer than the mail lives can miss posts.
 - **Pictures** are not in the settings: a card signs a hash of its picture, and each member posts their card with the
   picture into the mailbox.
 - **Leaving and removal.** Removing someone starts a new epoch: its key is sealed to each remaining member's group
@@ -510,6 +520,7 @@ key that is never written to its disk, or public because someone chose to publis
 | What | Where | How long |
 | --- | --- | --- |
 | Waiting envelopes (messages, receipts, call set-up) | Memory, and a journal on disk with every record sealed. Each envelope is added to the journal as it arrives | Until the recipient collects them, or **7 days**. After collection the journal is rewritten within minutes and the old file overwritten |
+| Group mail (groups and channels that share one mailbox) | Disk, sealed on the phones and again by the relay | The life the epoch was made with, **3 days** for every epoch made since build 14 (up to 7 for older ones). **Not erased when read**, so the relay can't learn who reads or how many do |
 | Short-lived signals (typing, "online") | Memory only | A few seconds to minutes; never journaled |
 | Big files, chat videos, story videos | Disk, sealed twice, in pieces | Erased when collected or deleted, **7 days at most** (an unfinished upload: 1 hour) |
 | Sealed backups and spare keys | Disk, in the backup store | Until switched off or Burn; **180 days** after the last save. Spares: also erased when used |

@@ -56,7 +56,11 @@ struct GroupEpoch: Codable, Equatable {
     /// Well-formed as received: a number in range and a whole key.
     var isValid: Bool { groupNumberRange.contains(number) && key.count == 32 && (1...7).contains(days) }
 
-    static func fresh(number: Int, days: Int = 7) -> GroupEpoch {
+    /// How long the relay keeps a group's mail, in days. Short, since it holds mail even after everyone has read it (it
+    /// mustn't learn who has); a member away longer asks the others for what they missed (`Payload.groupCatchUp`).
+    static let defaultDays = 3
+
+    static func fresh(number: Int, days: Int = defaultDays) -> GroupEpoch {
         GroupEpoch(number: number, key: .random(32), days: min(max(days, 1), 7), started: Date())
     }
 
@@ -638,6 +642,48 @@ struct GroupOutgoing: Codable, Equatable {
     /// Only worth sending soon (typing): dropped rather than retried later.
     var ephemeral: Bool
     var queued = Date()
+    /// The epoch it is posted in.
+    var epoch: Int?
+    /// This is the same sealed post sent again, because it never came back from the mailbox (`KeptPost.id`).
+    var keeps: UUID?
+    /// The message it carries, so the kept copy goes when the message does.
+    var about: UUID?
+    /// Said by people (not housekeeping): worth sending again to a member who was away.
+    var catchUp: Bool?
+    /// Sent again for a member who was away: nothing to record, the original is already kept.
+    var replay: Bool?
+}
+
+/// A post this device made, kept (sealed, as posted) until it has read it back from the mailbox, which shows the relay
+/// holds it for every member. If it doesn't come back (the relay lost mail) the same bytes are posted again. Posts people
+/// made are also kept for a while longer, so a member who was away longer than the relay keeps mail can ask for them again.
+/// Lives only in the device's own encrypted data, and goes with the message it carries.
+struct KeptPost: Codable, Equatable {
+    var id = UUID()
+    var epoch: Int
+    var index: UInt32
+    var sendID: Data
+    var days: Int
+    var blob: Data
+    var about: UUID?
+    var at = Date()
+    var lastTry = Date()
+    /// How many times it has been posted again.
+    var tries = 0
+    var seen = false
+    /// Said by people, so also kept for catching up.
+    var chat: Bool
+
+    static let maxCount = 200
+    static let maxBytes = 2 * 1024 * 1024
+    /// Bigger than this is not kept (a group's settings; they catch up another way).
+    static let maxBlob = 256 * 1024
+    /// How long posts people made are kept for catching up, and housekeeping ones for waiting to be read back.
+    static let keepFor: TimeInterval = 14 * 86_400
+    static let housekeepingFor: TimeInterval = 86_400
+    static let maxTries = 6
+    /// How long to wait for a post to come back before posting it again, after it has been posted again `tries` times.
+    static func gap(_ tries: Int) -> TimeInterval { [120, 600, 3_600, 21_600, 21_600, 43_200][min(max(tries, 0), 5)] }
 }
 
 /// A group post kept to read again later: which epoch's mailbox it came from, and the envelope.
@@ -739,6 +785,13 @@ struct SharedGroup: Codable, Equatable {
     /// Posts from someone the settings held here don't list yet (the settings that add them are still on the way):
     /// read again once they arrive, instead of being lost.
     var heldMail: [HeldGroupMail]?
+    /// This device's own recent posts, kept until read back (see `KeptPost`).
+    var kept: [KeptPost]?
+    /// The last time this device read the group's mailbox to the end.
+    var lastFetch: Date?
+    /// Set when this device was away longer than the relay keeps mail: the time it last read, to ask members for what it missed.
+    var catchUpSince: Date?
+    var catchUpAsked: Date?
 
     /// The epoch the settings name (the one everything is posted in).
     var current: GroupEpoch? { epochs.last { $0.number == settings.epoch && $0.check == settings.epochCheck } ?? epochs.last }

@@ -171,6 +171,9 @@ enum Payload: Codable, Equatable {
     /// In a group's mailbox: "this device never got epoch `epoch`'s key", posted on a key it has, so an admin's phone
     /// sends it again, sealed to that member alone. Apps from before ignore it.
     case groupKeyWanted(group: UUID, epoch: Int)
+    /// In a group's mailbox: "I was away longer than the relay keeps mail: whoever has posts from after `since` that I
+    /// may have missed, post them again." Members' phones answer with the same sealed posts. Apps from before ignore it.
+    case groupCatchUp(group: UUID, since: Date)
     /// In a group's mailbox: an invite to be friends for one member (`to`, their group key), sealed so only they can open
     /// it (a `FriendInviteBody`). Apps from before ignore it.
     case friendAsk(to: Data, sealed: Data)

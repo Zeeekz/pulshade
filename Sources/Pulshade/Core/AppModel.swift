@@ -1781,6 +1781,14 @@ final class AppModel {
     @ObservationIgnored var sharedChannelsEnabled = true
     /// Shared groups whose outbox is being posted right now.
     @ObservationIgnored var groupFlushing: Set<UUID> = []
+    /// When each group mailbox was last read to the end in this run, by group and epoch: a post that hasn't come back is
+    /// only posted again once its mailbox has been read since it was sent.
+    @ObservationIgnored var groupFetchedAt: [String: Date] = [:]
+    /// When a member's catch-up request was last answered, and the answers given in the last hour per group.
+    @ObservationIgnored var catchUpAnswered: [String: Date] = [:]
+    @ObservationIgnored var catchUpWindow: [UUID: [Date]] = [:]
+    static let catchUpAnswersPerHour = 6
+    static let catchUpMaxPosts = 100
     /// When a removal that didn't stick was last tried again, by group.
     @ObservationIgnored var lastGroupRetry: [UUID: Date] = [:]
     @ObservationIgnored var groupRetries: [UUID: Int] = [:]
@@ -5452,6 +5460,8 @@ final class AppModel {
                     lastMailReceived = Date()
                     save()
                 }
+                // Read to the end: the posts this device made that haven't come back by now can be posted again.
+                if !more, identity?.fingerprint == owner { noteGroupsFetched(cursors, at: started) }
                 // More group mail than fitted: straight back for the rest.
                 if more, envelopes.isEmpty { if wait > 0 { return true } else { continue } }
                 guard identity?.fingerprint == owner, !envelopes.isEmpty else { return waited }
@@ -6509,7 +6519,7 @@ final class AppModel {
             guard sender.hidden, !sender.isSelf else { break }
             noteFriendInvite(FriendInviteBody(code: code, note: note), from: fp, persona: persona,
                              group: data.conversations.first { $0.kind == .group && $0.persona == persona && $0.members.contains(fp) }?.id)
-        case .groupSettings, .groupRekey, .groupLinks, .groupRoster, .groupKeyWanted, .memberCard, .friendAsk, .membersAdded:
+        case .groupSettings, .groupRekey, .groupLinks, .groupRoster, .groupKeyWanted, .groupCatchUp, .memberCard, .friendAsk, .membersAdded:
             // Only ever said in a group's own mailbox.
             break
         case .deviceRemoved:
@@ -9117,7 +9127,8 @@ extension AppModel {
         guard var shared = data.conversations[i].shared, let current = shared.current,
               let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID) else { return }
         guard groupNumberRange.contains(current.number + 1) else { return }
-        let next = GroupEpoch.fresh(number: current.number + 1, days: current.days)
+        // Every new epoch gets the shorter relay life, even in a group that began with the old week.
+        let next = GroupEpoch.fresh(number: current.number + 1, days: GroupEpoch.defaultDays)
         var settings = shared.settings
         settings.members.removeAll { removed.contains($0.signingKey) }
         settings.admins.removeAll { removed.contains($0) }
@@ -9231,8 +9242,11 @@ extension AppModel {
         shared.chains[String(epoch.number)] = chain
         if payload.isChat { shared.chatInEpoch = true }
         if payload.isEphemeral { shared.outbox.removeAll { $0.ephemeral } }
+        var about = message
+        if about == nil, case let .clipBlob(id, _) = payload { about = id }
         shared.outbox.append(GroupOutgoing(sendID: epoch.sendID, days: epoch.days, blob: blob, message: message,
-                                           wake: payload.wakes, ephemeral: payload.isEphemeral))
+                                           wake: payload.wakes, ephemeral: payload.isEphemeral, epoch: epoch.number, about: about,
+                                           catchUp: payload.isChat && !payload.isEphemeral))
         data.conversations[i].shared = shared
         kick()
     }
@@ -9269,6 +9283,7 @@ extension AppModel {
                 }
                 guard let i = index(of: id) else { break }
                 data.conversations[i].shared?.outbox.removeAll { $0.id == next.id }
+                notePosted(next, at: i)
                 if let m = next.message { setStatus(.sent, for: [m]) }
                 save()
             }
@@ -9334,6 +9349,105 @@ extension AppModel {
         return out
     }
 
+    // MARK: Posts that must not get lost
+
+    /// A deposited post is kept, sealed as it went, until it has been read back from the mailbox.
+    private func notePosted(_ post: GroupOutgoing, at i: Int) {
+        guard var shared = data.conversations[i].shared, !post.ephemeral, post.replay != true else { return }
+        var kept = shared.kept ?? []
+        if let k = post.keeps {
+            guard let j = kept.firstIndex(where: { $0.id == k }) else { return }
+            kept[j].tries += 1
+            kept[j].lastTry = Date()
+        } else {
+            guard post.blob.count <= KeptPost.maxBlob, let number = post.epoch, let epoch = shared.epoch(number),
+                  let outer = try? GroupSeal.outer(post.blob, group: data.conversations[i].wireID, epoch: epoch) else { return }
+            kept.append(KeptPost(epoch: number, index: outer.index, sendID: post.sendID, days: post.days, blob: post.blob,
+                                 about: post.about, chat: post.catchUp == true))
+        }
+        // The oldest go first, past a few hundred or a couple of megabytes.
+        while kept.count > KeptPost.maxCount || (kept.count > 1 && kept.reduce(0, { $0 + $1.blob.count }) > KeptPost.maxBytes) {
+            kept.removeFirst()
+        }
+        shared.kept = kept
+        data.conversations[i].shared = shared
+    }
+
+    /// Notes that these mailboxes were just read to the end. A device that was away longer than the relay keeps mail
+    /// remembers when it last read, to ask the others for what it missed.
+    private func noteGroupsFetched(_ cursors: [(key: Data, after: UInt64, convo: UUID, epoch: Int)], at time: Date) {
+        for at in cursors where at.epoch != 0 { groupFetchedAt["\(at.convo)|\(at.epoch)"] = time }
+        for id in Set(cursors.map(\.convo)) {
+            guard let i = index(of: id), let shared = data.conversations[i].shared, !shared.gone, !shared.joining,
+                  let life = shared.current?.days else { continue }
+            if let last = shared.lastFetch {
+                if time.timeIntervalSince(last) > Double(life) * 86_400, shared.catchUpSince == nil {
+                    data.conversations[i].shared?.catchUpSince = last
+                }
+                if time.timeIntervalSince(last) > 600 { data.conversations[i].shared?.lastFetch = time }
+            } else {
+                data.conversations[i].shared?.lastFetch = time
+            }
+        }
+    }
+
+    /// Posts what this device said since `since` again, for a member who was away (once an hour for each, and a few
+    /// requests an hour for the group, so nobody can make everyone post over and over).
+    private func answerCatchUp(since: Date, from sender: Data, at i: Int) {
+        let now = Date()
+        let id = data.conversations[i].id
+        guard since <= now.addingTimeInterval(300), since > now.addingTimeInterval(-KeptPost.keepFor),
+              now.timeIntervalSince(catchUpAnswered[sender.hex] ?? .distantPast) > 3600,
+              var shared = data.conversations[i].shared, let kept = shared.kept else { return }
+        let recent = (catchUpWindow[id] ?? []).filter { now.timeIntervalSince($0) < 3600 }
+        guard recent.count < Self.catchUpAnswersPerHour else { return }
+        catchUpWindow[id] = recent + [now]
+        catchUpAnswered[sender.hex] = now
+        let wanted = kept.filter { $0.chat && $0.at > since.addingTimeInterval(-3600) }.suffix(Self.catchUpMaxPosts)
+        for k in wanted where !shared.outbox.contains(where: { $0.blob == k.blob }) {
+            shared.outbox.append(GroupOutgoing(sendID: k.sendID, days: k.days, blob: k.blob, message: nil, wake: false, ephemeral: false,
+                                               epoch: k.epoch, replay: true))
+        }
+        data.conversations[i].shared = shared
+        kick()
+    }
+
+    /// Housekeeping for a group's kept posts: ones that are gone with their message or too old are let go, those the
+    /// mailbox never gave back are posted again, and a device that was away asks for what it missed.
+    private func tendKept(at i: Int) {
+        guard var shared = data.conversations[i].shared, !shared.gone, !shared.joining else { return }
+        let now = Date()
+        let id = data.conversations[i].id
+        let gid = data.conversations[i].wireID
+        if var kept = shared.kept, !kept.isEmpty {
+            let messages = Set(data.conversations[i].messages.map(\.id))
+            let readable = Set(shared.readable.map(\.number))
+            kept.removeAll { k in
+                now.timeIntervalSince(k.at) > (k.chat ? KeptPost.keepFor : KeptPost.housekeepingFor)
+                    || (k.seen && !k.chat) || !readable.contains(k.epoch) || (k.about.map { !messages.contains($0) } ?? false)
+            }
+            for j in kept.indices where !kept[j].seen && kept[j].tries < KeptPost.maxTries {
+                let k = kept[j]
+                guard now.timeIntervalSince(k.lastTry) > KeptPost.gap(k.tries),
+                      let read = groupFetchedAt["\(id)|\(k.epoch)"], read > k.lastTry.addingTimeInterval(5),
+                      !shared.outbox.contains(where: { $0.keeps == k.id }) else { continue }
+                shared.outbox.append(GroupOutgoing(sendID: k.sendID, days: k.days, blob: k.blob, message: nil, wake: false, ephemeral: false,
+                                                   epoch: k.epoch, keeps: k.id))
+            }
+            shared.kept = kept
+        }
+        var ask: Date?
+        if let since = shared.catchUpSince, shared.settings.kind == .group,
+           now.timeIntervalSince(shared.catchUpAsked ?? .distantPast) > 3600 {
+            shared.catchUpSince = nil
+            shared.catchUpAsked = now
+            ask = since
+        }
+        data.conversations[i].shared = shared
+        if let since = ask { post(.groupCatchUp(group: gid, since: since), at: i) }
+        if !shared.outbox.isEmpty { kick() }
+    }
+
     // MARK: Keeping groups in order
 
     /// Housekeeping for shared groups: removals that didn't stick are done again, unanswered invites run out, reading
@@ -9341,6 +9455,8 @@ extension AppModel {
     func tendSharedGroups() {
         let now = Date()
         for i in data.conversations.indices {
+            // Before the copy of the group below is taken: this changes it.
+            tendKept(at: i)
             guard var shared = data.conversations[i].shared, !shared.gone,
                   let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID) else { continue }
             if let oldest = shared.readable.first?.number, shared.reader.chains.keys.contains(where: { (Int($0.split(separator: "|").first ?? "") ?? 0) < oldest }) {
@@ -9435,7 +9551,13 @@ extension AppModel {
         // Our own from this device: nothing to do. From another device of ours, only the group's housekeeping (the
         // messages themselves reach this device as its own through sync).
         let ours = outer.sender == keys.publicKey
-        if ours, outer.device == shared.myTag { return }
+        if ours, outer.device == shared.myTag {
+            // Read back from the mailbox: the relay has it for everyone, so there's nothing to post again.
+            if let j = data.conversations[i].shared?.kept?.firstIndex(where: { $0.epoch == number && $0.index == outer.index }) {
+                data.conversations[i].shared?.kept?[j].seen = true
+            }
+            return
+        }
         // The staff mailbox carries rosters and nothing else, and rosters are read nowhere else.
         if number == 0 {
             guard shared.settings.isAdmin(outer.sender) || ours else { return }
@@ -9523,6 +9645,10 @@ extension AppModel {
             keyResent[outer.sender.hex] = Date()
             post(.groupRekey(GroupRekey.make(current, group: gid, for: [card])), at: i, inEpoch: number)
             post(.groupSettings(shared.settings), at: i, inEpoch: number)
+        case let .groupCatchUp(group, since):
+            // A member was away longer than the relay keeps mail: this device posts again what it said since, if it still has it.
+            guard !ours, group == gid, shared.settings.kind == .group, shared.settings.isMember(outer.sender) else { return }
+            answerCatchUp(since: since, from: outer.sender, at: i)
         case let .left(conversation):
             guard !ours, conversation == gid else { return }
             // The owner's device takes them out for everyone, with a new epoch. Only the owner's, so two admins don't
@@ -9683,7 +9809,7 @@ extension Payload {
     /// Something people said (not the group's own housekeeping): a newcomer shouldn't be able to read it.
     var isChat: Bool {
         switch self {
-        case .groupSettings, .groupRekey, .groupLinks, .groupRoster, .groupKeyWanted, .friendAsk, .membersAdded, .typing, .memberCard: false
+        case .groupSettings, .groupRekey, .groupLinks, .groupRoster, .groupKeyWanted, .groupCatchUp, .friendAsk, .membersAdded, .typing, .memberCard: false
         default: true
         }
     }
