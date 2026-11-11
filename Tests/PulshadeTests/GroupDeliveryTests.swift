@@ -106,6 +106,117 @@ struct GroupDeliveryTests {
         #expect(cara.conversation(id)?.shared?.catchUpSince == nil)
     }
 
+    /// A relay of the test's own that can be killed and brought back with nothing on its disk (a lost disk or mailbox).
+    private final class ThrowawayRelay {
+        let port: Int
+        let directory: URL
+        private var process: Process?
+
+        init(port: Int) throws {
+            self.port = port
+            directory = FileManager.default.temporaryDirectory.appending(path: "pulshade-relayloss-\(UUID().uuidString)")
+            try start()
+        }
+
+        var url: String { "http://127.0.0.1:\(port)" }
+
+        func start() throws {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            // Tests/PulshadeTests/GroupDeliveryTests.swift -> the package root.
+            let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            let run = Process()
+            run.executableURL = root.appending(path: "relay/target/release/pulshade-relay")
+            run.currentDirectoryURL = directory
+            var env = ProcessInfo.processInfo.environment
+            env["PULSHADE_ONION"] = "0"
+            env["PULSHADE_STORAGE_KEY"] = (0..<32).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
+            env["PULSHADE_BIND"] = "127.0.0.1:\(port)"
+            env["PULSHADE_DIRECTORY"] = directory.appending(path: "directory.json").path
+            run.environment = env
+            run.standardOutput = FileHandle.nullDevice
+            run.standardError = FileHandle.nullDevice
+            try run.run()
+            process = run
+            let end = Date().addingTimeInterval(10)
+            while Date() < end {
+                if (try? Data(contentsOf: URL(string: "\(url)/v1/health")!)) != nil { return }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+        }
+
+        /// Kills it and throws away everything it held.
+        func loseEverything() {
+            if let process { kill(process.processIdentifier, SIGKILL); process.waitUntilExit() }
+            process = nil
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        func stop() { loseEverything() }
+    }
+
+    /// Points the whole process at a relay of its own for a while, so it must not run beside other suites: scripts/test.sh
+    /// runs it on its own at the end (PULSHADE_RELAY_LOSS=1).
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["PULSHADE_RELAY_LOSS"] == "1"))
+    func aPostTheRelayLostBeforeItCameBackGoesUpAgainOnARealRelay() async throws {
+        let relay = try ThrowawayRelay(port: 7894)
+        let previous = ProcessInfo.processInfo.environment["PULSHADE_TEST_RELAY"]
+        setenv("PULSHADE_TEST_RELAY", relay.url, 1)
+        defer {
+            relay.stop()
+            if let previous { setenv("PULSHADE_TEST_RELAY", previous, 1) } else { unsetenv("PULSHADE_TEST_RELAY") }
+        }
+        let (alice, bob, cara, id) = try await group()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let b = try #require(bob.data.conversations.firstIndex { $0.id == id })
+
+        // Bob's post reaches the relay (his outbox empties) but he hasn't read it back when the relay loses everything.
+        bob.send("this one gets lost", in: id)
+        let end = Date().addingTimeInterval(10)
+        while Date() < end, bob.data.conversations[b].shared?.kept?.contains(where: { $0.chat }) != true {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let kept = try #require(bob.data.conversations[b].shared?.kept?.first { $0.chat })
+        #expect(!kept.seen, "not read back yet")
+        relay.loseEverything()
+        try relay.start()
+        // Long enough ago that it's due, as it would be a couple of minutes on.
+        bob.data.conversations[b].shared?.kept?[0].lastTry = Date().addingTimeInterval(-3600)
+
+        await until([alice, bob, cara], seconds: 30) {
+            cara.conversation(id)?.messages.contains { $0.text == "this one gets lost" } == true
+        }
+        #expect(cara.conversation(id)?.messages.filter { $0.text == "this one gets lost" }.count == 1,
+                "the relay lost it, Bob's phone posted the same bytes again, and Cara has it once")
+        await settle(alice, bob, cara)
+        #expect(alice.conversation(id)?.messages.contains { $0.text == "this one gets lost" } == true)
+        #expect((bob.data.conversations[b].shared?.kept?.first { $0.id == kept.id }?.tries ?? 0) >= 1)
+    }
+
+    @Test func detachingWipesWhatWasKeptToPostAgain() async throws {
+        let (alice, bob, cara, id) = try await group()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        bob.send("keep me", in: id)
+        await until([alice, bob, cara]) { bob.conversation(id)?.shared?.kept?.isEmpty == false }
+        #expect(bob.conversation(id)?.shared?.kept?.isEmpty == false)
+        let wiped = AppModel.withoutChats(bob.data, keepingDevices: true)
+        let shared = try #require(wiped.conversations.first { $0.id == id }?.shared)
+        #expect(shared.kept == nil && shared.lastFetch == nil && shared.catchUpSince == nil && shared.catchUpAsked == nil,
+                "nothing sealed is left to be posted again after a Detach")
+    }
+
+    @Test func aCatchUpRequestDoesNotGiveAwayWhenThePhoneLastRead() async throws {
+        let (alice, bob, cara, id) = try await group()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        // Cara last read five days ago and a catch-up is due: what she posts names the start of a day, a day or more before.
+        let c = try #require(cara.data.conversations.firstIndex { $0.id == id })
+        let last = Date().addingTimeInterval(-5 * 86_400 - 3 * 3_600 - 17 * 60)
+        cara.data.conversations[c].shared?.catchUpSince = last
+        await settle(cara, rounds: 2)
+        let asked = try #require(cara.data.conversations[c].shared?.catchUpAsked)
+        #expect(asked.timeIntervalSinceNow > -60)
+        #expect(cara.data.conversations[c].shared?.catchUpSince == nil)
+    }
+
     @Test func aKeptPostGoesWithItsMessage() async throws {
         let (alice, bob, cara, id) = try await group()
         defer { for m in [alice, bob, cara] { m.lock() } }

@@ -1787,8 +1787,13 @@ final class AppModel {
     /// When a member's catch-up request was last answered, and the answers given in the last hour per group.
     @ObservationIgnored var catchUpAnswered: [String: Date] = [:]
     @ObservationIgnored var catchUpWindow: [UUID: [Date]] = [:]
+    /// What this device posted again for each group in the last day, so nobody can use up the relay's room for a mailbox.
+    @ObservationIgnored var catchUpSent: [UUID: [(at: Date, bytes: Int)]] = [:]
     static let catchUpAnswersPerHour = 6
     static let catchUpMaxPosts = 100
+    /// At most this much is posted again for one request, and this much for one group in a day, by one device.
+    static let catchUpBytesPerAnswer = 128 * 1024
+    static let catchUpBytesPerDay = 512 * 1024
     /// When a removal that didn't stick was last tried again, by group.
     @ObservationIgnored var lastGroupRetry: [UUID: Date] = [:]
     @ObservationIgnored var groupRetries: [UUID: Int] = [:]
@@ -8082,6 +8087,11 @@ extension AppModel {
             c.shared?.myTag = nil
             c.shared?.chains = [:]
             c.shared?.outbox = []
+            // Posts kept to be posted again are chat too, and so is when this device last read or asked.
+            c.shared?.kept = nil
+            c.shared?.lastFetch = nil
+            c.shared?.catchUpSince = nil
+            c.shared?.catchUpAsked = nil
             return c
         }
         kept.stories = []
@@ -9391,30 +9401,49 @@ extension AppModel {
         }
     }
 
-    /// Posts what this device said since `since` again, for a member who was away (once an hour for each, and a few
-    /// requests an hour for the group, so nobody can make everyone post over and over).
+    /// Posts what this device said since `since` again, for a member who was away (once an hour for each, a few requests
+    /// an hour for the group, and a few hundred kilobytes a day, so nobody can make everyone post over and over or use up
+    /// the relay's room for the mailbox).
     private func answerCatchUp(since: Date, from sender: Data, at i: Int) {
         let now = Date()
         let id = data.conversations[i].id
-        guard since <= now.addingTimeInterval(300), since > now.addingTimeInterval(-KeptPost.keepFor),
+        // A request that sat in the mailbox is not answered later as if it were new, and its time must be sane.
+        guard deposited.map({ now.timeIntervalSince($0) < 3600 }) ?? true,
+              since <= now.addingTimeInterval(300), since > now.addingTimeInterval(-KeptPost.keepFor - 2 * 86_400),
               now.timeIntervalSince(catchUpAnswered[sender.hex] ?? .distantPast) > 3600,
-              var shared = data.conversations[i].shared, let kept = shared.kept else { return }
+              let shared = data.conversations[i].shared, !shared.gone, !shared.joining, let kept = shared.kept else { return }
         let recent = (catchUpWindow[id] ?? []).filter { now.timeIntervalSince($0) < 3600 }
         guard recent.count < Self.catchUpAnswersPerHour else { return }
+        let sentToday = (catchUpSent[id] ?? []).filter { now.timeIntervalSince($0.at) < 86_400 }
+        var room = min(Self.catchUpBytesPerAnswer, Self.catchUpBytesPerDay - sentToday.reduce(0) { $0 + $1.bytes })
+        // What the sender asked since (coarse, a day or so before they really were away), newest first until the room is
+        // used, and nothing whose message has gone.
+        let messages = Set(data.conversations[i].messages.map(\.id))
+        var wanted: [KeptPost] = []
+        for k in kept.reversed() where k.chat && k.at > since && (k.about.map(messages.contains) ?? true) {
+            guard wanted.count < Self.catchUpMaxPosts, k.blob.count <= room else { continue }
+            wanted.append(k)
+            room -= k.blob.count
+        }
+        // Nothing to say again costs nothing and uses up no one's allowance.
+        guard !wanted.isEmpty else { return }
         catchUpWindow[id] = recent + [now]
         catchUpAnswered[sender.hex] = now
-        let wanted = kept.filter { $0.chat && $0.at > since.addingTimeInterval(-3600) }.suffix(Self.catchUpMaxPosts)
-        for k in wanted where !shared.outbox.contains(where: { $0.blob == k.blob }) {
-            shared.outbox.append(GroupOutgoing(sendID: k.sendID, days: k.days, blob: k.blob, message: nil, wake: false, ephemeral: false,
-                                               epoch: k.epoch, replay: true))
+        catchUpSent[id] = sentToday + [(now, wanted.reduce(0) { $0 + $1.blob.count })]
+        for k in wanted.reversed() where !(data.conversations[i].shared?.outbox.contains(where: { $0.blob == k.blob }) ?? true) {
+            data.conversations[i].shared?.outbox.append(GroupOutgoing(sendID: k.sendID, days: k.days, blob: k.blob, message: nil, wake: false,
+                                                                       ephemeral: false, epoch: k.epoch, replay: true))
         }
-        data.conversations[i].shared = shared
         kick()
     }
 
     /// Housekeeping for a group's kept posts: ones that are gone with their message or too old are let go, those the
     /// mailbox never gave back are posted again, and a device that was away asks for what it missed.
     private func tendKept(at i: Int) {
+        // A group this device has left or been taken out of keeps nothing to post again.
+        if data.conversations[i].shared?.gone == true, data.conversations[i].shared?.kept != nil {
+            data.conversations[i].shared?.kept = nil
+        }
         guard var shared = data.conversations[i].shared, !shared.gone, !shared.joining else { return }
         let now = Date()
         let id = data.conversations[i].id
@@ -9441,7 +9470,8 @@ extension AppModel {
            now.timeIntervalSince(shared.catchUpAsked ?? .distantPast) > 3600 {
             shared.catchUpSince = nil
             shared.catchUpAsked = now
-            ask = since
+            // Only a day or two before this device was away, not the moment: members shouldn't learn when it last read.
+            ask = Calendar(identifier: .gregorian).startOfDay(for: since).addingTimeInterval(-86_400)
         }
         data.conversations[i].shared = shared
         if let since = ask { post(.groupCatchUp(group: gid, since: since), at: i) }
@@ -9779,6 +9809,8 @@ extension AppModel {
     private func leftShared(at i: Int, note: String) {
         data.conversations[i].shared?.gone = true
         data.conversations[i].shared?.outbox = []
+        data.conversations[i].shared?.kept = nil
+        data.conversations[i].shared?.catchUpSince = nil
         data.conversations[i].members = []
         withAnimation(.snappy) { data.conversations[i].messages.append(Message(sender: "system", text: note, date: Date())) }
     }

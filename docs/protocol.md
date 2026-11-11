@@ -281,10 +281,14 @@ any group or channel with someone on an older app still uses the format above.
   bytes are posted again, up to six times; readers already remember what they read, so a copy someone has is ignored.
   A post goes when its message does (unsent, or its timer ran out), and is kept at most 14 days (a day if it was
   housekeeping), up to 200 posts or 2 MB per group, in the device's own encrypted data.
-- **Catching up.** A member whose device was away longer than the relay keeps mail posts `groupCatchUp(since)`; members'
-  devices post again what they said since then and still hold. Only members can ask, a member is answered once an hour, and
-  a group's devices answer at most six requests an hour, so nobody can make everyone post over and over. Not in
-  channels (a follower says nothing in one): there a follower who was away longer than the mail lives can miss posts.
+- **Catching up.** A member whose device was away longer than the relay keeps mail posts `groupCatchUp(since)`, where
+  `since` is only the start of a day, a day or more before the device was away, so members don't learn when it last read.
+  Members' devices post again what they said since then and still hold, newest first, and only what is still shown (not
+  unsent, not timed out). Only members can ask; a request that sat in the mailbox over an hour is not answered; a member
+  is answered once an hour; a group's devices answer at most six requests an hour; one answer is at most 128 KB and one
+  device gives at most 512 KB a day to a group, so nobody can make everyone post over and over or use up the relay's
+  room for the mailbox (50 MiB a day). A request with nothing to answer uses up no allowance. Not in channels (a follower
+  says nothing in one): there a follower who was away longer than the mail lives can miss posts.
 - **Pictures** are not in the settings: a card signs a hash of its picture, and each member posts their card with the
   picture into the mailbox.
 - **Leaving and removal.** Removing someone starts a new epoch: its key is sealed to each remaining member's group
