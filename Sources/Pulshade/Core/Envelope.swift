@@ -16,8 +16,10 @@ enum Envelope {
     /// Bit 1: files kept on the relay (`Attachment`). Bit 2: it answers group messages with a receipt, so a group
     /// tick can wait for it. Builds from before that never do, and aren't waited on. Bit 3: it takes and answers
     /// spare keys (`SpareSlot`), so its friends leave it one. Bit 4: it takes part in groups that share one mailbox
-    /// (`GroupSettings`), so a group can be made that way only once everyone in it says so.
-    static let reads: UInt8 = 31
+    /// (`GroupSettings`), so a group can be made that way only once everyone in it says so. Bit 5: photos, voice notes
+    /// and photo stories can come as a pointer to a sealed copy on the relay (`Payload.clipBlob`), after a message or
+    /// story that holds only a tiny preview. Builds from before get them inside the message, as always.
+    static let reads: UInt8 = 63
 
     /// Opened envelope: the payload, who sent it, from which of their devices, and when.
     struct Opened {
@@ -35,6 +37,7 @@ enum Envelope {
         var readsGroupReceipts: Bool { caps & 4 == 4 }
         var takesSpares: Bool { caps & 8 == 8 }
         var readsSharedGroups: Bool { caps & 16 == 16 }
+        var readsMediaBlobs: Bool { caps & 32 == 32 }
     }
 
     /// `framed` sends the payload and the inside of the envelope in frames, without the base64 that makes a big

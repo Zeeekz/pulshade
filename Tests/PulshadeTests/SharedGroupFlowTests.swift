@@ -74,7 +74,7 @@ struct SharedGroupFlowTests {
         cara.send("hey bob", in: group.id)
         await until([alice, bob, cara]) { bob.conversation(group.id)?.messages.count == 2 && alice.conversation(group.id)?.messages.count == 2 }
         #expect(bob.conversation(group.id)?.messages.map(\.text) == ["hi all", "hey bob"])
-        #expect(alice.conversation(group.id)?.messages.map(\.text) == ["hi all", "hey bob"])
+        #expect(alice.conversation(group.id)?.messages.filter { !$0.isSystem }.map(\.text) == ["hi all", "hey bob"])
         // Who said it shows by name.
         let fromCara = try #require(bob.conversation(group.id)?.messages.last)
         #expect(bob.displayName(fromCara.sender) == "Cara")
@@ -87,7 +87,7 @@ struct SharedGroupFlowTests {
         let mine = try #require(cara.conversation(group.id)?.messages.last)
         cara.unsend(mine.id, in: group.id)
         await until([alice, bob, cara]) { alice.conversation(group.id)?.messages.count == 1 }
-        #expect(alice.conversation(group.id)?.messages.map(\.text) == ["hi all"])
+        #expect(alice.conversation(group.id)?.messages.filter { !$0.isSystem }.map(\.text) == ["hi all"])
 
         // Details changed by the owner reach everyone; a plain member can't change them.
         alice.updateDetails(group.id, title: "Early birds", about: "", avatar: nil)
@@ -96,6 +96,142 @@ struct SharedGroupFlowTests {
         bob.updateDetails(group.id, title: "Mine now", about: "", avatar: nil)
         await settle(alice, bob, cara)
         #expect(alice.conversation(group.id)?.title == "Early birds")
+    }
+
+    /// The phone makes a group with the laptop and a friend who don't know each other. The friend joins at once and
+    /// chats with the phone; the laptop's app is closed and catches up later. The laptop and the friend must still read
+    /// each other, whichever order things happen in.
+    @Test(arguments: [false, true])
+    func aMemberWhoJoinsLateStillReadsAndIsRead(_ laptopWritesFirst: Bool) async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let group = alice.startConversation(kind: .group, title: "Late", members: [bobFP, caraFP])
+        #expect(group.shared != nil)
+        // Only the phone and the friend are open.
+        await until([alice, cara]) { cara.conversation(group.id)?.shared?.joining == false }
+        alice.send("phone 1", in: group.id)
+        cara.send("friend 1", in: group.id)
+        await until([alice, cara]) { alice.conversation(group.id)?.messages.contains { $0.text == "friend 1" } == true }
+        // The laptop opens Pulshade.
+        await until([alice, bob, cara]) {
+            bob.conversation(group.id)?.shared?.joining == false
+                && cara.conversation(group.id)?.members.count == 2 && alice.conversation(group.id)?.members.count == 2
+        }
+        #expect(bob.conversation(group.id)?.shared?.joining == false, "the laptop got in")
+        if laptopWritesFirst {
+            bob.send("laptop 1", in: group.id)
+            await until([alice, bob, cara]) { cara.conversation(group.id)?.messages.contains { $0.text == "laptop 1" } == true }
+            cara.send("friend 2", in: group.id)
+        } else {
+            cara.send("friend 2", in: group.id)
+            await until([alice, bob, cara]) { bob.conversation(group.id)?.messages.contains { $0.text == "friend 2" } == true }
+            bob.send("laptop 1", in: group.id)
+        }
+        await until([alice, bob, cara]) {
+            cara.conversation(group.id)?.messages.contains { $0.text == "laptop 1" } == true
+                && bob.conversation(group.id)?.messages.contains { $0.text == "friend 2" } == true
+                && alice.conversation(group.id)?.messages.contains { $0.text == "laptop 1" } == true
+        }
+        let epochs = [alice, bob, cara].map { $0.conversation(group.id)?.shared?.current?.number ?? -1 }
+        #expect(cara.conversation(group.id)?.messages.contains { $0.text == "laptop 1" } == true, "the friend reads the laptop (epochs \(epochs))")
+        #expect(bob.conversation(group.id)?.messages.contains { $0.text == "friend 2" } == true, "the laptop reads the friend (epochs \(epochs))")
+        #expect(alice.conversation(group.id)?.messages.contains { $0.text == "laptop 1" } == true)
+    }
+
+    /// A member's phone never got a new epoch's key (it was away, or the hand-out went astray). It asks again on its own
+    /// and an admin's phone sends it; nobody has to add anyone again.
+    @Test func aMemberWhoMissedAKeyGetsItBackOnTheirOwn() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let group = alice.startConversation(kind: .group, title: "Keys", members: [bobFP, caraFP])
+        await until([alice, bob, cara]) { cara.conversation(group.id)?.shared?.joining == false && bob.conversation(group.id)?.shared?.joining == false }
+        bob.send("chat", in: group.id)
+        await until([alice, bob, cara]) { cara.conversation(group.id)?.messages.contains { $0.text == "chat" } == true }
+        let before = try #require(cara.conversation(group.id)?.shared?.current?.number)
+
+        // A new epoch starts (as when someone is added after a chat); Cara reads the settings but loses the key.
+        alice.startNewEpoch(group.id)
+        await until([alice, bob]) { bob.conversation(group.id)?.shared?.current?.number == before + 1 }
+        let ci = try #require(cara.data.conversations.firstIndex { $0.id == group.id })
+        await until([cara]) { cara.data.conversations[ci].shared?.candidates.contains { $0.number == before + 1 } == true
+            || cara.data.conversations[ci].shared?.current?.number == before + 1 }
+        // Undo what the key did on Cara's phone: back to the old epoch, the new settings waiting for a key.
+        var held = try #require(cara.data.conversations[ci].shared)
+        if let newer = held.current, newer.number == before + 1 {
+            let settings = held.settings
+            held.epochs.removeAll { $0.number == before + 1 }
+            held.candidates.removeAll()
+            held.settings = try #require(held.previous)
+            held.pendingSettings = settings
+            held.missedKey = true
+            cara.data.conversations[ci].shared = held
+        } else {
+            held.candidates.removeAll()
+            cara.data.conversations[ci].shared = held
+        }
+        #expect(cara.conversation(group.id)?.shared?.current?.number == before)
+
+        bob.send("in the new epoch", in: group.id)
+        // Cara's phone asks, Alice's phone answers.
+        cara.tendSharedGroups()
+        await until([alice, bob, cara], seconds: 25) {
+            cara.conversation(group.id)?.messages.contains { $0.text == "in the new epoch" } == true
+        }
+        #expect(cara.conversation(group.id)?.shared?.current?.number == before + 1, "Cara has the new key")
+        #expect(cara.conversation(group.id)?.messages.contains { $0.text == "in the new epoch" } == true)
+    }
+
+    /// Two people who only share a group become friends from it: one taps the other's name and asks, the other accepts,
+    /// and each then has the other as a friend, with nobody else in the group able to read the invite.
+    @Test func groupMembersBecomeFriendsFromTheGroup() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let group = alice.startConversation(kind: .group, title: "Meet", members: [bobFP, caraFP])
+        await until([alice, bob, cara]) {
+            bob.conversation(group.id)?.members.count == 2 && cara.conversation(group.id)?.members.count == 2
+                && bob.conversation(group.id)?.shared?.joining == false && cara.conversation(group.id)?.shared?.joining == false
+        }
+        let bobGroup = try #require(bob.conversation(group.id))
+        let caraInBob = try #require(bobGroup.members.first { bob.displayName($0) == "Cara" })
+        #expect(bob.friendState(of: caraInBob, in: bobGroup) == .canAsk)
+        bob.addFriend(caraInBob, in: group.id, note: "hi from the group")
+        #expect(bob.friendState(of: caraInBob, in: bobGroup) == .asked)
+        await until([alice, bob, cara]) { cara.groupFriendInvites.count == 1 }
+        let invite = try #require(cara.groupFriendInvites.first)
+        #expect(invite.name == "Bob" && invite.note == "hi from the group" && invite.groupTitle == "Meet")
+        #expect(alice.groupFriendInvites.isEmpty, "only Cara could open it")
+
+        cara.acceptFriendInvite(invite.id)
+        let bobAccount = try #require(bob.me(nil)?.fingerprint)
+        let caraAccount = try #require(cara.me(nil)?.fingerprint)
+        await until([alice, bob, cara]) {
+            bob.data.contacts.contains { $0.fingerprint == caraAccount && !$0.hidden }
+                && cara.data.contacts.contains { $0.fingerprint == bobAccount && !$0.hidden && !$0.awaitingAcceptance }
+        }
+        #expect(bob.data.contacts.contains { $0.fingerprint == caraAccount && !$0.hidden }, "Bob has Cara as a friend")
+        #expect(cara.data.contacts.contains { $0.fingerprint == bobAccount && !$0.hidden }, "Cara has Bob as a friend")
+        #expect(cara.groupFriendInvites.isEmpty)
+    }
+
+    /// Adding someone shows at once, to everyone, as in other apps: before their app has answered, the group says who was
+    /// added and the admin sees them as invited; the invite asks to wake their phone; and they're in once it runs.
+    @Test func addingSomeoneShowsAtOnceAndWakesTheirPhone() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let group = alice.startConversation(kind: .group, title: "Now", members: [bobFP])
+        await until([alice, bob]) { bob.conversation(group.id)?.shared?.joining == false && alice.conversation(group.id)?.members.count == 1 }
+        alice.addMembers(group.id, [caraFP])
+        let aliceGroup = try #require(alice.conversation(group.id))
+        #expect(alice.contactsInvited(to: aliceGroup) == [caraFP], "shown as invited straight away")
+        #expect(aliceGroup.messages.contains { $0.isSystem && $0.text == "You added Cara" })
+        #expect(alice.data.outbox.contains { $0.wakes == true }, "the invite asks the relay to wake her phone")
+        // Bob hears about it before Cara's app has done anything.
+        await until([alice, bob]) { bob.conversation(group.id)?.messages.contains { $0.isSystem && $0.text == "Alice added Cara" } == true }
+        #expect(bob.conversation(group.id)?.messages.contains { $0.isSystem && $0.text == "Alice added Cara" } == true)
+        // Cara's app runs: she's in, and no longer listed as invited.
+        await until([alice, bob, cara]) { cara.conversation(group.id)?.shared?.joining == false && alice.conversation(group.id)?.members.count == 2 }
+        #expect(cara.conversation(group.id)?.shared?.joining == false)
+        #expect(alice.conversation(group.id).map { alice.contactsInvited(to: $0) }?.isEmpty == true)
     }
 
     @Test func someoneTakenOutCantReadWhatFollows() async throws {

@@ -294,39 +294,42 @@ What it changes, honestly:
 
 An admin of a group that shares one mailbox can make links that let people join without being anyone's contact.
 
-- **The link** is `pulshade://group/` followed by 40 bytes: a random 32-byte secret and the first 8 bytes of the SHA-256
-  of the member key of the admin who made it.
-- **The preview** (name, description, picture, member count, whether admins approve, and where to send a request) is
-  signed by that admin's member key, sealed with a key derived from the secret, padded to 32 KB and kept in the relay's
-  sealed-backup store under another key derived from the secret, exactly as spare keys are. The relay cannot open it or
-  tell what it is. The joining phone checks the signature and that the signer matches the 8 bytes in the link, so a
-  link cannot be pointed at a fake group.
+- **The link** is `pulshade://group/` followed by 48 bytes: a random 32-byte secret and the first 16 bytes of the
+  SHA-256 of the group owner's member key.
+- **The preview** (name, description, picture, member count, whether admins approve, the owner and admins by their
+  member keys, and where to send a request) is signed by the owner's member key, sealed with a key derived from the
+  secret, padded to 32 KB and kept in the relay's sealed-backup store under another key derived from the secret, exactly
+  as spare keys are. The relay cannot open it or tell what it is. The joining phone checks the signature and that the
+  signer is the owner the 16 bytes in the link name. Only the owner's phone writes previews, so an admin who is removed
+  cannot put out one of their own.
 - **Asking** sends one sealed envelope to an ordinary mailbox named in the preview. It is sealed from the newcomer's key
-  for this group alone (the same key they will be known by inside it) to a key only the group's members hold, and holds
+  for this group alone (the same key they will be known by inside it) to a key only the group's admins hold, and holds
   their card, an optional note, and a fresh mailbox for the answer. Their account key is never used.
-- **Letting in.** An admin's phone reads the request. Through an open link it adds the newcomer at once (starting a new
-  epoch first if anything has been said, so they cannot read what came before) and sends them the settings and the
-  current epoch key, sealed to their group key. Through a link that needs approval the request waits on the relay,
-  unacknowledged, where every admin's phone sees it, until one of them says yes or no. A banned key, an expired link or
-  one that is used up gets "no".
-- **The links themselves** (their secrets, limits, how many have used each) and the group's ban list are a document of
-  their own, signed by an admin and posted in the group's mailbox. Every member holds it; only admins act on it.
+- **Letting in.** Through an open link, one phone adds the newcomer at once: the leading device of the admin who made
+  the link. That admin's other devices step in after a minute, another admin's after two. Everyone let in at one look
+  goes into one change to the settings, and a link lets in at most 30 people an hour on its own; past that, requests wait
+  for an admin's yes. A request is answered once, can't be replayed later, and must be less than a day old. A new epoch starts first if anything has been said, so
+  the newcomer can't read what came before. The answer carries the settings and the current epoch key, sealed to the
+  newcomer's group key. Through a link that needs approval the request waits on the relay, unacknowledged, where every
+  admin's phone sees it, until one of them says yes or no (at most 100 waiting per link). A banned key, an expired link
+  or one that is used up gets "no".
+- **Taking the answer.** The newcomer's phone takes an answer, yes or no, only from the owner or an admin the preview
+  named, with settings signed by one of them that keep the same owner. A group it is already in only moves on to
+  settings that follow from the ones it holds.
+- **The links themselves** (their public parts, limits, how many have used each) and the group's ban list are a
+  document of their own, signed by an admin and posted in the group's mailbox. The keys that read and open requests are
+  sealed to each admin's group key separately; members cannot open them. When someone stops being an admin, the owner's
+  phone gives every link new keys (so old copies of the links stop working) and seals them to the admins that are left.
+  It keeps a record of everyone the keys have been sealed to since the last reset, and the owner's version wins when two
+  are made at once, so a change made at the same moment can't undo the reset.
 
-What this means: anyone who has a link can read the preview, so they learn the group's name, picture, description and
-size; they can also overwrite or delete the preview (the admin's phone puts it back within three days, or at once on
-any change; a reset gives the link new secrets). Members can see who asked to join through a link that needs approval.
-The relay sees a small backup-sized slot read now and then, and envelopes going into and out of two ordinary mailboxes.
-Two admins letting people in at the same moment can let a use limit be passed by one or two.
-
-Honest limits (the per-member format above):
-
-- A roster is only as trustworthy as the admins who sent it. A poisoned roster **cannot** let anyone read your messages
-  to a member (a session only opens on an answer signed by that member's own identity), but it can stop you reaching
-  that member. Checking the pulse code settles it. A later version may have members sign their own cards.
-- Because each member gets their own copy, a malicious member can send different members different things. There is no
-  group-wide transcript check.
-- The relay sees a burst of envelopes of the same size land in many mailboxes at the same moment. Over Tor it cannot tell
-  whose they are; in Fast mode it sees one IP address depositing all of them.
+What this means: anyone who has a link can read the preview, so they learn the group's name, picture, description, size
+and the member keys of its owner and admins (keys used only in this group); they can also overwrite or delete the
+preview (the admin's phone puts it back within three days, or at once on any change; a reset gives the link new
+secrets). Only admins can see who asked through a link that needs approval. The relay sees a small backup-sized slot
+read now and then, and envelopes going into and out of two ordinary mailboxes. If the owner's phone is away when an
+admin is removed, that admin can still read requests until it's back; previews aren't refreshed while it's away. Two admins changing the links at the same moment
+can let a use limit be passed by one or two; a ban or use count lost that way is put back by the phone that holds it.
 
 ## 8. Sealed backups
 
@@ -365,7 +368,10 @@ Honest limits:
 
 *Code: `Sources/Pulshade/Core/Blob.swift`.*
 
-Files up to **100 MB**, chat videos, and story videos are not sent inside a message. Instead:
+Files up to **100 MB**, chat videos, and story videos are not sent inside a message. Neither are photos, voice notes
+and photo stories bigger than about 48 KB, when every device of the person they go to says its app takes them that way
+(bit 5 of the `caps` byte): the message or story then carries only a tiny preview of the photo, or a voice note's length
+and waveform, and the rest follows as a pointer. Older apps still get them inside the message. Instead:
 
 1. The sender's app makes a fresh random **256-bit file key** and seals the file in **1 MiB pieces** with
    ChaCha20-Poly1305. Each piece's nonce is its position, and its authenticated data is the file id, the position and
@@ -377,7 +383,8 @@ Files up to **100 MB**, chat videos, and story videos are not sent inside a mess
 4. For each person the file goes to, the sender also makes a **one-time token** and tells the relay its hash. The
    receiver's phone fetches the pieces into **memory**, opens and checks them there, and then spends its token. When
    every token is spent the relay **erases the file**: overwrites the pieces with random bytes, removes them, and
-   destroys the file's key (so a stray copy on a flash disk cannot be opened). Video stories stay until their timer ends.
+   destroys the file's key (so a stray copy on a flash disk cannot be opened). Video and photo stories stay until their
+   timer ends.
 5. Deleting the message sends the erase secret, and the relay erases the file at once. A file nobody deletes is erased
    after **7 days at most**. Burn sends the same erase for everything the account uploaded.
 

@@ -14,6 +14,8 @@ struct ConversationView: View {
     @State private var draft = ""
     /// The message being forwarded, while the chat picker is up.
     @State private var forwarding: Message?
+    /// Someone in the chat whose profile is open (tapped their name).
+    @State private var profileOf: MemberRef?
     @State private var attachments: [Data] = []
     /// A video for the next message, while it's made ready and once it is.
     @State private var videoDraft: VideoDraft?
@@ -87,6 +89,7 @@ struct ConversationView: View {
             }
             .onChange(of: c.messages.count) { model.markRead(id) }
             .sheet(isPresented: $showInfo) { ConversationInfo(id: id) }
+            .sheet(item: $profileOf) { MemberProfileSheet(fingerprint: $0.fingerprint, conversation: id) }
             .sheet(item: $forwarding) { m in
                 ForwardSheet(message: m, from: id).presentationDetents([.medium, .large])
             }
@@ -239,7 +242,8 @@ struct ConversationView: View {
                                        retry: { model.retrySend(m.id, in: id) },
                                        canForward: model.canForward(m, in: c),
                                        canCopy: model.canCopy(m),
-                                       forward: { forwarding = m })
+                                       forward: { forwarding = m },
+                                       openSender: { profileOf = MemberRef(fingerprint: m.sender) })
                                 .equatable()
                             }
                         }
@@ -808,6 +812,8 @@ fileprivate struct Bubble: View, Equatable {
     var canForward = false
     var canCopy = true
     var forward: () -> Void = {}
+    /// Opens the sender's profile (their name was tapped).
+    var openSender: () -> Void = {}
     @State private var hovering = false
     @State private var picking = false
     @State private var viewingImage = false
@@ -1002,6 +1008,10 @@ fileprivate struct Bubble: View, Equatable {
             Text(senderName)
                 .font(.system(size: 13, weight: .semibold))
                 .foregroundStyle(tint)
+                .contentShape(.rect)
+                .onTapGesture(perform: openSender)
+                .accessibilityAddTraits(.isButton)
+                .accessibilityHint("Shows their profile")
         }
         if message.forwarded == true {
             // Only that it was forwarded: never from whom, or from where.
@@ -1113,6 +1123,20 @@ fileprivate struct Bubble: View, Equatable {
     @ViewBuilder private func media(_ size: CGSize) -> some View {
         if message.isVideo {
             VideoBubble(message: message, fill: size)
+        } else if message.awaiting == .photo {
+            // The photo is still on its way: its tiny preview, softened, until it lands.
+            ZStack {
+                if let data = message.image, let img = DecodedImages.image(data, fit: 64) {
+                    Image(platformImage: img).resizable().scaledToFill().blur(radius: 14)
+                } else {
+                    Ink.text.opacity(0.08)
+                }
+                ProgressView().tint(.white)
+            }
+            .frame(width: size.width, height: size.height)
+            .clipped()
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Photo, loading")
         } else if let data = message.image, let img = DecodedImages.image(data, fit: 1100) {
             Image(platformImage: img).resizable().scaledToFill()
                 .frame(width: size.width, height: size.height)
@@ -1134,7 +1158,7 @@ fileprivate struct Bubble: View, Equatable {
         return VStack(alignment: mine ? .trailing : .leading, spacing: 6) {
             header
             if let voice = message.voice {
-                VoiceBubble(note: voice, id: message.id, mine: mine)
+                VoiceBubble(note: voice, id: message.id, mine: mine, loading: message.awaiting == .voice)
             }
             if message.attachment?.kind == .file {
                 FileBubble(message: message, mine: mine)
@@ -1445,11 +1469,21 @@ private struct VoiceBubble: View {
     var note: VoiceNote
     var id: UUID
     var mine: Bool
+    /// The sound is still on its way: the length and waveform show, but nothing plays yet.
+    var loading = false
     private var player: VoicePlayer { .shared }
 
     var body: some View {
         let playing = player.playing == id
         HStack(spacing: 10) {
+            if loading {
+                ProgressView()
+                    .controlSize(.small)
+                    .tint(mine ? theme.colors[0] : Ink.onAccent)
+                    .frame(width: 32, height: 32)
+                    .background(Circle().fill(mine ? AnyShapeStyle(Ink.onAccent.opacity(0.8)) : AnyShapeStyle(theme.gradient)))
+                    .accessibilityLabel("Voice note, loading")
+            } else {
             Button { player.toggle(note, id: id) } label: {
                 Image(systemName: playing ? "pause.fill" : "play.fill")
                     .font(.system(size: 13, weight: .bold))
@@ -1460,6 +1494,7 @@ private struct VoiceBubble: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel(playing ? "Pause" : "Play voice note")
+            }
             Waveform(levels: note.levels, progress: playing ? player.progress : 0,
                      color: mine ? Ink.onAccent.opacity(0.75) : Ink.text)
                 .frame(width: 150, height: 28)
@@ -1692,6 +1727,8 @@ private struct ConversationInfo: View {
     @State private var pending: Pending?
     @State private var reporting: ReportSubject?
     @State private var adding = false
+    /// A member whose profile is open.
+    @State private var profileOf: MemberRef?
     /// Flips on as the sheet opens, so the profile eases in instead of just appearing.
     @State private var arrived = false
 
@@ -1766,6 +1803,7 @@ private struct ConversationInfo: View {
                 avatar = c.avatar
             }
             .sheet(isPresented: $adding) { AddPeopleSheet(id: id) }
+            .sheet(item: $profileOf) { MemberProfileSheet(fingerprint: $0.fingerprint, conversation: id) }
         }
     }
 
@@ -2127,13 +2165,33 @@ private struct ConversationInfo: View {
             ForEach(people, id: \.self) { fp in
                 personRow(name: model.displayName(fp), fp: fp, c: c, avatar: model.contact(fp, in: c.persona)?.avatar, seed: fp)
             }
+            // Added, but their app hasn't answered yet: in the group already as far as you're concerned.
+            ForEach(model.contactsInvited(to: c), id: \.self) { fp in
+                HStack(spacing: 10) {
+                    Avatar(image: model.contact(fp, in: c.persona)?.avatar, seed: fp, size: 28)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(model.displayName(fp)).font(.system(size: 13)).foregroundStyle(Ink.text).lineLimit(1)
+                        Text("Invited · joins when they open Pulshade").font(.system(size: 10)).foregroundStyle(Ink.faint)
+                    }
+                    Spacer()
+                }
+                .padding(.vertical, 3)
+            }
         }
     }
 
     private func personRow(name: String, fp: String, c: Conversation, avatar: Data?, seed: String) -> some View {
         HStack(spacing: 10) {
+            Button { if fp != "me" { profileOf = MemberRef(fingerprint: fp) } } label: {
+            HStack(spacing: 10) {
             Avatar(image: avatar, seed: seed, size: 28)
-            Text(name).font(.system(size: 13)).foregroundStyle(Ink.text).lineLimit(1)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(name).font(.system(size: 13)).foregroundStyle(Ink.text).lineLimit(1)
+                // In an older-style group, how this device stands with them: worth seeing when someone's messages don't arrive.
+                if let status = model.keyStatus(of: fp, in: c) {
+                    Text(status).font(.system(size: 10)).foregroundStyle(Ink.faint).lineLimit(2)
+                }
+            }
             Spacer()
             if let role = model.role(of: fp, in: c) {
                 Text(role)
@@ -2142,6 +2200,10 @@ private struct ConversationInfo: View {
                     .padding(.horizontal, 6).padding(.vertical, 2)
                     .background(theme.wash, in: .rect(cornerRadius: 4))
             }
+            }
+            .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
             if fp != "me", c.kind != .broadcast, c.amAdmin || (c.amMod && c.canRemove(fp, by: "me")), fp != c.owner {
                 Menu {
                     if c.amOwner {

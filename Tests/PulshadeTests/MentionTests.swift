@@ -114,10 +114,16 @@ struct MentionFlowTests {
         let model = testModel("pulshade-test")
         let old = Story(author: "k", style: .text("a", palette: 0), date: Date().addingTimeInterval(-60), seen: true)
         let fresh = Story(author: "k", style: .text("b", palette: 0), date: Date())
+        model.data.contacts = [Contact(fingerprint: "k", signingKey: Data(), agreementKey: Data(), sendID: Data())]
         model.data.stories = [old, fresh]
         let reel = model.unwatchedReel(of: "k")
         #expect(reel?.stories.map(\.id) == [old.id, fresh.id] && reel?.start == 1, "plays from the first one not watched")
         #expect(model.unwatchedReel(of: "someone-else") == nil && model.unwatchedReel(of: "me") == nil && model.unwatchedReel(of: "") == nil)
+
+        // Someone you only share a group with: their stories aren't shown.
+        model.data.contacts[0].hidden = true
+        #expect(model.unwatchedReel(of: "k") == nil && model.friendStories.isEmpty, "not a friend")
+        model.data.contacts[0].hidden = false
 
         model.data.stories[1].seen = true
         #expect(model.unwatchedReel(of: "k") == nil, "watched: the picture goes back to its normal tap")

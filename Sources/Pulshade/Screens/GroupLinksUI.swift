@@ -53,7 +53,7 @@ struct JoinGroupSheet: View {
         if model.isInGroup(p, persona: model.activePersona) {
             Text("You're in this group.").font(.system(size: 13)).foregroundStyle(Ink.dim)
             Button("Open") {
-                model.requestedConversation = p.group
+                model.requestedConversation = model.conversationID(forGroup: p.group, persona: model.activePersona)
                 dismiss()
             }
             .buttonStyle(PrimaryButtonStyle())
@@ -115,7 +115,7 @@ struct GroupLinksSection: View {
                     ForEach(held) { request(model: $0) }
                 }
             }
-            Card(title: "Join links", footer: "Anyone with a link can see the group's name, picture, description and size, and ask to join.") {
+            Card(title: "Join links", footer: "Anyone with a link can see the group's name, picture, description and size, and ask to join. Members can see the links; only admins can read who asked.") {
                 ForEach(links?.links ?? []) { linkRow($0) }
                 if (links?.links.count ?? 0) < GroupLinks.maxLinks {
                     Button { making = true } label: {
@@ -145,7 +145,7 @@ struct GroupLinksSection: View {
             }
         }
         .sheet(isPresented: $making) { NewJoinLinkSheet(id: id) }
-        .sheet(item: $showing) { LinkCodeSheet(link: $0) }
+        .sheet(item: $showing) { LinkCodeSheet(link: $0, text: model.linkCode($0, in: id)?.link ?? "") }
         .confirmationDialog(confirm?.title ?? "", isPresented: Binding(get: { confirm != nil }, set: { if !$0 { confirm = nil } }),
                             titleVisibility: .visible) {
             Button("Continue", role: .destructive) { confirm?.action(); confirm = nil }
@@ -162,7 +162,13 @@ struct GroupLinksSection: View {
                 }
             }
             Spacer()
-            Button("Decline") { model.declineJoin(held.id, in: id) }
+            Menu {
+                Button("Decline") { model.declineJoin(held.id, in: id) }
+                Button("Decline and ban", role: .destructive) { model.declineAndBan(held.id, in: id) }
+            } label: {
+                Text("Decline").font(.system(size: 12, weight: .semibold)).foregroundStyle(Ink.dim)
+            }
+            .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
                 .buttonStyle(.plain).font(.system(size: 12, weight: .semibold)).foregroundStyle(Ink.dim)
             Button("Add") { model.approveJoin(held.id, in: id) }
                 .buttonStyle(.plain).font(.system(size: 12, weight: .semibold)).foregroundStyle(theme.accent)
@@ -179,7 +185,7 @@ struct GroupLinksSection: View {
             }
             Spacer()
             Button {
-                copyToClipboard(link.code.link)
+                copyToClipboard(model.linkCode(link, in: id)?.link ?? "")
                 withAnimation(.snappy) { copied = link.id }
             } label: {
                 Image(systemName: copied == link.id ? "checkmark" : "doc.on.doc").font(.system(size: 12))
@@ -228,7 +234,7 @@ private struct NewJoinLinkSheet: View {
         SheetBody(width: 400) {
             VStack(alignment: .leading, spacing: 16) {
                 SheetHeader(symbol: "link.badge.plus", title: "New link")
-                TextField("Name (only admins see it)", text: $label)
+                TextField("Name (members can see it)", text: $label)
                     .textFieldStyle(.plain)
                     .padding(10)
                     .background(Ink.raised, in: .rect(cornerRadius: 8))
@@ -274,15 +280,17 @@ private struct NewJoinLinkSheet: View {
 private struct LinkCodeSheet: View {
     @Environment(\.theme) private var theme
     let link: JoinLink
+    /// The link as text (it names the group's owner).
+    let text: String
     @State private var copied = false
 
     var body: some View {
         SheetBody(width: 380) {
             VStack(spacing: 16) {
                 SheetHeader(symbol: "qrcode", title: link.label.isEmpty ? "Join link" : link.label)
-                QRCode(text: link.code.link, size: 220)
+                QRCode(text: text, size: 220)
                 Button {
-                    copyToClipboard(link.code.link)
+                    copyToClipboard(text)
                     withAnimation(.snappy) { copied = true }
                 } label: {
                     Label(copied ? "Copied" : "Copy link", systemImage: copied ? "checkmark" : "link").font(.system(size: 13, weight: .semibold))

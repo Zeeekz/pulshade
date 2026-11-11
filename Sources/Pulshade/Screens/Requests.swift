@@ -39,8 +39,8 @@ struct ContactsView: View {
             VStack(alignment: .leading, spacing: 22) {
                 HStack(spacing: 8) {
                     Text("Contacts").font(.system(size: 20, weight: .bold)).foregroundStyle(Ink.text)
-                    if !model.requests.isEmpty {
-                        Text("\(model.requests.count)")
+                    if !model.requests.isEmpty || !model.groupFriendInvites.isEmpty {
+                        Text("\(model.requests.count + model.groupFriendInvites.count)")
                             .font(.system(size: 12, weight: .bold)).foregroundStyle(Ink.onAccent)
                             .padding(.horizontal, 8).frame(height: 20).background(theme.accent, in: .capsule)
                     }
@@ -50,6 +50,7 @@ struct ContactsView: View {
                 if safety { safetyCard }
                 if found != nil || notFound || problem != nil { lookupResult }
                 if !model.requests.isEmpty && query.isEmpty { requestsSection }
+                if !model.groupFriendInvites.isEmpty && query.isEmpty { GroupFriendInvitesSection() }
                 if !model.sentRequests.isEmpty && query.isEmpty { waitingSection }
                 contactsSection
             }

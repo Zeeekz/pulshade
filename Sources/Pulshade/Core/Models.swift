@@ -105,6 +105,8 @@ struct DeviceLink: Codable {
     var takesSpares: Bool?
     /// Their app takes part in groups that share one mailbox. Nil for an app from before.
     var readsSharedGroups: Bool?
+    /// Their app takes photos, voice notes and photo stories as a pointer to a copy on the relay. Nil for an app from before.
+    var readsMediaBlobs: Bool?
     /// When this device answered that device's spare key, by the relay's clock: a hello of theirs sent before then was
     /// overtaken by the answer and isn't taken. Cleared once keys are opened any other way.
     var spareTakenAt: Date?
@@ -351,6 +353,31 @@ struct LinkRequest: Codable, Equatable {
 
 /// Someone who found your public profile and wants to talk. Nothing is set up until you accept.
 
+/// What a sealed invite to be friends carries: a one-time invite code for the sender's account, and a note.
+struct FriendInviteBody: Codable, Equatable {
+    var code: String
+    var note: String?
+}
+
+/// Someone you share a group with (but aren't friends with) invited you to be friends. Accepting uses their invite code,
+/// the same as scanning it.
+struct GroupFriendInvite: Codable, Identifiable, Equatable {
+    var id = UUID()
+    /// Which of your personas they asked, and the group it came through.
+    var persona: UUID?
+    var group: UUID?
+    var groupTitle: String
+    /// Who they are in that group, as this device knows them.
+    var from: String
+    var name: String
+    var avatar: Data?
+    var code: String
+    var note: String?
+    var at = Date()
+
+    static let max = 50
+}
+
 struct FriendRequest: Codable, Identifiable, Equatable {
     var id = UUID()
     var fingerprint: String
@@ -535,6 +562,9 @@ struct Message: Codable, Identifiable, Equatable {
     var noForward: Bool?
     /// Forwarded from another chat; nothing says from where.
     var forwarded: Bool?
+    /// A photo or voice note whose bytes are still on their way (from the relay, or in pieces): what's here until then
+    /// is a tiny preview, or a voice note's length and waveform without its sound.
+    var awaiting: Attachment.Kind?
 
     var isVideo: Bool { video != nil }
     /// Whether this message @-mentions you.
@@ -578,6 +608,7 @@ struct Message: Codable, Identifiable, Equatable {
         deliveredTo = try? c.decodeIfPresent([String].self, forKey: .deliveredTo)
         noForward = try? c.decodeIfPresent(Bool.self, forKey: .noForward)
         forwarded = try? c.decodeIfPresent(Bool.self, forKey: .forwarded)
+        awaiting = try? c.decodeIfPresent(Attachment.Kind.self, forKey: .awaiting)
     }
 }
 
@@ -713,6 +744,9 @@ struct Conversation: Codable, Identifiable, Equatable {
     static let maxMembers = 300
 
     var id = UUID()
+    /// The group's own id, when this copy is kept under another: one device can be in the same group as two of its
+    /// personas, and each keeps its own copy. Nil when `id` is the group's id (always, for a direct chat).
+    var groupID: UUID?
     var kind: ConversationKind
     var title: String
     var avatar: Data?
@@ -765,7 +799,7 @@ struct Conversation: Codable, Identifiable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case id, kind, title, avatar, members, messages, createdAt, pinned, muted, unread, disappearAfter, persona
-        case about, owner, admins, mods, postPolicy, version, isOwner, introsMade, introsMine, shared
+        case about, owner, admins, mods, postPolicy, version, isOwner, introsMade, introsMine, shared, groupID
     }
 
     init(from decoder: Decoder) throws {
@@ -789,6 +823,7 @@ struct Conversation: Codable, Identifiable, Equatable {
         introsMade = try c.decodeIfPresent([String: [String: Data]].self, forKey: .introsMade) ?? [:]
         introsMine = try c.decodeIfPresent([IntroMailbox].self, forKey: .introsMine) ?? []
         shared = try c.decodeIfPresent(SharedGroup.self, forKey: .shared)
+        groupID = try c.decodeIfPresent(UUID.self, forKey: .groupID)
         if let owner = try c.decodeIfPresent(String.self, forKey: .owner) {
             self.owner = owner
             postPolicy = (try? c.decodeIfPresent(PostPolicy.self, forKey: .postPolicy)) ?? .everyone
@@ -823,6 +858,23 @@ struct Conversation: Codable, Identifiable, Equatable {
         if !introsMade.isEmpty { try c.encode(introsMade, forKey: .introsMade) }
         if !introsMine.isEmpty { try c.encode(introsMine, forKey: .introsMine) }
         try c.encodeIfPresent(shared, forKey: .shared)
+        try c.encodeIfPresent(groupID, forKey: .groupID)
+    }
+
+    /// The id the group goes by between devices: in every payload, settings and key.
+    var wireID: UUID { groupID ?? id }
+
+    /// Where a second persona's copy of a group is kept on this device: worked out from the group and the persona, so
+    /// it's the same every time.
+    static func localID(group: UUID, persona: UUID?) -> UUID {
+        var input = Data("pulshade.local-group.v1".utf8)
+        withUnsafeBytes(of: group.uuid) { input.append(contentsOf: $0) }
+        if let persona { withUnsafeBytes(of: persona.uuid) { input.append(contentsOf: $0) } }
+        var bytes = Array(SHA256.hash(data: input).prefix(16))
+        bytes[6] = (bytes[6] & 0x0F) | 0x50
+        bytes[8] = (bytes[8] & 0x3F) | 0x80
+        return UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                           bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]))
     }
 
     var lastActivity: Date { messages.last?.date ?? createdAt }
@@ -992,10 +1044,13 @@ struct Story: Codable, Identifiable, Equatable {
         return true
     }
 
-    /// A video story is only shown once its whole clip has arrived.
+    /// A video story is only shown once its whole clip has arrived, and a photo one once its picture has.
     var isReady: Bool {
-        if case let .video(clip, _) = style { return !clip.isEmpty }
-        return true
+        switch style {
+        case let .video(clip, _): !clip.isEmpty
+        case let .image(photo, _): !photo.isEmpty
+        case .text: true
+        }
     }
 }
 
@@ -1262,8 +1317,11 @@ struct AppData: Codable {
     /// 12: your sent envelopes by digest, so a friend's locked phone can confirm delivery (`Payload.collected`).
     /// 13: the spare keys a device leaves for each friend (`SpareSlot`), and which friends' apps take them.
     /// 14: a chat background, built in or a photo of your own.
-    /// 15: requests to join groups through links; a shared group's links, bans and requests waiting for an admin.
-    static let currentFormat = 15
+    /// 15: a photo or voice note can still be on its way (`Message.awaiting`); a device says if it takes them apart.
+    /// 16: invites to be friends from people you share a group with.
+    /// 17: a group can be kept twice on one device, once per persona in it (`Conversation.groupID`).
+    /// 18: requests to join groups through links; a shared group's links, bans and requests waiting for an admin.
+    static let currentFormat = 18
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []
@@ -1328,6 +1386,8 @@ struct AppData: Codable {
     var blobWipes: [BlobWipe] = []
     /// Your requests to join groups through their links, until each is answered.
     var joinAsks: [JoinAsk] = []
+    /// Invites to be friends from people you share a group with, until you answer.
+    var friendInvites: [GroupFriendInvite] = []
     init() {}
 
     /// The relay new identities use. A build can set `PulshadeRelay` in its Info.plist (the iPhone
@@ -1378,6 +1438,7 @@ struct AppData: Codable {
         chatCodes = (try? c.decodeIfPresent([ChatCodeOffer].self, forKey: .chatCodes)) ?? []
         blobWipes = (try? c.decodeIfPresent([BlobWipe].self, forKey: .blobWipes)) ?? []
         joinAsks = (try? c.decodeIfPresent([JoinAsk].self, forKey: .joinAsks)) ?? []
+        friendInvites = (try? c.decodeIfPresent([GroupFriendInvite].self, forKey: .friendInvites)) ?? []
         personas = try c.decodeIfPresent([Persona].self, forKey: .personas) ?? []
         requests = (try? c.decodeIfPresent([FriendRequest].self, forKey: .requests)) ?? []
         blocked = try c.decodeIfPresent([String].self, forKey: .blocked) ?? []

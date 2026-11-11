@@ -168,8 +168,9 @@ struct StoryFace: View {
 
     /// A video still arriving says how far it has got, once its first piece is in.
     private var loadingLabel: String {
-        guard let got = model?.clipProgress(of: story.id, persona: story.persona), got.have > 0, got.of > 1 else { return "Loading video" }
-        return "Loading video · \(got.have) of \(got.of)"
+        let what = if case .image = story.style { "Loading photo" } else { "Loading video" }
+        guard let got = model?.clipProgress(of: story.id, persona: story.persona), got.have > 0, got.of > 1 else { return what }
+        return "\(what) · \(got.have) of \(got.of)"
     }
 
     /// A video still on its way: how far it has got, and once it has been asked for, who it is waiting on, with a
@@ -209,7 +210,15 @@ struct StoryFace: View {
                     .padding(compact ? 16 : 40)
             case let .image(data, caption):
                 Color.black
-                if let img = StoryImages.image(id: story.id, data: data) {
+                if data.isEmpty {
+                    // Still arriving: it shows as soon as the picture is in.
+                    VStack(spacing: 10) {
+                        ProgressView().tint(.white)
+                        if !compact { waiting }
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(loadingLabel)
+                } else if let img = StoryImages.image(id: story.id, data: data) {
                     Image(platformImage: img).resizable().scaledToFill()
                 }
                 if !caption.isEmpty { StoryCaption(text: caption, compact: compact) }

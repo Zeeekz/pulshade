@@ -63,6 +63,10 @@ struct WireMessage: Codable, Equatable {
     var noForward: Bool? = nil
     /// Forwarded from another chat. Says nothing about where from, or who wrote it first.
     var forwarded: Bool? = nil
+    /// The photo or voice note follows on its own (`Payload.clipBlob`, or in pieces), under this message's id: `image`
+    /// is only a tiny preview, and `voice` has its length and waveform but no sound. Only sent to apps that say they
+    /// read it (`Envelope.reads` bit 5).
+    var mediaFollows: Attachment.Kind? = nil
 }
 
 /// What a message says about the video that follows it.
@@ -161,6 +165,17 @@ enum Payload: Codable, Equatable {
     case groupRekey(GroupRekey)
     /// In a group's mailbox: the group's join links and bans, signed by an admin. Apps from before links don't read it.
     case groupLinks(GroupLinks)
+    /// In a group's mailbox: "this device never got epoch `epoch`'s key", posted on a key it has, so an admin's phone
+    /// sends it again, sealed to that member alone. Apps from before ignore it.
+    case groupKeyWanted(group: UUID, epoch: Int)
+    /// In a group's mailbox: an invite to be friends for one member (`to`, their group key), sealed so only they can open
+    /// it (a `FriendInviteBody`). Apps from before ignore it.
+    case friendAsk(to: Data, sealed: Data)
+    /// Over the keys two group members who aren't friends share: an invite to be friends. Apps from before ignore it.
+    case friendInvite(code: String, note: String?)
+    /// In a group's mailbox, from an admin: these people were just invited (their names, as the admin knows them), so
+    /// everyone sees it at once instead of when each one's app answers. Apps from before ignore it.
+    case membersAdded(names: [String])
     /// In a group's mailbox: a member's own card with their picture (the settings carry it without).
     case memberCard(MemberCard)
     /// A story, or a new version of one already sent (same id, edited text or lifetime). `lasts` is in seconds;
@@ -387,6 +402,8 @@ struct ConversationCard: Codable, Equatable {
     var pinned: Bool? = nil
     var muted: Bool? = nil
     var mods: [String]? = nil
+    /// The group's own id, when `id` is this device's copy for a second persona (`Conversation.groupID`).
+    var group: UUID? = nil
 }
 
 /// What one of your devices tells the others when you act on it.

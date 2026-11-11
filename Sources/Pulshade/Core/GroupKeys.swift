@@ -471,6 +471,16 @@ struct GroupOutgoing: Codable, Equatable {
     var queued = Date()
 }
 
+/// A group post kept to read again later: which epoch's mailbox it came from, and the envelope.
+struct HeldGroupMail: Codable, Equatable {
+    var epoch: Int
+    var seq: UInt64
+    var blob: Data
+    var at: Date
+
+    static let max = 100
+}
+
 /// What this device keeps about a group that shares one mailbox.
 struct SharedGroup: Codable, Equatable {
     var settings: GroupSettings
@@ -524,6 +534,19 @@ struct SharedGroup: Codable, Equatable {
     var previews: [String: PreviewMark]?
     /// The epoch the links were last posted in by this device.
     var linksEpoch: Int?
+    /// As an admin: each link's keys, by link id, opened from the copy sealed to this account. Only on admins' devices.
+    var linkSecrets: [String: LinkSecrets]?
+    /// As the owner: the admins the links' keys were last sealed to (so a new admin gets a copy), and everyone any version
+    /// since the last reset was sealed to (so the links get new keys once one of them isn't an admin any more).
+    var linksSealedTo: [Data]?
+    var linksExposed: [Data]?
+    /// As an admin: requests already dealt with (hash of the envelope), so the relay can't replay one to add someone again.
+    var handledJoins: [Data]?
+    /// When this device last asked for a key it missed (`Payload.groupKeyWanted`).
+    var keyAskedAt: Date?
+    /// Posts from someone the settings held here don't list yet (the settings that add them are still on the way):
+    /// read again once they arrive, instead of being lost.
+    var heldMail: [HeldGroupMail]?
 
     /// The epoch the settings name (the one everything is posted in).
     var current: GroupEpoch? { epochs.last { $0.number == settings.epoch && $0.check == settings.epochCheck } ?? epochs.last }
