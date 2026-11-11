@@ -97,6 +97,9 @@ enum Bridges: String, CaseIterable, Codable {
         var custom = ""
         /// Under Automatic, whether Snowflake is what last worked. Optional so files from before it still open.
         var fallback: Bool?
+        /// Whether relay traffic goes over Tor, if it was ever chosen. Kept here, not in the preferences file, so the
+        /// file in the clear doesn't say which way this device connects. Optional so files from before still open.
+        var tor: Bool?
     }
 
     private static let lock = NSLock()
@@ -120,25 +123,50 @@ enum Bridges: String, CaseIterable, Codable {
         // Builds before this kept the choice in the preferences file, in the clear: move it into the sealed file.
         // The plaintext copy goes whatever happens next: if it can't be sealed right now, the choice is used from
         // memory for this launch rather than left readable in a plist.
-        if let old = defaults.string(forKey: "pulshade.bridges") {
-            let moved = Saved(choice: Bridges(rawValue: old) ?? .off, custom: defaults.string(forKey: "pulshade.bridges.custom") ?? "")
-            _ = try? write(moved)
-            defaults.removeObject(forKey: "pulshade.bridges")
-            defaults.removeObject(forKey: "pulshade.bridges.custom")
-            return moved
+        var loaded: Saved
+        if let raw = try? Data(contentsOf: file), let key = keys.load().last,
+           let box = try? AES.GCM.SealedBox(combined: raw), let plain = try? AES.GCM.open(box, using: key),
+           let saved = try? JSONDecoder().decode(Saved.self, from: plain) {
+            loaded = saved
+        } else {
+            loaded = Saved()
         }
-        guard let raw = try? Data(contentsOf: file), let key = keys.load().last,
-              let box = try? AES.GCM.SealedBox(combined: raw), let plain = try? AES.GCM.open(box, using: key),
-              let saved = try? JSONDecoder().decode(Saved.self, from: plain) else { return Saved() }
-        return saved
+        var moved = false
+        if let old = defaults.string(forKey: "pulshade.bridges") {
+            loaded.choice = Bridges(rawValue: old) ?? .off
+            loaded.custom = defaults.string(forKey: "pulshade.bridges.custom") ?? ""
+            moved = true
+        }
+        // The Tor switch lived there in the clear too: same move.
+        if let old = defaults.object(forKey: "pulshade.tor") as? Bool {
+            loaded.tor = old
+            moved = true
+        }
+        if moved {
+            _ = try? write(loaded)
+            for key in ["pulshade.bridges", "pulshade.bridges.custom", "pulshade.tor"] { defaults.removeObject(forKey: key) }
+        }
+        return loaded
     }
 
     /// Keeps a choice for the next launch. Without a Keychain it holds until Pulshade quits, rather than going
     /// down unsealed.
     static func remember(_ choice: Bridges, custom lines: String? = nil) {
-        let saved = Saved(choice: choice, custom: lines ?? customLines, fallback: choice == .auto ? autoUsesSnowflake : nil)
+        let saved = Saved(choice: choice, custom: lines ?? customLines, fallback: choice == .auto ? autoUsesSnowflake : nil,
+                          tor: self.saved.tor)
         lock.withLock { cached = saved }
         try? write(saved)
+    }
+
+    /// The Tor switch, once chosen on this device. Nil if it never was.
+    static var torSwitch: Bool? { saved.tor }
+
+    /// Keeps the Tor switch for the next launch, beside the bridge choice.
+    static func rememberTor(_ on: Bool) {
+        var next = saved
+        next.tor = on
+        lock.withLock { cached = next }
+        try? write(next)
     }
 
     /// Reads the file again, as the next launch would.
@@ -169,5 +197,6 @@ enum Bridges: String, CaseIterable, Codable {
         keys.forget()
         UserDefaults.standard.removeObject(forKey: "pulshade.bridges")
         UserDefaults.standard.removeObject(forKey: "pulshade.bridges.custom")
+        UserDefaults.standard.removeObject(forKey: "pulshade.tor")
     }
 }

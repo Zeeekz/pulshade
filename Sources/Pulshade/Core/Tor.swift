@@ -11,8 +11,7 @@ enum Tor {
     /// Held while Tor starts, so it starts once.
     private static let starting = NSLock()
     /// On until someone turns it off: a fresh install, before there's an account, goes over Tor like the rest.
-    nonisolated(unsafe) private static var on = UserDefaults.standard.object(forKey: "pulshade.tor") as? Bool
-        ?? SecuritySettings.torByDefault
+    nonisolated(unsafe) private static var on = Bridges.torSwitch ?? SecuritySettings.torByDefault
     nonisolated(unsafe) private static var port: UInt16 = 0
     /// Picked at launch. Something else on this machine that finds the port can't use it without this.
     private static let secret = Data.random(16).hex
@@ -26,14 +25,14 @@ enum Tor {
         get { lock.withLock { on } }
         set {
             lock.withLock { on = newValue }
-            UserDefaults.standard.set(newValue, forKey: "pulshade.tor")
+            Bridges.rememberTor(newValue)
             // Started in the background so it's warm by the first request, and never on the main thread.
             if newValue { DispatchQueue.global(qos: .utility).async { start() } }
         }
     }
 
     /// Whether the person has chosen between Tor and a direct connection on this device.
-    static var chosen: Bool { UserDefaults.standard.object(forKey: "pulshade.tor") != nil }
+    static var chosen: Bool { Bridges.torSwitch != nil }
 
     /// Whenever there's no account on this device (a fresh install, after Detach or Burn), the first thing asked is how
     /// to connect, before anything connects. Not where the relay can only be reached over Tor: there is nothing to choose.
@@ -136,7 +135,6 @@ enum Tor {
         let caches = cache.deletingLastPathComponent()
         if (try? files.contentsOfDirectory(atPath: caches.path))?.isEmpty == true { try? files.removeItem(at: caches) }
         Bridges.forget()
-        UserDefaults.standard.removeObject(forKey: "pulshade.tor")
         lock.withLock { on = SecuritySettings.torByDefault }
     }
 

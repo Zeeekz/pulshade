@@ -211,6 +211,34 @@ struct BridgeNetworkTests {
         #expect(Bridges.current == .auto && !Bridges.autoUsesSnowflake && Bridges.customLines.isEmpty)
     }
 
+    @Test func theTorSwitchIsSealedWithTheChoiceAndOlderOnesMoveIn() throws {
+        let folder = testDirectory("pulshade-bridges")
+        Bridges.file = folder.appendingPathComponent("bridges.sealed")
+        let defaults = UserDefaults.standard
+        defer { Bridges.forget(); defaults.removeObject(forKey: "pulshade.tor"); try? FileManager.default.removeItem(at: folder) }
+
+        // A switch an older build left in the preferences file is moved into the sealed file and removed there.
+        defaults.set(false, forKey: "pulshade.tor")
+        Bridges.reload()
+        #expect(Bridges.torSwitch == false)
+        #expect(defaults.object(forKey: "pulshade.tor") == nil, "nothing about the switch is left in the clear")
+        Bridges.reload()
+        #expect(Bridges.torSwitch == false, "it was kept in the sealed file")
+
+        // Saving a bridge choice keeps the switch, and saving the switch keeps the choice.
+        Bridges.remember(.snowflake)
+        Bridges.reload()
+        #expect(Bridges.torSwitch == false && Bridges.current == .snowflake)
+        Bridges.rememberTor(true)
+        Bridges.reload()
+        #expect(Bridges.torSwitch == true && Bridges.current == .snowflake)
+        #expect(defaults.object(forKey: "pulshade.tor") == nil)
+
+        Bridges.forget()
+        Bridges.reload()
+        #expect(Bridges.torSwitch == nil, "Burn leaves no trace of the switch")
+    }
+
     @Test func aChoiceFromOlderBuildsMovesOutOfThePreferences() throws {
         let folder = testDirectory("pulshade-bridges")
         Bridges.file = folder.appendingPathComponent("bridges.sealed")

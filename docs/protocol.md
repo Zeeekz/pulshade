@@ -623,8 +623,9 @@ the apps.
 - **Disk.** Deleting a file overwrites it first, but on flash storage that only helps a little; what makes old data
   unreadable is that its key is gone. Pulshade keeps plain-text files off the disk wherever it can (voice notes and chat
   clips are made and played from memory; received files are never saved unless you ask; the story camera writes into
-  memory, not a file). Things that still sit on the disk in the clear: a few display settings, the Tor/bridge
-  choice's inputs (the bridge list itself is sealed), and Tor's own state and caches. Video you pick from your photo
+  memory, not a file). Things that still sit on the disk in the clear: a few display settings (theme, blur and the
+  like), the Mac updater's build counter, and Tor's own state and caches (iOS file protection, not our key). The Tor
+  switch and the bridge choice are sealed with a Keychain key (build 13). Video you pick from your photo
   library may be copied by the system to a temporary file before Pulshade reads it into memory; Pulshade deletes
   leftovers at launch, but we do not control that system copy. We are not aware of any other temporary files written
   by Apple's video code (AVFoundation) in Pulshade's paths, and this is one of the questions we ask auditors to check.
