@@ -108,6 +108,12 @@ final class Updater {
             return
         }
         phase = .downloading(release)
+        // The signed size caps what's held in memory: a broken or hostile relay can't make the updater read an
+        // unbounded body.
+        guard release.size > 0, release.size <= 256 * 1024 * 1024 else {
+            phase = .failed("That update is too large, so it wasn't downloaded.")
+            return
+        }
         do {
             let zip = try await client.releaseArchive()
             guard zip.count == release.size, Data(SHA256.hash(data: zip)).hex == release.sha256 else {
@@ -116,6 +122,7 @@ final class Updater {
             }
             phase = .installing
             let app = try await Task.detached { try Self.unpack(zip, expecting: release) }.value
+            defer { try? FileManager.default.removeItem(at: app.deletingLastPathComponent()) }
             _ = try FileManager.default.replaceItemAt(target, withItemAt: app)
             Self.relaunch(target)
         } catch {

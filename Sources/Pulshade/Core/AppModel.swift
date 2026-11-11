@@ -409,6 +409,9 @@ final class AppModel {
             data.security.torSince = on ? Date() : nil
             data.security.torFromStart = false
         }
+        // The locked-delivery helper can't run Tor: with Tor on it would connect directly and show the server this
+        // phone's address. Whatever a backup or another device said, it stays off here.
+        if on { data.security.lockedDelivery = false }
     }
 
     func create(identity: Identity, profile: Profile, passcode: String) async throws {
@@ -843,6 +846,10 @@ final class AppModel {
                     return false
                 }
                 Notifier.shared.clearAll()
+                // The real account's mail and keys must not outlive it in the shared Keychain either.
+                HelperStore.clear()
+                helperWritten = nil
+                helperKnown = false
                 // The real account's mailboxes can't be named any more: take this phone's token off the relay instead.
                 withdrawPush()
                 self.identity = landing
@@ -896,6 +903,10 @@ final class AppModel {
 
     private func didUnlock() {
         unlockedAt = Date()
+        // A device that was linked, or an account recovered, polled the relay before there was an account. From
+        // here on nothing may share a circuit or connection with that pre-account traffic.
+        Tor.newRoutes()
+        RelayClient.closeAll(finishing: true)
         lastRelayContact = Date()
         moveToOnionRelay()
         forgetUnusableRelays()
@@ -904,6 +915,8 @@ final class AppModel {
         // Unused contact invites die with the relay's 7-day retention.
         data.invites.removeAll { $0.channel == nil && !$0.isPublic && $0.createdAt < Date().addingTimeInterval(-7 * 24 * 3600) }
         data.invites.removeAll { ($0.retiresAt ?? .distantFuture) < Date() }
+        // A choice saved before Tor was turned on can't take effect: the helper would connect directly.
+        if data.security.tor { data.security.lockedDelivery = false }
         UserDefaults.standard.set(data.theme, forKey: "pulshade.theme")
         // Written straight away: a new account must have its file before anything else happens.
         save()
@@ -1066,7 +1079,7 @@ final class AppModel {
     /// Wipes this device. `leavingNoTrace` (Burn) also deletes the Keychain items, the folder, Tor's saved state
     /// and every setting Pulshade keeps outside the vault, bridges and the Tor switch included. Detach keeps
     /// those, since the device still needs them to reach the relay.
-    func destroyEverything(leavingNoTrace: Bool = false) {
+    func destroyEverything(leavingNoTrace: Bool = false, keepingBurnOrder: Bool = false) {
         if call != nil { hangUp() }
         Notifier.shared.clearAll()
         // The notification helper's keys and contacts go with everything else.
@@ -1091,6 +1104,11 @@ final class AppModel {
         backupTask = nil
         discardSaves()
         vault.destroy(leavingNoTrace: leavingNoTrace)
+        // A Burn keeps its order so the server side can still be finished; every other wipe leaves nothing behind.
+        if !keepingBurnOrder {
+            burnStore.delete()
+            burnPending = false
+        }
         failedAttempts = 0
         AnnouncementWatch.forget()
         // The few display settings kept outside the vault, so the lock screen can look right.
@@ -1116,12 +1134,19 @@ final class AppModel {
     private func forgetSession() {
         readyTask?.cancel()
         readyTask = nil
+        profileTask?.cancel()
+        profileTask = nil
+        // The helper's copy of this account's envelope keys lives in the Keychain so the locked phone can use it;
+        // the copy in this process must not outlive the unlock that wrote it.
+        helperWritten = nil
+        helperKnown = false
         recoveredSessions = [:]
         unreadable = [:]
         resentAt = [:]
         identityCache = [:]
         DecodedImages.forget()
         LinkPreviews.forgetLinked()
+        StoryImages.forget()
         sendHolds = [:]
         refusals = [:]
         unsentMessages = []
@@ -1262,7 +1287,10 @@ final class AppModel {
                 // change since the last successful write — unless something newer is already queued, or the
                 // vault was wiped in the meantime.
                 Task { @MainActor in
-                    guard let self, self.unsaved == nil, self.saveGeneration == generation else { return }
+                    // Only while this account is still the open one. After a lock (or a wipe) the identity has
+                    // left memory on purpose, and putting it back here would keep every key and message alive.
+                    guard let self, self.phase == .unlocked, self.identity?.fingerprint == identity.fingerprint,
+                          self.unsaved == nil, self.saveGeneration == generation else { return }
                     self.unsaved = (data, identity)
                 }
             }
@@ -4228,7 +4256,18 @@ final class AppModel {
         if data.security.tor != before.tor {
             data.security.torSince = data.security.tor ? Date() : nil
             if !data.security.tor { data.security.torFromStart = false }
+            if data.security.tor {
+                // The helper runs outside Tor. Turning Tor on turns collecting-while-locked off, and takes its
+                // keys out of the Keychain now rather than at the next housekeeping pass. Its inbox stays: the
+                // relay has already handed those envelopes over.
+                drainHelperInbox()
+                HelperStore.clearDelivery()
+                helperWritten = nil
+            }
         }
+        // Collecting while locked can't be used over Tor: it would connect directly and show the server this
+        // phone's address. Turning it on while Tor is on leaves it off.
+        if data.security.tor { data.security.lockedDelivery = false }
         if data.security.notifications && !before.notifications { Notifier.shared.start() }
         if pushWanted != (before.pushWake && before.notifications) { refreshPush(turningOff: !pushWanted) }
         // A new tone or sound setting goes to the relay, which names the sound in a locked phone's wake-up.
@@ -4279,6 +4318,13 @@ final class AppModel {
         guard identity?.fingerprint == main.fingerprint else { return }
         data.decoySeed = decoy.seed
         vault.disableBiometrics()
+        // A decoy means no helper: the real account's envelope keys must not stay in the shared Keychain, where
+        // someone who only has the decoy passcode (and the device) could reach them. Read what it already holds
+        // first, then leave nothing of it.
+        drainHelperInbox()
+        HelperStore.clear()
+        helperWritten = nil
+        helperKnown = false
         save()
         rebalanceFiles()
     }
@@ -4352,6 +4398,11 @@ final class AppModel {
         // The next backup carries the token's hash to the relay.
         data.backupDigest = nil
         vault.disableBiometrics()
+        // No helper with a panic passcode set: the real account's envelope keys go from the shared Keychain now.
+        drainHelperInbox()
+        HelperStore.clear()
+        helperWritten = nil
+        helperKnown = false
         save()
         rebalanceFiles()
         scheduleBackup(after: 5...30)
@@ -4750,7 +4801,7 @@ final class AppModel {
     /// delivery only when delivery receipts are on (see `LockedDelivery`).
     var lockedDeliveryOn: Bool {
         let s = data.security
-        guard pushWanted, s.lockedDeliveryChosen, !hasDecoy, !hasPanic, AppData.directRelay != nil
+        guard pushWanted, s.lockedDeliveryChosen, !s.tor, !hasDecoy, !hasPanic, AppData.directRelay != nil
         else { return false }
         return true
     }
@@ -4822,9 +4873,10 @@ final class AppModel {
         if let bundle {
             HelperStore.save(bundle)
         } else {
-            // Turned off: what the helper took off the relay is read first, so none of it goes unread.
+            // Turned off: what the helper took off the relay is read first, so none of it goes unread. Only the
+            // bundle goes: mail still waiting in the inbox stays for the next drain.
             drainHelperInbox()
-            HelperStore.clear()
+            HelperStore.clearDelivery()
         }
         helperWritten = bundle
         helperKnown = true
@@ -7416,11 +7468,12 @@ extension AppModel {
             destroyEverything(leavingNoTrace: true)
             Vault.scrubLeftovers()
         case .accountDetached:
-            // Contacts stop writing to this device; the account itself waits in the backup.
+            // Contacts stop writing to this device; the account itself waits in the backup. This is a full wipe:
+            // caches and Tor state go too, not just the vault.
             for c in data.contacts where !c.isSelf && !c.awaitingAcceptance { enqueue(.deviceRemoved, to: c) }
             Task {
                 try? await sendEverything()
-                destroyEverything()
+                wipeNow()
             }
         case let .history(id, messages):
             guard let i = index(of: id) else { break }
@@ -7692,6 +7745,7 @@ extension AppModel {
             sync(.deviceLoggedOut(data.deviceID))
             try await sendEverything()
             destroyEverything()
+            Vault.scrubLeftovers()
             return
         }
         guard let code = recoveryCode, Identity.seed(fromRecoveryCode: code) == identity.seed else {
@@ -7702,7 +7756,8 @@ extension AppModel {
             try await sendEverything()
         }
         try await leaveBackup(of: identity)
-        destroyEverything()
+        destroyEverything(leavingNoTrace: true)
+        Vault.scrubLeftovers()
     }
 
     /// Burns the account: as if it never existed. Every chat goes for both sides, every contact forgets it,
@@ -7748,8 +7803,8 @@ extension AppModel {
         let timer = Task { try? await Task.sleep(for: .seconds(20)); attempt.cancel() }
         let finished = await attempt.value
         timer.cancel()
-        // Whatever the relay said, the phone is wiped now.
-        destroyEverything(leavingNoTrace: true)
+        // Whatever the relay said, the phone is wiped now. The order outlives the wipe so the rest can still finish.
+        destroyEverything(leavingNoTrace: true, keepingBurnOrder: true)
         Vault.scrubLeftovers()
         if finished { return .complete }
         burnNotice = "This phone is wiped. Pulshade is finishing the erase on the server and will keep trying until it is done."

@@ -1165,12 +1165,15 @@ extension SecuritySettings {
         linkPreviews = c.linkPreviews
         notifications = c.notifications
         if pushWake != c.pushWake { pushWake = c.pushWake; pushWakeChosen = true }
+        pushRequests = c.pushRequests
         notificationContent = c.notificationContent
         autoLockMinutes = c.autoLockMinutes
         keepReceivingLocked = c.keepReceivingLocked
         blockCapture = c.blockCapture
         blurWhenInactive = c.blurWhenInactive
         keepBackup = c.keepBackup
+        allowForwarding = c.allowForwarding
+        lockedDelivery = c.lockedDelivery
     }
 
     /// The strictest choice for each, short of turning off the backup that makes Detach and recovery work.
@@ -1181,11 +1184,16 @@ extension SecuritySettings {
         s.typingIndicators = false
         s.onlineStatus = false
         s.linkPreviews = false
+        s.notifications = false
+        s.pushWake = false
+        s.pushRequests = false
         s.notificationContent = .hidden
         s.autoLockMinutes = 1
         s.keepReceivingLocked = false
         s.blockCapture = true
         s.blurWhenInactive = true
+        s.allowForwarding = false
+        s.lockedDelivery = false
         return s
     }
 }

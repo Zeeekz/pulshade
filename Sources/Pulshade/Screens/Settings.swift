@@ -1072,8 +1072,8 @@ private struct NotificationSettings: View {
                     .padding(.horizontal, 14)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if on, security.pushWake, security.tor, security.lockedDeliveryChosen {
-                Text("Collecting while locked connects directly for a moment, so the server sees your IP.")
+            if on, security.pushWake, security.tor {
+                Text("Collecting while locked is off while Tor is on: the helper can't use Tor, so it would connect directly and the server would see this phone's address.")
                     .font(.system(size: 12)).foregroundStyle(Ink.faint)
                     .padding(.horizontal, 14)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1392,7 +1392,11 @@ private struct NetworkSettings: View {
         case .snowflake: what = "Disguises Tor as a video call. Works on most networks."
         case .custom: what = "Your own bridges, such as from bridges.torproject.org. Hardest for a network to block."
         }
-        return bridgesPending ? what + " PULSHADE will use them from the next time it opens." : what
+        let snowflake = bridges == .snowflake || (bridges == .auto && Bridges.autoUsesSnowflake)
+        let stun = snowflake
+            ? " Snowflake also contacts third-party STUN servers directly, outside Tor, so your network can tell it's in use."
+            : ""
+        return (bridgesPending ? what + " PULSHADE will use them from the next time it opens." : what) + stun
     }
 
     private var routeText: String {

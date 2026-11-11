@@ -138,6 +138,10 @@ private struct StoryBubble: View {
 enum StoryImages {
     private static let cache = NSCache<NSString, PlatformImage>()
 
+    /// Drops every decoded story picture. Called when Pulshade locks, like the other picture caches, so the
+    /// process that stays alive for a decoy holds none of the last account's images.
+    static func forget() { cache.removeAllObjects() }
+
     static func image(id: UUID, data: Data) -> PlatformImage? {
         let key = "\(id.uuidString)-\(data.count)" as NSString
         if let hit = cache.object(forKey: key) { return hit }

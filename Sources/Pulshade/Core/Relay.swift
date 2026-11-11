@@ -138,6 +138,13 @@ final class RelayPinning: NSObject, URLSessionDelegate {
         }
         completionHandler(.useCredential, URLCredential(trust: trust))
     }
+
+    /// Never follow a redirect on relay traffic. The base address is the relay, so a redirect is only somewhere
+    /// else to send mailbox keys and envelopes (and would skip the pin, since only the built-in host has one).
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
 }
 
 /// Talks to a relay over HTTP, directly or over Tor. No cookies, no cache, no identifying headers.
@@ -146,6 +153,11 @@ struct RelayClient {
     /// Requests on different lanes never share a connection, so the relay can't group them by it. Over Tor
     /// each lane also has its own circuits, so they arrive from different addresses.
     var lane = "main"
+
+    /// Caps on what a single answer may be. Envelopes are padded to a few fixed sizes, the largest 2 MiB; a
+    /// hostile or broken relay can't make the app read without bound.
+    private static let maxResponse = 64 * 1024 * 1024
+    private static let maxEnvelope = 4 * 1024 * 1024
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var sessions: [String: URLSession] = [:]
@@ -247,8 +259,10 @@ struct RelayClient {
     static func configuration(for url: URL, lane: String) throws -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
         config.httpCookieStorage = nil
+        config.httpShouldSetCookies = false
         config.urlCache = nil
-        config.httpAdditionalHeaders = ["User-Agent": "pulshade"]
+        // A constant user agent and language, so the relay can't fingerprint a build or a locale through them.
+        config.httpAdditionalHeaders = ["User-Agent": "pulshade", "Accept-Language": "en"]
         config.timeoutIntervalForRequest = 20
         if Tor.uses(url) { try Tor.route(config, to: url, lane: lane) }
         return config
@@ -343,10 +357,12 @@ struct RelayClient {
             let body = try JSONEncoder().encode(Request(keys: chunk.map(\.hex), wait: chunks.count == 1 ? wait : 0))
             let (data, raw) = try await post("v1/fetch", body, timeout: TimeInterval(20 + wait))
             RelayClock.note(raw)
+            guard data.count <= Self.maxResponse else { throw URLError(.dataLengthExceedsMaximum) }
             let response = try JSONDecoder().decode(Response.self, from: data)
             let now = Date()
             all += response.items.compactMap { item in
-                guard chunk.indices.contains(item.k), let blob = Data(base64Encoded: item.blob) else { return nil }
+                guard chunk.indices.contains(item.k), let blob = Data(base64Encoded: item.blob),
+                      blob.count <= Self.maxEnvelope else { return nil }
                 return RelayEnvelope(receiveKey: chunk[item.k], id: item.id, blob: blob,
                                      deposited: item.age.map { now.addingTimeInterval(-max(0, $0)) })
             }
@@ -400,15 +416,18 @@ struct RelayClient {
                                                    groups: groups.map { Cursor(key: $0.key.hex, after: $0.after) }))
         let (data, raw) = try await post("v1/fetch", body, timeout: TimeInterval(20 + wait))
         RelayClock.note(raw)
+        guard data.count <= Self.maxResponse else { throw URLError(.dataLengthExceedsMaximum) }
         let response = try JSONDecoder().decode(Response.self, from: data)
         let now = Date()
         var envelopes = response.items.compactMap { item -> RelayEnvelope? in
-            guard keys.indices.contains(item.k), let blob = Data(base64Encoded: item.blob) else { return nil }
+            guard keys.indices.contains(item.k), let blob = Data(base64Encoded: item.blob),
+                  blob.count <= Self.maxEnvelope else { return nil }
             return RelayEnvelope(receiveKey: keys[item.k], id: item.id, blob: blob, deposited: item.age.map { now.addingTimeInterval(-max(0, $0)) })
         }
         if !rest.isEmpty { envelopes += try await fetch(rest) }
         let mail = (response.groups ?? []).compactMap { item -> GroupMail? in
-            guard groups.indices.contains(item.g), let blob = Data(base64Encoded: item.blob) else { return nil }
+            guard groups.indices.contains(item.g), let blob = Data(base64Encoded: item.blob),
+                  blob.count <= Self.maxEnvelope else { return nil }
             return GroupMail(receiveKey: groups[item.g].key, seq: item.seq, blob: blob, deposited: item.age.map { now.addingTimeInterval(-max(0, $0)) })
         }
         return (envelopes, mail, response.more == true)
@@ -521,7 +540,7 @@ struct RelayClient {
             throw DirectoryError.unreachable
         }
         if http.statusCode == 304 { return nil }
-        guard http.statusCode == 200 else { throw DirectoryError.unreachable }
+        guard http.statusCode == 200, data.count <= 4 * 1024 * 1024 else { throw DirectoryError.unreachable }
         return (try JSONDecoder().decode([Announcement].self, from: data), http.value(forHTTPHeaderField: "X-Pulshade-Version"))
     }
 
@@ -707,7 +726,7 @@ struct RelayClient {
     func backup(key: Data, sig: Data, ts: UInt64) async throws -> Data? {
         let (data, status) = try await backupRequest("get", key: key, sig: sig, ts: ts)
         if status == 404 { return nil }
-        guard status == 200 else { throw BackupError.refused }
+        guard status == 200, data.count <= Self.maxResponse else { throw BackupError.refused }
         return data
     }
 
@@ -737,6 +756,7 @@ struct RelayClient {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let (data, response) = try await load(request, body: body)
+        guard data.count <= Self.maxResponse else { throw URLError(.dataLengthExceedsMaximum) }
         guard let status = (response as? HTTPURLResponse)?.statusCode, (200..<300).contains(status) else {
             throw URLError(.badServerResponse)
         }
@@ -753,7 +773,7 @@ extension RelayClient {
         let (data, response) = try await load(request)
         let status = (response as? HTTPURLResponse)?.statusCode
         if status == 404 { return nil }
-        guard status == 200 else { throw URLError(.badServerResponse) }
+        guard status == 200, data.count <= 1024 * 1024 else { throw URLError(.badServerResponse) }
         return try JSONDecoder().decode(Release.self, from: data)
     }
 
@@ -853,7 +873,11 @@ extension RelayClient {
         request.setValue("bytes=\(range.lowerBound)-\(range.upperBound)", forHTTPHeaderField: "Range")
         let (data, response) = try await load(request)
         switch (response as? HTTPURLResponse)?.statusCode {
-        case 206, 200: return data
+        case 206, 200:
+            // A download asks for four pieces at a time (4 MiB). Anything much beyond that is a relay ignoring
+            // the range and trying to make the phone hold the whole file at once.
+            guard data.count <= 8 * 1024 * 1024 else { throw BlobError.damaged }
+            return data
         case 404: throw BlobError.gone
         case 429, 503: throw BlobError.relayFull
         default: throw URLError(.badServerResponse)

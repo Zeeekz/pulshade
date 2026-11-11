@@ -119,8 +119,9 @@ enum Platform {
     }
 
     /// Copies text and wipes it from the clipboard later, if nothing else was copied since. It stays on this
-    /// device (no Universal Clipboard), and clipboard managers are asked not to keep it.
-    @MainActor static func copy(_ text: String, clearAfter seconds: Double? = nil) {
+    /// device (no Universal Clipboard), and clipboard managers are asked not to keep it. Two minutes unless a
+    /// shorter or longer time is given.
+    @MainActor static func copy(_ text: String, clearAfter seconds: Double? = 120) {
         #if os(macOS)
         let board = NSPasteboard.general
         board.prepareForNewContents(with: .currentHostOnly)

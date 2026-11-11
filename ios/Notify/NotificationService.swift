@@ -50,8 +50,10 @@ private enum Helper {
         config.timeoutIntervalForRequest = 8
         config.timeoutIntervalForResource = 20
         config.httpCookieStorage = nil
+        config.httpShouldSetCookies = false
         config.urlCache = nil
-        config.httpAdditionalHeaders = ["User-Agent": "Pulshade"]
+        // The same constant the app sends, so helper traffic doesn't stand out as a different client.
+        config.httpAdditionalHeaders = ["User-Agent": "pulshade", "Accept-Language": "en"]
         let session = URLSession(configuration: config, delegate: Pinning(host: base.host()), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
 
@@ -155,5 +157,11 @@ private final class Pinning: NSObject, URLSessionDelegate {
             }
         }
         completionHandler(.useCredential, URLCredential(trust: trust))
+    }
+
+    /// The relay address is the relay: a redirect would only take mailbox keys somewhere else.
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
     }
 }

@@ -147,8 +147,9 @@ extension View {
     }
 }
 
-/// Copies text and wipes it from the clipboard later, if nothing else was copied since.
-@MainActor func copyToClipboard(_ text: String, clearAfter seconds: Double? = nil) {
+/// Copies text and, unless told otherwise, wipes it from the clipboard two minutes later. Links and codes that name
+/// a mailbox or group otherwise sit in the clipboard, and in whatever a clipboard manager keeps, indefinitely.
+@MainActor func copyToClipboard(_ text: String, clearAfter seconds: Double? = 120) {
     Platform.copy(text, clearAfter: seconds)
 }
 

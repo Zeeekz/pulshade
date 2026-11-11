@@ -61,7 +61,7 @@ enum SpareSlot {
 
     /// Nil for anything this slot's keys didn't seal.
     static func open(_ blob: Data, with keys: Keys) -> Card? {
-        guard let box = try? AES.GCM.SealedBox(combined: blob),
+        guard blob.count <= 64 * 1024, let box = try? AES.GCM.SealedBox(combined: blob),
               let plain = try? AES.GCM.open(box, using: keys.sealing, authenticating: keys.name),
               let unpadded = unpadded(plain) else { return nil }
         return try? JSONDecoder.pulshade.decode(Card.self, from: unpadded)

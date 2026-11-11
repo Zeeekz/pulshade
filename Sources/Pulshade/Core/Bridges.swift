@@ -118,12 +118,13 @@ enum Bridges: String, CaseIterable, Codable {
     private static func load() -> Saved {
         let defaults = UserDefaults.standard
         // Builds before this kept the choice in the preferences file, in the clear: move it into the sealed file.
+        // The plaintext copy goes whatever happens next: if it can't be sealed right now, the choice is used from
+        // memory for this launch rather than left readable in a plist.
         if let old = defaults.string(forKey: "pulshade.bridges") {
             let moved = Saved(choice: Bridges(rawValue: old) ?? .off, custom: defaults.string(forKey: "pulshade.bridges.custom") ?? "")
-            if (try? write(moved)) != nil {
-                defaults.removeObject(forKey: "pulshade.bridges")
-                defaults.removeObject(forKey: "pulshade.bridges.custom")
-            }
+            _ = try? write(moved)
+            defaults.removeObject(forKey: "pulshade.bridges")
+            defaults.removeObject(forKey: "pulshade.bridges.custom")
             return moved
         }
         guard let raw = try? Data(contentsOf: file), let key = keys.load().last,

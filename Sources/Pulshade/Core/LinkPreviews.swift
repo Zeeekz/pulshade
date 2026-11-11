@@ -83,8 +83,10 @@ enum LinkPreviews {
         guard let host = url.host()?.lowercased(), !Invite.isLocal(host) else { return nil }
         let config = URLSessionConfiguration.ephemeral
         config.httpCookieStorage = nil
+        config.httpShouldSetCookies = false
         config.urlCache = nil
-        config.httpAdditionalHeaders = ["Accept": "text/html,image/*"]
+        // Constant headers, so a previewed site learns neither the app's version nor the user's locale.
+        config.httpAdditionalHeaders = ["Accept": "text/html,image/*", "User-Agent": "pulshade", "Accept-Language": "en"]
         // A lane of its own, so previews never share circuits with your relay traffic.
         if Tor.uses(url) {
             guard (try? Tor.route(config, to: url, lane: "preview")) != nil else { return nil }

@@ -117,7 +117,15 @@ struct BurnOrderStore {
         guard let key = key(create: true), let plain = try? JSONEncoder().encode(order),
               let sealed = try? ChaChaPoly.seal(plain, using: key).combined else { return false }
         try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-        return (try? sealed.write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])) != nil
+        guard (try? sealed.write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])) != nil else { return false }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        // The wipe that makes this order is often followed by a restore from backup: this file holds signatures and
+        // erase-only secrets, and has no business riding along into a backup of the device it was made to wipe.
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var url = file
+        try? url.setResourceValues(values)
+        return true
     }
 
     /// Overwrites the file, removes it, and removes its key.

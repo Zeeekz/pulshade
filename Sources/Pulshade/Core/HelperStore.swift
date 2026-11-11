@@ -80,12 +80,20 @@ enum HelperStore {
         for name in names { delete(service: inboxService, account: name) }
     }
 
-    /// Burn, Detach, or the feature turned off: nothing is left for the helper, and nothing it kept. Pulshade
-    /// reads what's in the inbox before turning the feature off, so nothing unread goes with it.
+    /// Burn, Detach, or a decoy: nothing is left for the helper, and nothing it kept. Pulshade reads what's in the
+    /// inbox before turning the feature off, so nothing unread goes with it.
     static func clear() {
         delete(service: service, account: bundleAccount)
         delete(service: service, account: confirmedAccount)
         deleteAll(service: inboxService)
+    }
+
+    /// Stops the helper without losing mail it already took off the relay: the bundle and the confirmed digests
+    /// go, but the inbox stays for Pulshade to read (housekeeping drains it whatever the setting). The relay has
+    /// already been told those envelopes were collected, so deleting them here would lose them for good.
+    static func clearDelivery() {
+        delete(service: service, account: bundleAccount)
+        delete(service: service, account: confirmedAccount)
     }
 
     // MARK: Keychain

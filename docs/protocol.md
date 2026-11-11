@@ -422,9 +422,9 @@ What this costs, honestly:
   (never synced or backed up). It does **not** get the seed, the recovery code, the storage key or any ratchet key, so it
   cannot read a message. But someone who can extract Keychain items from a phone that has been unlocked once since
   boot could get those two keys (see the seized-phone rows below), and the sealed envelopes copied into the inbox.
-- The helper cannot run Tor, so it reaches the relay **directly**, and the relay sees your IP for that moment. That is
-  why locked-phone collection is **on by default only in Fast mode and off by default on Tor**; turning it on with Tor
-  says so.
+- The helper cannot run Tor, so it reaches the relay **directly**, and the relay sees your IP for that moment. It is
+  therefore only available in Fast mode: turning Tor on forces locked-phone collection off, so a Tor user can never
+  make those requests directly by accident.
 - It needs "Wake when locked" on. It covers the main identity only (not personas), and Burn and Detach remove
   everything the helper holds. If a decoy or panic passcode is set, it is off for the whole device, not only for those
   accounts.
@@ -442,8 +442,9 @@ asks how to connect, and nothing connects until that is answered.
 - **Private, through Tor.** Tor (the Arti program, built into the app) is started on the device. Every request goes
   through it, one lane per kind of use, each on its own circuits. The relay is reached as a Tor *onion service*: the
   relay itself hosts it, so nobody learns where the relay runs, and no exit relay sees the traffic. The relay never sees
-  your IP address; it makes up one address per circuit. Nothing falls back to a direct connection, apart from the
-  locked-phone helper above, if you turn it on. Bridges (Snowflake, webtunnel) can be turned on for networks that block Tor.
+  your IP address; it makes up one address per circuit. Nothing falls back to a direct connection. (The locked-phone
+  helper is the one direct path, and it can only be on in Fast mode.) Bridges (Snowflake, webtunnel) can be turned on
+  for networks that block Tor.
   Because new circuits are cheap, the relay's rate limits want a small proof of work (a fraction of a second of
   hashing) on some requests.
 - **Fast.** The app connects straight to the relay's ordinary https address. This is much quicker and more reliable.
@@ -490,8 +491,8 @@ the server's memory**, never written to the server's disk. A crash writes no mem
 sealed on your phone first.
 
 What the relay **sees**: that a sealed envelope arrived at a random mailbox, when, and its size class; which mailboxes
-one fetch asks for; when a backup, spare or file is written, read or erased and roughly how big; and (Fast mode,
-and the locked-phone helper) an IP address while it is connected.
+one fetch asks for; when a backup, spare or file is written, read or erased and roughly how big; and (in Fast mode,
+including the locked-phone helper) an IP address while it is connected.
 
 Each deposit also carries a few plain headers the relay acts on:
 
@@ -612,7 +613,7 @@ the apps.
 - **Your IP address in Fast mode.** The relay sees it while you are connected. We do not record it, and nothing on the
   server keeps an access log, but that is our promise, not something the code can prove.
 - **The locked-phone helper connects directly**, not over Tor, for a moment each time, when locked-phone collection is
-  on (the default in Fast mode, not on Tor).
+  on. It is only possible in Fast mode: turning Tor on turns it off.
 - **The 180-day backup.** A sealed backup stays on the relay until you switch it off, Burn, or 180 days without an
   update. It holds session keys (see section 8). It is sealed with a key only your recovery code makes. If that code
   leaks and a copy of the stored backup exists, it can be opened.

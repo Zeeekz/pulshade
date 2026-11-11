@@ -97,4 +97,14 @@ import PulshadeShared
         #expect(counted(0, "follower") == "0 followers")
         #expect(counted(12, "contact") == "12 contacts")
     }
+
+    @Test func maximumPrivacyTurnsOffEveryOutboundLever() {
+        let s = SecuritySettings.strictest
+        #expect(!s.notifications && !s.pushWake && !s.pushRequests && !s.deliveryReceipts && !s.readReceipts)
+        #expect(!s.typingIndicators && !s.onlineStatus && !s.linkPreviews && !s.allowForwarding && s.lockedDelivery == false)
+        var adopted = SecuritySettings()
+        adopted.adopt(s)
+        #expect(!adopted.notifications && !adopted.pushWake && !adopted.pushRequests && !adopted.allowForwarding)
+        #expect(adopted.lockedDelivery == false)
+    }
 }

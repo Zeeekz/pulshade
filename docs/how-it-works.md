@@ -307,8 +307,8 @@ and every lane (each persona, each public inbox, sending, linking, reports, each
 so each gets its own circuits and none can be linked to another by address. If a lane's circuit is slow to connect,
 a fresh one races it; if a request fails, the lane gets new circuits. Fetches, deposits, the directory, backups and
 call audio all go through it, and nothing falls back to a direct connection: if Tor can't start or can't reach the
-server, requests fail (with Tor on; the one exception is the locked-phone helper, if you turn it on: it can't run Tor and
-reaches the server directly for a moment, so it is off by default on Tor). A fresh install, a Detach or a Burn first asks how to connect, Fast or Tor, and nothing
+server, requests fail. (The locked-phone helper can't run Tor, so collecting while locked is only offered in Fast mode
+and is forced off whenever Tor is on.) A fresh install, a Detach or a Burn first asks how to connect, Fast or Tor, and nothing
 connects until that is answered.
 
 **Bridges.** For networks that block Tor or watch for it, Settings → Network → Bridges sends Tor's first hop to a
