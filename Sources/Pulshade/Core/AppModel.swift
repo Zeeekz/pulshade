@@ -1653,6 +1653,15 @@ final class AppModel {
                                mentions: message.mentions.isEmpty ? nil : message.mentions)
         wire.noForward = message.noForward
         wire.forwarded = message.forwarded
+        // A big photo or voice note in a group that shares one mailbox goes to the relay once, not into the mailbox,
+        // where the relay would hold it in memory for as long as the group's mail lives.
+        if convo.shared != nil, relayClipsEnabled, let light = lightened(wire) {
+            postLightened(light, full: wire, in: id, message: message.id)
+            sync(.sent(ref(convo), wire))
+            lastTypingSent[id] = nil
+            save()
+            return
+        }
         if postIfShared(.message(wire), in: id, message: message.id) {
             sync(.sent(ref(convo), wire))
             lastTypingSent[id] = nil
@@ -9054,6 +9063,33 @@ extension AppModel {
                 self.data.conversations[i].messages[m].attachment = prepared.attachment
             }
             self.post(.clipBlob(id: id, clip: prepared.attachment), at: i)
+            self.save()
+        }
+    }
+
+    /// A big photo or voice note in a shared group: the sealed bytes go up once, then the group gets the message with
+    /// a tiny preview and a pointer to them. If the upload can't be done (offline, say) the whole message goes into the
+    /// mailbox as it always did, so it is never lost.
+    private func postLightened(_ light: (wire: WireMessage, bytes: Data, kind: Attachment.Kind), full: WireMessage,
+                               in convoID: UUID, message: UUID) {
+        guard let relay = client(nil, lane: "blob"),
+              let prepared = try? BlobTransfer.prepare(data: light.bytes, kind: light.kind, lifetime: 7 * 86_400) else {
+            postIfShared(.message(full), in: convoID, message: message)
+            return
+        }
+        Task { [weak self] in
+            var uploaded = true
+            do { try await BlobTransfer.upload(prepared, to: relay) { _ in } } catch { uploaded = false }
+            guard let self, let i = self.index(of: convoID) else { return }
+            if uploaded {
+                if let m = self.data.conversations[i].messages.lastIndex(where: { $0.id == message && $0.isMine }) {
+                    self.data.conversations[i].messages[m].attachment = prepared.attachment
+                }
+                self.post(.message(light.wire), at: i, message: message)
+                self.post(.clipBlob(id: message, clip: prepared.attachment), at: i)
+            } else {
+                self.post(.message(full), at: i, message: message)
+            }
             self.save()
         }
     }

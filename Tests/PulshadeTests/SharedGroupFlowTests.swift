@@ -607,6 +607,39 @@ struct SharedGroupFlowTests {
         #expect(bob.conversation(group.id)?.shared?.settings.members.allSatisfy { $0.avatar == nil } == true)
     }
 
+    /// A big photo or voice note in a shared group goes to the relay once and the mailbox carries only a preview and a
+    /// pointer; everyone in the group still gets the whole thing.
+    @Test func bigPhotosAndVoiceNotesInASharedGroupGoViaTheBlobStore() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let group = alice.startConversation(kind: .group, title: "Crew", members: [bobFP, caraFP])
+        await until([alice, bob, cara]) {
+            bob.conversation(group.id)?.shared?.joining == false && cara.conversation(group.id)?.shared?.joining == false
+        }
+        let photo = RelayFlowTests.bigPhoto()
+        #expect(photo.count > AppModel.mediaInline)
+        alice.send("sunset", image: photo, in: group.id)
+        await until([alice, bob, cara], seconds: 30) {
+            bob.conversation(group.id)?.messages.last?.image == photo && cara.conversation(group.id)?.messages.last?.image == photo
+        }
+        #expect(bob.conversation(group.id)?.messages.last?.image == photo)
+        #expect(cara.conversation(group.id)?.messages.last?.image == photo)
+        #expect(bob.conversation(group.id)?.messages.last?.text == "sunset")
+        let pointer = try #require(alice.conversation(group.id)?.messages.last?.attachment, "it went to the relay as a file")
+        #expect(pointer.kind == .photo)
+        let relay = RelayClient(base: try #require(URL(string: AppData.defaultRelay)), lane: "group-media-check")
+        #expect(try await relay.blobHead(pointer.id) != nil, "one sealed copy is there for the group")
+
+        let note = VoiceNote(audio: Data.random(90_000), duration: 22, levels: [10, 200, 90])
+        bob.send("", voice: note, in: group.id)
+        await until([alice, bob, cara], seconds: 30) {
+            alice.conversation(group.id)?.messages.last?.voice?.audio == note.audio
+                && cara.conversation(group.id)?.messages.last?.voice?.audio == note.audio
+        }
+        #expect(alice.conversation(group.id)?.messages.last?.voice?.audio == note.audio)
+        #expect(cara.conversation(group.id)?.messages.last?.voice?.audio == note.audio)
+    }
+
     /// A member who missed several versions catches up on the newest the owner signed.
     @Test func aMemberWhoMissedVersionsCatchesUpOnTheOwners() async throws {
         let (alice, bob, cara, bobFP, caraFP) = try await trio()
