@@ -4153,8 +4153,28 @@ final class AppModel {
         guard let c = contact(fingerprint, in: persona), !c.isSelf, !c.hidden else { return }
         if !c.awaitingAcceptance { enqueue(.burn, to: c) }
         sync(.contactRemoved(fingerprint: fingerprint, persona: persona))
-        forget(c)
+        // Chat keys that aren't ready yet (an account just recovered, a friend who hasn't answered) leave the notice
+        // waiting inside the contact, and deleting the contact would delete it: their app would never hear. So the
+        // person goes from your screens at once and the record stays, hidden, until the notice has gone out.
+        forget(c, keepingRecord: waitingToTell(c))
         save()
+    }
+
+    /// Whether the notice that you removed them is still waiting for keys on any of their devices.
+    private func waitingToTell(_ contact: Contact) -> Bool {
+        guard let i = contactIndex(contact.fingerprint, contact.persona) else { return false }
+        return data.contacts[i].devices.contains { device in
+            device.pending.contains { if case .burn = $0.payload { true } else { false } }
+        }
+    }
+
+    /// Finishes removing people whose notice has gone out (or that has waited two weeks): from here on they're forgotten
+    /// the ordinary way.
+    private func finishDepartures() {
+        for c in data.contacts where c.departing != nil {
+            guard let since = c.departing, !waitingToTell(c) || Date().timeIntervalSince(since) > 14 * 24 * 3600 else { continue }
+            forget(c)
+        }
     }
 
     /// Takes back a request you sent that hasn't been accepted. It leaves your list at once; if it already reached them
@@ -4165,7 +4185,7 @@ final class AppModel {
     }
 
     /// Forgets someone and your chat with them: they burned, or one of you removed the other.
-    private func forget(_ contact: Contact) {
+    private func forget(_ contact: Contact, keepingRecord: Bool = false) {
         let (fp, persona) = (contact.fingerprint, contact.persona)
         withdrawSpare(for: contact)
         if let chat = directConversation(with: fp, persona: persona) { removeLocally(chat.id) }
@@ -4176,6 +4196,13 @@ final class AppModel {
                 data.conversations[i].members.removeAll { $0 == fp }
             }
             guard let i = contactIndex(fp, persona) else { return }
+            if keepingRecord {
+                data.contacts[i].hidden = true
+                data.contacts[i].nickname = ""
+                data.contacts[i].verified = false
+                data.contacts[i].departing = data.contacts[i].departing ?? Date()
+                return
+            }
             let sharesAGroup = data.conversations.contains {
                 ($0.kind == .group || $0.kind == .channel) && $0.persona == persona && ($0.members.contains(fp) || $0.owner == fp)
             }
@@ -4183,6 +4210,7 @@ final class AppModel {
                 data.contacts[i].hidden = true
                 data.contacts[i].nickname = ""
                 data.contacts[i].verified = false
+                data.contacts[i].departing = nil
             } else {
                 data.contacts.remove(at: i)
             }
@@ -5483,6 +5511,7 @@ final class AppModel {
         if introsStale { refileIntros() }
         resendUnconfirmedStories()
         resendUnconfirmedViews()
+        finishDepartures()
         // Only written when something is stale: assigning redraws every view that reads the data.
         let clipCutoff = Date().addingTimeInterval(-(StoryLifetime.twoDays.rawValue + 3600))
         if data.clipParts.contains(where: { $0.value.date <= clipCutoff }) {

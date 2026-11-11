@@ -176,6 +176,9 @@ struct Contact: Codable, Identifiable {
     /// still honoured for a while.
     var spare: SpareKey?
     var oldSpares: [SpareKey]?
+    /// You removed them, but the notice that tells their app is still waiting for chat keys, so the record stays (hidden)
+    /// until it has gone, or two weeks have passed.
+    var departing: Date?
 
     /// Where a new contact starts: their first device's mailbox.
     var sendID: Data {
@@ -200,7 +203,7 @@ struct Contact: Codable, Identifiable {
 
     private enum CodingKeys: String, CodingKey {
         case fingerprint, name, nickname, avatar, banner, color, bio, links, walletChangedAt, notes, handle, verified, badge, collectibles, signingKey, agreementKey, devices, receiveKey, relay
-        case hidden, isSelf, awaitingAcceptance, addedAt, persona, wantsMyPresence, toldPresence, spare, oldSpares
+        case hidden, isSelf, awaitingAcceptance, addedAt, persona, wantsMyPresence, toldPresence, spare, oldSpares, departing
         // Single-device fields from before linked devices.
         case sendID, session, handshake, pending
     }
@@ -234,6 +237,7 @@ struct Contact: Codable, Identifiable {
         toldPresence = try c.decodeIfPresent(Bool.self, forKey: .toldPresence)
         spare = try? c.decodeIfPresent(SpareKey.self, forKey: .spare)
         oldSpares = try? c.decodeIfPresent([SpareKey].self, forKey: .oldSpares)
+        departing = try? c.decodeIfPresent(Date.self, forKey: .departing)
         addedAt = try c.decodeIfPresent(Date.self, forKey: .addedAt) ?? Date()
         // A saved list of devices is taken as it is, even an empty one: your own entry once the last linked device leaves,
         // and the members of a group that shares one mailbox, who are never written to directly. (An empty list used to
@@ -281,6 +285,7 @@ struct Contact: Codable, Identifiable {
         try c.encodeIfPresent(toldPresence, forKey: .toldPresence)
         try c.encodeIfPresent(spare, forKey: .spare)
         try c.encodeIfPresent(oldSpares, forKey: .oldSpares)
+        try c.encodeIfPresent(departing, forKey: .departing)
     }
 
     var displayName: String {
@@ -1331,7 +1336,8 @@ struct AppData: Codable {
     /// 16: invites to be friends from people you share a group with.
     /// 17: a group can be kept twice on one device, once per persona in it (`Conversation.groupID`).
     /// 18: requests to join groups through links; a shared group's links, bans and requests waiting for an admin.
-    static let currentFormat = 18
+    /// 19: a removed friend kept hidden until the notice reaches their app (`Contact.departing`).
+    static let currentFormat = 19
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []

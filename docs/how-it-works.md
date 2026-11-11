@@ -197,7 +197,9 @@ identities. Scanning the other screen with the camera, or confirming the emoji m
 **Removing a contact.** Removing someone takes them off every one of your devices, with their keys, mailboxes and
 stories, and tells their app to forget you and your chat, the same message a burner sends when it burns, so the
 chat goes on both sides. They can only reach you again with a new invite or a request. Someone you still share a
-group or channel with stays only as a member there, like people you've never added.
+group or channel with stays only as a member there, like people you've never added. If your chat keys with them aren't
+ready yet (an account just recovered, a friend who hasn't answered), the person goes from your screens at once, but a
+hidden record is kept until that message has been sent, and dropped after two weeks if it never could be.
 
 **Videos in chats.** A video of up to 30 seconds, recorded by holding the chat camera's button or picked from the
 library, is shrunk on the device (its own shape, about 5 MB at most, no location or device metadata) and sent as a
