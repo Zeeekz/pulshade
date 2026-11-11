@@ -238,7 +238,24 @@ final class AppModel {
     /// a few seconds, but often enough it's one that carries nothing and only times out. So past a few seconds,
     /// a second check races it on a fresh circuit of the same lane, and the first answer counts.
     nonisolated static func reach(_ client: RelayClient, patience: Double = 5) async -> Bool {
-        guard Tor.uses(client.base) else { return await client.health() }
+        guard Tor.uses(client.base) else {
+            // A plain connection that went dead (a network change, say) can sit until its own timeout. A new one
+            // joins the first after `patience`, and whichever answers first wins.
+            return await withTaskGroup(of: Bool.self) { group in
+                group.addTask { await client.health() }
+                group.addTask {
+                    try? await Task.sleep(for: .seconds(patience))
+                    guard !Task.isCancelled else { return false }
+                    client.freshCircuit()
+                    return await client.health()
+                }
+                for await reached in group where reached {
+                    group.cancelAll()
+                    return true
+                }
+                return false
+            }
+        }
         // A route into an onion service usually connects in seconds, but now and then one gets stuck for good, and
         // through a bridge or on a slow network that's common. So the first attempt keeps going (it may yet get
         // there) while fresh routes join it: one after 5 seconds on a lane that has worked before; on one that
@@ -455,7 +472,7 @@ final class AppModel {
         return !ready && c.devices.contains { $0.handshake != nil || $0.session != nil }
     }
 
-    /// Opens fresh sessions with every contact, on request (Settings > Chats), for messages that stopped getting through.
+    /// Opens fresh sessions with every contact. No button for it any more (keys mend themselves); kept for tests.
     func renewChatKeys() {
         guard phase == .unlocked else { return }
         startFreshSessions()
@@ -5592,7 +5609,9 @@ final class AppModel {
         guard !autoChecking, let client = client(nil) else { return }
         autoChecking = true
         defer { autoChecking = false }
-        let reached = await Self.reach(client, patience: 15)
+        // Once the strip says it can't reach the server, as quick as the Retry button: waiting longer is for a
+        // connection that's only busy, which doesn't show the strip.
+        let reached = await Self.reach(client, patience: relayUnreachable ? 5 : 15)
         if !reached { lastRelayContact = .distantPast }
         noteRelay(reached: reached)
         if reached { kick() }
@@ -5603,7 +5622,7 @@ final class AppModel {
     /// When the last time the app checked the connection by itself.
     @ObservationIgnored private var lastAutoRetry = Date.distantPast
 
-    /// What pressing "Check connection" does, done for you: over Tor, when something has waited to send for 15 seconds,
+    /// What pressing "Check connection" does, done for you, over Tor or not: when something has waited to send for 15 seconds,
     /// or the relay has been silent for 40 (a fetch waits up to 25 for mail, so a quiet but healthy connection can't
     /// be told from a dead one sooner), look again on fresh routes and then send and fetch at once. A route that died
     /// quietly would take a minute to time out on its own. Every 5 seconds while it lasts (a check still under way is
@@ -5613,7 +5632,7 @@ final class AppModel {
         #if os(iOS)
         if backgroundedAt != nil { return }
         #endif
-        guard phase == .unlocked, trafficShaping, overTor, !retryingRelay, !autoChecking else { return }
+        guard phase == .unlocked, trafficShaping, !retryingRelay, !autoChecking else { return }
         let now = Date()
         let since = [resumedAt, unlockedAt].compactMap { $0 }.max() ?? unlockedAt
         // Silence counts, not how long something has waited: a big upload legitimately takes a while.

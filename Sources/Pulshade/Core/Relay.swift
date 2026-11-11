@@ -195,8 +195,10 @@ struct RelayClient {
             // A big upload that ran out of time was slow, not proof the route is dead: throwing the route away
             // would make the next request build a new one, which can take a minute.
             let slowUpload = (error as? URLError)?.code == .timedOut && (body?.count ?? 0) > 65_536
-            if Tor.uses(base), !Task.isCancelled, !slowUpload {
-                Tor.renew(lane: name)
+            // Over Tor the circuit is thrown away; on a plain connection the session is, so a dead connection kept
+            // alive by the system (after a network change, say) isn't reused by every request that follows.
+            if !Task.isCancelled, !slowUpload {
+                if Tor.uses(base) { Tor.renew(lane: name) }
                 let current = Self.lock.withLock {
                     Self.established.remove(name)
                     guard Self.sessions[name] === session else { return false }
@@ -211,8 +213,20 @@ struct RelayClient {
 
     /// Points the lane's next connection at a fresh circuit, leaving those already open alone.
     func freshCircuit() {
-        Tor.renew(lane: sessionName)
-        Self.lock.withLock { _ = Self.established.remove(sessionName) }
+        let name = sessionName
+        if Tor.uses(base) {
+            Tor.renew(lane: name)
+            Self.lock.withLock { _ = Self.established.remove(name) }
+        } else {
+            // No circuits on a plain connection: a new session opens new connections, and requests already under
+            // way on the old one finish or time out beside it.
+            let old = Self.lock.withLock { () -> URLSession? in
+                Self.established.remove(name)
+                defer { Self.sessions[name] = nil }
+                return Self.sessions[name]
+            }
+            old?.finishTasksAndInvalidate()
+        }
     }
 
     /// Drops every lane's connections, so the next requests open new ones (after Tor is switched on or off).

@@ -866,7 +866,7 @@ private struct PrivacySettings: View {
                         value: model.data.blocked.isEmpty ? "Nobody" : "\(model.data.blocked.count)")
             }
             SettingsGroup {
-                MenuRow(page: .privacyBackup, symbol: "externaldrive.fill.badge.checkmark", color: .hex(0x30D158), title: "Backup & keys",
+                MenuRow(page: .privacyBackup, symbol: "externaldrive.fill.badge.checkmark", color: .hex(0x30D158), title: "Backup",
                         value: model.data.security.keepBackup ? "On" : "Off")
             }
         }
@@ -978,7 +978,7 @@ private struct BackupSettings: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        SettingsScreen(title: "Backup & keys", back: "Privacy") {
+        SettingsScreen(title: "Backup", back: "Privacy") {
             SettingsGroup("Backup", footer: "A sealed copy of your profile, contacts, groups, settings and chat keys (never messages) on the relay. Only your recovery code opens it. Off erases it.") {
                 SettingRow("Keep a sealed backup") {
                     Toggle("Keep a sealed backup", isOn: Binding(get: { model.data.security.keepBackup },
@@ -990,14 +990,6 @@ private struct BackupSettings: View {
                     SettingRow("Last saved") {
                         Text(model.backupStatus).font(.system(size: 14)).foregroundStyle(Ink.faint)
                     }
-                }
-            }
-            SettingsGroup("Chat keys", footer: "Use if messages stop arriving both ways. Opens fresh sessions with every contact.") {
-                SettingRow("Renew keys with contacts") {
-                    Button("Renew") { model.renewChatKeys() }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(model.theme.accent)
                 }
             }
         }
