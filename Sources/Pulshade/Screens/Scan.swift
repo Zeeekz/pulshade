@@ -90,6 +90,12 @@ struct ScanSheet: View {
             dismiss()
             return
         }
+        // A group's join link: its preview, with Join.
+        if let code = GroupLinkCode(text) {
+            model.openedGroupLink = OpenedGroupLink(code: code)
+            dismiss()
+            return
+        }
         guard let preview = model.inspectCode(text) else {
             problem = "That isn't a PULSHADE code."
             return

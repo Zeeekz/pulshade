@@ -30,6 +30,7 @@ is never written to its disk. Here is every kind of thing, in plain words:
 | **Video stories** (a few MB) | The server's disk, one copy for everyone | Until the story's timer runs out (then overwritten and erased), or sooner if you delete the story | No. The same two layers of encryption. |
 | **Sealed backup** (profile, contacts, groups, settings, and the keys for each chat so mail sent while you were logged out can still be opened; never chats themselves) | The server's disk | Until you switch it off, Burn, or 180 days without an update | No. Sealed with a key only your recovery code makes. |
 | **Spare keys** (one per friend, so a friend who logs back in can write to you straight away) | The server's disk, in the sealed-backup store | Erased by your friend when they use it, or by you when you remove them; otherwise replaced every 5 to 10 days, and 180 days without an update at most | No. Only you and that friend can work out where it is or open it, and it holds no message. |
+| **Group link previews** (one per join link an admin makes) | The server's disk, in the sealed-backup store | Rewritten while the link is in use; erased when the link is reset or deleted; 180 days without an update at most | No. Only people who have the link can find or open it. It holds the group's name, picture, description and size, which anyone with the link can see. |
 | **Public @handle and profile** (only if you choose one) | The server's disk | Until you let it go | Yes, it is public by your choice. |
 | **Collectibles you own** | The server's disk | While they exist | They're not secret: the item, its number and a hash of its code. |
 | **The server's own records and keys** (handle directory, held handles, moderation lists, collectible records, announcements; its push, pet-signing and onion keys) | The server's disk | While the service runs | Only the server, which needs them to work. Sealed with its storage key, which is held in memory only and never written to the disk; after a reboot the server stays locked until we unlock it. The admin password is kept only as a hash. |
@@ -79,6 +80,12 @@ after they change, so your recovery code can restore it. We can't open it, and i
 server. It is deleted when you switch the backup off or Burn, and 180 days after it was last saved if the app never
 saves it again (for instance after a Detach). Chats are never included. The server sees when it was saved and its
 rough size, and, if you connect without Tor, your IP address during the upload, as with any connection.
+
+**Group join links.** An admin can make a link that lets people join a group without being anyone's contact. The
+group's name, picture, description and number of members are kept, sealed, in the sealed-backup store, at a place
+worked out from the link; anyone who has the link can find and read them, and the server can't. Asking to join sends
+one sealed message to the group's admins, from a key you use only in that group, with your name and picture as the group
+will see them and an optional note. The admins' answer comes back the same way. Your account is never named.
 
 **Spare keys.** After you log back in (Detach and your recovery code), the app needs new keys with each friend. So
 that you don't have to wait for every friend to open Pulshade, each friend's app leaves a spare key for you on the

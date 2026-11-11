@@ -516,6 +516,14 @@ struct SharedGroup: Codable, Equatable {
     var postedTo: Set<String> = []
     /// Settings that name an epoch whose key hasn't arrived yet, taken once it does.
     var pendingSettings: GroupSettings?
+    /// The group's join links and bans, as the newest admin-signed version says.
+    var links: GroupLinks?
+    /// As an admin: requests through links that need approval, as last read from their mailboxes.
+    var held: [HeldJoin]?
+    /// As the admin who made a link: when its preview was last written, by link id.
+    var previews: [String: PreviewMark]?
+    /// The epoch the links were last posted in by this device.
+    var linksEpoch: Int?
 
     /// The epoch the settings name (the one everything is posted in).
     var current: GroupEpoch? { epochs.last { $0.number == settings.epoch && $0.check == settings.epochCheck } ?? epochs.last }

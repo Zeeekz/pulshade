@@ -2042,6 +2042,8 @@ private struct ConversationInfo: View {
 
         if c.kind == .group { mailboxSection(c) }
 
+        if c.kind == .group, let shared = c.shared, !shared.gone, !shared.joining, c.amAdmin { GroupLinksSection(id: c.id) }
+
         membersSection(c)
     }
 
@@ -2160,6 +2162,13 @@ private struct ConversationInfo: View {
                         Button("Remove from \(c.kind == .channel ? "channel" : "group")", role: .destructive) {
                             pending = Pending(title: "Remove \(name) from the \(c.kind == .channel ? "channel" : "group")?", confirm: "Remove") {
                                 model.removeMember(c.id, fp)
+                            }
+                        }
+                        if c.shared != nil, c.amAdmin {
+                            Button("Remove and ban", role: .destructive) {
+                                pending = Pending(title: "Remove \(name) and turn down their requests to join again?", confirm: "Ban") {
+                                    model.banMember(fp, in: c.id)
+                                }
                             }
                         }
                     }

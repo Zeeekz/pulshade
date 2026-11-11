@@ -1262,7 +1262,8 @@ struct AppData: Codable {
     /// 12: your sent envelopes by digest, so a friend's locked phone can confirm delivery (`Payload.collected`).
     /// 13: the spare keys a device leaves for each friend (`SpareSlot`), and which friends' apps take them.
     /// 14: a chat background, built in or a photo of your own.
-    static let currentFormat = 14
+    /// 15: requests to join groups through links; a shared group's links, bans and requests waiting for an admin.
+    static let currentFormat = 15
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []
@@ -1325,6 +1326,8 @@ struct AppData: Codable {
     /// Files of yours kept on the relay that still have to be erased there (a message of yours was deleted while the
     /// relay couldn't be reached). Each is tried again until the relay says it's gone, or its time is up.
     var blobWipes: [BlobWipe] = []
+    /// Your requests to join groups through their links, until each is answered.
+    var joinAsks: [JoinAsk] = []
     init() {}
 
     /// The relay new identities use. A build can set `PulshadeRelay` in its Info.plist (the iPhone
@@ -1374,6 +1377,7 @@ struct AppData: Codable {
         linkOffers = (try? c.decodeIfPresent([LinkOffer].self, forKey: .linkOffers)) ?? []
         chatCodes = (try? c.decodeIfPresent([ChatCodeOffer].self, forKey: .chatCodes)) ?? []
         blobWipes = (try? c.decodeIfPresent([BlobWipe].self, forKey: .blobWipes)) ?? []
+        joinAsks = (try? c.decodeIfPresent([JoinAsk].self, forKey: .joinAsks)) ?? []
         personas = try c.decodeIfPresent([Persona].self, forKey: .personas) ?? []
         requests = (try? c.decodeIfPresent([FriendRequest].self, forKey: .requests)) ?? []
         blocked = try c.decodeIfPresent([String].self, forKey: .blocked) ?? []

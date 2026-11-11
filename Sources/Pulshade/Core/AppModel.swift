@@ -79,6 +79,8 @@ final class AppModel {
     var requestedConversation: Conversation.ID?
     /// A code that arrived as a pulshade:// link, waiting for the scan screen to use it.
     var openedCode: String?
+    /// A group's join link that was opened or scanned, for its preview.
+    var openedGroupLink: OpenedGroupLink?
     /// A handle from a profile link (`pulshade://u/<handle>`, a "Pulshade" button on a website), waiting for
     /// Contacts to look it up. Nothing is sent until you ask: it only shows the profile and its request button.
     var openedHandle: String?
@@ -1631,6 +1633,10 @@ final class AppModel {
     /// When a removal that didn't stick was last tried again, by group.
     @ObservationIgnored var lastGroupRetry: [UUID: Date] = [:]
     @ObservationIgnored var groupRetries: [UUID: Int] = [:]
+    /// When join and answer mailboxes were last read, whether a read is under way, and asks being sent.
+    @ObservationIgnored var lastJoinPoll = Date.distantPast
+    @ObservationIgnored var joinPolling = false
+    @ObservationIgnored var joinSending: Set<UUID> = []
 
     /// Gets a clip to one contact: as a pointer to the one sealed copy on the relay if their app reads those, otherwise in
     /// pieces as before. The clip is uploaded once, however many people are waiting for it. `known` is the copy already
@@ -5108,6 +5114,7 @@ final class AppModel {
     private func housekeep() async {
         drainHelperInbox()
         tendSharedGroups()
+        tendJoinLinks()
         tendStoryUpload()
         refreshPush()
         watchTor()
@@ -6090,7 +6097,7 @@ final class AppModel {
             acceptGroupInvite(invite, from: sender)
         case let .groupJoin(group, card):
             acceptGroupJoin(group, card: card, from: sender)
-        case .groupSettings, .groupRekey, .memberCard:
+        case .groupSettings, .groupRekey, .groupLinks, .memberCard:
             // Only ever said in a group's own mailbox.
             break
         case .deviceRemoved:
@@ -8091,7 +8098,9 @@ extension AppModel {
     /// Both wait there while Pulshade is locked.
     func open(_ url: URL) {
         guard url.scheme?.lowercased() == "pulshade" else { return }
-        if let link = DirectoryProfile.handle(fromLink: url) {
+        if let code = GroupLinkCode(url.absoluteString) {
+            openedGroupLink = OpenedGroupLink(code: code)
+        } else if let link = DirectoryProfile.handle(fromLink: url) {
             openedKeyCheck = link.keyCheck
             openedHandle = link.handle
         } else {
@@ -8661,6 +8670,8 @@ extension AppModel {
         case let .memberCard(card):
             guard !ours, card.signingKey == outer.sender, let avatar = card.avatar else { return }
             noteAvatar(avatar, of: card, at: i)
+        case let .groupLinks(links):
+            adoptLinks(links, from: outer.sender, at: i)
         case let .left(conversation):
             guard !ours, conversation == id else { return }
             // The owner's device takes them out for everyone, with a new epoch. Only the owner's, so two admins don't
@@ -8797,8 +8808,437 @@ extension Payload {
     /// Something people said (not the group's own housekeeping): a newcomer shouldn't be able to read it.
     var isChat: Bool {
         switch self {
-        case .groupSettings, .groupRekey, .typing, .memberCard: false
+        case .groupSettings, .groupRekey, .groupLinks, .typing, .memberCard: false
         default: true
         }
+    }
+}
+
+// MARK: - Join links
+
+/// Links into groups that share one mailbox (see `JoinLinks.swift` and docs/groups-design.md, section 5). Admins make
+/// them, their phones admit people who ask through an open link and hold the rest for a yes, and anyone with a link sees
+/// a signed preview first and asks with a key made for that group alone.
+extension AppModel {
+    /// The group's links and bans as this device holds them.
+    func joinLinks(_ id: Conversation.ID) -> GroupLinks? { conversation(id)?.shared?.links }
+
+    /// Requests waiting for an admin's yes.
+    func heldJoins(_ id: Conversation.ID) -> [HeldJoin] { conversation(id)?.shared?.held ?? [] }
+
+    private func amGroupAdmin(at i: Int) -> GroupMemberKeys? {
+        guard let shared = data.conversations[i].shared, !shared.gone, !shared.joining,
+              let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].id),
+              shared.settings.isAdmin(keys.publicKey) else { return nil }
+        return keys
+    }
+
+    // MARK: Making and changing links
+
+    /// A new link. Nil if this account isn't an admin or the group has as many as it may.
+    @discardableResult
+    func makeJoinLink(in id: Conversation.ID, label: String, approval: Bool, expires: Date? = nil, limit: Int? = nil) -> JoinLink? {
+        guard let i = index(of: id), let keys = amGroupAdmin(at: i),
+              (data.conversations[i].shared?.links?.links.count ?? 0) < GroupLinks.maxLinks else { return nil }
+        let link = JoinLink.make(label: label, approval: approval, expires: expires, limit: limit, creator: keys.publicKey)
+        guard publishLinks(at: i, { $0.links.append(link) }) else { return nil }
+        writePreviews(at: i)
+        return link
+    }
+
+    /// New secrets for a link: every copy of the old one stops working, and its preview is erased.
+    func resetJoinLink(_ link: UUID, in id: Conversation.ID) {
+        guard let i = index(of: id), amGroupAdmin(at: i) != nil, let old = data.conversations[i].shared?.links?.link(link) else { return }
+        guard publishLinks(at: i, { links in
+            if let n = links.links.firstIndex(where: { $0.id == link }) { links.links[n] = links.links[n].reset() }
+        }) else { return }
+        erasePreview(old)
+        data.conversations[i].shared?.previews?[link.uuidString] = nil
+        writePreviews(at: i)
+    }
+
+    func deleteJoinLink(_ link: UUID, in id: Conversation.ID) {
+        guard let i = index(of: id), amGroupAdmin(at: i) != nil, let old = data.conversations[i].shared?.links?.link(link) else { return }
+        guard publishLinks(at: i, { $0.links.removeAll { $0.id == link } }) else { return }
+        erasePreview(old)
+        data.conversations[i].shared?.previews?[link.uuidString] = nil
+        data.conversations[i].shared?.held?.removeAll { $0.request.link == link }
+        save()
+    }
+
+    /// Takes someone out and turns down any request of theirs from now on.
+    func banMember(_ fingerprint: String, in id: Conversation.ID) {
+        guard let i = index(of: id), amGroupAdmin(at: i) != nil, let target = contact(fingerprint, in: data.conversations[i].persona) else { return }
+        let key = target.signingKey
+        _ = publishLinks(at: i) { links in
+            if !links.bans.contains(key) { links.bans.append(key) }
+            if links.bans.count > GroupLinks.maxBans { links.bans.removeFirst(links.bans.count - GroupLinks.maxBans) }
+        }
+        data.conversations[i].shared?.held?.removeAll { $0.request.card.signingKey == key }
+        if data.conversations[i].shared?.settings.isMember(key) == true, data.conversations[i].canRemove(fingerprint, by: "me") {
+            removeSharedMember(fingerprint, at: i)
+        }
+        save()
+    }
+
+    func unban(_ key: Data, in id: Conversation.ID) {
+        guard let i = index(of: id), amGroupAdmin(at: i) != nil else { return }
+        _ = publishLinks(at: i) { $0.bans.removeAll { $0 == key } }
+    }
+
+    /// The name a banned key was last known by in this group, if any.
+    func bannedName(_ key: Data, in id: Conversation.ID) -> String {
+        guard let convo = conversation(id) else { return "Someone" }
+        return contact(Identity.fingerprint(of: key), in: convo.persona)?.displayName ?? "Someone"
+    }
+
+    /// Signs and posts the next version of the links, changed by `change`.
+    private func publishLinks(at i: Int, _ change: (inout GroupLinks) -> Void) -> Bool {
+        guard let keys = amGroupAdmin(at: i), let shared = data.conversations[i].shared else { return false }
+        var next = shared.links ?? GroupLinks(group: data.conversations[i].id, version: 0)
+        change(&next)
+        next.version += 1
+        next.sign(with: keys)
+        guard next.wellFormed else { return false }
+        data.conversations[i].shared?.links = next
+        data.conversations[i].shared?.linksEpoch = shared.current?.number
+        post(.groupLinks(next), at: i)
+        save()
+        return true
+    }
+
+    /// A version of the links from the group's mailbox: taken if an admin signed it and it's newer (or, at the same
+    /// number, wins the same tie-break everyone uses).
+    func adoptLinks(_ next: GroupLinks, from sender: Data, at i: Int) {
+        guard let shared = data.conversations[i].shared, next.group == data.conversations[i].id, next.signer == sender,
+              shared.settings.isAdmin(sender), next.signatureIsValid, next.wellFormed else { return }
+        if let held = shared.links {
+            guard next.version > held.version || (next.version == held.version && next != held
+                                                  && next.tieBreak.lexicographicallyPrecedes(held.tieBreak)) else { return }
+            // A link this account made that's gone or was reset elsewhere (another device of ours, another admin):
+            // its old preview goes.
+            if let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].id) {
+                for old in held.links where old.creator == keys.publicKey && next.link(old.id)?.secret != old.secret {
+                    erasePreview(old)
+                    data.conversations[i].shared?.previews?[old.id.uuidString] = nil
+                }
+            }
+        }
+        data.conversations[i].shared?.links = next
+        data.conversations[i].shared?.held?.removeAll { held in
+            next.link(held.request.link) == nil || next.bans.contains(held.request.card.signingKey)
+        }
+        writePreviews(at: i)
+        save()
+    }
+
+    // MARK: Previews
+
+    /// The preview of one link as this account would sign it now.
+    private func preview(of link: JoinLink, at i: Int, keys: GroupMemberKeys) -> GroupPreview? {
+        guard let shared = data.conversations[i].shared, let requestKey = link.requestPublicKey else { return nil }
+        let s = shared.settings
+        var preview = GroupPreview(group: s.group, link: link.id, title: String(s.title.prefix(100)), about: s.about.map { String($0.prefix(500)) },
+                                   avatar: Self.thumbnail(s.avatar, side: 160), members: s.members.count, approval: link.approval,
+                                   expires: link.expires.map(wholeSecond), requestKey: requestKey, mailbox: Mailbox.sendID(for: link.mailbox),
+                                   made: wholeSecond(Date()))
+        if (preview.avatar?.count ?? 0) > 32 * 1024 { preview.avatar = nil }
+        preview.sign(with: keys)
+        return preview
+    }
+
+    /// Writes the previews of links this account made whose content changed, or that haven't been written for a few days
+    /// (so one a link holder overwrote doesn't stay broken).
+    func writePreviews(at i: Int) {
+        guard let keys = amGroupAdmin(at: i), let links = data.conversations[i].shared?.links else { return }
+        let now = Date()
+        for link in links.links where link.creator == keys.publicKey && link.isOpen(at: now) {
+            guard let preview = preview(of: link, at: i, keys: keys), let slot = JoinSlot.keys(link.secret),
+                  let sealed = JoinSlot.seal(preview, with: slot) else { continue }
+            let mark = data.conversations[i].shared?.previews?[link.id.uuidString]
+            if let mark, mark.hash == preview.contentHash, now.timeIntervalSince(mark.at) < 3 * 86_400 { continue }
+            guard let client = client(nil, lane: "join-\(link.id.uuidString.prefix(8))") else { continue }
+            let group = data.conversations[i].id, hash = preview.contentHash, id = link.id.uuidString
+            // Marked before it goes, so a slow write isn't started again; put back if it fails.
+            var marks = data.conversations[i].shared?.previews ?? [:]
+            marks[id] = PreviewMark(hash: hash, at: now)
+            data.conversations[i].shared?.previews = marks
+            Task { [weak self] in
+                let (key, sig, ts) = SpareSlot.proof("pulshade.backup.put.v1", slot, body: sealed)
+                let done = (try? await client.putBackup(sealed, key: key, sig: sig, ts: ts)) != nil
+                guard !done, let self, let i = self.index(of: group) else { return }
+                self.data.conversations[i].shared?.previews?[id] = nil
+            }
+        }
+    }
+
+    private func erasePreview(_ link: JoinLink) {
+        guard let slot = JoinSlot.keys(link.secret), let client = client(nil, lane: "join-\(link.id.uuidString.prefix(8))") else { return }
+        Task {
+            let (key, sig, ts) = SpareSlot.proof("pulshade.backup.del.v1", slot)
+            try? await client.deleteBackup(key: key, sig: sig, ts: ts)
+        }
+    }
+
+    // MARK: Reading requests and answers
+
+    /// How often join and answer mailboxes are looked at while the app is open.
+    static let joinPoll: TimeInterval = 15
+
+    /// Housekeeping: posts the links into a new epoch's mailbox (so whoever becomes an admin later has them), sends asks
+    /// still waiting to go, drops ones nobody answered, and reads every join and answer mailbox this device looks after.
+    func tendJoinLinks(force: Bool = false) {
+        let now = Date()
+        for i in data.conversations.indices {
+            guard let shared = data.conversations[i].shared, amGroupAdmin(at: i) != nil, let links = shared.links,
+                  let current = shared.current?.number, shared.linksEpoch != current else { continue }
+            data.conversations[i].shared?.linksEpoch = current
+            post(.groupLinks(links), at: i)
+        }
+        let before = data.joinAsks.count
+        data.joinAsks.removeAll { now.timeIntervalSince($0.asked) > JoinAsk.life }
+        if data.joinAsks.count != before { save() }
+        for ask in data.joinAsks where !ask.sent { sendAsk(ask.id) }
+        guard force || now.timeIntervalSince(lastJoinPoll) >= Self.joinPoll, !joinPolling else { return }
+        // Which mailbox is whose: a link of a group this account admins, or one of its own asks.
+        var links: [Data: (group: UUID, link: JoinLink)] = [:]
+        for convo in data.conversations {
+            guard let i = index(of: convo.id), amGroupAdmin(at: i) != nil, let held = convo.shared?.links else { continue }
+            for link in held.links { links[link.mailbox] = (convo.id, link) }
+        }
+        var asks: [Data: UUID] = [:]
+        for ask in data.joinAsks where ask.sent && !ask.declined { asks[ask.reply] = ask.id }
+        let keys = Array(links.keys) + Array(asks.keys)
+        guard !keys.isEmpty, let client = client(nil, lane: "joins") else { return }
+        lastJoinPoll = now
+        joinPolling = true
+        Task { [weak self] in
+            let envelopes = (try? await client.fetch(keys)) ?? []
+            guard let self else { return }
+            self.joinPolling = false
+            var done: [RelayEnvelope] = []
+            var seen: [UUID: Set<Data>] = [:]
+            for envelope in envelopes {
+                if let (group, link) = links[envelope.receiveKey] {
+                    switch self.readRequest(envelope, link: link, group: group) {
+                    case .done: done.append(envelope)
+                    case let .held(key): seen[link.id, default: []].insert(key)
+                    }
+                } else if let ask = asks[envelope.receiveKey] {
+                    self.readAnswer(envelope, ask: ask)
+                    done.append(envelope)
+                }
+            }
+            // Held requests no longer on the relay were decided by another admin (or ran out): they go here too.
+            for (_, (group, link)) in links where link.approval {
+                guard let i = self.index(of: group) else { continue }
+                self.data.conversations[i].shared?.held?.removeAll { $0.request.link == link.id && !(seen[link.id] ?? []).contains($0.id) }
+            }
+            if !done.isEmpty { try? await client.ack(done) }
+            self.save()
+        }
+    }
+
+    private enum RequestOutcome { case done, held(Data) }
+
+    /// A request through one of the group's links. Admitted at once through an open link, kept for a yes through one
+    /// that needs approval, turned down if the link is used up or they're banned, and dropped if it's not genuine.
+    private func readRequest(_ envelope: RelayEnvelope, link: JoinLink, group: UUID) -> RequestOutcome {
+        guard let i = index(of: group), amGroupAdmin(at: i) != nil, let shared = data.conversations[i].shared,
+              let current = shared.links?.link(link.id), current.mailbox == link.mailbox,
+              let requestKey = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: link.requestKey),
+              let opened = JoinSeal.open(envelope.blob, with: requestKey), case let .request(request) = opened.mail,
+              request.group == group, request.link == link.id, request.wellFormed,
+              opened.signer == request.card.signingKey, opened.agreement == request.card.agreementKey,
+              request.card.verified(group: group), abs(opened.at.timeIntervalSinceNow) < 8 * 86_400 else { return .done }
+        let key = request.card.signingKey
+        if shared.links?.bans.contains(key) == true { answer(.declined(group: group), to: request, at: i); return .done }
+        if shared.settings.isMember(key) {
+            // In already: the answer may have gone astray, so it goes again.
+            if let epoch = shared.current { answer(.admitted(GroupInvite(settings: shared.settings, epoch: epoch)), to: request, at: i) }
+            return .done
+        }
+        guard current.isOpen(), shared.settings.members.count < GroupSettings.maxMembers else {
+            answer(.declined(group: group), to: request, at: i)
+            return .done
+        }
+        if current.approval {
+            var held = shared.held ?? []
+            if let n = held.firstIndex(where: { $0.id == key }) {
+                held[n].envelope = envelope.id
+            } else {
+                held.append(HeldJoin(request: request, envelope: envelope.id, seen: Date()))
+                if !data.conversations[i].muted {
+                    Notifier.shared.post((title: data.conversations[i].title, body: "\(String(request.card.name.prefix(40))) asks to join"),
+                                         conversation: data.conversations[i].id, sound: data.security.notificationSound)
+                }
+            }
+            data.conversations[i].shared?.held = Array(held.suffix(500))
+            return .held(key)
+        }
+        admit(request, through: link.id, at: i)
+        return .done
+    }
+
+    /// Puts someone who asked into the group, and tells them. A newcomer gets a new epoch first if anything has been said
+    /// in this one, so they read from when they joined.
+    private func admit(_ request: JoinRequest, through link: UUID, at i: Int) {
+        guard amGroupAdmin(at: i) != nil, var shared = data.conversations[i].shared, !shared.settings.isMember(request.card.signingKey) else { return }
+        if shared.chatInEpoch {
+            startEpoch(at: i, without: [])
+            guard let updated = data.conversations[i].shared else { return }
+            shared = updated
+        }
+        var next = shared.settings
+        next.members.append(request.card.withoutAvatar)
+        guard publishSettings(next, at: i), let settings = data.conversations[i].shared?.settings,
+              let epoch = data.conversations[i].shared?.current else { return }
+        if let avatar = request.card.avatar { noteAvatar(avatar, of: request.card, at: i) }
+        answer(.admitted(GroupInvite(settings: settings, epoch: epoch)), to: request, at: i)
+        _ = publishLinks(at: i) { links in
+            if let n = links.links.firstIndex(where: { $0.id == link }) { links.links[n].used += 1 }
+        }
+    }
+
+    /// An admin says yes to a request waiting for approval.
+    func approveJoin(_ key: Data, in id: Conversation.ID) {
+        decide(key, in: id, yes: true)
+    }
+
+    func declineJoin(_ key: Data, in id: Conversation.ID) {
+        decide(key, in: id, yes: false)
+    }
+
+    private func decide(_ key: Data, in id: Conversation.ID, yes: Bool) {
+        guard let i = index(of: id), amGroupAdmin(at: i) != nil,
+              let held = data.conversations[i].shared?.held?.first(where: { $0.id == key }),
+              let link = data.conversations[i].shared?.links?.link(held.request.link) else { return }
+        data.conversations[i].shared?.held?.removeAll { $0.id == key }
+        if yes, link.isOpen() { admit(held.request, through: link.id, at: i) } else { answer(.declined(group: id), to: held.request, at: i) }
+        save()
+        // Let go of it on the relay, so the other admins' phones drop it too.
+        guard let client = client(nil, lane: "joins") else { return }
+        let envelope = RelayEnvelope(receiveKey: link.mailbox, id: held.envelope, blob: Data(), deposited: nil)
+        Task { try? await client.ack([envelope]) }
+    }
+
+    /// Sends an answer to whoever asked, from this account's key in the group to theirs.
+    private func answer(_ mail: JoinMail, to request: JoinRequest, at i: Int) {
+        guard let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].id),
+              let blob = JoinSeal.seal(mail, from: keys, to: request.card.agreementKey),
+              let client = client(nil, lane: "joins") else { return }
+        let to = request.reply
+        Task {
+            for delay in [0.0, 5, 30] {
+                try? await Task.sleep(for: .seconds(delay))
+                if (try? await client.deposit(blob, to: to, wake: true)) != nil { return }
+            }
+        }
+    }
+
+    // MARK: Asking to join
+
+    /// Reads a link's preview from the relay and checks it's from the admin the link names.
+    func previewGroup(_ code: GroupLinkCode) async -> GroupPreview? {
+        guard let slot = JoinSlot.keys(code.secret), let client = client(nil, lane: "join-preview") else { return nil }
+        let (key, sig, ts) = SpareSlot.proof("pulshade.backup.get.v1", slot)
+        guard let blob = try? await client.backup(key: key, sig: sig, ts: ts), let preview = JoinSlot.open(blob, with: slot),
+              preview.verified(by: code) else { return nil }
+        return preview
+    }
+
+    /// Whether you're already in the group a preview is for (on this persona).
+    func isInGroup(_ preview: GroupPreview, persona: UUID?) -> Bool {
+        guard let convo = conversation(preview.group) else { return false }
+        return convo.persona == persona && convo.shared.map { !$0.gone } == true
+    }
+
+    /// Asks to join, as `persona`, with a key made for this group alone. The answer comes to a mailbox made for it.
+    func askToJoin(_ preview: GroupPreview, note: String = "", persona: UUID?) {
+        guard sharedGroupsEnabled, !isInGroup(preview, persona: persona),
+              !data.joinAsks.contains(where: { $0.group == preview.group && $0.persona == persona && !$0.declined }),
+              let keys = memberKeys(persona, group: preview.group), var card = myCard(persona, group: preview.group) else { return }
+        if (card.avatar?.count ?? 0) > 16 * 1024 { card.avatar = nil }
+        let reply = Data.random(32)
+        let words = note.trimmingCharacters(in: .whitespacesAndNewlines)
+        let request = JoinRequest(group: preview.group, link: preview.link, card: card, reply: Mailbox.sendID(for: reply),
+                                  note: words.isEmpty ? nil : String(words.prefix(200)), at: RelayClock.now)
+        guard let blob = JoinSeal.seal(.request(request), from: keys, to: preview.requestKey) else { return }
+        data.joinAsks.removeAll { $0.group == preview.group && $0.persona == persona }
+        let ask = JoinAsk(group: preview.group, persona: persona, title: preview.title, avatar: preview.avatar, approval: preview.approval,
+                          reply: reply, request: blob, mailbox: preview.mailbox)
+        data.joinAsks.append(ask)
+        save()
+        sendAsk(ask.id)
+    }
+
+    func cancelJoinAsk(_ id: UUID) {
+        data.joinAsks.removeAll { $0.id == id }
+        save()
+    }
+
+    private func sendAsk(_ id: UUID) {
+        guard !joinSending.contains(id), let ask = data.joinAsks.first(where: { $0.id == id }), !ask.sent,
+              let client = client(nil, lane: "joins") else { return }
+        joinSending.insert(id)
+        Task { [weak self] in
+            let sent = (try? await client.deposit(ask.request, to: ask.mailbox, wake: true)) != nil
+            guard let self else { return }
+            self.joinSending.remove(id)
+            guard sent, let n = self.data.joinAsks.firstIndex(where: { $0.id == id }) else { return }
+            self.data.joinAsks[n].sent = true
+            self.save()
+            self.tendJoinLinks(force: true)
+        }
+    }
+
+    /// An answer to one of your asks: in, with what's needed to read the group, or turned down.
+    private func readAnswer(_ envelope: RelayEnvelope, ask id: UUID) {
+        guard let n = data.joinAsks.firstIndex(where: { $0.id == id }) else { return }
+        let ask = data.joinAsks[n]
+        guard let keys = memberKeys(ask.persona, group: ask.group), let opened = JoinSeal.open(envelope.blob, with: keys.agreement) else { return }
+        switch opened.mail {
+        case let .declined(group) where group == ask.group:
+            data.joinAsks[n].declined = true
+        case let .admitted(invite):
+            let s = invite.settings
+            guard s.group == ask.group, s.kind == .group, s.signatureIsValid, s.wellFormed(), s.isAdmin(s.signer), s.isAdmin(opened.signer),
+                  s.isMember(keys.publicKey), invite.epoch.isValid, s.epoch == invite.epoch.number, s.epochCheck == invite.epoch.check
+            else { return }
+            joinedThroughLink(invite, persona: ask.persona)
+            data.joinAsks.removeAll { $0.id == id }
+        default:
+            break
+        }
+        save()
+    }
+
+    /// In through a link: the group is added (or, if you'd been in it before, picked up again), already a member.
+    private func joinedThroughLink(_ invite: GroupInvite, persona: UUID?) {
+        let s = invite.settings
+        if let i = index(of: s.group) {
+            guard data.conversations[i].persona == persona, data.conversations[i].kind == .group else { return }
+            if var shared = data.conversations[i].shared, !shared.gone {
+                guard s.version >= shared.settings.version else { return }
+                install(invite.epoch, in: &shared)
+                shared.previous = shared.settings
+                shared.settings = s
+                shared.joining = false
+                shared.missedKey = false
+                data.conversations[i].shared = shared
+            } else {
+                // Left (or was taken out) before: back in, with only what the group says now.
+                data.conversations[i].shared = SharedGroup(settings: s, epochs: [invite.epoch])
+                withAnimation(.snappy) { data.conversations[i].messages.append(Message(sender: "system", text: "You joined again", date: Date())) }
+            }
+            applySharedSettings(at: i)
+        } else {
+            var convo = Conversation(id: s.group, kind: .group, title: String(s.title.prefix(80)), avatar: s.avatar, members: [])
+            convo.persona = persona
+            convo.shared = SharedGroup(settings: s, epochs: [invite.epoch])
+            withAnimation(.snappy) { data.conversations.insert(convo, at: 0) }
+            if let i = index(of: s.group) { applySharedSettings(at: i) }
+        }
+        syncConversation(s.group)
     }
 }

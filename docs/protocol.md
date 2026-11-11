@@ -288,6 +288,36 @@ What it changes, honestly:
 - **Admins** can still leave someone out of the settings (but cannot alter a card), and a hostile admin can be a
   nuisance until the owner removes them.
 
+### 7b. Join links
+
+*Code: `Sources/Pulshade/Core/JoinLinks.swift`, and the "Join links" section of `AppModel.swift`.*
+
+An admin of a group that shares one mailbox can make links that let people join without being anyone's contact.
+
+- **The link** is `pulshade://group/` followed by 40 bytes: a random 32-byte secret and the first 8 bytes of the SHA-256
+  of the member key of the admin who made it.
+- **The preview** (name, description, picture, member count, whether admins approve, and where to send a request) is
+  signed by that admin's member key, sealed with a key derived from the secret, padded to 32 KB and kept in the relay's
+  sealed-backup store under another key derived from the secret, exactly as spare keys are. The relay cannot open it or
+  tell what it is. The joining phone checks the signature and that the signer matches the 8 bytes in the link, so a
+  link cannot be pointed at a fake group.
+- **Asking** sends one sealed envelope to an ordinary mailbox named in the preview. It is sealed from the newcomer's key
+  for this group alone (the same key they will be known by inside it) to a key only the group's members hold, and holds
+  their card, an optional note, and a fresh mailbox for the answer. Their account key is never used.
+- **Letting in.** An admin's phone reads the request. Through an open link it adds the newcomer at once (starting a new
+  epoch first if anything has been said, so they cannot read what came before) and sends them the settings and the
+  current epoch key, sealed to their group key. Through a link that needs approval the request waits on the relay,
+  unacknowledged, where every admin's phone sees it, until one of them says yes or no. A banned key, an expired link or
+  one that is used up gets "no".
+- **The links themselves** (their secrets, limits, how many have used each) and the group's ban list are a document of
+  their own, signed by an admin and posted in the group's mailbox. Every member holds it; only admins act on it.
+
+What this means: anyone who has a link can read the preview, so they learn the group's name, picture, description and
+size; they can also overwrite or delete the preview (the admin's phone puts it back within three days, or at once on
+any change; a reset gives the link new secrets). Members can see who asked to join through a link that needs approval.
+The relay sees a small backup-sized slot read now and then, and envelopes going into and out of two ordinary mailboxes.
+Two admins letting people in at the same moment can let a use limit be passed by one or two.
+
 Honest limits (the per-member format above):
 
 - A roster is only as trustworthy as the admins who sent it. A poisoned roster **cannot** let anyone read your messages

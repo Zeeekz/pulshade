@@ -32,6 +32,7 @@ struct MainView: View {
         .sheet(isPresented: Binding(get: { model.openedCode != nil }, set: { if !$0 { model.openedCode = nil } })) {
             ScanSheet(initial: model.openedCode)
         }
+        .sheet(item: Binding(get: { model.openedGroupLink }, set: { model.openedGroupLink = $0 })) { JoinGroupSheet(code: $0.code) }
         // The backup code now covers something new: save it, or know it's covered.
         .sheet(item: Binding(get: { model.codeAlert }, set: { model.codeAlert = $0 })) { BackupCodeSheet(alert: $0) }
         .overlay { CallView() }
