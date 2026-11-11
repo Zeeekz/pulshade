@@ -249,7 +249,7 @@ Groups, channels and broadcasts are made **between phones. The relay knows nothi
 
 New groups use this format when every member's app takes part (bit 4 of the `caps` byte); the owner of an older group
 can move it over once everyone can. Channels use it too when every follower's app takes part (bit 6, see 7a-i below);
-the built-in Announcements channel and any group or channel with someone on an older app still use the format above.
+any group or channel with someone on an older app still uses the format above.
 
 - **One mailbox per epoch.** A member seals each message **once** and posts it into the group's mailbox on the relay;
   every member reads it from there with a cursor ("everything after the last one I saw"). The relay keeps group mail
@@ -317,7 +317,8 @@ byte, `Envelope.reads` 127). Someone on an older app waits until they update.
   roster into the settings. When an older channel moves over, its admins are asked the same way.
 - **Left out.** Follower reactions are dropped (staff can still react). A follower cannot leave from inside the channel
   (they delete it and staff can take them out), and one who is away through a rekey must be added again.
-- **Announcements** stays in the older format, so the older format's reading code stays in the app for now.
+- **Announcements** is not part of either format: the relay hands every app the same admin-signed list, with no account
+  attached.
 
 ### 7b. Join links
 

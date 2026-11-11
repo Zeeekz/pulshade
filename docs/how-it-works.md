@@ -374,8 +374,8 @@ kept in memory only.
   Apple's push service (see [wake-up pushes](push-notifications.md)). Blank screenshots
   rely on iOS behaviour Apple doesn't document; if an update changes it, screenshots would show the app again.
 - **Groups in the older format cap out at 300 members.** Every message goes out as one envelope per member. Groups that
-  share one mailbox take 5,000, and so do channels whose followers all run a recent app. Announcements and any group or
-  channel with someone on an older app still use the older format.
+  share one mailbox take 5,000, and so do channels whose followers all run a recent app. Any group or channel with someone on an
+  older app still uses the older format.
 - **A group's member list is only as trustworthy as its admins.** The keys and mailboxes in a group's details are
   asserted by whoever sent them. A poisoned card can't read your messages to that member (a session only opens on
   an answer signed by the member's own identity key), but it can stop you reaching them. Check the safety code
