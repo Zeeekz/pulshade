@@ -304,4 +304,57 @@ struct GroupKeysTests {
         long.sign(with: owner)
         #expect(!long.wellFormed(), "few characters but many bytes")
     }
+
+    @Test func aChannelRekeyDoesntListItsReadersAndHidesHowManyThereAre() throws {
+        let owner = keys(.random(32))
+        let followers = (0..<5).map { _ in keys(.random(32)) }
+        let outsider = keys(.random(32))
+        let cards = ([owner] + followers).map { MemberCard.make($0, group: group, name: "", avatar: nil, color: nil) }
+        let next = GroupEpoch.fresh(number: 2)
+        let rekey = GroupRekey.make(next, group: group, for: cards, tagged: true)
+        for who in [owner] + followers { #expect(rekey.open(with: who)?.key == next.key) }
+        #expect(rekey.open(with: outsider) == nil)
+        #expect(rekey.tagged == true)
+        for who in [owner] + followers { #expect(rekey.sealed[who.publicKey.hex] == nil, "no reader's key is named") }
+        #expect(rekey.sealed.count == 8, "padded up to eight")
+        let more = (0..<12).map { _ in MemberCard.make(keys(.random(32)), group: group, name: "", avatar: nil, color: nil) }
+        #expect(GroupRekey.make(next, group: group, for: cards + more, tagged: true).sealed.count == 32, "then to a power of two")
+        // A copy filed under someone else's tag opens nothing for them.
+        var swapped = rekey
+        let mine = rekey.sealed.first { (name, _) in followers[1].publicKey.hex != name }!
+        swapped.sealed = [mine.key: mine.value]
+        #expect(swapped.open(with: outsider) == nil)
+    }
+
+    @Test func aChannelsFollowerListOpensOnlyForStaffAndMergesWithoutLosingAnyone() throws {
+        let owner = keys(.random(32)), admin = keys(.random(32)), follower = keys(.random(32)), other = keys(.random(32))
+        let staff = [owner, admin].map { MemberCard.make($0, group: group, name: "s", avatar: nil, color: nil) }
+        let a = MemberCard.make(follower, group: group, name: "", avatar: nil, color: nil)
+        let b = MemberCard.make(other, group: group, name: "", avatar: nil, color: nil)
+        let t0 = Date()
+        let one = GroupRoster.Body(entries: [.init(card: a, added: t0)], removed: [])
+        let two = GroupRoster.Body(entries: [.init(card: b, added: t0.addingTimeInterval(1))], removed: [])
+        let roster = try #require(GroupRoster.make(one, group: group, epoch: 1, staff: staff, keys: owner))
+        #expect(roster.signatureIsValid)
+        #expect(roster.open(with: owner) == one && roster.open(with: admin) == one)
+        #expect(roster.open(with: follower) == nil && roster.open(with: other) == nil, "a follower can't read it")
+        var forged = roster
+        forged.box = Data(forged.box.reversed())
+        #expect(!forged.signatureIsValid)
+        // Two admins add at once: both stay.
+        #expect(Set(one.merged(with: two, group: group).live.map(\.signingKey)) == Set([a.signingKey, b.signingKey]))
+        // A removal beats the entry it names, but a later add beats the removal.
+        let removed = GroupRoster.Body(entries: [], removed: [.init(key: a.signingKey, at: t0.addingTimeInterval(5))])
+        #expect(one.merged(with: removed, group: group).live.isEmpty)
+        let again = GroupRoster.Body(entries: [.init(card: a, added: t0.addingTimeInterval(9))], removed: [])
+        #expect(one.merged(with: removed, group: group).merged(with: again, group: group).live.map(\.signingKey) == [a.signingKey])
+        // A card that isn't genuine for this group is left out.
+        var fake = b
+        fake.signature = Data(repeating: 1, count: 64)
+        #expect(one.merged(with: .init(entries: [.init(card: fake, added: t0)], removed: []), group: group).live.count == 1)
+        // The size doesn't give the number away to within a power of two.
+        let small = GroupRoster.make(one, group: group, epoch: 1, staff: staff, keys: owner)!
+        let few = GroupRoster.Body(entries: (0..<3).map { _ in .init(card: a, added: t0) }, removed: [])
+        #expect(GroupRoster.make(few, group: group, epoch: 1, staff: staff, keys: owner)!.box.count == small.box.count)
+    }
 }

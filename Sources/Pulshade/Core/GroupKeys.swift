@@ -282,39 +282,196 @@ struct GroupSettings: Codable, Equatable {
 
 /// A new epoch's key, sealed to each remaining member's group key, so whoever was taken out (who can still read the
 /// old epoch's mail) can't open it.
+///
+/// In a channel the copies are filed under a short tag worked out from each reader's own key instead of the key itself,
+/// and padded with copies nobody can open up to a power of two, so followers can't list each other from it and learn
+/// only roughly how many there are.
 struct GroupRekey: Codable, Equatable {
     var group: UUID
     var epoch: Int
     var days: Int
     /// The one-off public key the copies were sealed with.
     var ephemeral: Data
-    /// Each member's copy, by the member's signing key (hex).
+    /// Each member's copy, by the member's signing key (hex), or by their tag (hex) when `tagged`.
     var sealed: [String: Data]
+    /// Filed by tag, with padding (channels); apps from before can't open these.
+    var tagged: Bool?
 
-    static func make(_ epoch: GroupEpoch, group: UUID, for members: [MemberCard]) -> GroupRekey {
+    /// Copies a tagged rekey holds at least, and the most it may hold (the group size limit, rounded up).
+    static let minTagged = 8
+    static let maxTagged = 8_192
+
+    static func make(_ epoch: GroupEpoch, group: UUID, for members: [MemberCard], tagged: Bool = false) -> GroupRekey {
         let eph = Curve25519.KeyAgreement.PrivateKey()
         var sealed: [String: Data] = [:]
         for member in members {
             guard let theirs = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: member.agreementKey),
                   let shared = try? eph.sharedSecretFromKeyAgreement(with: theirs) else { continue }
-            let key = Self.wrapKey(shared.withUnsafeBytes { Data($0) }, group: group, epoch: epoch.number, member: member.signingKey)
-            sealed[member.signingKey.hex] = try? ChaChaPoly.seal(epoch.key, using: key).combined
+            let secret = shared.withUnsafeBytes { Data($0) }
+            let key = Self.wrapKey(secret, group: group, epoch: epoch.number, member: member.signingKey)
+            let name = tagged ? Self.tag(secret, group: group, epoch: epoch.number).hex : member.signingKey.hex
+            sealed[name] = try? ChaChaPoly.seal(epoch.key, using: key).combined
         }
-        return GroupRekey(group: group, epoch: epoch.number, days: epoch.days, ephemeral: eph.publicKey.rawRepresentation, sealed: sealed)
+        if tagged {
+            var size = minTagged
+            while size < sealed.count, size < maxTagged { size *= 2 }
+            // Same length as a real copy (a 32-byte key sealed: 12 + 32 + 16), so none stands out.
+            while sealed.count < size { sealed[Data.random(8).hex] = Data.random(60) }
+        }
+        return GroupRekey(group: group, epoch: epoch.number, days: epoch.days, ephemeral: eph.publicKey.rawRepresentation,
+                          sealed: sealed, tagged: tagged ? true : nil)
     }
 
     /// This member's copy, opened.
     func open(with keys: GroupMemberKeys) -> GroupEpoch? {
-        guard let box = sealed[keys.publicKey.hex], let eph = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: ephemeral),
+        guard let eph = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: ephemeral),
               let shared = try? keys.agreement.sharedSecretFromKeyAgreement(with: eph) else { return nil }
-        let key = Self.wrapKey(shared.withUnsafeBytes { Data($0) }, group: group, epoch: epoch, member: keys.publicKey)
+        let secret = shared.withUnsafeBytes { Data($0) }
+        let name = tagged == true ? Self.tag(secret, group: group, epoch: epoch).hex : keys.publicKey.hex
+        guard let box = sealed[name] else { return nil }
+        let key = Self.wrapKey(secret, group: group, epoch: epoch, member: keys.publicKey)
         guard let sealedBox = try? ChaChaPoly.SealedBox(combined: box), let raw = try? ChaChaPoly.open(sealedBox, using: key),
               raw.count == 32 else { return nil }
         return GroupEpoch(number: epoch, key: raw, days: min(max(days, 1), 7), started: Date())
     }
 
+    /// Whether the number of copies is one a tagged rekey may have (so a huge one can't be used to fill someone's phone).
+    var isReasonable: Bool { tagged == true ? sealed.count <= Self.maxTagged : sealed.count <= GroupSettings.maxMembers }
+
     private static func wrapKey(_ shared: Data, group: UUID, epoch: Int, member: Data) -> SymmetricKey {
         SymmetricKey(data: derive(shared, "pulshade.group.rekey.v1", salt: bytes(group) + be32(UInt32(truncatingIfNeeded: epoch)) + member))
+    }
+
+    /// The eight bytes a reader's copy is filed under: only the reader (and whoever sealed it) can work them out.
+    private static func tag(_ shared: Data, group: UUID, epoch: Int) -> Data {
+        Data(derive(shared, "pulshade.group.rekey.tag.v1", salt: bytes(group) + be32(UInt32(truncatingIfNeeded: epoch))).prefix(8))
+    }
+}
+
+/// The people following a channel, kept by its staff and hidden from everyone else: the staff need them to hand each a new
+/// epoch's key when someone is taken out. One document, posted in the channel's mailbox, that only a staff member can open:
+/// the list is sealed under a random key, and that key is sealed to each staff member's group key. A copy is padded to a
+/// power of two, so the size tells followers little more than "roughly this many".
+///
+/// Admins merge what they get: an entry stays unless a later removal names it (`removed`), so two admins adding at once
+/// both end up in.
+struct GroupRoster: Codable, Equatable {
+    struct Entry: Codable, Equatable {
+        var card: MemberCard
+        var added: Date
+    }
+    struct Gone: Codable, Equatable {
+        var key: Data
+        var at: Date
+    }
+    struct Body: Codable, Equatable {
+        var entries: [Entry]
+        var removed: [Gone]
+
+        static let maxEntries = 5_000
+        static let maxRemoved = 5_000
+
+        /// The people in it now: added, and not taken out since.
+        var live: [MemberCard] {
+            entries.filter { entry in !removed.contains { $0.key == entry.card.signingKey && $0.at >= entry.added } }.map(\.card)
+        }
+
+        /// This and `other`, together: the newest entry for each person, and every removal; removals older than the entry
+        /// they name are let go, and so are the oldest when there are too many.
+        func merged(with other: Body, group: UUID) -> Body {
+            var byKey: [Data: Entry] = [:]
+            for entry in entries + other.entries where entry.card.verified(group: group) {
+                if let held = byKey[entry.card.signingKey], held.added >= entry.added { continue }
+                byKey[entry.card.signingKey] = entry
+            }
+            var gone: [Data: Gone] = [:]
+            for g in removed + other.removed {
+                if let held = gone[g.key], held.at >= g.at { continue }
+                gone[g.key] = g
+            }
+            let keptGone = gone.values.filter { g in byKey[g.key].map { g.at >= $0.added } ?? true }
+                .sorted { $0.at > $1.at }
+            return Body(entries: Array(byKey.values.sorted { $0.added < $1.added }.suffix(Self.maxEntries)),
+                        removed: Array(keptGone.prefix(Self.maxRemoved)))
+        }
+    }
+
+    var group: UUID
+    var epoch: Int
+    /// The one-off public key the roster key was sealed with.
+    var ephemeral: Data
+    /// The roster key, sealed to each staff member under their tag, padded.
+    var keys: [String: Data]
+    /// The body, sealed under the roster key.
+    var box: Data
+    var signer: Data
+    var signature: Data
+
+    private func signable() -> Data {
+        var d = Data("pulshade.group.roster.v1".utf8) + bytes(group) + be32(UInt32(truncatingIfNeeded: epoch)) + ephemeral
+        for name in keys.keys.sorted() { d += Data(name.utf8) + Data(SHA256.hash(data: keys[name] ?? Data())) }
+        return d + Data(SHA256.hash(data: box))
+    }
+
+    var signatureIsValid: Bool {
+        guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: signer) else { return false }
+        return key.isValidSignature(signature, for: signable())
+    }
+
+    /// The biggest sealed body a roster may have, in bytes (about 5,000 entries).
+    static let maxBox = 2_000_000
+
+    var isReasonable: Bool { keys.count <= 4_096 && box.count <= Self.maxBox }
+
+    /// A roster for `staff` to read, signed by `keys`.
+    static func make(_ body: Body, group: UUID, epoch: Int, staff: [MemberCard], keys: GroupMemberKeys) -> GroupRoster? {
+        guard let plain = try? JSONEncoder.pulshade.encode(body) else { return nil }
+        let rosterKey = SymmetricKey(size: .bits256)
+        let eph = Curve25519.KeyAgreement.PrivateKey()
+        var sealedKeys: [String: Data] = [:]
+        let secretBytes = rosterKey.withUnsafeBytes { Data($0) }
+        for member in staff {
+            guard let theirs = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: member.agreementKey),
+                  let shared = try? eph.sharedSecretFromKeyAgreement(with: theirs) else { continue }
+            let secret = shared.withUnsafeBytes { Data($0) }
+            sealedKeys[Self.tag(secret, group: group).hex] = try? ChaChaPoly.seal(secretBytes, using: Self.wrap(secret, group: group, member: member.signingKey)).combined
+        }
+        var size = 4
+        while size < sealedKeys.count { size *= 2 }
+        while sealedKeys.count < size { sealedKeys[Data.random(8).hex] = Data.random(60) }
+        // The body is padded to a power of two (at least 1 KiB) before sealing.
+        var padded = plain
+        var target = 1_024
+        while target < padded.count + 4 { target *= 2 }
+        padded = be32(UInt32(plain.count)) + plain + Data(count: target - plain.count - 4)
+        guard let box = try? ChaChaPoly.seal(padded, using: rosterKey).combined else { return nil }
+        var roster = GroupRoster(group: group, epoch: epoch, ephemeral: eph.publicKey.rawRepresentation, keys: sealedKeys, box: box,
+                                 signer: keys.publicKey, signature: Data())
+        roster.signature = (try? keys.signing.signature(for: roster.signable())) ?? Data()
+        return roster
+    }
+
+    /// The list, if this staff member has a copy of the key.
+    func open(with keys: GroupMemberKeys) -> Body? {
+        guard isReasonable, let eph = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: ephemeral),
+              let shared = try? keys.agreement.sharedSecretFromKeyAgreement(with: eph) else { return nil }
+        let secret = shared.withUnsafeBytes { Data($0) }
+        guard let copy = self.keys[Self.tag(secret, group: group).hex], let copyBox = try? ChaChaPoly.SealedBox(combined: copy),
+              let rosterKey = try? ChaChaPoly.open(copyBox, using: Self.wrap(secret, group: group, member: keys.publicKey)),
+              rosterKey.count == 32, let sealedBox = try? ChaChaPoly.SealedBox(combined: box),
+              let padded = try? ChaChaPoly.open(sealedBox, using: SymmetricKey(data: rosterKey)), padded.count >= 4 else { return nil }
+        let n = padded.prefix(4).reduce(0) { $0 << 8 | Int($1) }
+        guard n <= padded.count - 4, let body = try? JSONDecoder.pulshade.decode(Body.self, from: padded.dropFirst(4).prefix(n)),
+              body.entries.count <= Body.maxEntries, body.removed.count <= Body.maxRemoved else { return nil }
+        return body
+    }
+
+    private static func wrap(_ shared: Data, group: UUID, member: Data) -> SymmetricKey {
+        SymmetricKey(data: derive(shared, "pulshade.group.roster.wrap.v1", salt: bytes(group) + member))
+    }
+
+    private static func tag(_ shared: Data, group: UUID) -> Data {
+        Data(derive(shared, "pulshade.group.roster.tag.v1", salt: bytes(group)).prefix(8))
     }
 }
 
