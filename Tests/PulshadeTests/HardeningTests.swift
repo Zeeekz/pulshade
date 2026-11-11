@@ -78,6 +78,39 @@ import PulshadeShared
         #expect(kept.decoySeed == nil && kept.panicSeed == nil && kept.clipParts.isEmpty)
     }
 
+    @Test func theBackupHoldsNoChatKeysExceptForAContactStillWaiting() throws {
+        let them = Identity.generate(), me = Identity.generate()
+        func ratchet() throws -> Ratchet {
+            let (pending, request) = try Handshake.start()
+            let (_, answer) = try Handshake.accept(request, me: them, initiatorAgreement: me.card.agreement)
+            return try Handshake.complete(pending, answer, me: me, responderAgreement: them.card.agreement)
+        }
+        var known = Contact(fingerprint: them.fingerprint, name: "Kai", signingKey: them.card.signing,
+                            agreementKey: them.card.agreement, sendID: Mailbox.make().sendID)
+        known.devices[0].session = try ratchet()
+        known.devices[0].handshake = try Handshake.start().0
+        known.devices[0].earlierAsks = [try Handshake.start().0]
+        known.devices[0].acceptedHello = Data.random(32)
+        known.devices[0].acceptedHelloAt = Date()
+        var waiting = Contact(fingerprint: Identity.generate().fingerprint, name: "Sam", signingKey: them.card.signing,
+                              agreementKey: them.card.agreement, sendID: Mailbox.make().sendID)
+        waiting.awaitingAcceptance = true
+        waiting.devices[0].handshake = try Handshake.start().0
+        var data = AppData()
+        data.contacts = [known, waiting]
+
+        let kept = AppModel.backupContents(of: data)
+        let device = kept.contacts[0].devices[0]
+        #expect(kept.contacts.map(\.name) == ["Kai", "Sam"], "Contacts still come back")
+        #expect(device.session == nil && device.handshake == nil && device.earlierAsks == nil)
+        #expect(device.acceptedHello == nil && device.acceptedHelloAt == nil)
+        #expect(kept.contacts[1].devices[0].handshake != nil, "Only an ask nobody has accepted yet can't be started again")
+        let text = String(decoding: try JSONEncoder.pulshade.encode(kept), as: UTF8.self)
+        #expect(!text.contains("\"rk\"") && !text.contains("\"cks\"") && !text.contains("\"dhs\""), "No ratchet state in the file")
+        let before = String(decoding: try JSONEncoder.pulshade.encode(data), as: UTF8.self)
+        #expect(before.contains("\"rk\""), "the check above can tell a ratchet when one is there")
+    }
+
     @Test func onlyTheAdminKeyMakesAGuardian() throws {
         let admin = Curve25519.Signing.PrivateKey(), relay = Curve25519.Signing.PrivateKey(), owner = Data(repeating: 1, count: 32)
         let forged = try Collectible.make(.guardian, serial: 1, owner: owner, signedBy: relay)

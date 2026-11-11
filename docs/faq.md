@@ -168,8 +168,9 @@ Install Pulshade on a new device and use your recovery code. Your profile, handl
 settings come back from the sealed backup. Chats don't: they never leave your devices.
 
 **What is the sealed backup?**
-A copy of your profile, contacts, groups, personas, settings and the keys for each chat (never the messages), encrypted
-with a key only your recovery code makes. The chat keys let you open mail sent while you were logged out. We can't open it or link it to you. It is on by default and erased when you switch it off in Settings, Burn,
+A copy of your profile, contacts, groups, personas and settings (never the messages or any chat keys), encrypted
+with a key only your recovery code makes. After you log back in the app opens new chat keys with each contact, so mail
+sent while you were logged out can't be opened. We can't open it or link it to you. It is on by default and erased when you switch it off in Settings, Burn,
 or 180 days after its last save.
 
 **Can I use Pulshade on several devices?**

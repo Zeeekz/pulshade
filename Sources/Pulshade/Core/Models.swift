@@ -1126,6 +1126,8 @@ struct Outgoing: Codable, Identifiable {
     /// mailbox (a key request asked again, the latest "I'm here"). Made from this device and the mailbox, so it says
     /// nothing the relay can't already see. Nil for anything that must arrive in full.
     var collapse: Data?
+    /// The kind behind `collapse` ("hello", "typing"), kept so a queued ask can be found after its tag has moved on.
+    var collapseKind: String?
 
     /// The sending lane for a persona (nil is the main one).
     static func lane(for persona: UUID?) -> String {

@@ -44,7 +44,7 @@ possible:
   phone with a key that only travels inside the end-to-end encrypted message, sealed again by the server, erased the
   moment the message is deleted (the server's key for it is destroyed) or after 7 days. A phone only ever holds a
   received file in memory.
-  The relay and the web server in front of it keep no request log. Your sealed backup (profile, contacts, groups and chat keys; never messages) is saved again as things change and erased 180
+  The relay and the web server in front of it keep no request log. Your sealed backup (profile, contacts, groups and settings; never messages or chat keys) is saved again as things change and erased 180
   days after its last save, so a detached account's waits at most that long for its recovery code. Turn it off in
   Settings and it's erased at once.
 

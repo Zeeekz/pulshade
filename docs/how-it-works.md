@@ -46,8 +46,8 @@ file of about that size was uploaded and collected, and when.
 
 **The sealed backup.** So that Detach can be instant, the app keeps one backup of your profile, @handles, contacts,
 groups, personas and settings (never chats, stories or requests, nor a message still waiting to be sent, nor
-a decoy or panic identity) on the relay. It does hold each contact's session keys, so mail sent to you while you were
-detached can still be opened. It is sealed on the device with a key
+a decoy or panic identity) on the relay. It holds no chat keys: after a restore the app opens new ones with each
+contact, so mail sent to you while you were detached can't be opened. It is sealed on the device with a key
 only the recovery code makes, filed under a throwaway public key derived from the recovery code and from nothing
 else, so the relay can't read it or tie it to your account. It is padded to a power of two (at least 64 KB), so its
 size says little. A few minutes after something in it changes (a random 1.5 to 10 minutes, so an upload can't be

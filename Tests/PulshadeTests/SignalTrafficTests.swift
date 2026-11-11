@@ -71,12 +71,18 @@ import Foundation
         #expect(Set(asks.compactMap(\.collapse)).count == 2, "each mailbox has its own tag")
     }
 
-    @Test func tagsAreStablePerKindAndMailbox() {
+    @Test func tagsAreStablePerKindAndMailboxWithinAWindowAndMoveOnAfterIt() {
         let box = Data.random(32), other = Data.random(32), device = Data([7])
-        #expect(AppModel.collapseTag("hello", sendID: box, from: device) == AppModel.collapseTag("hello", sendID: box, from: device))
-        #expect(AppModel.collapseTag("hello", sendID: box, from: device) != AppModel.collapseTag("presence", sendID: box, from: device))
-        #expect(AppModel.collapseTag("hello", sendID: box, from: device) != AppModel.collapseTag("hello", sendID: other, from: device))
-        #expect(AppModel.collapseTag("hello", sendID: box, from: device) != AppModel.collapseTag("hello", sendID: box, from: Data([8])))
+        let start = Date(timeIntervalSince1970: 1_800_000_000 - 1_800_000_000.truncatingRemainder(dividingBy: AppModel.collapseWindow))
+        let soon = start.addingTimeInterval(AppModel.collapseWindow - 1), later = start.addingTimeInterval(AppModel.collapseWindow)
+        func tag(_ kind: String = "hello", _ mailbox: Data? = nil, _ from: Data? = nil, at: Date? = nil) -> Data {
+            AppModel.collapseTag(kind, sendID: mailbox ?? box, from: from ?? device, at: at ?? start)
+        }
+        #expect(tag() == tag(at: soon), "the same sender replaces its older copy within a window")
+        #expect(tag() != tag(at: later), "the relay can't follow one sender device across windows")
+        #expect(tag() != tag("presence"))
+        #expect(tag() != tag("hello", other))
+        #expect(tag() != tag("hello", nil, Data([8])))
         #expect(Payload.typing(conversation: UUID()).collapseKind == "typing")
         #expect(Payload.presence(online: true).collapseKind == "presence")
     }

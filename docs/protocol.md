@@ -339,9 +339,11 @@ can let a use limit be passed by one or two; a ban or use count lost that way is
 
 So that Detach can be instant, the app keeps **one backup** of your account on the relay.
 
-- **What is in it:** your profile, @handles, contacts, groups, personas and settings, **and the session keys** for each
-  contact device, so mail sent to you while you were detached can still be opened after you log back in. **Not** in it:
-  chat history, stories, requests, messages still waiting to be sent, and any decoy or panic identity.
+- **What is in it:** your profile, @handles, contacts, groups, personas and settings. **Not** in it: chat history,
+  stories, requests, messages still waiting to be sent, any decoy or panic identity, **and (since build 13) any
+  session keys.** A recovered account opens new sessions with every contact (on their spare keys where they left
+  one), so mail sent to you while you were detached can't be opened. The one exception is a contact who hasn't
+  accepted yet, whose waiting ask has to stay.
 - **How it is sealed:** AES-256-GCM, with a key made from your seed (so only the recovery code can open it). The seed
   is 256 bits of randomness, so there is nothing to guess.
 - **Padding:** to a power of two, at least 64 KB, behind a length marker. The relay learns a rough size class, not how
@@ -358,12 +360,11 @@ So that Detach can be instant, the app keeps **one backup** of your account on t
 
 Honest limits:
 
-- Because session keys are in the backup, **forward secrecy is weaker against one specific attacker**: someone who gets
-  *both* your recovery code *and* a stored copy of your backup can read what that snapshot's keys cover (messages that
-  were in flight, and the ones sent in the same chain until the other side's next reply). They would not need much
-  else, since the recovery code on its own is your whole identity. The backup is overwritten on each save, but copies
-  of old versions may linger on the relay's disk or in storage snapshots, sealed. The same goes for the handshake
-  secrets kept to finish late answers ([section 2](#2-the-handshake)) and spare keys' secret halves.
+- The backup no longer holds session keys, so a leaked recovery code with a stored copy shows no chat key that was ever
+  used. It does show your contacts, groups and settings, and the recovery code on its own is still your whole identity
+  (someone holding it can take over the account and be sent new sessions). It also holds the secret halves of spare keys
+  ([section 2](#2-the-handshake)), which are made ahead and carry no message. Copies of old versions may linger on the
+  relay's disk or in storage snapshots, sealed.
 - The relay can see *when* a backup was saved, its rough size, and (in Fast mode) the IP that saved it.
 
 ## 9. The blob store (big files)
@@ -502,8 +503,8 @@ Each deposit also carries a few plain headers the relay acts on:
   from a background signal from a call.
 - **Life and collapse:** typing and "online" signals say how long they are worth keeping (at most an hour), and some
   signals and key requests carry a tag so a newer copy replaces the older one. The tag is a hash of the kind of signal,
-  the sender's device id and the mailbox: it says nothing else, but it is the same each time, so the relay can tell
-  that repeated signals to one mailbox come from the same sender device.
+  the sender's device id, the mailbox and a ten-minute window: it says nothing else, and it changes every ten minutes,
+  so the relay can tell that repeated signals to one mailbox come from the same sender device only within a window.
 - **Recall stamp:** a random number and a hash only the sender can make the matching token for. It lets a Burn take
   back the account's mail that is still waiting. When a Burn hands over those tokens, the relay learns which waiting
   envelopes came from the account that burned (not who it was).
@@ -544,7 +545,7 @@ or who you are behind Tor.
 | Which mailboxes share a push token, if "Wake when locked" is on | Anything that ties your personas together, apart from Fast-mode IP or a shared push token (main identity only) |
 | When a backup, spare or file is written, read or erased, and how big | A backup's or a spare's contents, or whose it is |
 | A burst of equal-size envelopes landing in many mailboxes at once (a group message) | |
-| Whether a deposit is a message, a signal or a call; that repeated tagged signals to one mailbox come from one sender device | Which device that is |
+| Whether a deposit is a message, a signal or a call; that tagged signals to one mailbox within ten minutes come from one sender device | Which device that is, or that two windows are the same one |
 | After a Burn, which waiting envelopes came from the burned account | |
 
 A **dishonest relay** can also drop, delay or replay envelopes, refuse service, and in Fast mode record IP addresses.
@@ -617,7 +618,7 @@ the apps.
 - **The locked-phone helper connects directly**, not over Tor, for a moment each time, when locked-phone collection is
   on. It is only possible in Fast mode: turning Tor on turns it off.
 - **The 180-day backup.** A sealed backup stays on the relay until you switch it off, Burn, or 180 days without an
-  update. It holds session keys (see section 8). It is sealed with a key only your recovery code makes. If that code
+  update. It holds no session keys (see section 8) but does hold your contacts and settings. It is sealed with a key only your recovery code makes. If that code
   leaks and a copy of the stored backup exists, it can be opened.
 - **Disk.** Deleting a file overwrites it first, but on flash storage that only helps a little; what makes old data
   unreadable is that its key is gone. Pulshade keeps plain-text files off the disk wherever it can (voice notes and chat

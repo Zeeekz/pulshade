@@ -482,6 +482,9 @@ final class AppModel {
         save()
     }
 
+    /// How long between asks for new keys from a device whose messages can't be opened. Short in tests only.
+    nonisolated(unsafe) static var mendWait: TimeInterval = 120
+
     /// Starts a new session with a device whose messages can't be opened, at most every couple of minutes.
     @ObservationIgnored private var lastMend: [String: Date] = [:]
 
@@ -535,7 +538,7 @@ final class AppModel {
                   let d = data.contacts[i].devices.firstIndex(where: { $0.id == item.device }) else { unreadable[key] = nil; continue }
             if let started = data.contacts[i].devices[d].handshake?.startedAt {
                 // Asked and not answered (they weren't running Pulshade): asked again after a while.
-                guard Date().timeIntervalSince(started) > 120, Date().timeIntervalSince(lastMend[key] ?? .distantPast) > 120 else { continue }
+                guard Date().timeIntervalSince(started) > Self.mendWait, Date().timeIntervalSince(lastMend[key] ?? .distantPast) > Self.mendWait else { continue }
                 lastMend[key] = Date()
                 startHandshake(contact: i, device: d)
             } else {
@@ -549,7 +552,7 @@ final class AppModel {
               data.contacts[i].devices[d].awaitingHello != true else { return }
         let key = sessionKey(contact: i, device: d)
         if sparesFetching.contains(key) { return }
-        if let last = lastMend[key], Date().timeIntervalSince(last) < 120 { return }
+        if let last = lastMend[key], Date().timeIntervalSince(last) < Self.mendWait { return }
         lastMend[key] = Date()
         // Keep the keys this chat was using, in memory only, so a message that was sealed under them and arrives
         // while the new session is being set up can still be read. Dropped at lock with the other recovery keys.
@@ -4530,9 +4533,10 @@ final class AppModel {
     /// Whether it was: false when it has gone, or is going.
     @discardableResult
     private func withdrawHello(contact i: Int, device d: Int) -> Bool {
-        let tag = Self.collapseTag("hello", sendID: data.contacts[i].devices[d].sendID, from: deviceID(for: data.contacts[i].persona))
+        // By kind and mailbox, not by tag: the tag changes every few minutes, and an ask queued earlier still counts.
+        let box = data.contacts[i].devices[d].sendID
         let before = data.outbox.count
-        data.outbox.removeAll { $0.collapse == tag && !sendingIDs.contains($0.id) }
+        data.outbox.removeAll { $0.collapseKind == "hello" && $0.sendID == box && !sendingIDs.contains($0.id) }
         return data.outbox.count < before
     }
 
@@ -4583,7 +4587,10 @@ final class AppModel {
         // A signal is let go by the relay if it isn't collected soon, so a device that's away doesn't come back to a
         // pile of "typing" and "I'm here"; the newest of a kind replaces the one before.
         if ephemeral { outgoing.life = Self.signalLife }
-        if let collapse { outgoing.collapse = Self.collapseTag(collapse, sendID: sendID, from: deviceID(for: c.persona)) }
+        if let collapse {
+            outgoing.collapse = Self.collapseTag(collapse, sendID: sendID, from: deviceID(for: c.persona))
+            outgoing.collapseKind = collapse
+        }
         // Stamped so a Burn can take it back from the relay while it waits. Not signals, and not the Burn's own farewells.
         if !ephemeral && !burning {
             let stamp = Recall.stamp(me.recallKey)
@@ -4598,13 +4605,21 @@ final class AppModel {
     /// it means something when it lands.
     static let signalLife = 120
 
-    /// The relay's tag for "the same kind of thing from the same sender": a hash of the kind, this device's id and the
-    /// mailbox, so it's stable for one sender and one mailbox and tells the relay nothing else.
-    nonisolated static func collapseTag(_ kind: String, sendID: Data, from device: Data) -> Data {
+    /// How long one collapse tag lasts. A signal is only kept two minutes and a key request that crosses a boundary
+    /// just leaves one extra copy (the receiver ignores a stale ask), so the tag can change often.
+    nonisolated static let collapseWindow: TimeInterval = 600
+
+    /// The relay's tag for "the same kind of thing from the same sender": a hash of the kind, this device's id, the
+    /// mailbox and a ten-minute window. Within a window it is stable, so the relay can replace the older copy; across
+    /// windows it changes, so the relay can't tell for longer than that that signals to one mailbox come from one
+    /// sender device.
+    nonisolated static func collapseTag(_ kind: String, sendID: Data, from device: Data, at time: Date = Date()) -> Data {
         var hasher = SHA256()
         hasher.update(data: Data("pulshade.collapse.\(kind)".utf8))
         hasher.update(data: sendID)
         hasher.update(data: device)
+        var window = Int64((time.timeIntervalSince1970 / collapseWindow).rounded(.down)).bigEndian
+        withUnsafeBytes(of: &window) { hasher.update(bufferPointer: $0) }
         return Data(hasher.finalize().prefix(16))
     }
 
@@ -8033,10 +8048,20 @@ extension AppModel {
         kept.backupSavedAt = nil
         kept.backupDigest = nil
         // Nothing you wrote that is still waiting to be sent: that is chat, and chats never go in the backup.
-        // Session keys do stay, so mail sent to you while the device was detached can still be opened.
+        // No session keys either: a recovered account opens fresh ones with every contact (`startFreshSessions`), so a
+        // copy of the backup, with the recovery code, shows no chat key that was ever used. Only a contact who hasn't
+        // accepted yet keeps its half of the handshake, since nothing else can finish it.
         for c in kept.contacts.indices {
             for d in kept.contacts[c].devices.indices {
                 kept.contacts[c].devices[d].pending.removeAll { $0.message != nil }
+                guard !kept.contacts[c].awaitingAcceptance else { continue }
+                kept.contacts[c].devices[d].session = nil
+                kept.contacts[c].devices[d].handshake = nil
+                kept.contacts[c].devices[d].earlierAsks = nil
+                kept.contacts[c].devices[d].awaitingHello = nil
+                kept.contacts[c].devices[d].acceptedHello = nil
+                kept.contacts[c].devices[d].acceptedHelloAt = nil
+                kept.contacts[c].devices[d].sessionAskAt = nil
             }
         }
         // Nor story video still arriving, or the decoy and panic identities, which live only on the device
