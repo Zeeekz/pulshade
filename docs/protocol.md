@@ -239,7 +239,8 @@ Groups, channels and broadcasts are made **between phones. The relay knows nothi
 - Members who are not your contacts are kept as hidden peers, used only inside that group. Members who do not know
   each other first meet through **introduction mailboxes**, made by whoever sends the group's details. Nobody is given
   the mailbox another member uses with the owner. After the first hello each pair moves to a mailbox of its own.
-- In a channel, followers learn who can post, not who else follows.
+- In a channel, followers learn who can post, not who else follows (in both formats; see 7a-i for how the newer one
+  keeps the follower list from followers).
 
 ### 7a. Groups that share one mailbox
 
@@ -247,7 +248,8 @@ Groups, channels and broadcasts are made **between phones. The relay knows nothi
 `docs/groups-design.md`.*
 
 New groups use this format when every member's app takes part (bit 4 of the `caps` byte); the owner of an older group
-can move it over once everyone can. Channels still use the format above.
+can move it over once everyone can. Channels use it too when every follower's app takes part (bit 6, see 7a-i below);
+the built-in Announcements channel and any group or channel with someone on an older app still use the format above.
 
 - **One mailbox per epoch.** A member seals each message **once** and posts it into the group's mailbox on the relay;
   every member reads it from there with a cursor ("everything after the last one I saw"). The relay keeps group mail
@@ -289,6 +291,33 @@ What it changes, honestly:
   readers apart; in Fast mode it sees their addresses and could estimate the group's size.
 - **Admins** can still leave someone out of the settings (but cannot alter a card), and a hostile admin can be a
   nuisance until the owner removes them.
+
+### 7a-i. Channels in the shared-mailbox format
+
+*Code: `GroupKeys.swift` (`GroupRoster`, tagged rekeys) and the "A channel's followers" section of `AppModel.swift`.
+Design: `docs/groups-design.md` section 17.*
+
+A channel moves over when every follower's app says it reads channels that share one mailbox (bit 6 of the `caps`
+byte, `Envelope.reads` 127). Someone on an older app waits until they update.
+
+- **Followers are not in the settings.** The signed settings carry only the staff (owner and admins). A follower holds
+  the epoch key and a group key of their own, with a card that has no name or picture, and posts nothing: the app
+  refuses, and mail from an unlisted sender in a channel is dropped.
+- **Staff roster.** The staff keep the follower list in a signed `GroupRoster` (follower keys and when they were added,
+  no names; at most 1,500). It is posted in a second, staff-only mailbox (an "epoch 0") that opens with a 32-byte staff
+  key the owner gives each admin with the ask to be staff. Followers never have the key, so they cannot see joins and
+  leaves as they happen. The owner's phone posts the roster again every three days, since the relay keeps mail a week,
+  and makes a new staff key whenever an admin is let go. Dates in the roster are clamped to a few minutes ahead, and a
+  removal outranks an older entry, so nothing can be made that cannot be beaten.
+- **Removal.** A follower taken out is dropped from the roster and the channel starts a new epoch whose key is sealed
+  to the staff and every remaining follower. These rekeys are tagged (filed under a tag worked out from each reader's own
+  key) and padded to a power of two copies, so the size reveals only roughly how many followers there are. A removed
+  follower learns it only because their mailbox goes quiet.
+- **Admins.** The owner can ask a follower to join the staff; they answer with a card with their name and move from the
+  roster into the settings. When an older channel moves over, its admins are asked the same way.
+- **Left out.** Follower reactions are dropped (staff can still react). A follower cannot leave from inside the channel
+  (they delete it and staff can take them out), and one who is away through a rekey must be added again.
+- **Announcements** stays in the older format, so the older format's reading code stays in the app for now.
 
 ### 7b. Join links
 

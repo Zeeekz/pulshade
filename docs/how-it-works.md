@@ -228,7 +228,9 @@ sealed for up to 7 days and can't tell who reads it over Tor. The owner of an ol
 details. The trade-off: a stolen group key reads that group until its key next changes, and group messages show
 "sent" rather than ticking per member.
 
-**Groups, channels and broadcasts.** Groups and channels fan out one envelope per member; members who aren't your
+**Groups, channels and broadcasts.** In the older format groups and channels fan out one envelope per member (newer
+groups and channels share one mailbox instead, and a channel's followers can't see who else follows: only its staff
+keep that list, in a mailbox of their own); members who aren't your
 contacts are kept as hidden peers, used only inside that group. Each has an owner, optional admins and a posting
 rule (everyone, admins, or owner only). Changes carry a version number and only count when they come from an admin.
 Admins add people from their contacts and remove members; only the owner appoints admins, changes the posting rule
@@ -372,7 +374,8 @@ kept in memory only.
   Apple's push service (see [wake-up pushes](push-notifications.md)). Blank screenshots
   rely on iOS behaviour Apple doesn't document; if an update changes it, screenshots would show the app again.
 - **Groups in the older format cap out at 300 members.** Every message goes out as one envelope per member. Groups that
-  share one mailbox take 5,000; channels still use the older format.
+  share one mailbox take 5,000, and so do channels whose followers all run a recent app. Announcements and any group or
+  channel with someone on an older app still use the older format.
 - **A group's member list is only as trustworthy as its admins.** The keys and mailboxes in a group's details are
   asserted by whoever sent them. A poisoned card can't read your messages to that member (a session only opens on
   an answer signed by the member's own identity key), but it can stop you reaching them. Check the safety code
