@@ -1,7 +1,8 @@
 # Wake-up pushes
 
-**Status: built, optional, off by default.** On iPhone, Settings → Notifications → **Wake when locked** lets the
-relay wake a locked phone through Apple's push service (APNs) when a message arrives. Without it, an iPhone only
+**Status: built, optional, on by default** (together with notifications; you can turn it off in Settings →
+Notifications, and onboarding offers the choice). On iPhone, **Wake when locked** lets the
+relay wake a locked phone through Apple's push service (APNs) when a message arrives. With it off, an iPhone only
 receives while Pulshade is open, because iOS wakes a closed app only through Apple. The Mac doesn't need it: the app
 keeps running.
 
@@ -17,13 +18,13 @@ keeps running.
    what. The phone then fetches and decrypts as usual. A phone is woken at most once every 3 seconds, however much
    mail lands, and the relay as a whole sends at most 30 pushes a second.
 4. **Staying registered.** The relay keeps registrations in memory and, sealed, in a file on its disk, so a restart, crash or reboot keeps them, and a locked phone is still woken. Turning the setting off takes the phone out of the file within seconds. It
-   forgets one after 7 days without a renewal. The phone renews every 15 minutes while Pulshade is open and at every launch.
+   forgets one after 7 days without a renewal. The phone renews every 15 minutes while Pulshade is open and at every launch. Because the switch starts on, the app asks Apple for a device token the first time it is unlocked on an iPhone, and again at launches while it is on.
 5. **Removing.** Turning the switch off, Burn, Detach, a panic passcode or opening a decoy takes the phone's
    registrations off the relay.
 
 ## What each party learns
 
-| | With wake-ups on |
+| | With wake-ups on (the default) |
 |---|---|
 | Message content | Hidden from everyone but the recipient |
 | Apple | That your iPhone was woken for Pulshade, and when. Never who wrote or what |

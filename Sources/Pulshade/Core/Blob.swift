@@ -1,5 +1,8 @@
 import Foundation
 import CryptoKit
+#if canImport(PulshadeShared)
+import PulshadeShared
+#endif
 
 /// A file kept on the relay, as a message names it. The file itself is not in the message: it was sealed on the sender's
 /// phone with `key` (which only travels in this end-to-end encrypted message) and uploaded once, in pieces, to the relay,
@@ -38,10 +41,13 @@ struct Attachment: Codable, Equatable {
             && (token == nil || token?.count == 32)
     }
 
-    /// The name to show: no folders, no control characters, never empty.
+    /// The name to show: no folders, no control, direction-changing or other invisible characters (a name can't be
+    /// made to read as a different file type), never empty.
     var shownName: String {
         let base = (name ?? "").split(whereSeparator: { $0 == "/" || $0 == "\\" }).last.map(String.init) ?? ""
-        let clean = String(base.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }.prefix(120))
+        let clean = String(base.unicodeScalars.filter {
+            !CharacterSet.controlCharacters.contains($0) && !ProfileLinkKind.hasHidden(String($0))
+        }.prefix(120))
         return clean.trimmingCharacters(in: .whitespaces).isEmpty ? "File" : clean
     }
 

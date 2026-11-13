@@ -15,7 +15,12 @@ struct PulseCheckView: View {
     @State private var result: Bool?
 
     private var mine: String { model.me(persona)?.fingerprint ?? "" }
-    private var code: SafetyCode { SafetyCode(mine: mine, theirs: fingerprint) }
+    private var code: SafetyCode {
+        SafetyCode(mine: mine, mineAgreement: model.me(persona)?.card.agreement ?? Data(),
+                   minePQ: model.me(persona)?.pq.pin.commitment ?? Data(),
+                   theirs: fingerprint, theirsAgreement: contact?.agreementKey ?? Data(),
+                   theirsPQ: contact?.pq?.commitment ?? Data())
+    }
     private var contact: Contact? { model.contact(fingerprint, in: persona) }
     private var verified: Bool { contact?.verified ?? false }
 
@@ -116,6 +121,8 @@ struct PulseCheckView: View {
     }
 
     private func confirm(_ match: Bool) {
+        // Without their post-quantum keys the code doesn't cover them, so it can't vouch for this contact.
+        let match = match && contact?.pq != nil
         withAnimation(.snappy) { result = match }
         if match { model.setVerified(fingerprint, true) }
     }

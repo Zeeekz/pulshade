@@ -120,7 +120,7 @@ struct VideoBubble: View {
     }
 }
 
-private struct VideoPlayerCover: ViewModifier {
+struct VideoPlayerCover: ViewModifier {
     @Binding var isPresented: Bool
     var clip: Data
 

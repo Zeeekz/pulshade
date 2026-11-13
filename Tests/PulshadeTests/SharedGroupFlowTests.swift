@@ -3,13 +3,12 @@ import Foundation
 @testable import Pulshade
 
 /// Groups that share one mailbox, end to end through a real relay (see scripts/test.sh): making one, joining,
-/// talking, a removal that starts a new epoch, and moving an old group over.
+/// talking, and a removal that starts a new epoch.
 @MainActor
 @Suite(.enabled(if: ProcessInfo.processInfo.environment["PULSHADE_RELAY_TEST"] == "1"), .serialized)
 struct SharedGroupFlowTests {
     private func makeUser(_ name: String) async throws -> AppModel {
         let model = testModel("pulshade-shared")
-        model.sharedGroupsEnabled = true
         try await model.create(identity: .generate(), profile: Profile(name: name), passcode: "test-passcode")
         return model
     }
@@ -50,7 +49,7 @@ struct SharedGroupFlowTests {
     @Test func aSharedGroupIsMadeJoinedAndTalkedIn() async throws {
         let (alice, bob, cara, bobFP, caraFP) = try await trio()
         defer { for m in [alice, bob, cara] { m.lock() } }
-        #expect(alice.canShareMailbox([bobFP, caraFP], persona: nil, kind: .group))
+        #expect(alice.membersNeedingUpdate([bobFP, caraFP], persona: nil, kind: .group).isEmpty)
 
         let group = alice.startConversation(kind: .group, title: "Night owls", members: [bobFP, caraFP])
         #expect(group.shared != nil, "everyone's app can, so it shares one mailbox")
@@ -61,7 +60,6 @@ struct SharedGroupFlowTests {
         }
         let bobGroup = try #require(bob.conversation(group.id))
         #expect(bobGroup.title == "Night owls" && bobGroup.members.count == 2 && bobGroup.owner != "me")
-        #expect(bobGroup.introsMine.isEmpty, "no introduction mailboxes")
         // Bob and Cara never became contacts of each other with anywhere to write: only names.
         let caraForBob = try #require(bob.data.contacts.first { $0.name == "Cara" })
         #expect(caraForBob.hidden && caraForBob.devices.isEmpty)
@@ -136,6 +134,58 @@ struct SharedGroupFlowTests {
         #expect(cara.conversation(group.id)?.messages.contains { $0.text == "laptop 1" } == true, "the friend reads the laptop (epochs \(epochs))")
         #expect(bob.conversation(group.id)?.messages.contains { $0.text == "friend 2" } == true, "the laptop reads the friend (epochs \(epochs))")
         #expect(alice.conversation(group.id)?.messages.contains { $0.text == "laptop 1" } == true)
+    }
+
+    /// An epoch's key opens everything said in it, so an admin's phone starts a new one, with everyone still in, once the
+    /// current one is long (or old) and something was said; a quiet group keeps its epoch. A member who was taken out
+    /// afterwards reads nothing in the new ones.
+    @Test func anEpochRotatesByCountAndAgeAndATakenOutMemberStaysOut() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let savedChats = AppModel.epochMaxChats, savedRetry = AppModel.rotationRetry
+        defer { AppModel.epochMaxChats = savedChats; AppModel.rotationRetry = savedRetry }
+        let group = alice.startConversation(kind: .group, title: "Rotate", members: [bobFP, caraFP])
+        await until([alice, bob, cara]) { cara.conversation(group.id)?.shared?.joining == false && bob.conversation(group.id)?.shared?.joining == false }
+        let first = try #require(alice.conversation(group.id)?.shared?.current?.number)
+
+        // Quiet: nothing said, so even an old epoch is left alone.
+        let ai = try #require(alice.data.conversations.firstIndex { $0.id == group.id })
+        func setStarted(_ date: Date) {
+            var shared = alice.data.conversations[ai].shared!
+            shared.epochs[shared.epochs.count - 1].started = date
+            alice.data.conversations[ai].shared = shared
+        }
+        setStarted(Date().addingTimeInterval(-30 * 86_400))
+        alice.data.conversations[ai].shared?.chatInEpoch = false
+        alice.tendSharedGroups()
+        #expect(alice.conversation(group.id)?.shared?.current?.number == first)
+
+        // Said enough: a new epoch by count.
+        AppModel.epochMaxChats = 3
+        AppModel.rotationRetry = 0
+        for text in ["one", "two", "three"] { bob.send(text, in: group.id) }
+        await until([alice, bob, cara]) { alice.conversation(group.id)?.messages.contains { $0.text == "three" } == true
+            && cara.conversation(group.id)?.messages.contains { $0.text == "three" } == true }
+        setStarted(Date())
+        alice.tendSharedGroups()
+        await until([alice, bob, cara]) { [alice, bob, cara].allSatisfy { $0.conversation(group.id)?.shared?.current?.number == first + 1 } }
+        for m in [alice, bob, cara] { #expect(m.conversation(group.id)?.shared?.current?.number == first + 1) }
+        #expect(alice.conversation(group.id)?.shared?.chatsInEpoch == nil, "The count starts again")
+
+        // Everyone reads in the new epoch, and mail still on its way from the old one opens too.
+        cara.send("after", in: group.id)
+        await until([alice, bob, cara]) { bob.conversation(group.id)?.messages.contains { $0.text == "after" } == true }
+        #expect(bob.conversation(group.id)?.messages.contains { $0.text == "after" } == true)
+
+        // Cara is taken out: a newer epoch, which she doesn't get.
+        AppModel.epochMaxChats = 1_000
+        let removed = try #require(alice.conversation(group.id)?.members.first { alice.displayName($0) == "Cara" })
+        alice.removeSharedMember(removed, at: ai)
+        await until([alice, bob]) { bob.conversation(group.id)?.shared?.current?.number == first + 2 }
+        bob.send("secret after removal", in: group.id)
+        await until([alice, bob, cara], seconds: 6) { cara.conversation(group.id)?.messages.contains { $0.text == "secret after removal" } == true }
+        #expect(cara.conversation(group.id)?.messages.contains { $0.text == "secret after removal" } != true)
+        #expect(alice.conversation(group.id)?.messages.contains { $0.text == "secret after removal" } == true)
     }
 
     /// A member's phone never got a new epoch's key (it was away, or the hand-out went astray). It asks again on its own
@@ -234,46 +284,31 @@ struct SharedGroupFlowTests {
         #expect(alice.conversation(group.id).map { alice.contactsInvited(to: $0) }?.isEmpty == true)
     }
 
-    /// An older-style group moves to the new format on its own once everyone in it can take part: no button, same chat.
-    @Test func anOlderGroupMovesOverByItself() async throws {
-        let (alice, bob, cara, bobFP, caraFP) = try await trio()
-        defer { for m in [alice, bob, cara] { m.lock() } }
-        alice.sharedGroupsEnabled = false
-        let group = alice.startConversation(kind: .group, title: "Old", members: [bobFP, caraFP])
-        #expect(group.shared == nil)
-        await until([alice, bob, cara]) { bob.conversation(group.id)?.members.count == 2 && cara.conversation(group.id)?.members.count == 2 }
-        alice.send("before", in: group.id)
-        await until([alice, bob, cara]) { cara.conversation(group.id)?.messages.contains { $0.text == "before" } == true }
-        alice.sharedGroupsEnabled = true
-        await until([alice, bob, cara]) {
-            alice.conversation(group.id)?.shared != nil && bob.conversation(group.id)?.shared?.joining == false
-                && cara.conversation(group.id)?.shared?.joining == false
-        }
-        #expect(alice.conversation(group.id)?.shared != nil, "moved without anyone pressing anything")
-        #expect(cara.conversation(group.id)?.messages.contains { $0.text == "before" } == true, "the chat is kept")
-        bob.send("after", in: group.id)
-        await until([alice, bob, cara]) { cara.conversation(group.id)?.messages.contains { $0.text == "after" } == true }
-        #expect(cara.conversation(group.id)?.messages.contains { $0.text == "after" } == true)
-    }
-
-    /// A new group is always the new format. Someone whose app can't take part yet is added once it can.
-    @Test func someoneOnAnOlderAppIsAddedOnceTheyUpdate() async throws {
+    /// A new group is always the new format. Someone whose app can't take part is refused with their name, and nothing is kept
+    /// to add them later; once their app says it can, they are added like anyone else.
+    @Test func someoneOnAnOlderAppIsRefusedUntilTheyUpdate() async throws {
         let (alice, bob, cara, bobFP, caraFP) = try await trio()
         defer { for m in [alice, bob, cara] { m.lock() } }
         // Alice's phone thinks Cara's app is from before groups that share a mailbox.
         let ci = try #require(alice.data.contacts.firstIndex { $0.fingerprint == caraFP })
         for d in alice.data.contacts[ci].devices.indices { alice.data.contacts[ci].devices[d].readsSharedGroups = nil }
+        #expect(alice.membersNeedingUpdate([bobFP, caraFP], persona: nil, kind: .group) == [caraFP])
+        #expect(alice.needsUpdateMessage([caraFP]) == "Cara needs to update Pulshade first.")
         let group = alice.startConversation(kind: .group, title: "New", members: [bobFP, caraFP])
-        #expect(group.shared != nil, "new format whatever")
+        #expect(group.shared != nil, "never the old format")
         let aliceGroup = try #require(alice.conversation(group.id))
-        #expect(alice.contactsAwaitingUpdate(in: aliceGroup) == [caraFP])
-        #expect(alice.contactsInvited(to: aliceGroup) == [bobFP])
+        #expect(alice.contactsInvited(to: aliceGroup) == [bobFP], "Cara is not invited")
+        #expect(alice.addMembers(group.id, [caraFP]) == [caraFP], "refused, and told who")
+        await settle(alice, bob, cara)
+        #expect(cara.conversation(group.id) == nil, "nothing reached her")
         // Cara "updates": her app's next message says it can.
         let caraChat = try #require(cara.data.conversations.first { $0.kind == .direct })
         cara.send("updated", in: caraChat.id)
+        await settle(alice, bob, cara)
+        #expect(alice.membersNeedingUpdate([caraFP], persona: nil, kind: .group).isEmpty)
+        #expect(alice.addMembers(group.id, [caraFP]).isEmpty)
         await until([alice, bob, cara]) { cara.conversation(group.id)?.shared?.joining == false && bob.conversation(group.id)?.shared?.joining == false }
         #expect(cara.conversation(group.id)?.shared?.joining == false, "in once her app could")
-        #expect(alice.conversation(group.id).map { alice.contactsAwaitingUpdate(in: $0) }?.isEmpty == true)
     }
 
     @Test func someoneTakenOutCantReadWhatFollows() async throws {
@@ -323,6 +358,18 @@ struct SharedGroupFlowTests {
         #expect(bob.conversation(group.id)?.shared?.current?.number == epoch + 1)
     }
 
+    /// The owner deleting a group removes it for everyone; a member deleting it only leaves.
+    @Test func theOwnerDeletingAGroupRemovesItForEveryone() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let group = alice.startConversation(kind: .group, title: "Gone soon", members: [bobFP, caraFP])
+        await until([alice, bob, cara]) { bob.conversation(group.id)?.shared?.joining == false && cara.conversation(group.id)?.shared?.joining == false }
+        alice.delete(group.id)
+        #expect(alice.conversation(group.id) == nil)
+        await until([alice, bob, cara]) { bob.conversation(group.id) == nil && cara.conversation(group.id) == nil }
+        #expect(bob.conversation(group.id) == nil && cara.conversation(group.id) == nil)
+    }
+
     /// Someone added after the group was made, and people already in it, see each other's messages both ways,
     /// including a member who isn't the owner and a newcomer who isn't anyone's friend but the owner's.
     @Test func membersAddedLaterAndEarlierHearEachOther() async throws {
@@ -348,24 +395,6 @@ struct SharedGroupFlowTests {
         if let fromCara = bob.conversation(group.id)?.messages.first(where: { $0.text == "hi from cara" }) {
             #expect(bob.displayName(fromCara.sender) == "Cara")
         }
-    }
-
-    /// The same with groups in the old form (one copy per member), for people whose app can't share a mailbox.
-    @Test func oldStyleMembersAddedLaterHearEachOther() async throws {
-        let (alice, bob, cara, bobFP, caraFP) = try await trio()
-        defer { for m in [alice, bob, cara] { m.lock() } }
-        for m in [alice, bob, cara] { m.sharedGroupsEnabled = false }
-        let group = alice.startConversation(kind: .group, title: "Old crew", members: [bobFP])
-        #expect(group.shared == nil)
-        await until([alice, bob]) { bob.conversation(group.id) != nil }
-        alice.addMembers(group.id, [caraFP])
-        await until([alice, bob, cara]) { cara.conversation(group.id)?.members.count == 2 && bob.conversation(group.id)?.members.count == 2 }
-        cara.send("old hi from cara", in: group.id)
-        await until([alice, bob, cara], seconds: 25) { bob.conversation(group.id)?.messages.contains { $0.text == "old hi from cara" } == true }
-        #expect(bob.conversation(group.id)?.messages.contains { $0.text == "old hi from cara" } == true, "Bob sees the newcomer")
-        bob.send("old hi from bob", in: group.id)
-        await until([alice, bob, cara], seconds: 25) { cara.conversation(group.id)?.messages.contains { $0.text == "old hi from bob" } == true }
-        #expect(cara.conversation(group.id)?.messages.contains { $0.text == "old hi from bob" } == true, "the newcomer sees Bob")
     }
 
     /// Friends who have only just been added, with no chat yet, then a third added to the group afterwards.
@@ -413,30 +442,6 @@ struct SharedGroupFlowTests {
         #expect(cara.conversation(group.id)?.messages.contains { $0.text == "back at you" } == true, "the newcomer sees Bob")
     }
 
-    @Test func theOwnerMovesAnOldGroupOver() async throws {
-        let (alice, bob, cara, bobFP, caraFP) = try await trio()
-        defer { for m in [alice, bob, cara] { m.lock() } }
-        // Made the old way.
-        for m in [alice, bob, cara] { m.sharedGroupsEnabled = false }
-        let group = alice.startConversation(kind: .group, title: "Old crew", members: [bobFP, caraFP])
-        #expect(group.shared == nil)
-        await settle(alice, bob, cara)
-        bob.send("old way", in: group.id)
-        await until([alice, bob, cara]) { cara.conversation(group.id)?.messages.count == 1 }
-        for m in [alice, bob, cara] { m.sharedGroupsEnabled = true }
-
-        #expect(alice.canUpgrade(try #require(alice.conversation(group.id))))
-        alice.upgradeToSharedMailbox(group.id)
-        await until([alice, bob, cara]) { alice.conversation(group.id)?.members.count == 2
-            && bob.conversation(group.id)?.shared?.joining == false && cara.conversation(group.id)?.shared?.joining == false }
-        #expect(bob.conversation(group.id)?.shared != nil && cara.conversation(group.id)?.shared != nil)
-        #expect(bob.conversation(group.id)?.messages.map(\.text) == ["old way"], "history stays")
-        cara.send("new way", in: group.id)
-        await until([alice, bob, cara]) { bob.conversation(group.id)?.messages.count == 2 }
-        #expect(bob.conversation(group.id)?.messages.map(\.text) == ["old way", "new way"])
-        #expect(!bob.canUpgrade(try #require(bob.conversation(group.id))), "only the owner moves it")
-    }
-
     private func linkNewDevice(to model: AppModel) async throws -> AppModel {
         let code = model.makeLinkCode()
         let linker = DeviceLinker()
@@ -447,10 +452,13 @@ struct SharedGroupFlowTests {
         }
         model.approveLink()
         await model.syncOnce()
-        for _ in 0..<30 where linker.stage != .received { try await Task.sleep(for: .milliseconds(250)) }
+        for _ in 0..<30 where linker.stage != .confirming { try await Task.sleep(for: .milliseconds(250)) }
+        // The account isn't taken until the digits match what the approving device shows.
+        #expect(linker.senderConfirms && linker.confirmation != nil && linker.confirmation == model.linkConfirmation)
+        linker.confirm()
+        #expect(linker.stage == .received)
         let bundle = try #require(linker.bundle)
         let device = testModel("pulshade-shared-linked")
-        device.sharedGroupsEnabled = true
         try await device.finishLink(bundle, deviceID: linker.deviceID, selfMailbox: linker.selfMailbox,
                                     relay: linker.relay, passcode: "second-device")
         return device
@@ -467,7 +475,7 @@ struct SharedGroupFlowTests {
         await until([alice, bob, cara, bobsMac]) { bobsMac.data.conversations.contains { $0.kind == .direct } }
         let chat = try #require(bobsMac.data.conversations.first { $0.kind == .direct })
         bobsMac.send("my mac", in: chat.id)
-        await until([alice, bob, cara, bobsMac]) { alice.canShareMailbox([bobFP, caraFP], persona: nil, kind: .group) }
+        await until([alice, bob, cara, bobsMac]) { alice.membersNeedingUpdate([bobFP, caraFP], persona: nil, kind: .group).isEmpty }
         let group = alice.startConversation(kind: .group, title: "Crew", members: [bobFP, caraFP])
         #expect(group.shared != nil)
         await until([alice, bob, cara, bobsMac]) { bobsMac.conversation(group.id)?.shared?.joining == false
@@ -582,9 +590,8 @@ struct SharedGroupFlowTests {
         let group = alice.startConversation(kind: .group, title: "Crew", members: [bobFP])
         await until([alice, bob]) { bob.conversation(group.id)?.shared?.joining == false }
         // Cara's app gets the invite but never answers (she's left out of syncing on purpose here).
-        cara.sharedGroupsEnabled = false
         alice.addMembers(group.id, [caraFP])
-        await until([alice, bob, cara]) { alice.conversation(group.id)?.shared?.invited[caraFP] != nil }
+        await until([alice, bob]) { alice.conversation(group.id)?.shared?.invited[caraFP] != nil }
         let given = try #require(alice.conversation(group.id)?.shared?.current?.number)
         alice.cancelInvite(caraFP, in: group.id)
         #expect(alice.conversation(group.id)?.shared?.invited.isEmpty == true)

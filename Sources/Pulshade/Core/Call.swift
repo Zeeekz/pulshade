@@ -109,7 +109,7 @@ final class CallMedia: @unchecked Sendable {
         guard let url = parts.url, let config = try? RelayClient.configuration(for: url, lane: "call|" + invite.room.hex) else { return nil }
         var request = URLRequest(url: url)
         // Over the onion service, joining is rate-limited per circuit only with a proof of work.
-        if Tor.isOnion(url) { request.setValue(Work.proof(for: "call|" + invite.room.hex), forHTTPHeaderField: "X-Pulshade-Pow") }
+        if Tor.isOnion(url) { request.setValue(Work.header(for: "call|" + invite.room.hex), forHTTPHeaderField: "X-Pulshade-Pow") }
         // Pin alongside the relay's other requests, and keep the session so it can be invalidated on hang-up.
         let session = URLSession(configuration: config, delegate: RelayPinning.shared, delegateQueue: nil)
         self.session = session

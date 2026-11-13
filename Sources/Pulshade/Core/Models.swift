@@ -83,6 +83,10 @@ struct DeviceLink: Codable {
     var pending: [PendingPayload] = []
     /// What the device calls itself (your own linked devices only).
     var name: String?
+    /// Your own account's device that introduced itself here without this device having approved it (another of
+    /// your devices may have). Shown as a warning in the device list until you confirm or remove it. Nil otherwise,
+    /// and for anything saved before this existed.
+    var unconfirmed: Bool?
     /// The device that approved this one opens the session; until it does, don't open a competing one.
     var awaitingHello: Bool?
     /// The handshake behind the current session, so a redelivered copy is recognised and ignored.
@@ -109,6 +113,9 @@ struct DeviceLink: Codable {
     var readsMediaBlobs: Bool?
     /// Their app takes part in channels that share one mailbox. Nil for an app from before.
     var readsChannels: Bool?
+    /// Their app is from before the sparse post-quantum ratchet (bit 7 of what it can read; its messages say so too),
+    /// so nothing is sent to it and nothing of its is read, until it updates. Nil: it isn't known to be.
+    var needsUpdate: Bool?
     /// When this device answered that device's spare key, by the relay's clock: a hello of theirs sent before then was
     /// overtaken by the answer and isn't taken. Cleared once keys are opened any other way.
     var spareTakenAt: Date?
@@ -181,6 +188,19 @@ struct Contact: Codable, Identifiable {
     /// You removed them, but the notice that tells their app is still waiting for chat keys, so the record stays (hidden)
     /// until it has gone, or two weeks have passed.
     var departing: Date?
+    /// Their post-quantum keys, pinned from the first card that verified (see `PQCard`). From then on only envelopes sealed
+    /// to them with these, and signed by them where it counts, are accepted: a classical-only envelope from them is refused.
+    /// Nil until they've sent one. The keys come from their seed, so they never change for the same account.
+    var pq: PQPin?
+    /// What the invite you used to add them committed their post-quantum keys to (`PQPin.commitment`). Until `pq` is set,
+    /// the first card is accepted only if its keys match this; nil for someone who didn't come by an invite.
+    var pqCommit: Data?
+    /// They have this account's post-quantum card (sent in a hello, a request or an introduction, or they've sealed an
+    /// envelope to us, which they can only do with it), so envelopes to them needn't carry it.
+    var pqCardSent: Bool?
+    /// An envelope from them arrived in the old classical form, so their app is too old: nothing from it is read. When it
+    /// last did, so you're told once, not each time.
+    var tooOld: Date?
 
     /// Where a new contact starts: their first device's mailbox.
     var sendID: Data {
@@ -205,7 +225,7 @@ struct Contact: Codable, Identifiable {
 
     private enum CodingKeys: String, CodingKey {
         case fingerprint, name, nickname, avatar, banner, color, bio, links, walletChangedAt, notes, handle, verified, badge, collectibles, signingKey, agreementKey, devices, receiveKey, relay
-        case hidden, isSelf, awaitingAcceptance, addedAt, persona, wantsMyPresence, toldPresence, spare, oldSpares, departing
+        case hidden, isSelf, awaitingAcceptance, addedAt, persona, wantsMyPresence, toldPresence, spare, oldSpares, departing, pq, pqCommit, pqCardSent, tooOld
         // Single-device fields from before linked devices.
         case sendID, session, handshake, pending
     }
@@ -240,6 +260,10 @@ struct Contact: Codable, Identifiable {
         spare = try? c.decodeIfPresent(SpareKey.self, forKey: .spare)
         oldSpares = try? c.decodeIfPresent([SpareKey].self, forKey: .oldSpares)
         departing = try? c.decodeIfPresent(Date.self, forKey: .departing)
+        pq = try? c.decodeIfPresent(PQPin.self, forKey: .pq)
+        pqCommit = try? c.decodeIfPresent(Data.self, forKey: .pqCommit)
+        pqCardSent = try? c.decodeIfPresent(Bool.self, forKey: .pqCardSent)
+        tooOld = try? c.decodeIfPresent(Date.self, forKey: .tooOld)
         addedAt = try c.decodeIfPresent(Date.self, forKey: .addedAt) ?? Date()
         // A saved list of devices is taken as it is, even an empty one: your own entry once the last linked device leaves,
         // and the members of a group that shares one mailbox, who are never written to directly. (An empty list used to
@@ -288,6 +312,10 @@ struct Contact: Codable, Identifiable {
         try c.encodeIfPresent(spare, forKey: .spare)
         try c.encodeIfPresent(oldSpares, forKey: .oldSpares)
         try c.encodeIfPresent(departing, forKey: .departing)
+        try c.encodeIfPresent(pq, forKey: .pq)
+        try c.encodeIfPresent(pqCommit, forKey: .pqCommit)
+        try c.encodeIfPresent(pqCardSent, forKey: .pqCardSent)
+        try c.encodeIfPresent(tooOld, forKey: .tooOld)
     }
 
     var displayName: String {
@@ -739,15 +767,8 @@ enum PostPolicy: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-/// A mailbox a group's owner or admin made for one of your devices, so other members can first reach you
-/// without learning the mailbox you use with them.
-struct IntroMailbox: Codable, Equatable {
-    var receiveKey: Data
-    var relay: String?
-}
-
 struct Conversation: Codable, Identifiable, Equatable {
-    /// Most people a group, broadcast or channel's owner can add. Every message goes out as one envelope per member.
+    /// Most people a broadcast list can hold. Every message goes out as one envelope per person.
     static let maxMembers = 300
 
     var id = UUID()
@@ -781,13 +802,8 @@ struct Conversation: Codable, Identifiable, Equatable {
     var postPolicy: PostPolicy = .everyone
     /// Bumped on every change to details or membership, so stale updates are ignored.
     var version = 0
-    /// As an owner or admin: the introduction mailbox made for each member's device (by fingerprint, then device
-    /// id), which the other members are given instead of the mailbox that member uses with you.
-    var introsMade: [String: [String: Data]] = [:]
-    /// As a member: the introduction mailboxes made for this device, where other members first say hello.
-    var introsMine: [IntroMailbox] = []
-    /// Set for a group that shares one mailbox on the relay (see docs/groups-design.md); nil for one that sends each
-    /// member their own copy.
+    /// Set for a group or channel that shares one mailbox on the relay (see docs/groups-design.md). Nil for a direct chat,
+    /// a broadcast list, Announcements, and a group saved from before groups shared a mailbox (see `isOldFormat`).
     var shared: SharedGroup?
 
     init(id: UUID = UUID(), kind: ConversationKind, title: String, avatar: Data? = nil, members: [String],
@@ -806,7 +822,7 @@ struct Conversation: Codable, Identifiable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case id, kind, title, avatar, members, messages, createdAt, pinned, muted, unread, disappearAfter, persona
-        case about, owner, admins, mods, postPolicy, version, isOwner, introsMade, introsMine, shared, groupID
+        case about, owner, admins, mods, postPolicy, version, isOwner, shared, groupID
     }
 
     init(from decoder: Decoder) throws {
@@ -827,8 +843,6 @@ struct Conversation: Codable, Identifiable, Equatable {
         admins = try c.decodeIfPresent([String].self, forKey: .admins) ?? []
         mods = try c.decodeIfPresent([String].self, forKey: .mods) ?? []
         version = try c.decodeIfPresent(Int.self, forKey: .version) ?? 0
-        introsMade = try c.decodeIfPresent([String: [String: Data]].self, forKey: .introsMade) ?? [:]
-        introsMine = try c.decodeIfPresent([IntroMailbox].self, forKey: .introsMine) ?? []
         shared = try c.decodeIfPresent(SharedGroup.self, forKey: .shared)
         groupID = try c.decodeIfPresent(UUID.self, forKey: .groupID)
         if let owner = try c.decodeIfPresent(String.self, forKey: .owner) {
@@ -862,8 +876,6 @@ struct Conversation: Codable, Identifiable, Equatable {
         if !mods.isEmpty { try c.encode(mods, forKey: .mods) }
         try c.encode(postPolicy, forKey: .postPolicy)
         try c.encode(version, forKey: .version)
-        if !introsMade.isEmpty { try c.encode(introsMade, forKey: .introsMade) }
-        if !introsMine.isEmpty { try c.encode(introsMine, forKey: .introsMine) }
         try c.encodeIfPresent(shared, forKey: .shared)
         try c.encodeIfPresent(groupID, forKey: .groupID)
     }
@@ -885,6 +897,11 @@ struct Conversation: Codable, Identifiable, Equatable {
     }
 
     var lastActivity: Date { messages.last?.date ?? createdAt }
+
+    /// A group or channel saved from before groups shared one mailbox: a copy used to go to each member. Its past messages
+    /// stay readable, but nothing is sent in it or read for it any more. Announcements is not one: it is not a group on
+    /// the wire, only a chat of its own kind with no members.
+    var isOldFormat: Bool { shared == nil && !isAnnouncements && (kind == .group || kind == .channel) }
 
     var amOwner: Bool { owner == "me" }
     var amAdmin: Bool { amOwner || admins.contains("me") }
@@ -931,6 +948,7 @@ struct Conversation: Codable, Identifiable, Equatable {
         case .group: ("Leave this group?", "It's removed from your Mac and the others are told you left.")
         case .channel where amOwner: ("Delete this channel for everyone?", "Every follower loses it. This can't be undone.")
         case .channel where isAnnouncements: ("Delete Announcements?", "It comes back with the next announcement.")
+        case .channel where !amAdmin: ("Leave this channel?", "It's removed from this device and its staff are told you left, so you stop getting its key. The channel stays for everyone else.")
         case .channel: ("Leave this channel?", "The channel stays for everyone else.")
         case .broadcast: ("Delete this broadcast list?", "Messages already sent stay in each person's chat with you.")
         }
@@ -1044,6 +1062,8 @@ struct Story: Codable, Identifiable, Equatable {
     /// Your own video story only: the clip kept sealed on the relay, once it has been uploaded, so each contact is sent
     /// a pointer to it instead of the clip. Erased when the story is taken back or runs out.
     var clipBlob: Attachment?
+    /// A video story only: when it ends it plays again from the start, until the viewer moves on. Nil is no.
+    var loops: Bool?
 
     /// Whether it can ride along in a device sync, which fits a story only as small as a photo.
     var isSyncable: Bool {
@@ -1135,6 +1155,15 @@ struct Outgoing: Codable, Identifiable {
     var collapse: Data?
     /// The kind behind `collapse` ("hello", "typing"), kept so a queued ask can be found after its tag has moved on.
     var collapseKind: String?
+    /// A control message (key setup, an introduction, anything signed) or one carrying this account's post-quantum keys. It can be
+    /// as big as a photo's envelope, but what follows it needs it: it goes on the ordinary lane and ahead of what follows.
+    var introduces: Bool?
+
+    /// Over the bucket of a short message: a photo or a story piece, sent on a lane of its own.
+    var isBulk: Bool { blob.count > Self.smallEnvelope && introduces != true }
+    /// What the sender goes by when picking the next one to send: smallest first, introductions before anything.
+    var weight: Int { introduces == true ? 0 : blob.count }
+    static let smallEnvelope = 32_768
 
     /// The sending lane for a persona (nil is the main one).
     static func lane(for persona: UUID?) -> String {
@@ -1261,13 +1290,14 @@ struct SecuritySettings: Codable, Equatable {
     /// can be an instant wipe and your recovery code still brings them back. The relay can't open it.
     var keepBackup = true
     /// Let the notification helper take short mail off the relay while this iPhone is locked, and give friends their
-    /// second tick when delivery receipts are on (see `LockedDelivery`). Nil is
-    /// automatic: on when connecting the fast way, off on Tor, since the helper can't run Tor and connects
-    /// directly for those few seconds.
+    /// second tick when delivery receipts are on (see `LockedDelivery`). Off unless chosen by hand: the helper
+    /// keeps this account's signing and agreement keys in the Keychain, which a phone that has been unlocked once
+    /// since it started doesn't protect from someone who can extract it. Nil, as in vaults written before this was
+    /// a plain choice, counts as off. It can't run on Tor either: the helper connects directly for those few seconds.
     var lockedDelivery: Bool?
-    /// `lockedDelivery` as it stands, automatic choice included, for the switch.
+    /// `lockedDelivery` as it stands, for the switch.
     var lockedDeliveryChosen: Bool {
-        get { lockedDelivery ?? !tor }
+        get { lockedDelivery ?? false }
         set { lockedDelivery = newValue }
     }
 
@@ -1339,7 +1369,10 @@ struct AppData: Codable {
     /// 17: a group can be kept twice on one device, once per persona in it (`Conversation.groupID`).
     /// 18: requests to join groups through links; a shared group's links, bans and requests waiting for an admin.
     /// 19: a removed friend kept hidden until the notice reaches their app (`Contact.departing`).
-    static let currentFormat = 19
+    /// 20: a ratchet session carries the sparse post-quantum ratchet's state (its refresh fields from before are gone), a
+    /// device can be marked as needing to update (`DeviceLink.needsUpdate`), and post-quantum keys are pinned per contact
+    /// (`Contact.pq`, `pqCommit`, `pqCardSent`, `tooOld`).
+    static let currentFormat = 20
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []

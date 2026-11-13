@@ -113,7 +113,7 @@ private struct FileSheet: View {
     var file: OpenedFile
     @State private var saving = false
 
-    private var image: PlatformImage? { (file.type ?? "").hasPrefix("image/") ? PlatformImage(data: file.data) : nil }
+    private var image: PlatformImage? { (file.type ?? "").hasPrefix("image/") ? PlatformImage.checked(file.data) : nil }
     private var text: String? {
         guard (file.type ?? "").hasPrefix("text/"), file.data.count <= 400_000 else { return nil }
         return String(data: file.data, encoding: .utf8)

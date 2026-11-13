@@ -19,22 +19,20 @@ struct MemberProfileSheet: View {
     var body: some View {
         SheetBody(width: 380) {
             if let convo = model.conversation(conversation), let person = model.contact(fingerprint, in: convo.persona) {
-                VStack(spacing: 14) {
+                let role: String? = model.role(of: fingerprint, in: convo).map { "\($0) in \(convo.title)" }
+                    ?? (convo.kind == .group ? "In \(convo.title)" : nil)
+                VStack(spacing: 16) {
                     SheetHeader(symbol: "person.crop.circle", title: "Profile")
-                    Avatar(image: person.avatar, seed: fingerprint, size: 84)
-                    VStack(spacing: 4) {
-                        Text(person.displayName).font(.system(size: 18, weight: .bold)).foregroundStyle(Ink.text)
-                        if let handle = person.handle { Text("@" + handle).font(.system(size: 13)).foregroundStyle(Ink.dim) }
-                        if let role = model.role(of: fingerprint, in: convo) {
-                            Text("\(role) in \(convo.title)").font(.system(size: 12)).foregroundStyle(Ink.faint)
-                        } else if convo.kind == .group {
-                            Text("In \(convo.title)").font(.system(size: 12)).foregroundStyle(Ink.faint)
-                        }
+                    ProfileHero(avatar: person.avatar, seed: fingerprint,
+                                name: person.displayName, subtitle: role, badge: person.badge, handle: person.handle,
+                                bio: person.hidden ? nil : person.bio, verified: person.verified) {
+                        VStack(spacing: 10) { action(person, convo) }
                     }
-                    if let bio = person.bio, !bio.isEmpty, !person.hidden {
-                        Text(bio).font(.system(size: 13)).foregroundStyle(Ink.text).multilineTextAlignment(.center)
+                    if !person.hidden {
+                        ProfileTabs(links: person.links ?? [], collectibles: person.collectibles ?? [], notes: person.notes ?? [],
+                                    messages: convo.messages.filter { $0.sender == fingerprint },
+                                    walletChangedAt: person.walletChangedAt, isMine: person.isSelf)
                     }
-                    action(person, convo)
                 }
             } else {
                 Text("They're no longer in this chat.").font(.system(size: 13)).foregroundStyle(Ink.dim).padding(30)

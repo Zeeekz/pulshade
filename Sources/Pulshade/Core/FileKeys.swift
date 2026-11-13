@@ -67,6 +67,14 @@ struct FileKeys {
         SecItemDelete(Self.query(account) as CFDictionary)
     }
 
+    /// Every file key and the wrong-passcode count, for a fresh install that finds keys an earlier, deleted install left.
+    static func forgetAll() {
+        if inMemory { lock.withLock { memory.removeAll() }; return }
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+                                    kSecAttrSynchronizable as String: false]
+        SecItemDelete(query as CFDictionary)
+    }
+
     // MARK: Wrong-passcode count
 
     /// How many wrong passcodes in a row, kept in the Keychain so quitting and reopening doesn't start the

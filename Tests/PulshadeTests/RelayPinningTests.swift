@@ -37,4 +37,28 @@ struct RelayPinningTests {
         #expect(RelayPinning.accepts(host: "relay.example", leafDER: current))
         #expect(RelayPinning.accepts(host: "relay.example", leafDER: next))
     }
+
+    @Test func aPublicKeyPinSurvivesARenewalThatKeepsTheKey() {
+        let saved = RelayPinning.pins
+        defer { RelayPinning.pins = saved }
+        let key = P256.Signing.PrivateKey().publicKey
+        let info = key.derRepresentation
+        let before = Data("certificate before renewal".utf8)
+        let after = Data("certificate after renewal, same key".utf8)
+        RelayPinning.pins = ["relay.example": [Data(SHA256.hash(data: info))]]
+
+        #expect(RelayPinning.accepts(host: "relay.example", leafDER: before, leafKeyInfo: info))
+        #expect(RelayPinning.accepts(host: "relay.example", leafDER: after, leafKeyInfo: info), "a new certificate on the same key is accepted")
+        let other = P256.Signing.PrivateKey().publicKey.derRepresentation
+        #expect(!RelayPinning.accepts(host: "relay.example", leafDER: after, leafKeyInfo: other), "another key is not")
+        #expect(!RelayPinning.accepts(host: "relay.example", leafDER: after), "and without a readable key only a certificate hash can match")
+    }
+
+    @Test func theKeyInfoIsRebuiltExactlyAsOpenSSLPrintsIt() {
+        let p256 = P256.Signing.PrivateKey().publicKey
+        #expect(RelayPinning.keyInfo(ofPoint: p256.x963Representation) == p256.derRepresentation)
+        let p384 = P384.Signing.PrivateKey().publicKey
+        #expect(RelayPinning.keyInfo(ofPoint: p384.x963Representation) == p384.derRepresentation)
+        #expect(RelayPinning.keyInfo(ofPoint: Data(repeating: 4, count: 33)) == nil, "other kinds are left to the certificate hash")
+    }
 }

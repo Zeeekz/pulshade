@@ -33,6 +33,8 @@ other key is derived from it with HKDF-SHA256, each with its own label:
 | --- | --- |
 | Signing key (Ed25519) | Vouches for the agreement key, signs directory entries (public @handles) |
 | Agreement key (X25519) | The long-term key people seal envelopes to; used in the handshake |
+| Envelope key (ML-KEM-768) | The post-quantum half of what envelopes are sealed to. Seed (64 bytes) from HKDF label `pulshade.pq.envelope.kem.v1` |
+| Post-quantum signing key (ML-DSA-65) | Signs, next to the Ed25519 key, everything that is not a ratchet message. Seed (32 bytes) from label `pulshade.pq.signing.v1` |
 | Storage key | Seals the local database on the device. Never leaves it |
 | Backup signing key and backup sealing key | For the sealed backup. Unrelated to the keys above on the wire |
 | Public-inbox key, one per @handle | The mailbox behind a public handle |
@@ -43,8 +45,8 @@ groups of four. It is the only way back in if the device is lost. Anyone who has
 The **fingerprint** is the first 16 bytes (32 hex characters) of SHA-256 of the signing public key. It names an account
 inside the app and seeds the artwork you see for it.
 
-**Checking who you are talking to** (the "pulse check"): both phones work out the same code from both fingerprints,
-sorted so the order does not matter. It is shown as 10 emoji (60 bits), 30 digits, two colours, and a QR code that
+**Checking who you are talking to** (the "pulse check"): both phones work out the same code from both identities (each a
+signing-key fingerprint together with its agreement key and a commitment to its post-quantum keys, `pulshade.safety.v3`), sorted so the order does not matter. It is shown as 10 emoji (60 bits), 30 digits, two colours, and a QR code that
 carries 160 bits. Comparing in person, or scanning the other phone's QR, marks the contact verified. Nothing is
 verified for you automatically: the first time you meet a key you trust it, the way most messengers do, and the code
 is how you catch someone sitting in the middle. There is no key transparency log.
@@ -108,12 +110,44 @@ After the handshake, each pair of devices talks through a Double Ratchet, as Sig
   then they are protected only by being mixed into the root key, and a conversation with an older build stays that way.
 - **Out of order:** up to 1,000 missed messages can be skipped over, and up to 2,000 spare keys are kept to open late
   arrivals. A message that fails to open never changes the saved state (it is tried on a copy).
-- **Post-quantum refresh:** the handshake gives quantum resistance at the start. After **50 messages or 24 hours** a side
-  offers a new ML-KEM-768 key inside its messages; the other side answers on its next new chain with a ciphertext, and
-  that secret goes into the root alongside the X25519 step. So someone who breaks X25519 later is locked out again at
-  the next refresh. Messages that carry a refresh are bigger (about 8 KB instead of 2 KB), so someone who can see sizes
-  could tell roughly when one happens. This is like Apple's PQ3, not Signal's "triple ratchet". A chat with someone on
-  an old version never refreshes.
+- **Sparse post-quantum ratchet:** the handshake gives quantum resistance at the start; after that a second, slower
+  exchange keeps adding fresh ML-KEM-768 secrets, spread over many small messages so that no message is bigger.
+  *Code: `Ratchet.swift` (the exchange), `ChunkCode.swift` (the erasure code).*
+  - Each side keeps making fresh ML-KEM-768 keys and *offers* them. The other side *answers* with a ciphertext. Two such
+    exchanges run at once, one offered by each side.
+  - A key (1,184 bytes) and a ciphertext (1,088) are each followed by a SHA-256 digest, cut into 96-byte pieces and
+    erasure coded: pieces are combinations of the data blocks over GF(2^8) with a Cauchy matrix, so **any 13 different
+    pieces of a key (12 of a ciphertext) rebuild it**, in any order, whichever messages were lost. A rebuilt key or
+    ciphertext that does not match its digest is thrown away and collected again.
+  - **Every message carries exactly one piece** in its header (`pq`, 102 bytes: kind, epoch, piece number, bytes), and
+    when there is nothing to send, random filler of the same length. So the field is always present and always the same
+    size, and message sizes say nothing about when an exchange runs. It adds about 150 bytes of JSON to a message; a
+    short message still fits the 2 KiB bucket (`RatchetPQTests.aMessageStillFitsTheSmallestBucket`), and one that was
+    within about 150 bytes of a bucket edge now falls into the next bucket, like any other message that grows.
+  - When the offerer has rebuilt the ciphertext and decapsulated, it says so in every message (`pd`, the epoch). Only
+    when the other side has seen that does it mix the secret into the **root key** at its next new chain (the same step
+    that mixes in X25519), and it says so in every message of that chain (`pm`). The offerer, seeing `pm`, mixes the same
+    secret in on its side of the same step, and both start the next epoch. A secret is never used before the other side
+    holds it, so no message ever waits on a piece, and it adds no message keys of its own: lost, late and repeated
+    messages are handled by the ordinary skipped-key logic.
+  - The secret goes in as `HKDF-SHA256(secret, salt = SHA-256(key ‖ ciphertext), info = "pulshade.pqr.mix" ‖ epoch)`,
+    next to the X25519 output, so it is bound to the exact key and ciphertext. Piece digests use the label
+    `pulshade.pqr.digest`. The piece, `pd` and `pm` are part of what each message's AEAD authenticates (label
+    `pulshade.ratchet.bound.v3`), so a changed piece or flag fails on the spot.
+  - **How often:** measured in the tests (`RatchetPQTests.secretsKeepGoingIn`), a back-and-forth chat completes a new
+    secret about every 35 to 40 messages in total, in both directions in turn, with no day timer. Healing therefore
+    no longer depends on X25519 alone between refreshes. A chat where one side only sends does not advance (it needs
+    the other side's ciphertext and a new chain), the same as the X25519 ratchet itself.
+  - Limits kept: at most 1,000 skipped messages per jump and 2,000 spare keys; at most 240 piece numbers per epoch and one
+    epoch of each exchange in memory (under about 3 KB). A message that fails to open, for any reason, changes nothing in
+    the saved state (it is tried on a copy).
+  - **Old builds.** Every message has to be in this form (header version 3, bit 7 of the `caps` byte). A message from a
+    build from before is refused (`RatchetError.peerTooOld`) and the friend is marked as needing to update
+    (`DeviceLink.needsUpdate`): nothing is sent to that device, the chat's composer is closed with "<name> needs to update
+    Pulshade first.", and no new keys are started over it. Their next envelope with bit 7 lifts the mark. Sessions
+    saved by the build before load as they are (the old refresh fields are dropped when saved again; saved-data format
+    20) and start the new exchange at once. Mail from an old build that was still waiting when the app updated, and a
+    refresh that was half done at that moment, are not read.
 
 Everything people do in a chat (text, photos, reactions, typing dots, read receipts, unsends, group changes, story
 views) goes through the ratchet. A few things travel only inside the sealed-sender envelope of
@@ -132,18 +166,63 @@ the text of friend-request notes sent to you.
 
 *Code: `Sources/Pulshade/Core/EnvelopeCore.swift`, `Envelope.swift`.*
 
+*Code also: `EnvelopePQ.swift`.*
+
 A ratchet message is sealed again before it goes to the relay, so the relay does not learn who sent it.
 
-- **Outer seal.** A fresh X25519 key per envelope; its DH with the recipient's long-term agreement key gives a
-  ChaCha20-Poly1305 key. Inside: the sender's agreement key, then the inner seal. The recipient's key is the only
+**Version 3 (from build 15; the only version read, apart from introductions below).** The wire form is `3`, a fresh
+X25519 key (32 bytes), an ML-KEM-768 ciphertext (1088 bytes), then the sealed content. The recipient's ML-KEM key is
+encapsulated to for every envelope, and its secret is mixed into **both** layers next to the X25519 results (HKDF salt
+includes the ephemeral key, the recipient's key and the ciphertext). Breaking X25519 later therefore opens nothing that
+was recorded, and a forger needs both halves. The fixed padding buckets below are unchanged; every envelope is 1121 bytes
+longer on the outside (`1 + 32 + 1088`), which is the whole cost of the sealing. The inner layer is a frame: a small JSON
+header (signing key, the Ed25519 binding, device, time, capability bits, and optionally the sender's post-quantum card),
+then raw bytes: an ML-DSA-65 signature (3309 bytes) when there is one, then the payload.
+
+- **Hybrid signature.** Anything that is not a ratchet message (key setup, erase notices, delivery notes, introductions)
+  carries an ML-DSA-65 signature over the transcript (ephemeral key, hash of the ML-KEM ciphertext, recipient, sender,
+  time, device, hash of the payload), next to the Ed25519 binding. **Both must verify.** A signed control message moves
+  from the 2 KiB bucket to the 8 KiB one. Ratchet messages are not signed: their session, whose root is post-quantum,
+  authenticates them, and they keep their size.
+- **Post-quantum card (`PQCard`).** Both public keys, with an Ed25519 signature and an ML-DSA signature over them and over
+  the signing and agreement keys. It counts only if both verify. It travels inside hello and request cards, in an
+  introduction (`pqIntro`), or in the header of a version 3 envelope to someone who isn't known to have ours.
+- **Pinning and downgrade.** The first card that verifies for a contact is pinned in their record (trust on first use,
+  like the signing key itself; the keys come from their seed, so they never change for the same account). When the
+  contact came by an invite, that first card is held to the invite: a `psh3` invite carries a 16-byte commitment to the
+  maker's post-quantum keys (SHA-256 over `pulshade.pq.commit.v1`, the ML-KEM key and the ML-DSA key, cut to 16 bytes),
+  covered by the invite's signing-key signature (`pulshade.invite.bind.v2` over the agreement key and the commitment). The
+  record keeps it (`pqCommit`) and refuses any first card whose keys don't match. Older invites (`psh1`, `psh2`) are not
+  accepted. Contacts from a public handle, a group or a request have no commitment and are still trust on first use. From then on
+  the signature of every non-ratchet envelope from them is checked against the pin and a different card is refused. **A
+  classical (version 2) envelope is never read from anyone pinned.** For someone not yet pinned the only classical
+  envelope read is the introduction itself (hello, request or `pqIntro` carrying a card that verifies): the invite and
+  the public profile carry no post-quantum key to seal to, so the first envelope each way cannot be post-quantum. It
+  reveals that envelope's sender and contents to a recorder who later breaks X25519, and nothing after it does.
+  A contact who sends anything else classical (an app from before) is refused by name: "needs to update Pulshade", once a
+  day, and nothing from them is read; nothing classical is sent to them, and messages written meanwhile wait.
+- **Existing contacts.** At the first unlock after the update the app sends each contact (once) a `pqIntro`; a classical
+  introduction is answered with the other side's, so both pin. Accounts, contact records, sessions and chats are not
+  touched; the new keys come from the same seed, so recovery, linked devices and the sealed backup need nothing new
+  (the backup carries each contact's pin). The notification helper gets the key seeds and each friend's pin; with
+  neither it does nothing.
+- **Not covered.** Group-member keys (per-group, per-member X25519 keys used for join links and friend invites sent through a
+  group) still use the version 2 seal: they are not identity keys, but they are classical. Directory profiles and the
+  request layer's signatures are Ed25519 only.
+
+The rest of this section describes the layers; in version 3 each mixes in the ML-KEM secret as above.
+
+- **Outer seal.** A fresh X25519 key per envelope; its DH with the recipient's long-term agreement key (and the ML-KEM secret)
+  gives a ChaCha20-Poly1305 key. Inside: the sender's agreement key, then the inner seal. The recipient's keys are the only
   thing needed to *send*, so anyone can write to a mailbox they know; what the relay sees is one random-looking blob.
-- **Inner seal.** A second key mixes two DH results: ephemeral-to-recipient *and* sender's long-term key to the
-  recipient's long-term key. Inside it: the sender's signing key, a signature by that key over the sender's agreement
+- **Inner seal.** A second key mixes the DH results: ephemeral-to-recipient *and* sender's long-term key to the
+  recipient's long-term key, and the ML-KEM secret. Inside it: the sender's signing key, a signature by that key over the sender's agreement
   key ("these two keys are the same person"), the device id, the time in whole seconds, a byte saying what the sender's
   app can read, and the payload.
 - **Deniable:** only the sender could have made the inner seal, so the recipient knows who it is from, but the
   recipient could have made it too. It proves nothing to a third party. The signature covers only the key pairing, and
-  is the same every time; **no message is ever signed.** (Public directory entries, @handles and announcements *are*
+  is the same every time; **no chat message is ever signed** (only key setup and control messages carry the ML-DSA
+  signature above, and nothing signed can be shown to a third party as a statement about what was said). (Public directory entries, @handles and announcements *are*
   signed, because they are meant to be checked by anyone.)
 - **Padding buckets.** Before the outer seal, the content is padded with zeros to a fixed size: **2 KiB, 8 KiB, 32 KiB,
   128 KiB, 512 KiB, 2 MiB**, or beyond that the next whole MiB. The relay accepts envelopes up to 4 MiB. So it sees a
@@ -225,31 +304,36 @@ address. Each lane's fetches also run on their own timers.
 
 ## 7. Groups
 
-*Code: `GroupInfo` and the group handling in `Wire.swift` and `AppModel.swift`.*
+*Code: `GroupKeys.swift` and the group handling in `Wire.swift` and `AppModel.swift`.*
 
-Groups, channels and broadcasts are made **between phones. The relay knows nothing about them.**
+Groups and channels have **one format** since build 15: the shared mailbox of 7a below. Before it, a group was a
+roster held on each phone and every message went as one envelope per member through each pair's ratchet (`Payload.group`
+carried the roster, with introduction mailboxes, `Payload.moved`, `Payload.removed` and the per-member
+`friendInvite`). Builds 13 and 14 moved those groups and channels over by themselves, and the old reading and sending
+code has been removed. Those cases are no longer part of the wire format: an envelope that carries one cannot be decoded and
+is dropped, and a message that names a group, arriving one to one, is ignored.
 
-- A group is a list (the *roster*) of members' public keys and mailboxes, held on each member's phone. It travels as a
-  normal message through each pair's ratchet. The relay sees an ordinary envelope.
-- Every group message is sent as **one envelope per member device**, each through that pair's own ratchet. There is no
-  shared group key. The cap is 300 members, because of this fan-out.
+- **What stays from before.** A group or channel saved in the old format stays on the device with its past messages,
+  closed: nothing is sent in it, read for it, or synced to other devices, and the chat says it is on an old format and
+  can't be used (the owner starts it again). The capability bits are still sent, so other apps see what this one reads.
+- **Nobody is put in the old format.** An app whose devices don't all say they take part (bit 4 for groups, bit 6 for
+  channels) is refused when someone makes a group or adds them: "X needs to update Pulshade first". Nothing is kept to add
+  them later.
 - A group has an **owner**, optional **admins**, optional **mods**, and a **posting rule** (everyone, admins, or owner
   only). Changes carry a version number and count only when they come from someone allowed to make them. Mods can only
   remove ordinary members; everyone ignores a mod's update that does anything else.
-- Members who are not your contacts are kept as hidden peers, used only inside that group. Members who do not know
-  each other first meet through **introduction mailboxes**, made by whoever sends the group's details. Nobody is given
-  the mailbox another member uses with the owner. After the first hello each pair moves to a mailbox of its own.
-- In a channel, followers learn who can post, not who else follows (in both formats; see 7a-i for how the newer one
-  keeps the follower list from followers).
+- Members who are not your contacts are kept as hidden peers, used only inside that group. In a channel, followers learn
+  who can post, not who else follows (7a-i).
+- **Broadcast lists** (the old send-to-many list) still send one private copy per person. They are not groups and
+  cannot be made any more.
 
 ### 7a. Groups that share one mailbox
 
 *Code: `GroupKeys.swift`, and the "Groups that share one mailbox" section of `AppModel.swift`. Design:
 `docs/groups-design.md`.*
 
-New groups use this format when every member's app takes part (bit 4 of the `caps` byte); the owner of an older group
-can move it over once everyone can. Channels use it too when every follower's app takes part (bit 6, see 7a-i below);
-any group or channel with someone on an older app still uses the format above.
+Every group uses this format, and every member's app has to take part (bit 4 of the `caps` byte). Channels use it too
+when every follower's app takes part (bit 6, see 7a-i below).
 
 - **One mailbox per epoch.** A member seals each message **once** and posts it into the group's mailbox on the relay;
   every member reads it from there with a cursor ("everything after the last one I saw"). The relay keeps group mail
@@ -261,7 +345,10 @@ any group or channel with someone on an older app still uses the format above.
   member's own group key.
 - **Epoch keys and sending chains.** A random 32-byte epoch key gives the mailbox, an outer key that hides who sent
   an envelope from the relay, and the start of each member device's sending chain. Each message takes the next chain key
-  (HMAC steps), so a used key is not kept. Each envelope is signed by the sender's group key, so one member cannot pass
+  (HMAC steps), so a used key is not kept. An epoch key is replaced when someone is removed, and also by an admin's
+  device once the epoch is **7 days old or 1,000 chat posts long** and something was said in it (a quiet group keeps its
+  epoch); two admins doing it together settle like two removals. Old epoch keys are kept only until a week after the
+  next epoch began, for late mail. Each envelope is signed by the sender's group key, so one member cannot pass
   a message off as another's. Each device of an account posts on its own chain, tagged with 8 random bytes it makes for
   itself; backups and newly linked devices make their own.
 - **Settings.** Name, picture, roles, posting rule, timer and the member cards are one numbered document, signed by
@@ -299,7 +386,11 @@ any group or channel with someone on an older app still uses the format above.
 What it changes, honestly:
 
 - **Healing.** A 1:1 chat heals at the next reply after a key is stolen. In a group, a stolen epoch key reads everything
-  in that epoch until the next one (a removal, or a newcomer after the group has talked).
+  in that epoch (every member's chain starts from it), so epochs are short: a removal, a newcomer after the group has
+  talked, or 7 days / 1,000 posts. Within an epoch each sender's chain still only moves forward, so a member's
+  device holds no key of a message it has already read from a sender it has heard; but it can work out the chain of any
+  sender it has not, from the epoch key, so **there is no per-message forward secrecy against someone who steals an
+  epoch key** (see `docs/groups-design.md`, "Forward secrecy inside an epoch").
 - **Receipts.** A group message shows "sent" once it is on the relay; members do not confirm it one by one.
 - **The relay** sees one mailbox that many devices read, and can count how often it is read. Over Tor it cannot tell the
   readers apart; in Fast mode it sees their addresses and could estimate the group's size.
@@ -311,8 +402,8 @@ What it changes, honestly:
 *Code: `GroupKeys.swift` (`GroupRoster`, tagged rekeys) and the "A channel's followers" section of `AppModel.swift`.
 Design: `docs/groups-design.md` section 17.*
 
-A channel moves over when every follower's app says it reads channels that share one mailbox (bit 6 of the `caps`
-byte, `Envelope.reads` 127). Someone on an older app waits until they update.
+A follower's app has to say it reads channels that share one mailbox (bit 6 of the `caps` byte, `Envelope.reads` is 255 with bit 7, which every current app sets).
+Someone on an older app is refused until they update.
 
 - **Followers are not in the settings.** The signed settings carry only the staff (owner and admins). A follower holds
   the epoch key and a group key of their own, with a card that has no name or picture, and posts nothing: the app
@@ -328,11 +419,25 @@ byte, `Envelope.reads` 127). Someone on an older app waits until they update.
   key) and padded to a power of two copies, so the size reveals only roughly how many followers there are. A removed
   follower learns it only because their mailbox goes quiet.
 - **Admins.** The owner can ask a follower to join the staff; they answer with a card with their name and move from the
-  roster into the settings. When an older channel moves over, its admins are asked the same way.
-- **Left out.** Follower reactions are dropped (staff can still react). A follower cannot leave from inside the channel
-  (they delete it and staff can take them out), and one who is away through a rekey must be added again.
-- **Announcements** is not part of either format: the relay hands every app the same admin-signed list, with no account
-  attached.
+  roster into the settings.
+- **Left out.** Follower reactions are dropped (staff can still react).
+- **Leaving.** A follower who leaves sends `channelLeave(group)` over their 1:1 chat with the staff member who invited
+  them, then removes the channel from their devices. Nothing is posted in the channel's mailbox. That staff phone acts only
+  if the chat's sender (authenticated by the session, never by the payload) is an account it admitted to this channel and
+  whose roster entry is still live (hidden contacts count: a follower through a channel's code is one); it drops them from the
+  roster at once and makes the new epoch once for everyone who leaves within ten minutes (retrying until it exists). A repeat,
+  a late copy (older than the entry by more than ten minutes), or one from anyone else finds no live entry and changes nothing. An app from before cannot decode the payload and drops it.
+- **A key that was missed.** A follower whose settings name a newer epoch whose key never came (`missedKey`) can send
+  `channelKeyWanted(group, epoch)` (the newest epoch it holds) over the same chat. The inviting staff phone checks the same
+  things as for a leave, and that `epoch` is older than the current one, then answers over that chat with the ordinary
+  `groupInvite` (current settings and epoch key), at most once every ten minutes per follower whatever arrives. A follower's
+  phone answers such an invite with its card, and takes a staff key or a new inviter from it, only from the account that invited
+  it (another contact's copy only refreshes keys). A follower asks at most
+  once every ten minutes. A channel's code lets in at most 60 new followers an hour (repeat hellos from one identity count once); the rest wait, earliest first, and the list drops the newest when it is full (1,500). Nothing is
+  posted in any mailbox. With no answer (an older app, an absent phone, or a follower already taken out) the follower is just
+  told that none came.
+- **Announcements** is not a group on the wire: the relay hands every app the same admin-signed list, with no account
+  attached. Its chat is a channel with no members, and it works as it always did.
 
 ### 7b. Join links
 
@@ -492,8 +597,15 @@ asks how to connect, and nothing connects until that is answered.
   your IP address; it makes up one address per circuit. Nothing falls back to a direct connection. (The locked-phone
   helper is the one direct path, and it can only be on in Fast mode.) Bridges (Snowflake, webtunnel) can be turned on
   for networks that block Tor.
-  Because new circuits are cheap, the relay's rate limits want a small proof of work (a fraction of a second of
-  hashing) on some requests.
+  Because new circuits are cheap, the relay's rate limits want a proof of work on some requests, in the header
+  `X-Pulshade-Pow: 2:<seconds>:<nonce>`, SHA-256 of `pulshade.pow.v2|<what it is for>|<seconds>|<nonce>` with enough
+  leading zero bits, used once. Routes ask for 21 bits (lookups, announcements, reads) or 23 (claims, backups, burns, push,
+  new group mailboxes): about two or eight million hashes, a fraction of a second to about a second on one core of a phone
+  (the app's solver does roughly eight million a second on a laptop core and spreads across up to four cores). A circuit that has
+  made many requests lately is asked for one more bit per doubling past eight in ten minutes, everyone for up to three more
+  while the relay sees hundreds to thousands of onion requests a minute, never more than 27. A proof that is too light
+  counts as none, and the answer (429) carries `X-Pulshade-Pow-Bits`, which the app does once more. The first format (a
+  fixed 18 bits, no version) is answered 426 with `X-Pulshade-Update: required`.
 - **Fast.** The app connects straight to the relay's ordinary https address. This is much quicker and more reliable.
   The relay and your internet provider see your **IP address**, and roughly where you are. Nothing on the server keeps
   an access log, and the relay keeps no log of requests or addresses; but on Fast **you are trusting us
@@ -523,9 +635,9 @@ key that is never written to its disk, or public because someone chose to publis
 
 | What | Where | How long |
 | --- | --- | --- |
-| Waiting envelopes (messages, receipts, call set-up) | Memory, and a journal on disk with every record sealed. Each envelope is added to the journal as it arrives | Until the recipient collects them, or **7 days**. After collection the journal is rewritten within minutes and the old file overwritten |
+| Waiting envelopes (messages, receipts, call set-up) | Disk, in segment files with every record sealed under a key of the segment's own (keys only in an index sealed by the storage key); recent ones also cached in memory. Written before the 202 | Until the recipient collects them, or **7 days**. Collected envelopes are dead at once: a segment with none alive has its key forgotten, its file overwritten and deleted; one kept alive by a slow reader is rewritten without them once at least half of it is dead. A full share of the disk answers **507** and drops nothing |
 | Group mail (groups and channels that share one mailbox) | Disk, sealed on the phones and again by the relay | The life the epoch was made with, **3 days** for every epoch made since build 14 (up to 7 for older ones). **Not erased when read**, so the relay can't learn who reads or how many do |
-| Short-lived signals (typing, "online") | Memory only | A few seconds to minutes; never journaled |
+| Short-lived signals (typing, "online") | Memory only | A few seconds to minutes; never written to the disk |
 | Big files, chat videos, story videos | Disk, sealed twice, in pieces | Erased when collected or deleted, **7 days at most** (an unfinished upload: 1 hour) |
 | Sealed backups and spare keys | Disk, in the backup store | Until switched off or Burn; **180 days** after the last save. Spares: also erased when used |
 | Wake-up registrations (Apple push tokens) | Memory, and a sealed file | While the setting is on; dropped after 7 days without renewal |
@@ -533,7 +645,7 @@ key that is never written to its disk, or public because someone chose to publis
 | Rate-limit counters | Memory | An hour. Only a salted hash of an address, never the address |
 | Mailboxes closed by a Burn | Memory | 7 days |
 
-The relay's disk files (journal, directory, backups, blobs, keys) are sealed with a **storage key that is kept only in
+The relay's disk files (mail segments, directory, backups, blobs, keys) are sealed with a **storage key that is kept only in
 the server's memory**, never written to the server's disk. A crash writes no memory to disk. What this does
 **not** stop: someone who controls the *running* server can read the key from memory. That is why anything personal is
 sealed on your phone first.
@@ -620,7 +732,7 @@ keep its own records of notifications and app use, which Pulshade cannot control
 | What the attacker faces | |
 | --- | --- |
 | The vault | Sealed with the passcode (PBKDF2-SHA256, 600,000 rounds, AES-GCM), **mixed with a key only that phone's Secure Enclave can use**. A copy taken off the phone cannot be guessed at elsewhere. On iPhone the files are also unreadable while locked. |
-| The Keychain | If the phone has been **unlocked once since it started** ("after first unlock" state), and the attacker has a way to extract Keychain items, they may get: the two envelope keys, friends' public keys and mailbox keys, and short sealed envelopes waiting in the helper's inbox — **only if Wake when locked and locked-phone collection are on**. That lets them open envelope *wrappers* to this account and write to it as anyone. It does **not** open messages (the ratchet keys are in the vault). |
+| The Keychain | Only if **Wake when locked** and **Collect messages when locked** are both on. Collecting is **off by default**; it is a choice made by hand, with a warning. Then the notification helper keeps in the Keychain ("after first unlock": readable once the phone has been unlocked since it started) this account's raw **signing and agreement keys**, this device's id, and each friend's agreement key and mailbox key, plus short sealed envelopes waiting in its inbox. An attacker who can extract Keychain items from such a phone can **impersonate the account** (sign as you, and open new sessions with your friends), open the envelope wrappers sent to you, and so **read what is sent to you from then on**. They cannot read **past** messages: the chat keys (ratchet state) are in the vault, behind your passcode and the Secure Enclave. Turning the setting off removes the bundle. |
 | Decoy / panic passcodes | A decoy opens an empty identity; the panic passcode shreds the real one. The lock file always has three equal slots and four data files, so the disk does not show which are real. |
 | Old copies | The whole lock file is sealed again with a Keychain key that changes every time Pulshade locks, so an old copy recovered from flash storage no longer opens (unless the attacker also recovers that key's old Keychain entry and knows the old passcode). |
 
@@ -648,9 +760,10 @@ the apps.
 
 | Recorded traffic, broken later | Result |
 | --- | --- |
-| Message content | **Still safe.** The handshake mixes ML-KEM-768, and the ratchet refreshes it every 50 messages or a day. |
-| The sealed-sender layer and any TLS/Tor layers (X25519-based) | **Could be opened.** That would reveal sender key, device id and timing for recorded envelopes, and the mailbox read keys sent in requests; not message content. |
-| Identity authentication (Ed25519, X25519) | Not post-quantum. A quantum attacker could impersonate in *new* conversations once such a machine exists. Existing verified contacts and the pulse code are not protected by ML-KEM. |
+| Message content | **Still safe.** The handshake mixes ML-KEM-768, and the sparse post-quantum ratchet adds a fresh ML-KEM-768 secret about every 35 to 40 messages of a back-and-forth chat. |
+| The sealed-sender layer (version 3 envelopes) | **Still safe.** ML-KEM-768 is mixed into both layers. Exceptions: the first, introducing envelope each way (hello, request or introduction), and group-member envelopes, which are classical. |
+| Any TLS/Tor layers (X25519-based) | **Could be opened** (outside what Pulshade controls). That would reveal the mailbox read keys sent in requests and timing, not message content or, for version 3 envelopes, the sender. |
+| Identity authentication | **Hybrid.** Control messages need an Ed25519 and an ML-DSA-65 signature, and a pinned contact can't be downgraded. Pinning is trust on first use; the pulse code covers both signing keys and both agreement keys (Ed25519 and X25519), not the post-quantum keys, and public directory entries, collectibles and admin signatures are still Ed25519 only. |
 | Files, backups, the vault | Symmetric (256-bit) and hash-based: **still safe** at current estimates. |
 
 ## Honest limits
@@ -675,7 +788,9 @@ the apps.
   leftovers at launch, but we do not control that system copy. We are not aware of any other temporary files written
   by Apple's video code (AVFoundation) in Pulshade's paths, and this is one of the questions we ask auditors to check.
 - **Keychain items after first unlock** (section 10) when locked-phone collection is on.
-- **One operator.** The official app talks only to Pulshade's own servers. A modified app could point at others; the
-  rate limits and the terms of use, not the code, hold that back.
+- **One operator.** The official app sends your messages and account traffic only to Pulshade's own servers. It also contacts Apple's push
+  service (while Wake when locked is on, the default), the sites behind link previews you turn on (over Tor if Tor is on),
+  and, if you pick the Snowflake bridge, its CDN front and public STUN servers; links you tap open in the browser. A modified app
+  could point at other servers; the rate limits and the terms of use, not the code, hold that back.
 - **Disappearing messages** and **deleted stories** depend on the other person's app.
 - **Groups** cap at 300 members and trust their admins for the roster.

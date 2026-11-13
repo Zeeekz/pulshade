@@ -12,7 +12,7 @@ import Foundation
 
     @Test func roundTripRevealsSenderOnlyInside() throws {
         let payload = message("hi bob")
-        let blob = try Envelope.seal(payload, from: alice, to: bob.card.agreement)
+        let blob = try Envelope.seal(payload, from: alice, to: bob.recipient, introduce: true)
         let (opened, signer) = try Envelope.open(blob, with: bob)
         #expect(opened == payload)
         #expect(signer == alice.card.signing)
@@ -22,12 +22,12 @@ import Foundation
     }
 
     @Test func wrongRecipientCannotOpen() throws {
-        let blob = try Envelope.seal(message("secret"), from: alice, to: bob.card.agreement)
+        let blob = try Envelope.seal(message("secret"), from: alice, to: bob.recipient)
         #expect(throws: (any Error).self) { try Envelope.open(blob, with: Identity.generate()) }
     }
 
     @Test func tamperingIsDetected() throws {
-        var blob = try Envelope.seal(message("x"), from: alice, to: bob.card.agreement)
+        var blob = try Envelope.seal(message("x"), from: alice, to: bob.recipient)
         blob[blob.count / 2] ^= 0x01
         #expect(throws: (any Error).self) { try Envelope.open(blob, with: bob) }
     }
@@ -36,10 +36,10 @@ import Foundation
     /// rather than nearly twice that. Sealed the old way it still opens, for apps that haven't updated.
     @Test func aFramedEnvelopeCarriesBigBytesRawAndOpensTheSame() throws {
         let bytes = Data((0..<400_000).map { _ in UInt8.random(in: 0...255) })
-        let header = RatchetHeader(dh: Data(repeating: 7, count: 32), pn: 3, n: 9, kem: nil, kemCiphertext: nil)
+        let header = RatchetHeader(dh: Data(repeating: 7, count: 32), pn: 3, n: 9)
         let payload = Payload.ratchet(RatchetMessage(header: header, ciphertext: bytes))
-        let framed = try Envelope.seal(payload, from: alice, device: Data([1, 2]), to: bob.card.agreement, framed: true)
-        let plain = try Envelope.seal(payload, from: alice, device: Data([1, 2]), to: bob.card.agreement)
+        let framed = try Envelope.seal(payload, from: alice, device: Data([1, 2]), to: bob.recipient, framed: true)
+        let plain = try Envelope.seal(payload, from: alice, device: Data([1, 2]), to: bob.recipient)
         for blob in [framed, plain] {
             let opened = try Envelope.openFull(blob, with: bob)
             #expect(opened.payload == payload && opened.signer == alice.card.signing && opened.device == Data([1, 2]))
@@ -66,22 +66,22 @@ import Foundation
     }
 
     @Test func sizesAreBucketed() throws {
-        let short = try Envelope.seal(message("a"), from: alice, to: bob.card.agreement)
-        let longer = try Envelope.seal(message(String(repeating: "b", count: 900)), from: alice, to: bob.card.agreement)
+        let short = try Envelope.seal(message("a"), from: alice, to: bob.recipient)
+        let longer = try Envelope.seal(message(String(repeating: "b", count: 900)), from: alice, to: bob.recipient)
         #expect(short.count == longer.count)
     }
 
     @Test func sameMessageLooksDifferentEachTime() throws {
         let p = message("same")
-        let a = try Envelope.seal(p, from: alice, to: bob.card.agreement)
-        let b = try Envelope.seal(p, from: alice, to: bob.card.agreement)
+        let a = try Envelope.seal(p, from: alice, to: bob.recipient)
+        let b = try Envelope.seal(p, from: alice, to: bob.recipient)
         #expect(a != b)
     }
 
     @Test func anyoneElseClaimingToBeTheSenderIsRefused() throws {
         // Mallory pairs Alice's signing key with her own agreement key: the binding doesn't check out.
         let mallory = Identity.generate()
-        let blob = try Envelope.seal(message("trust me"), from: mallory, to: bob.card.agreement)
+        let blob = try Envelope.seal(message("trust me"), from: mallory, to: bob.recipient, introduce: true)
         let (_, signer) = try Envelope.open(blob, with: bob)
         #expect(signer == mallory.card.signing && signer != alice.card.signing)
     }
@@ -98,15 +98,18 @@ import Foundation
         #expect(Invite.validRelay("http://relay.onion.example.com") == nil)
     }
 
-    @Test func chatCodesAreTwelveDigitsSealedToAFixedSize() throws {
+    @Test func chatCodesAreTwentyDigitsSealedToAFixedSize() throws {
         let code = ChatCode.make()
-        #expect(code.digits.count == 12 && code.digits.allSatisfy(\.isNumber))
+        #expect(code.digits.count == 20 && code.digits.allSatisfy(\.isNumber))
         #expect(ChatCode(code.display) == code)
-        #expect(ChatCode("1234-5678-9012")?.display == "1234 5678 9012")
-        #expect(ChatCode("1234 5678 901") == nil)
+        #expect(ChatCode("1234-5678-9012-3456-7890")?.display == "1234 5678 9012 3456 7890")
+        #expect(ChatCode("1234 5678 9012 3456 789") == nil)
         #expect(ChatCode("pshchat1abc") == nil)
+        // SEC-107: twelve digits, from an older app, are refused and recognised as old, never used.
+        #expect(ChatCode("1234 5678 9012") == nil && ChatCode.isOutdated("1234 5678 9012") && !ChatCode.isOutdated(code.display))
+        #expect(Set((0..<50).map { _ in ChatCode.make().digits }).count == 50)
 
-        let link = ChatLink(invite: Invite(kind: .contact, signingKey: .random(32), agreementKey: .random(32), sendID: .random(32)).code,
+        let link = ChatLink(invite: try Invite(kind: .contact, identity: .generate(), sendID: .random(32)).code,
                             endsAt: Date(timeIntervalSince1970: Date().addingTimeInterval(600).timeIntervalSince1970.rounded(.down)))
         let (_, seal) = code.keys()
         let blob = try #require(ChatCode.seal(link, with: seal))

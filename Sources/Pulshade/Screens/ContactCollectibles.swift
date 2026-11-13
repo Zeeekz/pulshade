@@ -26,7 +26,7 @@ struct ContactCollectibles: View {
                 }
                 .padding(12)
             }
-            .frame(maxWidth: 340)
+            .frame(maxWidth: .infinity)
             .sheet(item: $viewing) { item in CollectibleViewerSheet(item: item, readOnly: true) }
         }
     }

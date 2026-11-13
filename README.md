@@ -18,7 +18,7 @@ Built by Zeekz.
   Nothing you say is signed, so a message can't be proven to anyone else.
 - **Personas and burners.** Separate identities that can't be tied together, and throwaway ones that destroy
   themselves on a timer.
-- **One-time chats.** A chat for a single conversation, shared by QR code, link or a 12-digit code you read out.
+- **One-time chats.** A chat for a single conversation, shared by QR code, link or a 20-digit code you read out.
 - **Decoy and panic passcodes.** One opens a harmless empty account; the other quietly destroys the real one.
 - **Lock, Detach and Burn.** Lock the app; detach this device with one tap, which wipes it at once and keeps your
   profile, contacts and groups in a sealed backup that only your recovery code opens (never your chats); or burn it
@@ -39,7 +39,7 @@ possible:
   don't carry their sender.
 - **Not where you are.** Over Tor the server sees a made-up address for each connection, never your IP address.
   Each persona and inbox uses its own Tor circuit, so they can't be linked by address.
-- **Nothing for long.** Envelopes are deleted once collected, or after 7 days. While they wait they are held in memory and, sealed, in a journal on the server's disk (every record sealed with a key the server keeps only in memory), so a restart, crash or reboot doesn't lose them. Collected mail is overwritten and removed from the journal within minutes.
+- **Nothing for long.** Envelopes are deleted once collected, or after 7 days. While they wait they are written, sealed, to the server's disk (every record sealed with a key the server keeps only in memory), and the server keeps no second copy of them in memory, so a restart, crash or reboot doesn't lose them. Collected mail is overwritten and removed within minutes.
   Files you send (up to 100 MB) are the one other thing the server keeps on disk besides that journal, profiles and backups: sealed on your
   phone with a key that only travels inside the end-to-end encrypted message, sealed again by the server, erased the
   moment the message is deleted (the server's key for it is destroyed) or after 7 days. A phone only ever holds a
@@ -50,32 +50,6 @@ possible:
 
 The full design, from the key derivations to the decoy passcode's disk layout, is in
 [How Pulshade works](docs/how-it-works.md).
-
-## Known limits
-
-An honest list. More detail is in [How Pulshade works](docs/how-it-works.md).
-
-- **Not yet audited** (see above).
-- **Tor hides addresses, not timing.** Someone watching both ends of the network could still line up when things
-  happen. Unless you turn on bridges (Settings → Network), your network can see you use Tor, though not that it's
-  Pulshade.
-- **Turning Tor off is a real step down.** It's allowed, for speed, and the app explains first: the server then sees
-  your IP address, and your personas can be tied together by it.
-- **Disappearing messages and deleted stories trust the other device.** A modified app could keep them, and anyone
-  can photograph a screen. A story deleted or expired is gone from every unmodified app, but one posted before
-  deleting existed can't be recalled and just runs out its time.
-- **One operator.** Everything goes through Pulshade's servers, which can see when and how much traffic flows, but
-  never what it says, or who you are behind Tor.
-- **Post-quantum keys refresh every 50 messages or a day**, not on every reply, and a refresh makes that message
-  larger.
-- **Old files on an SSD.** Pulshade replaces its keys every time it locks, but the operating system, not the app,
-  decides when old disk blocks are truly erased.
-- **iPhone:** messages arrive while the app is open, unless you turn on **Wake when locked** (Settings →
-  Notifications), which lets the relay wake your phone through Apple. Apple then learns that it was woken, and when
-  (see [wake-up pushes](docs/push-notifications.md)). Screenshots come out blank through iOS behaviour Apple
-  doesn't document, so an update could undo that.
-- **Outside the app,** your IP address still reaches wherever you downloaded it, and Apple when a Mac first checks
-  the app.
 
 ## Requirements
 

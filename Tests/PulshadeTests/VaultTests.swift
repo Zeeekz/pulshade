@@ -152,6 +152,8 @@ import Foundation
             damaged[damaged.count / 2] ^= 0xFF
             try damaged.write(to: url)
         }
+        // The count is kept in a store every model in the process shares, which other tests' wrong guesses also use.
+        model.failedAttempts = 0
         #expect(await model.unlock(passcode: "real-pass") == false)
         #expect(model.dataUnreadable && model.identity == nil && model.phase == .locked)
         #expect(model.failedAttempts == 0, "A right passcode isn't counted as a wrong guess")

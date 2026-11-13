@@ -10,17 +10,18 @@ import Foundation
 
     @Test func theSharedCoreReadsAndWritesTheSameEnvelopesAsTheApp() throws {
         let payload = Payload.typing(conversation: UUID())
-        let blob = try Envelope.seal(payload, from: alice, device: Data([7, 7]), to: bob.card.agreement)
-        let header = try EnvelopeCore.open(blob, agreement: bob.agreementKey)
+        let blob = try Envelope.seal(payload, from: alice, device: Data([7, 7]), to: bob.recipient)
+        let header = try EnvelopeCore.openPQ(blob, agreement: bob.agreementKey, pq: bob.pq, known: { _ in alice.pq.pin }).header
         #expect(try Payload.fromWire(header.body) == payload)
         #expect(LockedDelivery.fingerprint(of: header.signer) == alice.fingerprint)
         #expect(header.device == Data([7, 7]))
 
-        let made = try EnvelopeCore.seal(body: try payload.wire(framed: false), framed: false, signing: alice.signingKey,
-                                         agreement: alice.agreementKey, device: Data(), caps: 0, at: Date(), to: bob.card.agreement)
+        let made = try EnvelopeCore.sealPQ(body: try payload.wire(framed: false), signing: alice.signingKey, agreement: alice.agreementKey,
+                                           pq: alice.pq, sign: true, introduce: true, device: Data(), caps: 0, at: Date(), to: bob.recipient)
         let opened = try Envelope.openFull(made, with: bob)
         #expect(opened.payload == payload)
         #expect(opened.signer == alice.signingKey.publicKey.rawRepresentation)
+        #expect(opened.introduced == alice.pq.pin)
     }
 
     @Test func theHandWrittenNoteIsTheAppsCollectedPayload() throws {

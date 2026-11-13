@@ -39,7 +39,7 @@ struct AppDataFormatTests {
     /// Fails when a field is added to what's saved without raising `AppData.currentFormat`. Change the lists below
     /// together with it.
     @Test func changingWhatIsSavedMeansRaisingTheFormat() throws {
-        #expect(AppData.currentFormat == 19)
+        #expect(AppData.currentFormat == 20)
         let app = keys(AppData())
         let profile = keys(Profile())
         #expect(app == Self.appKeys, "AppData's saved fields changed: raise AppData.currentFormat, then update this list")
@@ -54,6 +54,6 @@ struct AppDataFormatTests {
     static let profileKeys = ["avatar", "badge", "banner", "bio", "collectibleCodes", "collectibles", "collectionCode", "color", "format", "handle", "links",
                               "moreHandles", "name", "notes", "updatedAt"]
     static let contactKeys = ["addedAt", "agreementKey", "avatar", "awaitingAcceptance", "badge", "banner", "bio", "collectibles", "color", "departing", "devices",
-                              "fingerprint", "handle", "hidden", "isSelf", "links", "name", "nickname", "notes", "oldSpares", "persona", "receiveKey", "relay",
-                              "signingKey", "spare", "toldPresence", "verified", "walletChangedAt", "wantsMyPresence"]
+                              "fingerprint", "handle", "hidden", "isSelf", "links", "name", "nickname", "notes", "oldSpares", "persona", "pq", "pqCardSent", "pqCommit", "receiveKey", "relay",
+                              "signingKey", "spare", "toldPresence", "tooOld", "verified", "walletChangedAt", "wantsMyPresence"]
 }

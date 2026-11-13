@@ -59,7 +59,7 @@ struct ConversationView: View {
             VStack(spacing: 0) {
                 header(c)
                 messages(c)
-                if model.canPost(in: c) { composer(c) } else { ReadOnlyBar(kind: c.kind, announcements: c.isAnnouncements) }
+                if model.canPost(in: c) { composer(c) } else { ReadOnlyBar(kind: c.kind, announcements: c.isAnnouncements, oldFormat: c.isOldFormat, needsUpdate: model.peerNeedingUpdate(in: c)) }
             }
             // Fills the whole screen, keyboard or not, so the background doesn't jump when it opens.
             .background { ChatBackdrop(background: model.data.chatBackground, theme: model.theme).equatable().ignoresSafeArea() }
@@ -137,16 +137,17 @@ struct ConversationView: View {
                     Button { dismiss() } label: { Image(systemName: "chevron.left") }
                         .buttonStyle(BarButtonStyle())
                         .accessibilityLabel("Back")
-                    // Their picture beside the back button: tap it to see it full size, or the details if they have none.
+                    // Their picture beside the back button: an unwatched story opens first (the picture does that itself),
+                    // otherwise their profile. A group's or channel's own picture still opens full size.
                     let picture = c.avatar ?? (c.kind == .direct ? model.contact(c.members.first ?? "", in: c.persona)?.avatar : nil)
                     Button {
-                        if let picture { headerPicture = picture } else { showInfo = true }
+                        if c.kind != .direct, let picture { headerPicture = picture } else { showInfo = true }
                     } label: {
                         Avatar(image: picture, seed: c.kind == .direct ? (c.members.first ?? "") : c.id.uuidString,
                                size: 34, symbol: c.kind == .direct ? nil : c.kind.symbol)
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel(picture != nil ? "\(c.title), picture" : "\(c.title), details")
+                    .accessibilityLabel(c.kind != .direct && picture != nil ? "\(c.title), picture" : "\(c.title), profile")
                 }
                 Spacer(minLength: 0)
                 if let burner = model.burner(c.persona), let at = burner.burnsAt {
@@ -167,7 +168,7 @@ struct ConversationView: View {
                         .help("Call")
                         .accessibilityLabel("Call")
                 }
-                if c.kind == .direct || c.kind == .group { TimerMenu(conversation: c) }
+                if c.kind == .direct || (c.kind == .group && !c.isOldFormat) { TimerMenu(conversation: c) }
                 // On the phone the relay indicator only speaks up when something is wrong.
                 if !phone || model.link != .online { LinkBadge() }
                 if !phone {
@@ -771,15 +772,22 @@ private struct DayPill: View {
 private struct ReadOnlyBar: View {
     var kind: ConversationKind
     var announcements = false
+    /// A group or channel saved in the format from before groups shared one mailbox: readable, but closed.
+    var oldFormat = false
+    /// The friend in a one-to-one chat whose app has to update first.
+    var needsUpdate: String?
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: "lock")
-            Text(announcements ? "Only PULSHADE can post here"
-                 : kind == .channel ? "Only admins can post in this channel" : "Only admins can post in this group")
+            Text(needsUpdate.map { "\($0) needs to update Pulshade first." } ?? (oldFormat ? "This \(kind == .channel ? "channel" : "group") is on an old format and can't be used. Ask the owner to start it again."
+                 : announcements ? "Only PULSHADE can post here"
+                 : kind == .channel ? "Only admins can post in this channel" : "Only admins can post in this group"))
+                .multilineTextAlignment(.center)
         }
         .font(.system(size: 12))
         .foregroundStyle(Ink.faint)
-        .frame(maxWidth: .infinity).frame(height: 52)
+        .padding(.horizontal, 16)
+        .frame(maxWidth: .infinity).frame(minHeight: 52)
         .background(Ink.base)
         .overlay(alignment: .top) { Rectangle().fill(Ink.line).frame(height: 1) }
     }
@@ -861,7 +869,12 @@ fileprivate struct Bubble: View, Equatable {
         HStack(alignment: .bottom, spacing: 8) {
             if mine { Spacer(minLength: Platform.isPhone ? 44 : 160) }
             if showsSender {
+                // An unwatched story opens first (the picture does that itself); otherwise their profile.
                 Avatar(image: senderAvatar, seed: message.sender, size: 26).opacity(last ? 1 : 0)
+                    .contentShape(.circle)
+                    .onTapGesture { if last { openSender() } }
+                    .accessibilityAddTraits(last ? .isButton : [])
+                    .accessibilityHint(last ? "Shows their profile" : "")
             }
             if mine && !Platform.isPhone { actions }
             VStack(alignment: mine ? .trailing : .leading, spacing: -5) {
@@ -1061,6 +1074,7 @@ fileprivate struct Bubble: View, Equatable {
             .foregroundStyle(mine ? Ink.onAccent.opacity(0.88) : Ink.text)
             .tint(mine ? Ink.onAccent.opacity(0.85) : theme.accent)
             .modifier(SelectableText(enabled: canCopy))
+            .confirmsLinkTaps()
     }
 
     private var timeLine: some View {
@@ -1393,10 +1407,11 @@ private struct PreviewCard: View {
     @Environment(\.theme) private var theme
     var preview: LinkPreview
     var mine: Bool
+    @State private var asking: URL?
 
     var body: some View {
         Button {
-            if let url = URL(string: preview.url), LinkPreviews.isWebLink(preview.url) { Platform.open(url) }
+            if let url = URL(string: preview.url), LinkPreviews.isWebLink(preview.url) { asking = url }
         } label: {
             VStack(alignment: .leading, spacing: 0) {
                 if let image = preview.image, let ns = DecodedImages.image(image, fit: 900) {
@@ -1408,7 +1423,8 @@ private struct PreviewCard: View {
                         Text(title).font(.system(size: 13, weight: .semibold)).lineLimit(2)
                             .foregroundStyle(mine ? Ink.onAccent.opacity(0.85) : Ink.text)
                     }
-                    Text(preview.site ?? URL(string: preview.url)?.host() ?? preview.url)
+                    // The real host, never the sender's own word for it.
+                    Text(LinkPreviews.openable(URL(string: preview.url))?.host() ?? URL(string: preview.url)?.host() ?? "link")
                         .font(.system(size: 11))
                         .foregroundStyle(mine ? Ink.onAccent.opacity(0.55) : Ink.faint)
                         .lineLimit(1)
@@ -1422,6 +1438,7 @@ private struct PreviewCard: View {
         }
         .buttonStyle(.plain)
         .help(preview.url)
+        .confirmsExternalLink($asking)
     }
 }
 
@@ -1736,10 +1753,10 @@ private struct ConversationInfo: View {
         if let c = model.conversation(id) {
             let person = c.kind == .direct ? model.contact(c.members.first ?? "", in: c.persona) : nil
             VStack(spacing: 0) {
-                // A person's profile opens straight onto their banner; anything else keeps its title bar.
-                if person == nil {
+                // Every sheet keeps its title bar, so a person's profile is plainly a profile.
+                Group {
                     HStack {
-                        Text(c.kind == .direct ? "Profile" : c.kind.label)
+                        Text(c.kind == .direct || person != nil ? "Profile" : c.kind.label)
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundStyle(Ink.text)
                         Spacer()
@@ -1776,21 +1793,6 @@ private struct ConversationInfo: View {
                     .scaleEffect(arrived ? 1 : 0.96, anchor: .top)
                 }
                 .scrollIndicators(.never)
-                .ignoresSafeArea(edges: person == nil ? [] : .top)
-            }
-            .overlay(alignment: .topTrailing) {
-                if person != nil {
-                    Button { dismiss() } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 13, weight: .bold)).foregroundStyle(.white)
-                            .frame(width: 32, height: 32)
-                            .background(.black.opacity(0.45), in: .circle)
-                    }
-                    .buttonStyle(.plain)
-                    .keyboardShortcut(.cancelAction)
-                    .padding(14)
-                    .accessibilityLabel("Close")
-                }
             }
             .frame(width: Platform.isPhone ? nil : 440, height: Platform.isPhone ? nil : 640)
             .background(Ink.base)
@@ -1813,7 +1815,7 @@ private struct ConversationInfo: View {
         if c.kind == .direct, let peer = model.contact(c.members.first ?? "", in: c.persona) {
             personProfile(peer, in: c)
         } else {
-            let editable = c.kind != .direct && c.amAdmin
+            let editable = c.kind != .direct && c.amAdmin && !c.isOldFormat
             VStack(spacing: 10) {
                 if editable {
                     AvatarPicker(image: Binding(get: { avatar }, set: { avatar = $0; commitDetails(c) }), seed: c.id.uuidString, size: 84)
@@ -1836,131 +1838,42 @@ private struct ConversationInfo: View {
         }
     }
 
-    /// A person's whole profile, as they made it. The banner runs edge to edge and fades into the page, their picture
+    /// A person's whole profile, as they made it: their picture, name, @handle and bio in a card, and what they've
     /// sits half over it inside a ring of their own colour, then the name, @handle, bio and the things they've
     /// pinned. Pulling down stretches the banner; everything eases in when the sheet opens.
     private func personProfile(_ peer: Contact, in c: Conversation) -> some View {
-        let tint = Signature.color(peer.color, seed: peer.fingerprint)
         let theirName = peer.name.isEmpty ? "Anonymous" : peer.name
-        let bannerHeight: CGFloat = 150
-        return VStack(spacing: 0) {
-            Banner(image: peer.banner, seed: peer.fingerprint, height: bannerHeight)
-                .overlay {
-                    // Their colour comes up from under the picture, and the banner melts into the page.
-                    ZStack {
-                        RadialGradient(colors: [tint.opacity(0.45), .clear], center: .bottom, startRadius: 0, endRadius: 220)
-                        LinearGradient(stops: [.init(color: .clear, location: 0.35), .init(color: Ink.base.opacity(0.7), location: 0.8),
-                                               .init(color: Ink.base, location: 1)], startPoint: .top, endPoint: .bottom)
-                    }
-                }
-                .visualEffect { content, proxy in
-                    let pull = max(0, proxy.frame(in: .scrollView).minY)
-                    return content.scaleEffect(1 + pull / bannerHeight, anchor: .bottom)
-                }
-                .accessibilityHidden(true)
-            VStack(spacing: 10) {
-                Avatar(image: c.avatar ?? peer.avatar, seed: peer.fingerprint, size: 96)
-                    .padding(5)
-                    .background(Ink.base, in: .circle)
-                    .overlay {
-                        Circle().strokeBorder(AngularGradient(colors: [tint, tint.opacity(0.35), tint], center: .center), lineWidth: 3)
-                    }
-                    .shadow(color: tint.opacity(0.45), radius: 20, y: 4)
-                    .scaleEffect(arrived ? 1 : 0.8)
-                VStack(spacing: 5) {
-                    HStack(spacing: 7) {
-                        Text(peer.nickname.isEmpty ? theirName : peer.nickname)
-                            .font(.system(size: 24, weight: .bold))
-                            .foregroundStyle(Ink.text)
-                            .lineLimit(2).multilineTextAlignment(.center).minimumScaleFactor(0.7)
-                        BadgeMark(badge: peer.badge, size: 24)
-                        if peer.verified {
-                            Image(systemName: "checkmark.seal.fill").font(.system(size: 16)).foregroundStyle(theme.accent)
-                                .help("You checked their safety code in person")
-                                .accessibilityLabel("Verified in person")
-                        }
-                    }
-                    if !peer.nickname.isEmpty {
-                        Text("Calls themselves \(theirName)").font(.system(size: 12)).foregroundStyle(Ink.faint)
-                    }
-                }
-                if let handle = peer.handle {
-                    HStack(spacing: 6) {
-                        Text("@\(handle)").font(.system(size: 13, weight: .bold)).foregroundStyle(tint)
-                            .textSelection(.enabled)
-                            .padding(.horizontal, 12).padding(.vertical, 5)
-                            .background(tint.opacity(0.14), in: .capsule)
-                            .overlay(Capsule().strokeBorder(tint.opacity(0.3)))
-                        if DirectoryProfile.isReserved(handle) {
-                            Label("Creator", systemImage: "checkmark.seal.fill")
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(Ink.onAccent.opacity(0.85))
-                                .padding(.horizontal, 7).padding(.vertical, 3)
-                                .background(theme.gradient, in: .capsule)
-                                .help("This handle can only belong to PULSHADE's creator")
-                        }
-                    }
-                }
-                if peer.badge.isModerator { ModeratorTag() }
-                if let bio = peer.bio, !bio.isEmpty {
-                    Text(LinkPreviews.linked(bio))
-                        .font(.system(size: 15))
-                        .foregroundStyle(Ink.dim)
-                        .tint(tint)
-                        .lineSpacing(2)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: 320)
-                        .textSelection(.enabled)
-                }
-                HStack(spacing: 12) {
-                    profileAction("Message", "bubble.left.fill", tint: tint) { dismiss() }
+        var info: [ProfileInfoRow] = []
+        if !peer.isSelf {
+            info.append(ProfileInfoRow(symbol: peer.verified ? "checkmark.seal.fill" : "checkmark.seal", label: "Safety number",
+                                       value: peer.verified ? "Verified in person" : "Not verified yet", action: { pulseCheck = true }))
+        }
+        info.append(ProfileInfoRow(symbol: "lock.fill", label: "Encryption", value: summary(c)))
+        let shared = model.data.conversations.filter { $0.kind == .group && $0.persona == c.persona && $0.members.contains(peer.fingerprint) }
+            .map { ProfileGroupRef(id: $0.id, title: $0.title, avatar: $0.avatar, count: $0.members.count + 1) }
+        return VStack(spacing: 14) {
+            ProfileHero(avatar: c.avatar ?? peer.avatar, seed: peer.fingerprint,
+                        name: peer.nickname.isEmpty ? theirName : peer.nickname,
+                        subtitle: peer.nickname.isEmpty ? nil : "Calls themselves \(theirName)",
+                        badge: peer.badge, handle: peer.handle, bio: peer.bio, verified: peer.verified) {
+                HStack(spacing: 8) {
+                    ProfileActionTile(title: "Message", symbol: "bubble.left.fill") { dismiss() }
                     if !peer.isSelf {
-                        profileAction("Call", "phone.fill", tint: tint) {
+                        ProfileActionTile(title: "Call", symbol: "phone.fill") {
                             dismiss()
                             model.startCall(with: peer.fingerprint, persona: c.persona)
                         }
                     }
-                    profileAction(c.muted ? "Unmute" : "Mute", c.muted ? "bell.fill" : "bell.slash.fill", tint: tint) {
+                    ProfileActionTile(title: c.muted ? "Unmute" : "Mute", symbol: c.muted ? "bell.fill" : "bell.slash.fill") {
                         model.toggleMute(c.id)
                     }
                 }
-                .padding(.top, 2)
-                HStack(spacing: 5) {
-                    Image(systemName: "lock.fill").font(.system(size: 9))
-                    Text(summary(c)).font(.system(size: 12))
-                }
-                .foregroundStyle(Ink.faint)
-                VStack(spacing: 10) {
-                    ContactCollectibles(items: peer.collectibles ?? [], tint: tint)
-                    ProfileLinkList(links: peer.links ?? [], tint: tint, walletChangedAt: peer.walletChangedAt, isMine: peer.isSelf)
-                    ProfileNoteList(notes: peer.notes ?? [], tint: tint)
-                }
-                .padding(.top, 2)
             }
-            .padding(.horizontal, 16)
-            .offset(y: -52)
-            .padding(.bottom, -52)
+            ProfileTabs(info: info, links: peer.links ?? [], collectibles: peer.collectibles ?? [], notes: peer.notes ?? [],
+                        groups: shared, messages: c.messages, walletChangedAt: peer.walletChangedAt, isMine: peer.isSelf)
         }
+        .padding(.horizontal, 16).padding(.top, 16)
         .frame(maxWidth: .infinity)
-    }
-
-    /// One of the round buttons under a profile: an icon in the person's colour, with its name beneath.
-    private func profileAction(_ title: String, _ symbol: String, tint: Color, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 6) {
-                Image(systemName: symbol)
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(tint)
-                    .frame(width: 52, height: 52)
-                    .background(tint.opacity(0.14), in: .circle)
-                    .overlay(Circle().strokeBorder(tint.opacity(0.28)))
-                Text(title).font(.system(size: 11, weight: .medium)).foregroundStyle(Ink.dim)
-            }
-            .frame(width: 72)
-            .contentShape(.rect)
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(title)
     }
 
     private func summary(_ c: Conversation) -> String {
@@ -2041,7 +1954,7 @@ private struct ConversationInfo: View {
 
     @ViewBuilder private func groupSections(_ c: Conversation) -> some View {
         Card(title: "About") {
-            if c.amAdmin {
+            if c.amAdmin && !c.isOldFormat {
                 TextField("", text: $about, prompt: Text("Describe this \(c.kind == .channel ? "channel" : "group")")
                     .foregroundStyle(Ink.faint), axis: .vertical)
                     .textFieldStyle(.plain)
@@ -2056,11 +1969,11 @@ private struct ConversationInfo: View {
         }
         .onDisappear { if c.amAdmin && (about != (c.about ?? "") || title != c.title) { commitDetails(c) } }
 
-        if c.kind == .channel && c.amAdmin { inviteSection(c) }
+        if c.kind == .channel && c.amAdmin && !c.isOldFormat { inviteSection(c) }
 
         Card(title: "Permissions") {
             Field(label: "Who can post") {
-                if c.amOwner {
+                if c.amOwner && !c.isOldFormat {
                     Picker("", selection: Binding(get: { c.postPolicy }, set: { model.setPostPolicy(c.id, $0) })) {
                         ForEach(c.kind == .channel ? [PostPolicy.admins, .owner] : PostPolicy.allCases) { Text($0.label).tag($0) }
                     }
@@ -2078,15 +1991,16 @@ private struct ConversationInfo: View {
             }
         }
 
-        if c.kind == .group { mailboxSection(c) }
+        if c.kind == .group || c.isOldFormat { mailboxSection(c) }
+
+        if model.isFollower(c), c.shared?.missedKey == true { missedKeySection(c) }
 
         if c.kind == .group, let shared = c.shared, !shared.gone, !shared.joining, c.amAdmin { GroupLinksSection(id: c.id) }
 
         membersSection(c)
     }
 
-    /// How the group's messages travel: one shared mailbox, or a copy to each member. The owner of an older group can
-    /// move it over once everyone's app can.
+    /// What the group says about itself when it can't be used: joining, left, or saved in an older format.
     @ViewBuilder
     private func mailboxSection(_ c: Conversation) -> some View {
         if let shared = c.shared {
@@ -2097,13 +2011,35 @@ private struct ConversationInfo: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
-        } else if c.amOwner, !model.holdingBackNewFormat(c).isEmpty {
-            // Older-style groups move to the new format by themselves once everyone's app can take part.
-            let names = model.holdingBackNewFormat(c).map { model.displayName($0) }
+        } else if c.isOldFormat {
             Card(title: "Group") {
-                Text("Moves to the new format when \(AppModel.list(names)) \(names.count == 1 ? "updates" : "update") Pulshade.")
+                Text("This group is on an old format and can't be used any more. Its past messages stay here. Ask the owner to start it again.")
                     .font(.system(size: 12)).foregroundStyle(Ink.dim)
                     .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    /// A follower who was away while the channel changed its key can't read new posts until the staff member who added them
+    /// sends it again.
+    private func missedKeySection(_ c: Conversation) -> some View {
+        let asked = c.shared?.keyAskedAt
+        let reachable = model.canTellInviter(c)
+        return Card(title: "Key", footer: !reachable ? "The person who added you can't be reached from here (they may have left the staff, or the chat is gone). Ask the channel's staff to add you again."
+                    : asked == nil ? nil
+                    : "If nothing comes, the owner's app may need to update, they may be offline, or you may no longer be a follower.") {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(asked.map { "You asked \($0.formatted(.relative(presentation: .named)))." }
+                     ?? "You were away while this channel changed its key, so you can't read new posts.")
+                    .font(.system(size: 12)).foregroundStyle(Ink.dim)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Button { model.askForKeyAgain(c.id) } label: {
+                    Label(asked == nil ? "Ask for the key again" : "Ask again", systemImage: "key")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(theme.accent)
+                .disabled(!model.canAskForKey(c))
             }
         }
     }
@@ -2134,7 +2070,7 @@ private struct ConversationInfo: View {
         let people = c.members
         let title = c.kind == .channel ? (c.amAdmin ? "Followers & admins" : "Admins") : "Members"
         return Card(title: "\(title) · \(people.count + (c.kind == .group ? 1 : 0))") {
-            if c.kind != .broadcast, c.amAdmin {
+            if c.kind != .broadcast, !c.isOldFormat, c.amAdmin {
                 Button { adding = true } label: {
                     HStack(spacing: 10) {
                         Image(systemName: "plus").font(.system(size: 12, weight: .semibold))
@@ -2155,18 +2091,6 @@ private struct ConversationInfo: View {
             }
             ForEach(people, id: \.self) { fp in
                 personRow(name: model.displayName(fp), fp: fp, c: c, avatar: model.contact(fp, in: c.persona)?.avatar, seed: fp)
-            }
-            // Added, but their app is too old to take part yet: invited as soon as it can.
-            ForEach(model.contactsAwaitingUpdate(in: c), id: \.self) { fp in
-                HStack(spacing: 10) {
-                    Avatar(image: model.contact(fp, in: c.persona)?.avatar, seed: fp, size: 28)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(model.displayName(fp)).font(.system(size: 13)).foregroundStyle(Ink.text).lineLimit(1)
-                        Text("Added · joins once they update Pulshade").font(.system(size: 10)).foregroundStyle(Ink.faint)
-                    }
-                    Spacer()
-                }
-                .padding(.vertical, 3)
             }
             // Added, but their app hasn't answered yet: in the group already as far as you're concerned.
             ForEach(model.contactsInvited(to: c), id: \.self) { fp in
@@ -2190,10 +2114,6 @@ private struct ConversationInfo: View {
             Avatar(image: avatar, seed: seed, size: 28)
             VStack(alignment: .leading, spacing: 1) {
                 Text(name).font(.system(size: 13)).foregroundStyle(Ink.text).lineLimit(1)
-                // In an older-style group, how this device stands with them: worth seeing when someone's messages don't arrive.
-                if let status = model.keyStatus(of: fp, in: c) {
-                    Text(status).font(.system(size: 10)).foregroundStyle(Ink.faint).lineLimit(2)
-                }
             }
             Spacer()
             if let role = model.role(of: fp, in: c) {
@@ -2207,7 +2127,7 @@ private struct ConversationInfo: View {
             .contentShape(.rect)
             }
             .buttonStyle(.plain)
-            if fp != "me", c.kind != .broadcast, c.amAdmin || (c.amMod && c.canRemove(fp, by: "me")), fp != c.owner {
+            if fp != "me", c.kind != .broadcast, !c.isOldFormat, c.amAdmin || (c.amMod && c.canRemove(fp, by: "me")), fp != c.owner {
                 Menu {
                     if c.amOwner {
                         if c.admins.contains(fp) {
@@ -2321,7 +2241,7 @@ private struct ConversationInfo: View {
             Divider().overlay(Ink.line)
             Button { confirmDelete = true } label: {
                 HStack {
-                    Text(c.kind == .direct || c.amOwner || c.kind == .broadcast ? "Delete chat" : "Leave")
+                    Text(c.kind == .direct || c.amOwner || c.kind == .broadcast ? "Delete chat" : c.kind == .channel && !c.isAnnouncements ? "Leave channel" : "Leave")
                         .foregroundStyle(Color.red.opacity(0.9))
                     Spacer()
                 }
@@ -2335,7 +2255,9 @@ private struct ConversationInfo: View {
                     model.delete(id)
                 }
             } message: {
-                Text(c.deleteWarning.detail)
+                Text(c.deleteWarning.detail + (model.isFollower(c) && !model.canTellInviter(c)
+                     ? " The person who added you can't be reached from here, so the staff won't be told: you leave on this device only, and may keep being sent the channel's keys until they take you out."
+                     : ""))
             }
         }
     }

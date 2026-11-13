@@ -18,6 +18,7 @@ import Foundation
         var contact = Contact(fingerprint: them.fingerprint, name: "Them", signingKey: them.card.signing,
                               agreementKey: them.card.agreement, sendID: Mailbox.make().sendID, device: Data([1]))
         contact.devices.append(DeviceLink(id: Data([2]), sendID: Mailbox.make().sendID))
+        contact.pq = them.pq.pin
         let chat = Conversation(kind: .direct, title: "Them", members: [them.fingerprint])
         model.data.contacts = [contact]
         model.data.conversations = [chat]
@@ -52,10 +53,10 @@ import Foundation
         defer { model.lock() }
         let (contact, _) = seed(model)
         // Typing in two chats with the same person gets past the per-chat throttle.
-        let group = Conversation(kind: .group, title: "Group", members: [contact.fingerprint])
-        model.data.conversations.append(group)
+        let other = Conversation(kind: .direct, title: "Other chat", members: [contact.fingerprint])
+        model.data.conversations.append(other)
         model.noteTyping(in: model.data.conversations[0].id)
-        model.noteTyping(in: group.id)
+        model.noteTyping(in: other.id)
         let signals = model.data.contacts[0].devices[0].pending.filter { $0.payload.isEphemeral }
         #expect(signals.count == 1)
     }

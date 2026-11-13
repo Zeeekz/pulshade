@@ -71,8 +71,8 @@ No. Messages, files and backups are sealed on phones before they arrive. The ser
 too, with a key that is never written to its disk, so a copy of the disk holds nothing that can be opened.
 
 **Does it protect against quantum computers?**
-Chats start with a handshake that mixes X25519 and ML-KEM-768, and new post-quantum keys are mixed in as you chat
-(every 50 messages or a day).
+Chats start with a handshake that mixes X25519 and ML-KEM-768, and new post-quantum secrets are mixed in as you chat
+(about every 35 to 40 messages of a back-and-forth conversation).
 
 **Can someone prove I said something?**
 No. Nothing you say is signed, so a message can't be shown to a third party as coming from you.
@@ -92,7 +92,7 @@ Never. You add friends by scanning a code or sharing a link, so there is nothing
 ## Friends and chats
 
 **How do I add a friend?**
-Scan their QR code or open their link. A one-time chat can also be started with a 12-digit code you read out loud.
+Scan their QR code or open their link. A one-time chat can also be started with a 20-digit code you read out loud.
 
 **How do I know I'm talking to the right person?**
 Use Pulse check. Both of you see the same ten emoji, 30 digits, colours and QR code, derived from both your keys.
@@ -215,9 +215,9 @@ Settings → Anonymity Report shows the address the server sees for you.
 ## Notifications
 
 **Why don't I get messages when the app is closed?**
-On iPhone, messages arrive while the app is open. Turn on **Wake when locked** in Settings → Notifications to let the
-server wake your phone through Apple. Apple then learns your phone was woken, and when, though never what was said.
-Leave it off if you need the strongest anonymity.
+On iPhone, **Wake when locked** (Settings → Notifications) is on by default and lets the server wake your phone through
+Apple; with it off, messages arrive only while the app is open. Apple then learns your phone was woken, and when, though never what was said.
+Turn it off if you need the strongest anonymity.
 
 **What do notifications show?**
 Only "New message" unless you choose otherwise, because the system stores notification text outside Pulshade's

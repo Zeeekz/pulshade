@@ -59,6 +59,26 @@ struct Vault {
 
     var exists: Bool { FileManager.default.fileExists(atPath: lockURL.path) }
 
+    private var installMarkerURL: URL { directory.appendingPathComponent("install.marker") }
+
+    /// True once, on the first run of an install that has no vault at all: the app was deleted without a Burn (or
+    /// Burned), and Keychain items, which iOS keeps when an app is deleted, may be left from it. The marker lives in
+    /// the app's own folder, which deletion takes with it and the Keychain doesn't, so it is missing exactly then.
+    /// An install that has anything in its folder besides the marker (any vault, old or new) never counts, so an
+    /// update can't clear a live account's keys: it only gets the marker.
+    func claimFreshInstall() -> Bool {
+        let files = FileManager.default
+        guard !files.fileExists(atPath: installMarkerURL.path) else { return false }
+        let others = ((try? files.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.lastPathComponent != installMarkerURL.lastPathComponent }
+        let empty = others.isEmpty && !exists
+        guard files.createFile(atPath: installMarkerURL.path, contents: Data(), attributes: [.posixPermissions: 0o600]) else {
+            // Couldn't leave the marker: clearing again on every launch could do harm later, so not this time.
+            return false
+        }
+        return empty
+    }
+
     /// What a passcode opened.
     enum Opened {
         case identity(Identity, slot: Int)

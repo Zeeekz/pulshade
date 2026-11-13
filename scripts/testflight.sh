@@ -13,6 +13,13 @@ build=${1:?Give the build number, higher than the last upload: ./scripts/testfli
 relay="http://$(cat relay/pulshade-onion/hostname 2>/dev/null)"
 [[ "$relay" != "http://" ]] || { echo "No relay/pulshade-onion/hostname: the build would have no relay to reach."; exit 1; }
 
+# A release must carry the relay's certificate pin and direct address: an empty one would ship a build that can't
+# check, or can't reach, the relay.
+pin="${PULSHADE_RELAY_PIN:-$(cat relay/relay-pin 2>/dev/null)}"
+direct="${PULSHADE_RELAY_DIRECT:-$(cat relay/direct-address 2>/dev/null)}"
+[[ -n "$pin" ]] || { echo "No relay pin (relay/relay-pin or PULSHADE_RELAY_PIN): refusing to upload a release without it."; exit 1; }
+[[ -n "$direct" ]] || { echo "No direct address (relay/direct-address or PULSHADE_RELAY_DIRECT): refusing to upload a release without it."; exit 1; }
+
 out=build/testflight
 rm -rf "$out"; mkdir -p "$out"
 
@@ -23,8 +30,8 @@ xcodegen generate >/dev/null
 xcodebuild -project Pulshade.xcodeproj -scheme PulshadeiOS -configuration Release \
   -destination "generic/platform=iOS" -archivePath "$out/Pulshade.xcarchive" -derivedDataPath ios/build \
   -allowProvisioningUpdates CURRENT_PROJECT_VERSION="$build" \
-  PULSHADE_RELAY="$relay" PULSHADE_RELAY_DIRECT="${PULSHADE_RELAY_DIRECT:-$(cat relay/direct-address 2>/dev/null)}" \
-  PULSHADE_RELAY_PIN="${PULSHADE_RELAY_PIN:-$(cat relay/relay-pin 2>/dev/null)}" \
+  PULSHADE_RELAY="$relay" PULSHADE_RELAY_DIRECT="$direct" \
+  PULSHADE_RELAY_PIN="$pin" \
   PULSHADE_ADMIN_KEY="$(cat relay/admin-key.pub 2>/dev/null)" PULSHADE_PET_KEY="$(cat relay/pet-key.pub 2>/dev/null)" \
   archive | grep -E "error:|ARCHIVE (SUCCEEDED|FAILED)"
 

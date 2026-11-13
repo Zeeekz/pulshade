@@ -9,7 +9,6 @@ import Foundation
 struct GroupDeliveryTests {
     private func makeUser(_ name: String) async throws -> AppModel {
         let model = testModel("pulshade-delivery")
-        model.sharedGroupsEnabled = true
         try await model.create(identity: .generate(), profile: Profile(name: name), passcode: "test-passcode")
         return model
     }

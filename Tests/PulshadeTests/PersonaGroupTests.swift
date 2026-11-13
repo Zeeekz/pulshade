@@ -9,9 +9,8 @@ import ImageIO
 @MainActor
 @Suite(.enabled(if: ProcessInfo.processInfo.environment["PULSHADE_RELAY_TEST"] == "1"), .serialized)
 struct PersonaGroupTests {
-    private func makeUser(_ name: String, shared: Bool) async throws -> AppModel {
+    private func makeUser(_ name: String) async throws -> AppModel {
         let model = testModel("pulshade-persona-group")
-        model.sharedGroupsEnabled = shared
         try await model.create(identity: .generate(), profile: Profile(name: name), passcode: "test-passcode")
         return model
     }
@@ -24,10 +23,9 @@ struct PersonaGroupTests {
         }
     }
 
-    @Test(arguments: [false, true])
-    func aMainAccountAndItsPersonaInOneGroupReadEachOther(_ shared: Bool) async throws {
-        let phone = try await makeUser("Phone", shared: shared)
-        let laptop = try await makeUser("Laptop", shared: shared)
+    @Test func aMainAccountAndItsPersonaInOneGroupReadEachOther() async throws {
+        let phone = try await makeUser("Phone")
+        let laptop = try await makeUser("Laptop")
         defer { for m in [phone, laptop] { m.lock() } }
         let persona = try #require(laptop.createPersona(name: "Mask"))
         let main = try #require(phone.addContact(code: laptop.makeInviteCode(persona: .some(nil)), nickname: ""))
@@ -43,7 +41,7 @@ struct PersonaGroupTests {
         await until([phone, laptop]) { phone.data.conversations.filter { $0.kind == .direct }.allSatisfy { $0.messages.count == 2 } }
 
         let group = phone.startConversation(kind: .group, title: "Both", members: [main.fingerprint, masked.fingerprint])
-        #expect((group.shared != nil) == shared)
+        #expect(group.shared != nil)
         await until([phone, laptop]) { laptop.data.conversations.filter { $0.kind == .group }.count == 2 }
         let copies = laptop.data.conversations.filter { $0.kind == .group }
         #expect(copies.count == 2, "one copy for the main account, one for the persona: \(copies.map(\.persona))")
@@ -51,10 +49,8 @@ struct PersonaGroupTests {
         let mainCopy = try #require(copies.first { $0.persona == nil })
         let maskCopy = try #require(copies.first { $0.persona == persona.id })
         #expect(mainCopy.id != maskCopy.id && mainCopy.wireID == group.id && maskCopy.wireID == group.id)
-        if shared {
-            await until([phone, laptop]) {
-                laptop.conversation(mainCopy.id)?.shared?.joining == false && laptop.conversation(maskCopy.id)?.shared?.joining == false
-            }
+        await until([phone, laptop]) {
+            laptop.conversation(mainCopy.id)?.shared?.joining == false && laptop.conversation(maskCopy.id)?.shared?.joining == false
         }
 
         laptop.send("from main", in: mainCopy.id)

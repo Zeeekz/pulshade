@@ -16,6 +16,8 @@ if [[ "$config" != "debug" ]]; then
     *) echo "No usable relay: relay/pulshade-onion/hostname is missing. A release build would have no relay." >&2; exit 1 ;;
   esac
 fi
+[[ -n "${PULSHADE_RELAY_PIN:-$(cat relay/relay-pin 2>/dev/null)}" ]] \
+  || echo "Warning: no relay pin (relay/relay-pin or PULSHADE_RELAY_PIN): this build won't pin the relay's certificate." >&2
 
 [[ -n ${PULSHADE_SKIP_TOR_BUILD:-} ]] || # PULSHADE_SKIP_TOR_BUILD=1 uses Tor as last built, when tor/ hasn't changed since.
 [[ -n ${PULSHADE_SKIP_TOR_BUILD:-} ]] || ./scripts/build-tor.sh

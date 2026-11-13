@@ -116,7 +116,7 @@ final class Updater {
             return
         }
         do {
-            let zip = try await client.releaseArchive()
+            let zip = try await client.releaseArchive(maxBytes: release.size)
             guard zip.count == release.size, Data(SHA256.hash(data: zip)).hex == release.sha256 else {
                 phase = .failed("The download didn't match the update, so it wasn't installed. Try again in a moment.")
                 return

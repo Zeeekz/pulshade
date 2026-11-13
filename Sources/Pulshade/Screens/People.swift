@@ -130,6 +130,10 @@ struct PeopleView: View {
                 .modifier(Shake(trigger: shake))
                 .animation(.snappy, value: parsed?.fingerprint)
 
+                if parsed == nil, Invite.isOutdated(theirCode) {
+                    Text(Invite.outdatedNotice).font(.system(size: 12)).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if parsed != nil {
                     if parsed?.kind != .channel {
                         TextField("", text: $nickname, prompt: Text("Nickname (optional)").foregroundStyle(Ink.faint))

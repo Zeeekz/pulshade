@@ -19,7 +19,7 @@ struct ScanSheet: View {
         SheetBody(width: 420) {
             VStack(spacing: 16) {
                 SheetHeader(symbol: "qrcode.viewfinder", title: "Scan a code")
-                if model.pendingLink != nil {
+                if model.pendingLink != nil || model.linkConfirmation != nil {
                     LinkApproval()
                 } else if let pending {
                     confirmation(pending.preview)
@@ -57,6 +57,7 @@ struct ScanSheet: View {
                 }
             }
             .animation(.snappy, value: model.pendingLink?.request.deviceID)
+            .onDisappear { model.linkConfirmation = nil }
             .animation(.snappy, value: added?.fingerprint)
             .animation(.snappy, value: pending?.text)
         }
@@ -97,7 +98,7 @@ struct ScanSheet: View {
             return
         }
         guard let preview = model.inspectCode(text) else {
-            problem = "That isn't a PULSHADE code."
+            problem = Invite.isOutdated(text) ? Invite.outdatedNotice : "That isn't a PULSHADE code."
             return
         }
         if preview.kind == .device {
@@ -121,6 +122,7 @@ struct ScanSheet: View {
             dismiss()
         case .expired: problem = "This chat link has run out, or has already been used."
         case .unknown: problem = "That isn't a PULSHADE code."
+        case .outdated: problem = Invite.outdatedNotice
         case .refused: problem = "Codes for linking a device only work from the camera, pointed at your own new device."
         }
     }
@@ -130,7 +132,7 @@ struct ScanSheet: View {
         let (symbol, title, detail): (String, String, String) = switch preview.kind {
         case .contact: ("person.crop.circle.badge.plus", "Add this person?",
                         "They'll see your name and picture as \(persona).")
-        case .channel: ("megaphone", "Follow this channel?", "Its owner will see your name and picture as \(persona).")
+        case .channel: ("megaphone", "Follow this channel?", "Its staff will see your name and picture as \(persona).")
         case let .chat(endsAt): ("timer", "Join this one-time chat?",
                                  "You'll join as a throwaway identity, wiped \(endsAt.formatted(.relative(presentation: .named))).")
         case .device: ("iphone.gen3", "", "")
@@ -169,7 +171,26 @@ struct LinkApproval: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        if let pending = model.pendingLink {
+        if let digits = model.linkConfirmation, model.pendingLink == nil {
+            VStack(spacing: 14) {
+                Image(systemName: "checkmark.shield")
+                    .font(.system(size: 40, weight: .light)).foregroundStyle(theme.accent)
+                Text("Check the new device")
+                    .font(.system(size: 16, weight: .semibold)).foregroundStyle(Ink.text)
+                Text(digits)
+                    .font(.system(size: 24, weight: .semibold, design: .monospaced)).foregroundStyle(Ink.text)
+                Text("The new device now shows digits. If they are not exactly these, tap Cancel on the new device: someone else answered first. If it shows none, update PULSHADE on it.")
+                    .font(.system(size: 12, weight: .medium)).foregroundStyle(.orange).multilineTextAlignment(.center)
+                Button {
+                    model.linkConfirmation = nil
+                    dismiss()
+                } label: {
+                    Text("Done").font(.system(size: 13, weight: .semibold)).padding(.horizontal, 16)
+                }
+                .buttonStyle(GlowButtonStyle(size: 34))
+            }
+            .transition(.opacity)
+        } else if let pending = model.pendingLink {
             VStack(spacing: 14) {
                 Image(systemName: Platform.isPhone ? "laptopcomputer.and.iphone" : "iphone.gen3")
                     .font(.system(size: 40, weight: .light)).foregroundStyle(theme.accent)
@@ -187,12 +208,12 @@ struct LinkApproval: View {
                 HStack(spacing: 10) {
                     Button("Cancel") {
                         model.cancelLink()
+                        model.linkConfirmation = nil
                         dismiss()
                     }
                     .buttonStyle(.plain).foregroundStyle(Ink.dim)
                     Button {
                         model.approveLink()
-                        dismiss()
                     } label: {
                         Text("Link").font(.system(size: 13, weight: .semibold)).padding(.horizontal, 16)
                     }

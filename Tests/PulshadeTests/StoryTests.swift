@@ -29,8 +29,28 @@ struct StoryTests {
     @Test func aStoryFromAnOlderAppStillDecodes() throws {
         let payload = Payload.story(id: UUID(), style: .text("hi", palette: 0), date: Date())
         let decoded = try JSONDecoder.pulshade.decode(Payload.self, from: JSONEncoder.pulshade.encode(payload))
-        guard case let .story(_, _, _, lasts) = decoded else { Issue.record("not a story"); return }
+        guard case let .story(_, _, _, lasts, loops) = decoded else { Issue.record("not a story"); return }
         #expect(lasts == nil)
+        #expect(loops == nil, "no loop unless the author asked for one")
+    }
+
+    /// A video story set to loop says so on the wire, and the story an older app saved (with no such field) is not one.
+    @Test func aLoopingStoryKeepsItsLoopOnTheWireAndInSavedData() throws {
+        let payload = Payload.story(id: UUID(), style: .video(Data([1, 2, 3]), caption: ""), date: Date(), lasts: 3600, loops: true)
+        let decoded = try JSONDecoder.pulshade.decode(Payload.self, from: JSONEncoder.pulshade.encode(payload))
+        guard case let .story(_, _, _, _, loops) = decoded else { Issue.record("not a story"); return }
+        #expect(loops == true)
+
+        var story = Story(author: "me", style: .video(Data([1]), caption: ""))
+        #expect(story.loops == nil)
+        story.loops = true
+        let saved = try JSONDecoder.pulshade.decode(Story.self, from: JSONEncoder.pulshade.encode(story))
+        #expect(saved.loops == true)
+        // Saved data from before the option has no `loops` key at all.
+        var plain = try #require(JSONSerialization.jsonObject(with: JSONEncoder.pulshade.encode(Story(author: "me", style: .text("hi", palette: 0)))) as? [String: Any])
+        plain["loops"] = nil
+        let old = try JSONDecoder.pulshade.decode(Story.self, from: JSONSerialization.data(withJSONObject: plain))
+        #expect(old.loops == nil)
     }
 }
 
@@ -272,7 +292,7 @@ struct StoryMediaTests {
         let id = UUID()
         let payload = Payload.story(id: id, style: .video(clip, caption: "hey"), date: Date(timeIntervalSince1970: 100), lasts: 3600)
         let decoded = try JSONDecoder.pulshade.decode(Payload.self, from: JSONEncoder.pulshade.encode(payload))
-        guard case let .story(gotID, style, _, lasts) = decoded else { Issue.record("not a story"); return }
+        guard case let .story(gotID, style, _, lasts, _) = decoded else { Issue.record("not a story"); return }
         #expect(gotID == id && style == .video(clip, caption: "hey") && lasts == 3600)
     }
 

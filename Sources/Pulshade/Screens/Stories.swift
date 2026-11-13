@@ -297,6 +297,8 @@ struct StoryComposer: View {
     @State private var failure: String?
     @State private var audience: StoryAudience = .everyone
     @State private var lifetime = StoryLifetime.day.rawValue
+    /// A video story plays again from the start when it ends, until the viewer moves on.
+    @State private var loops = false
     @State private var choosingAudience = false
     /// Text placed on the picture, clip or colours, and the piece being worked on.
     @State private var overlays: [StoryTextOverlay] = []
@@ -341,7 +343,11 @@ struct StoryComposer: View {
         }
         _audience = State(initialValue: story.shownTo)
         _lifetime = State(initialValue: story.lifetime ?? StoryLifetime.day.rawValue)
+        _loops = State(initialValue: story.loops == true)
     }
+
+    /// Whether this is a video, new or being edited: the only kind a loop applies to.
+    private var isVideoStory: Bool { clip != nil || isVideoEdit }
 
     /// Whether the picture or clip can still change its look (a posted story keeps the one it was posted with).
     private var canFilter: Bool { editing == nil && (image != nil || clip != nil) }
@@ -449,6 +455,10 @@ struct StoryComposer: View {
                         .pickerStyle(.menu)
                         .labelsHidden()
                         .fixedSize()
+                    }
+                    if isVideoStory {
+                        RowDivider(inset: 52)
+                        SettingRow("Loop", symbol: "repeat") { Toggle("", isOn: $loops).labelsHidden() }
                     }
                 }
 
@@ -683,6 +693,10 @@ struct StoryComposer: View {
                         }
                         .pickerStyle(.menu).labelsHidden().fixedSize()
                     }
+                    if isVideoStory {
+                        RowDivider(inset: 52)
+                        SettingRow("Loop", symbol: "repeat") { Toggle("", isOn: $loops).labelsHidden() }
+                    }
                 }
             }
         }
@@ -715,7 +729,7 @@ struct StoryComposer: View {
             .accessibilityLabel("Video preview")
         } else if clip != nil {
             Color.black.overlay { ProgressView().tint(.white) }
-        } else if let shown = looked ?? image, let img = PlatformImage(data: shown) {
+        } else if let shown = looked ?? image, let img = PlatformImage.checked(shown) {
             ZStack {
                 Color.black
                 Image(platformImage: img).resizable().scaledToFill()
@@ -861,7 +875,7 @@ struct StoryComposer: View {
 
     private func post() {
         if let editing {
-            model.editStory(editing.id, style: preview.style, audience: audience, lifetime: lifetime)
+            model.editStory(editing.id, style: preview.style, audience: audience, lifetime: lifetime, loops: loops)
             finish()
         } else if let clip {
             exporting = true
@@ -882,7 +896,7 @@ struct StoryComposer: View {
                         partMaking = part + 1
                         let data = try await StoryVideo.export(from: clip, filter: look, zoom: track, maxBytes: budget,
                                                                maxSeconds: piece.seconds, text: words, from: piece.start, framing: placed)
-                        model.postStory(.video(data, caption: ""), audience: audience, lifetime: lifetime)
+                        model.postStory(.video(data, caption: ""), audience: audience, lifetime: lifetime, loops: loops)
                         posted += 1
                     }
                     exporting = false
@@ -1714,7 +1728,9 @@ struct StoryViewer: View {
             guard !paused else { return }
             if let clip {
                 clock.progress = clip.progress
-                if clip.finished { step(1) }
+                // A story set to loop plays again from the start, and so does one of yours that is still going out (so
+                // the picture behind "Uploading" keeps moving); a tap moves on.
+                if clip.finished { if loopsNow { clip.restart() } else { step(1) } }
                 return
             }
             clock.progress += 1 / (duration * 30)
@@ -1743,6 +1759,14 @@ struct StoryViewer: View {
 
     private func markSeenIfReady() {
         if current.indices.contains(index), current[index].isReady { model.markSeen(current[index].id, persona: current[index].persona) }
+    }
+
+    /// Whether the video on screen plays again when it ends: the author asked for a loop, or it is one of yours that is
+    /// still being sent.
+    private var loopsNow: Bool {
+        guard current.indices.contains(index) else { return false }
+        let story = current[index]
+        return story.loops == true || (story.author == "me" && model.isUploading(story.id))
     }
 
     /// Plays the video of the story now on screen, and lets go of the last one.

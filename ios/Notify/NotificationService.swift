@@ -89,7 +89,7 @@ private enum Helper {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             let body: [String: Any] = ["keys": chunk.map(hex), "wait": 0]
             guard let json = try? JSONSerialization.data(withJSONObject: body),
-                  let (data, response) = try? await session.upload(for: request, from: json),
+                  let (data, response) = await send(request, json, in: session, limit: 6 * 1024 * 1024),
                   (response as? HTTPURLResponse)?.statusCode == 200,
                   let answer = try? JSONDecoder().decode(Answer.self, from: data) else { continue }
             for item in answer.items where chunk.indices.contains(item.k) {
@@ -109,7 +109,7 @@ private enum Helper {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         guard let json = try? JSONSerialization.data(withJSONObject: ["acks": acks]) else { return }
-        _ = try? await session.upload(for: request, from: json)
+        _ = await send(request, json, in: session, limit: 64 * 1024)
     }
 
     /// Hands a note to the relay without waking anyone: it's only a tick.
@@ -118,8 +118,15 @@ private enum Helper {
         request.httpMethod = "PUT"
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         request.setValue("0", forHTTPHeaderField: "X-Pulshade-Wake")
-        guard let (_, response) = try? await session.upload(for: request, from: blob) else { return false }
+        guard let (_, response) = await send(request, blob, in: session, limit: 64 * 1024) else { return false }
         return (response as? HTTPURLResponse)?.statusCode == 202
+    }
+
+    /// The request and its answer, read only up to `limit` bytes: the helper has very little memory, and a relay
+    /// that sends more is dropped mid-answer instead of being buffered.
+    private static func send(_ request: URLRequest, _ body: Data, in session: URLSession, limit: Int) async -> (Data, URLResponse)? {
+        guard let pinning = session.delegate as? Pinning else { return nil }
+        return try? await pinning.collect(request, body: body, in: session, limit: limit)
     }
 
     private static func hex(_ data: Data) -> String { data.map { String(format: "%02x", $0) }.joined() }
@@ -127,9 +134,71 @@ private enum Helper {
 
 /// The same certificate pin the app uses (`RelayPinning`): when the build names the relay certificate's hashes,
 /// only those are accepted. Without one, ordinary certificate checks apply, as in the app.
-private final class Pinning: NSObject, URLSessionDelegate {
+private final class Pinning: NSObject, URLSessionDataDelegate {
     private let hashes: Set<Data>?
     private let host: String?
+
+    private final class Collected {
+        let limit: Int
+        var data = Data()
+        var response: URLResponse?
+        var tooBig = false
+        let finish: (Result<(Data, URLResponse), Error>) -> Void
+        init(limit: Int, finish: @escaping (Result<(Data, URLResponse), Error>) -> Void) {
+            self.limit = limit
+            self.finish = finish
+        }
+    }
+
+    private let collecting = NSLock()
+    private var open: [ObjectIdentifier: Collected] = [:]
+
+    /// Sends the request and returns its answer, failing (and cancelling the transfer) as soon as the announced
+    /// length, or what has really arrived, passes `limit`.
+    func collect(_ request: URLRequest, body: Data, in session: URLSession, limit: Int) async throws -> (Data, URLResponse) {
+        let task = session.uploadTask(with: request, from: body)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Data, URLResponse), Error>) in
+                let entry = Collected(limit: limit) { continuation.resume(with: $0) }
+                collecting.withLock { open[ObjectIdentifier(task)] = entry }
+                task.resume()
+            }
+        } onCancel: { task.cancel() }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        let refuse = collecting.withLock { () -> Bool in
+            guard let entry = open[ObjectIdentifier(dataTask)] else { return false }
+            entry.response = response
+            if response.expectedContentLength > Int64(entry.limit) { entry.tooBig = true }
+            return entry.tooBig
+        }
+        completionHandler(refuse ? .cancel : .allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        let exceeded = collecting.withLock { () -> Bool in
+            guard let entry = open[ObjectIdentifier(dataTask)] else { return false }
+            entry.data.append(data)
+            if entry.data.count > entry.limit { entry.tooBig = true; entry.data = Data() }
+            return entry.tooBig
+        }
+        if exceeded { dataTask.cancel() }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let entry = collecting.withLock({ open.removeValue(forKey: ObjectIdentifier(task)) }) else { return }
+        if entry.tooBig {
+            entry.finish(.failure(URLError(.dataLengthExceedsMaximum)))
+        } else if let error {
+            entry.finish(.failure(error))
+        } else if let response = entry.response ?? task.response {
+            entry.finish(.success((entry.data, response)))
+        } else {
+            entry.finish(.failure(URLError(.badServerResponse)))
+        }
+    }
 
     init(host: String?) {
         self.host = host?.lowercased()

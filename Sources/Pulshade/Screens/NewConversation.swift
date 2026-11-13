@@ -12,6 +12,7 @@ struct NewConversationSheet: View {
     @State private var avatar: Data?
     @State private var picked: Set<String> = []
     @State private var seed = UUID().uuidString
+    @State private var problem: String?
 
     var body: some View {
         SheetBody(width: 480) {
@@ -51,7 +52,7 @@ struct NewConversationSheet: View {
                     .multilineTextAlignment(.center)
             }
             if kind != .channel {
-                ContactPicker(single: kind == .direct, picked: $picked)
+                ContactPicker(single: kind == .direct, kind: kind, picked: $picked)
             } else {
                 VStack(spacing: 8) {
                     Image(systemName: "person.wave.2.fill")
@@ -61,8 +62,9 @@ struct NewConversationSheet: View {
                         .font(.system(size: 12)).foregroundStyle(Ink.faint)
                 }
             }
+            if let problem { ProblemText(problem) }
             HStack(spacing: 12) {
-                Button { self.kind = nil; picked = [] } label: { Image(systemName: "chevron.left") }
+                Button { self.kind = nil; picked = []; problem = nil } label: { Image(systemName: "chevron.left") }
                     .buttonStyle(IconButtonStyle(size: 46))
                     .accessibilityLabel("Back")
                 Button { create(kind) } label: { Image(systemName: "checkmark") }
@@ -76,7 +78,9 @@ struct NewConversationSheet: View {
     private func valid(_ kind: ConversationKind) -> Bool {
         switch kind {
         case .direct: picked.count == 1
-        case .group, .broadcast:
+        case .group:
+            !picked.isEmpty && picked.count < GroupSettings.maxMembers && !title.trimmingCharacters(in: .whitespaces).isEmpty
+        case .broadcast:
             !picked.isEmpty && picked.count <= Conversation.maxMembers && !title.trimmingCharacters(in: .whitespaces).isEmpty
         case .channel: !title.trimmingCharacters(in: .whitespaces).isEmpty
         }
@@ -84,6 +88,12 @@ struct NewConversationSheet: View {
 
     private func create(_ kind: ConversationKind) {
         guard valid(kind) else { return }
+        // Nobody whose app is too old goes into a group: it would have to be in an old format that is gone.
+        let tooOld = model.membersNeedingUpdate(Array(picked), persona: model.activePersona, kind: kind)
+        if kind == .group, !tooOld.isEmpty {
+            problem = model.needsUpdateMessage(tooOld)
+            return
+        }
         let convo = model.startConversation(kind: kind, title: title.trimmingCharacters(in: .whitespaces),
                                             members: Array(picked).sorted(), avatar: avatar)
         opened(convo.id)
@@ -124,6 +134,8 @@ struct ContactPicker: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     var single: Bool
+    /// The kind of chat being made, so people whose app can't take part in it are shown as such and can't be picked.
+    var kind: ConversationKind?
     @Binding var picked: Set<String>
 
     var body: some View {
@@ -142,6 +154,7 @@ struct ContactPicker: View {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 76, maximum: 96), spacing: 10)], spacing: 14) {
                     ForEach(model.visibleContacts) { c in
                         let on = picked.contains(c.fingerprint)
+                        let able = kind != .group || model.takes(c, .group)
                         Button {
                             withAnimation(.snappy(duration: 0.3)) {
                                 if single { picked = [c.fingerprint] }
@@ -159,9 +172,14 @@ struct ContactPicker: View {
                                     .font(.system(size: 11, weight: .medium))
                                     .foregroundStyle(on ? Ink.text : Ink.dim)
                                     .lineLimit(1)
+                                if !able {
+                                    Text("Needs a newer Pulshade").font(.system(size: 9)).foregroundStyle(Ink.faint).lineLimit(1)
+                                }
                             }
+                            .opacity(able ? 1 : 0.5)
                         }
                         .buttonStyle(.plain)
+                        .disabled(!able)
                     }
                 }
                 .padding(4)
@@ -206,7 +224,8 @@ private struct ChatLinkForm: View {
                         Text("Or have them type this code")
                             .font(.system(size: 12)).foregroundStyle(Ink.faint)
                         Text(code.display)
-                            .font(.system(size: 24, weight: .semibold, design: .monospaced)).foregroundStyle(Ink.text)
+                            .font(.system(size: 22, weight: .semibold, design: .monospaced)).foregroundStyle(Ink.text)
+                            .lineLimit(1).minimumScaleFactor(0.5)
                             .textSelection(.enabled)
                     } else if codeFailed {
                         Text("Couldn't reach the relay to make a code. The QR code and link still work.")
@@ -299,7 +318,9 @@ private struct ChatLinkForm: View {
             return
         }
         guard let parsed = ChatLink(theirLink) else {
-            problem = "That isn't a one-time chat link or code."
+            problem = ChatCode.isOutdated(theirLink)
+                ? "That code is from an older version of PULSHADE. Ask them to update the app and make a new one."
+                : "That isn't a one-time chat link or code."
             withAnimation(.default) { shake += 1 }
             return
         }

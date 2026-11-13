@@ -144,13 +144,9 @@ struct SettingsView: View {
     /// Picture, name and @handle, centred, as the top of the page.
     private var header: some View {
         VStack(spacing: 10) {
-            VStack(spacing: -46) {
-                Banner(image: model.activeProfile.banner, seed: model.fingerprint, height: 110)
-                AvatarPicker(image: Binding(get: { model.activeProfile.avatar },
-                                            set: { v in model.updateProfile { $0.avatar = v } }),
-                             seed: model.fingerprint, size: 92)
-                    .background(Circle().fill(Ink.base).padding(-4))
-            }
+            AvatarPicker(image: Binding(get: { model.activeProfile.avatar },
+                                        set: { v in model.updateProfile { $0.avatar = v } }),
+                         seed: model.fingerprint, size: 92)
             HStack(spacing: 6) {
                 Text(model.activeProfile.displayName)
                     .font(.system(size: 22, weight: .semibold))
@@ -293,6 +289,36 @@ private struct SecurityToggle: View {
             Toggle(title, isOn: Binding(get: { model.data.security[keyPath: key] },
                                      set: { v in withAnimation(.snappy) { model.updateSecurity { $0[keyPath: key] = v } } }))
                 .toggleStyle(GlowToggleStyle())
+        }
+    }
+}
+
+/// The switch for collecting mail while locked. Turning it on asks first, because it leaves keys in the Keychain.
+private struct LockedDeliveryRow: View {
+    @Environment(AppModel.self) private var model
+    @State private var confirming = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            SettingRow("Collect messages when locked") {
+                Toggle("Collect messages when locked", isOn: Binding(
+                    get: { model.data.security.lockedDeliveryChosen },
+                    set: { v in
+                        if v { confirming = true; return }
+                        withAnimation(.snappy) { model.updateSecurity { $0.lockedDeliveryChosen = false } }
+                    }))
+                    .toggleStyle(GlowToggleStyle())
+            }
+            Text(LockedDeliveryWarning.short)
+                .font(.system(size: 12)).foregroundStyle(Ink.faint)
+                .padding(.horizontal, 14).padding(.bottom, 8)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .alert(LockedDeliveryWarning.title, isPresented: $confirming) {
+            Button("Turn on", role: .destructive) { withAnimation(.snappy) { model.updateSecurity { $0.lockedDeliveryChosen = true } } }
+            Button("Keep it off", role: .cancel) {}
+        } message: {
+            Text(LockedDeliveryWarning.confirm)
         }
     }
 }
@@ -486,40 +512,6 @@ private struct ProfileSettings: View {
         .frame(minHeight: 50)
     }
 
-    /// Your profile as people you chat with see it, changing as you edit, with the colour picker built in.
-    private var hero: some View {
-        let tint = model.signature("me")
-        return VStack(spacing: 8) {
-            VStack(spacing: -48) {
-                BannerPicker(image: Binding(get: { model.activeProfile.banner },
-                                            set: { v in model.updateProfile { $0.banner = v } }),
-                             seed: model.fingerprint)
-                AvatarPicker(image: Binding(get: { model.activeProfile.avatar },
-                                            set: { v in model.updateProfile { $0.avatar = v } }),
-                             seed: model.fingerprint, size: 96, ring: tint, ringGap: Ink.base)
-            }
-            VStack(spacing: 6) {
-                HStack(spacing: 0) {
-                    ForEach(Signature.colors.indices, id: \.self) { i in
-                        let on = tint == Signature.colors[i]
-                        Button { withAnimation(.snappy) { model.updateProfile { $0.color = i } } } label: {
-                            Circle().fill(Signature.colors[i])
-                                .frame(width: 22, height: 22)
-                                .overlay(Circle().strokeBorder(Ink.text, lineWidth: on ? 2 : 0).padding(-4))
-                                .frame(maxWidth: .infinity, minHeight: 40)
-                                .contentShape(.rect)
-                        }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("Signature colour \(i + 1)")
-                    }
-                }
-            }
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity)
-        .glass(14)
-    }
-
     /// Which persona this page is editing, with a tap to switch: every persona has its own profile, handles and pins.
     private var personaBar: some View {
         ScrollView(.horizontal) {
@@ -556,6 +548,42 @@ private struct ProfileSettings: View {
         .accessibilityAddTraits(on ? .isSelected : [])
     }
 
+    /// Cards for what your profile doesn't show yet, each opening the page where you add it. They leave as you fill them.
+    @ViewBuilder private var addPrompts: some View {
+        let hasLinks = !ProfileLink.cleaned(model.activeProfile.links ?? []).isEmpty
+        let hasNotes = !ProfileNote.cleaned(model.activeProfile.notes ?? []).isEmpty
+        let hasCollectibles = !(model.activeProfile.collectibles ?? []).filter { $0.kind != nil }.isEmpty
+        if !hasLinks || !hasNotes || !hasCollectibles {
+            VStack(spacing: 8) {
+                if !hasLinks { addPrompt(.pinned, "link", "Add links and wallets", "Show your socials and wallets on your profile.") }
+                if !hasNotes { addPrompt(.pinned, "doc.text", "Pin a note", "Public, or locked with a password.") }
+                if !hasCollectibles { addPrompt(.collectibles, "sparkles", "Show collectibles", "Wear one next to your name.") }
+            }
+        }
+    }
+
+    private func addPrompt(_ page: SettingsPage, _ symbol: String, _ title: String, _ subtitle: String) -> some View {
+        NavigationLink(value: page) {
+            HStack(spacing: 12) {
+                Image(systemName: symbol).font(.system(size: 16, weight: .semibold)).foregroundStyle(theme.accent)
+                    .frame(width: 36, height: 36)
+                    .background(theme.accent.opacity(0.14), in: .rect(cornerRadius: 10, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(.system(size: 15, weight: .semibold)).foregroundStyle(Ink.text)
+                    Text(subtitle).font(.system(size: 12)).foregroundStyle(Ink.faint)
+                }
+                Spacer(minLength: 8)
+                Image(systemName: "plus").font(.system(size: 13, weight: .semibold)).foregroundStyle(Ink.faint)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Ink.surface, in: .rect(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Ink.line, style: StrokeStyle(lineWidth: 1, dash: [5, 4])))
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+    }
+
     private func sectionNote(_ text: String) -> some View {
         Text(text).font(.system(size: 12)).foregroundStyle(Ink.faint)
             .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 6)
@@ -567,9 +595,17 @@ private struct ProfileSettings: View {
                 personaBar
             }
             VStack(spacing: 6) {
-                hero
-                sectionNote("Tap your picture or banner to change it.")
+                ProfileHero(avatar: model.activeProfile.avatar, seed: model.fingerprint,
+                            name: model.activeProfile.displayName, badge: model.activeProfile.badge, handle: model.activeProfile.handle,
+                            bio: model.activeProfile.bio,
+                            avatarEditor: AnyView(AvatarPicker(image: Binding(get: { model.activeProfile.avatar },
+                                                                              set: { v in model.updateProfile { $0.avatar = v } }),
+                                                               seed: model.fingerprint, size: 84))) { EmptyView() }
+                sectionNote("This is how people see you. Tap your picture to change it.")
             }
+            ProfileTabs(links: model.activeProfile.links ?? [], collectibles: model.activeProfile.collectibles ?? [],
+                        notes: model.activeProfile.notes ?? [], isMine: true)
+            addPrompts
             SettingsGroup("About you", footer: "Only people you chat with see these.") {
                 fieldRow("Name") {
                     TextField("", text: $name, prompt: Text("Your name").foregroundStyle(Ink.faint))
@@ -855,7 +891,8 @@ private struct PrivacySettings: View {
         SettingsScreen(title: "Privacy & Security") {
             SettingsGroup {
                 MenuRow(page: .privacyLock, symbol: "lock.fill", color: .hex(0x8E8E93), title: "Lock & screen",
-                        value: model.data.security.autoLockMinutes == 0 ? "No auto-lock" : "\(model.data.security.autoLockMinutes) min")
+                        value: model.hasShortPIN ? "Change your 4-digit PIN"
+                            : model.data.security.autoLockMinutes == 0 ? "No auto-lock" : "\(model.data.security.autoLockMinutes) min")
                 RowDivider(inset: 54)
                 MenuRow(page: .privacyMessages, symbol: "bubble.left.and.bubble.right.fill", color: .hex(0x3D8BFF), title: "What others see")
                 RowDivider(inset: 54)
@@ -876,9 +913,34 @@ private struct PrivacySettings: View {
 private struct LockSettings: View {
     @Environment(AppModel.self) private var model
     @State private var biometrics = false
+    @State private var changing = false
+    @State private var confirmWipe: Int?
+
+    private var wipeFooter: String {
+        let backup = model.data.security.keepBackup
+            ? "Your recovery code brings back your profile, contacts and groups from the sealed backup, but never your chats."
+            : "Sealed backup is off, so nothing at all can be brought back, not even with your recovery code."
+        return "Off by default. After this many wrong guesses in a row, this device is wiped at once, the same as Detach, and the count survives closing the app. \(backup) A child or a friend fiddling with your phone can set it off."
+    }
 
     var body: some View {
         SettingsScreen(title: "Lock & screen", back: "Privacy") {
+            if model.isPrimary {
+                SettingsGroup("Passcode", footer: model.hasShortPIN
+                              ? "Your PIN is only 4 digits, which can be guessed. New ones need at least 6 digits; a passcode with letters is stronger still. Change it now."
+                              : "A longer passcode is the strongest protection you control.") {
+                    ActionRow(title: model.hasShortPIN ? "Change your 4-digit PIN" : "Change passcode") { changing = true }
+                    RowDivider()
+                    MenuChoiceRow(title: "Wipe after wrong guesses", values: WipeAfterFailures.choices,
+                                  selected: model.wipeAfterAttempts, label: { $0 == 0 ? "Off" : "\($0) in a row" }) { n in
+                        if n == 0 || n >= 10 { model.setWipeAfterAttempts(n) } else { confirmWipe = n }
+                    }
+                    Text(wipeFooter)
+                        .font(.system(size: 12)).foregroundStyle(Ink.faint)
+                        .padding(.horizontal, 14).padding(.vertical, 8)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
             SettingsGroup("Lock", footer: model.biometricsBlocked
                           ? "\(Vault.biometryName) is off while a decoy or panic passcode is set."
                           : "Locks PULSHADE when you leave it, so a borrowed or stolen phone shows nothing.") {
@@ -911,6 +973,77 @@ private struct LockSettings: View {
             }
         }
         .onAppear { biometrics = model.biometricsOn }
+        .sheet(isPresented: $changing) { ChangePasscodeSheet() }
+        .alert("Wipe after \(confirmWipe ?? 0) wrong guesses?", isPresented: Binding(get: { confirmWipe != nil }, set: { if !$0 { confirmWipe = nil } })) {
+            Button("Turn on", role: .destructive) { if let n = confirmWipe { model.setWipeAfterAttempts(n) }; confirmWipe = nil }
+            Button("Cancel", role: .cancel) { confirmWipe = nil }
+        } message: {
+            Text("Few tries leave little room for slips. \(wipeFooter)")
+        }
+    }
+}
+
+/// Changes the passcode of the real account. Asks for the current one first.
+private struct ChangePasscodeSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @State private var current = ""
+    @State private var style = LockStyle.remembered.forChoosing
+    @State private var passcode = ""
+    @State private var confirm = ""
+    @State private var working = false
+    @State private var problem: String?
+    @State private var shake = 0
+
+    var body: some View {
+        SheetBody(width: 420) {
+            VStack(spacing: 18) {
+                SheetHeader(symbol: "lock.rotation", title: "Change passcode")
+                PasscodeField(placeholder: "Current passcode or PIN", text: $current, onSubmit: save)
+                LockStylePicker(style: $style, options: LockStyle.forNewSecret)
+                    .onChange(of: style) { _, _ in passcode = ""; confirm = "" }
+                if let length = style.length {
+                    PinSetup(length: length, passcode: $passcode, confirm: $confirm, onDone: save)
+                } else {
+                    PasscodeField(placeholder: "New passcode", text: $passcode, onSubmit: save)
+                    PasscodeField(placeholder: "Again", text: $confirm, onSubmit: save)
+                        .modifier(Shake(trigger: shake))
+                }
+                if let advice = LockStyle.guidance(for: passcode, style: style) {
+                    Text(advice).font(.system(size: 12)).foregroundStyle(Ink.faint).multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let problem { ProblemText(problem) }
+                Button(action: save) {
+                    if working { ProgressView().controlSize(.small).tint(Ink.onAccent) } else { Image(systemName: "checkmark") }
+                }
+                .buttonStyle(GlowButtonStyle(size: 48))
+                .disabled(working)
+            }
+        }
+    }
+
+    private func save() {
+        guard !current.isEmpty, style.accepts(passcode), passcode == confirm else {
+            problem = style.accepts(passcode) ? "Entries don't match" : style.problem(for: passcode)
+            withAnimation(.default) { shake += 1 }
+            return
+        }
+        working = true
+        Task {
+            do {
+                try await model.changePasscode(current: current, to: passcode)
+                LockStyle.remembered = style
+                dismiss()
+            } catch AppModel.PasscodeSetupError.wrongCurrent {
+                problem = "The current passcode isn't right"
+            } catch AppModel.PasscodeSetupError.inUse {
+                problem = "That passcode is already used"
+            } catch {
+                problem = "Couldn't change it"
+            }
+            working = false
+        }
     }
 }
 
@@ -1058,7 +1191,7 @@ private struct NotificationSettings: View {
                         RowDivider()
                         SecurityToggle(title: "Friend request alerts when locked", key: \.pushRequests)
                         RowDivider()
-                        SecurityToggle(title: "Collect messages when locked", key: \.lockedDeliveryChosen)
+                        LockedDeliveryRow()
                     }
                     #endif
                 }

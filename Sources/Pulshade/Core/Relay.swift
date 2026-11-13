@@ -1,6 +1,8 @@
 import Foundation
 import CryptoKit
+import CommonCrypto
 import Security
+import os
 #if canImport(PulshadeShared)
 import PulshadeShared
 #endif
@@ -61,22 +63,114 @@ enum RelayClock {
 }
 
 /// Proof of work for onion requests, so that building fresh Tor circuits doesn't buy fresh rate-limit allowances.
-/// A fraction of a second's hashing, tied to one request and used once.
+/// Tied to one request and used once. How much work depends on the route (`light`, `heavy`) and, when the relay is busy
+/// or one circuit has been asking a lot, on what the relay asks for: it answers a request whose proof was too light
+/// with `X-Pulshade-Pow-Bits`, and the request is made again with that much work (see `RelayClient.load`).
+/// The relay's `pow.rs` has the same table; the hash is SHA-256 over `pulshade.pow.v2|<bound>|<seconds>|<nonce>`, and
+/// the header reads `2:<seconds>:<nonce>`. The first form (`<seconds>:<nonce>`, 18 bits) is no longer accepted.
 enum Work {
-    static let bits = 18
+    static let light = 21
+    static let heavy = 23
+    /// The most work ever done for one request: a few seconds on a recent iPhone, asked for only of a caller already
+    /// sending far more than an ordinary account does, or when the relay is under a flood.
+    static let ceiling = 27
 
-    /// The `X-Pulshade-Pow` value for a request about `bound`, stamped by the relay's clock.
-    static func proof(for bound: String) -> String {
-        let ts = UInt64(max(0, RelayClock.now.timeIntervalSince1970))
-        var nonce = UInt64.random(in: 0..<(1 << 40))
-        while true {
-            let digest = SHA256.hash(data: Data("pulshade.pow.v1|\(bound)|\(ts)|\(nonce)".utf8))
-            if leadingZeroBits(digest) >= bits { return "\(ts):\(nonce)" }
-            nonce += 1
+    /// Routes that cost the relay more (a claim, a backup, a burn, a push registration, a new group mailbox).
+    private static let heavyRoutes: Set<Substring> = ["claim", "retire", "backup", "burn", "push", "group", "giveaway-claim", "collectible-claim"]
+
+    static func baseBits(for bound: String) -> Int {
+        heavyRoutes.contains(bound.split(separator: "|", maxSplits: 1).first ?? "") ? heavy : light
+    }
+
+    /// What the relay last said it wants, by route, so the next request starts there: for ten minutes at most, and one bit
+    /// lower for every `decayEvery` of requests that go through at it (`accepted`), so a flood that has passed stops costing
+    /// every request seconds of work well before the ten minutes are up. If the relay still wants more, it says so again.
+    private static let learned = OSAllocatedUnfairLock(initialState: [String: (bits: Int, until: Date, stepped: Date)]())
+    static let decayEvery: TimeInterval = 60
+    /// The route each header was made for, until its answer is in, so a refusal can be made again.
+    private static let made = OSAllocatedUnfairLock(initialState: [String: String]())
+
+    private static func route(_ bound: String) -> String { String(bound.split(separator: "|", maxSplits: 1).first ?? "") }
+
+    static func bits(for bound: String) -> Int {
+        let known = learned.withLock { $0[route(bound)].flatMap { $0.until > Date() ? $0.bits : nil } } ?? 0
+        return min(max(baseBits(for: bound), known), ceiling)
+    }
+
+    static func learn(_ bits: Int, for bound: String, now: Date = Date()) {
+        guard (1...ceiling).contains(bits) else { return }
+        learned.withLock { $0[route(bound)] = (bits, now.addingTimeInterval(600), now) }
+    }
+
+    /// A request about `bound` was accepted: if what is being asked for is above the route's base, step it down one bit once
+    /// `decayEvery` has passed since it was raised or last lowered, and forget it when it reaches the base.
+    static func accepted(_ bound: String, now: Date = Date()) {
+        let key = route(bound), base = baseBits(for: bound)
+        learned.withLock { table in
+            guard let entry = table[key] else { return }
+            guard entry.until > now, entry.bits > base else { table[key] = nil; return }
+            guard now.timeIntervalSince(entry.stepped) >= decayEvery else { return }
+            table[key] = entry.bits - 1 > base ? (entry.bits - 1, entry.until, now) : nil
         }
     }
 
-    static func leadingZeroBits(_ digest: SHA256.Digest) -> Int {
+    /// Tells `accepted` about the proof a request carried, once its answer shows it was taken.
+    static func accepted(header value: String) {
+        if let bound = bound(ofHeader: value) { accepted(bound) }
+    }
+
+    /// The `X-Pulshade-Pow` value for a request about `bound`, stamped by the relay's clock.
+    static func header(for bound: String, bits: Int? = nil) -> String {
+        let proof = proof(for: bound, bits: bits ?? self.bits(for: bound))
+        made.withLock { if $0.count > 64 { $0.removeAll() }; $0[proof] = bound }
+        return proof
+    }
+
+    static func bound(ofHeader value: String) -> String? { made.withLock { $0.removeValue(forKey: value) } }
+
+    static func proof(for bound: String, bits: Int) -> String {
+        let ts = UInt64(max(0, RelayClock.now.timeIntervalSince1970))
+        let found = solve(prefix: "pulshade.pow.v2|\(bound)|\(ts)|", bits: bits)
+        return "2:\(ts):\(found)"
+    }
+
+    /// Finds a nonce whose hash has `bits` leading zero bits. The prefix is hashed once and each try copies that state, which
+    /// is about twenty times faster than building a string per try, and the search is spread over the cores (a few, so
+    /// the phone stays responsive): a heavy route takes a fraction of a second on a recent iPhone.
+    static func solve(prefix: String, bits: Int, threads: Int = max(1, min(4, ProcessInfo.processInfo.activeProcessorCount - 1))) -> UInt64 {
+        var base = CC_SHA256_CTX()
+        CC_SHA256_Init(&base)
+        let bytes = Array(prefix.utf8)
+        _ = bytes.withUnsafeBufferPointer { CC_SHA256_Update(&base, $0.baseAddress, CC_LONG(bytes.count)) }
+        let start = UInt64.random(in: 0..<(1 << 40))
+        let state = OSAllocatedUnfairLock<UInt64?>(initialState: nil)
+        let stop = OSAllocatedUnfairLock(initialState: false)
+        DispatchQueue.concurrentPerform(iterations: threads) { lane in
+            var digits = [UInt8](repeating: 0, count: 20)
+            var out = [UInt8](repeating: 0, count: 32)
+            var nonce = start &+ UInt64(lane)
+            var tries = 0
+            while true {
+                tries += 1
+                if tries & 0x3fff == 0, stop.withLock({ $0 }) { return }
+                var ctx = base
+                var v = nonce
+                var i = 20
+                repeat { i -= 1; digits[i] = UInt8(48 + v % 10); v /= 10 } while v > 0
+                digits.withUnsafeBufferPointer { _ = CC_SHA256_Update(&ctx, $0.baseAddress! + i, CC_LONG(20 - i)) }
+                _ = CC_SHA256_Final(&out, &ctx)
+                if leadingZeroBits(out) >= bits {
+                    state.withLock { if $0 == nil { $0 = nonce } }
+                    stop.withLock { $0 = true }
+                    return
+                }
+                nonce &+= UInt64(threads)
+            }
+        }
+        return state.withLock { $0 } ?? 0
+    }
+
+    static func leadingZeroBits(_ digest: [UInt8]) -> Int {
         var bits = 0
         for byte in digest {
             if byte != 0 { return bits + byte.leadingZeroBitCount }
@@ -84,6 +178,8 @@ enum Work {
         }
         return bits
     }
+
+    static func leadingZeroBits(_ digest: SHA256.Digest) -> Int { leadingZeroBits(Array(digest)) }
 }
 
 /// Pins the built-in relay's certificate on its direct, plain-HTTPS address (Tor off), as a second check
@@ -93,13 +189,79 @@ enum Work {
 /// nothing here to pin it to. An onion address needs none of this either: Tor already authenticates the
 /// service end to end by its address, and the direct connection to it is kept to plain `http://`.
 ///
-/// Off unless a build sets `PulshadeRelayPin` to one or more base64 SHA-256 hashes of the relay's leaf
-/// certificate (DER), comma-separated so the next certificate's hash can be published ahead of a renewal and
-/// both accepted while it happens. Hashing the whole certificate rather than its key keeps the check exact
-/// and easy for an operator to reproduce (`openssl x509 -in cert.pem -outform der | shasum -a 256`), at the
-/// cost of a new hash to publish at every renewal rather than one that can outlive several.
-final class RelayPinning: NSObject, URLSessionDelegate {
+/// Off unless a build sets `PulshadeRelayPin` to one or more base64 SHA-256 hashes, comma-separated, each of
+/// either the relay's leaf certificate (DER) or its public key (SubjectPublicKeyInfo). A certificate hash is
+/// exact but changes at every renewal; a public-key hash survives renewals for as long as the server keeps its
+/// key (Caddy's `reuse_private_keys`, set by the server installer), so the shipped app keeps working through
+/// them. Listing a second hash ahead of a planned key change lets both be accepted while it happens. Both
+/// hashes are easy to reproduce with openssl: `openssl x509 -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64`.
+final class RelayPinning: NSObject, URLSessionDataDelegate {
     static let shared = RelayPinning()
+
+    // MARK: Answers read with a cap
+
+    /// One answer being read. The relay is not trusted to keep to the size it announces, so reading stops, and the
+    /// connection is dropped, the moment either the announced length or what has actually arrived passes the cap.
+    private final class Collected {
+        let limit: Int
+        var data = Data()
+        var response: URLResponse?
+        var tooBig = false
+        let finish: (Result<(Data, URLResponse), Error>) -> Void
+        init(limit: Int, finish: @escaping (Result<(Data, URLResponse), Error>) -> Void) {
+            self.limit = limit
+            self.finish = finish
+        }
+    }
+
+    private let collecting = OSAllocatedUnfairLock(initialState: [ObjectIdentifier: Collected]())
+
+    /// Sends the request and returns its answer, failing with `dataLengthExceedsMaximum` (and cancelling the
+    /// transfer) if the body is, or turns out to be, more than `limit` bytes.
+    func collect(_ request: URLRequest, body: Data?, in session: URLSession, limit: Int) async throws -> (Data, URLResponse) {
+        let task = body.map { session.uploadTask(with: request, from: $0) } ?? session.dataTask(with: request)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Data, URLResponse), Error>) in
+                let entry = Collected(limit: limit) { continuation.resume(with: $0) }
+                collecting.withLock { $0[ObjectIdentifier(task)] = entry }
+                task.resume()
+            }
+        } onCancel: { task.cancel() }
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
+                    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        let refuse = collecting.withLock { open -> Bool in
+            guard let entry = open[ObjectIdentifier(dataTask)] else { return false }
+            entry.response = response
+            if response.expectedContentLength > Int64(entry.limit) { entry.tooBig = true }
+            return entry.tooBig
+        }
+        completionHandler(refuse ? .cancel : .allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        let exceeded = collecting.withLock { open -> Bool in
+            guard let entry = open[ObjectIdentifier(dataTask)] else { return false }
+            entry.data.append(data)
+            if entry.data.count > entry.limit { entry.tooBig = true; entry.data = Data() }
+            return entry.tooBig
+        }
+        if exceeded { dataTask.cancel() }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let entry = collecting.withLock({ $0.removeValue(forKey: ObjectIdentifier(task)) }) else { return }
+        if entry.tooBig {
+            entry.finish(.failure(URLError(.dataLengthExceedsMaximum)))
+        } else if let error {
+            entry.finish(.failure(error))
+        } else if let response = entry.response ?? task.response {
+            entry.finish(.success((entry.data, response)))
+        } else {
+            entry.finish(.failure(URLError(.badServerResponse)))
+        }
+    }
 
     #if DEBUG
     /// Tests substitute this directly; every other build fixes it at launch from the bundle.
@@ -123,9 +285,33 @@ final class RelayPinning: NSObject, URLSessionDelegate {
     }
 
     /// Whether `host`'s pin, if it has one, accepts this leaf certificate. True when the host isn't pinned.
-    static func accepts(host: String, leafDER: Data) -> Bool {
+    static func accepts(host: String, leafDER: Data, leafKeyInfo: Data? = nil) -> Bool {
         guard let hashes = pins[host.lowercased()] else { return true }
-        return hashes.contains(Data(SHA256.hash(data: leafDER)))
+        if hashes.contains(Data(SHA256.hash(data: leafDER))) { return true }
+        if let info = leafKeyInfo, hashes.contains(Data(SHA256.hash(data: info))) { return true }
+        return false
+    }
+
+    /// The leaf's public key as DER SubjectPublicKeyInfo, the form `openssl pkey -pubin -outform der` prints. Only
+    /// P-256 and P-384 keys (what Let's Encrypt issues today) are rebuilt; any other kind is left to the
+    /// certificate hash.
+    static func keyInfo(of certificate: SecCertificate) -> Data? {
+        guard let key = SecCertificateCopyKey(certificate),
+              let point = SecKeyCopyExternalRepresentation(key, nil) as Data? else { return nil }
+        return keyInfo(ofPoint: point)
+    }
+
+    /// `keyInfo(of:)` from the key's uncompressed point (what Security hands back for an elliptic-curve key).
+    static func keyInfo(ofPoint point: Data) -> Data? {
+        let header: [UInt8]
+        switch point.count {
+        case 65: header = [0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+                           0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00]
+        case 97: header = [0x30, 0x76, 0x30, 0x10, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+                           0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22, 0x03, 0x62, 0x00]
+        default: return nil
+        }
+        return Data(header) + point
     }
 
     func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
@@ -137,7 +323,8 @@ final class RelayPinning: NSObject, URLSessionDelegate {
         }
         guard SecTrustEvaluateWithError(trust, nil),
               let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate], let leaf = chain.first,
-              Self.accepts(host: space.host, leafDER: SecCertificateCopyData(leaf) as Data) else {
+              Self.accepts(host: space.host, leafDER: SecCertificateCopyData(leaf) as Data,
+                           leafKeyInfo: Self.keyInfo(of: leaf)) else {
             completionHandler(.cancelAuthenticationChallenge, nil)
             return
         }
@@ -161,7 +348,7 @@ struct RelayClient {
 
     /// Caps on what a single answer may be. Envelopes are padded to a few fixed sizes, the largest 2 MiB; a
     /// hostile or broken relay can't make the app read without bound.
-    private static let maxResponse = 64 * 1024 * 1024
+    fileprivate static let maxResponse = 64 * 1024 * 1024
     private static let maxEnvelope = 4 * 1024 * 1024
 
     private static let lock = NSLock()
@@ -195,13 +382,27 @@ struct RelayClient {
     /// Every request goes through here. When one fails over Tor, the lane gets a fresh circuit and connection:
     /// a circuit into an onion service can stay up while carrying nothing, and every request after would hang
     /// on it until it timed out.
-    private func load(_ request: URLRequest, body: Data? = nil) async throws -> (Data, URLResponse) {
+    private func load(_ request: URLRequest, body: Data? = nil, limit: Int = RelayClient.maxResponse) async throws -> (Data, URLResponse) {
         let session = try self.session
         let name = sessionName
         var request = request
         if Tor.uses(base), !isEstablished { request.timeoutInterval = max(request.timeoutInterval, Self.firstRequestTimeout) }
         do {
-            let answer = if let body { try await session.upload(for: request, from: body) } else { try await session.data(for: request) }
+            var answer = try await RelayPinning.shared.collect(request, body: body, in: session, limit: limit)
+            // Too little work for this route right now: the relay says how much, and the request is made once more with it.
+            if let http = answer.1 as? HTTPURLResponse, http.statusCode == 429,
+               let bits = http.value(forHTTPHeaderField: "X-Pulshade-Pow-Bits").flatMap(Int.init),
+               let sent = request.value(forHTTPHeaderField: "X-Pulshade-Pow"), let bound = Work.bound(ofHeader: sent),
+               (1...Work.ceiling).contains(bits) {
+                Work.learn(bits, for: bound)
+                let again = await Task.detached(priority: .userInitiated) { Work.header(for: bound, bits: bits) }.value
+                request.setValue(again, forHTTPHeaderField: "X-Pulshade-Pow")
+                answer = try await RelayPinning.shared.collect(request, body: body, in: session, limit: limit)
+            }
+            if let http = answer.1 as? HTTPURLResponse, http.statusCode != 429, http.statusCode != 426,
+               let sent = request.value(forHTTPHeaderField: "X-Pulshade-Pow") {
+                Work.accepted(header: sent)
+            }
             Self.lock.withLock { _ = Self.established.insert(name) }
             // Every answer carries the relay's boot mark, so a restart is noticed whatever the app was doing.
             if let boot = (answer.1 as? HTTPURLResponse)?.value(forHTTPHeaderField: "X-Pulshade-Boot") { Self.note(boot: boot, of: base) }
@@ -493,7 +694,7 @@ struct RelayClient {
     /// Over the onion service, rate-limited requests carry a proof of work.
     private func prove(_ request: inout URLRequest, _ bound: String) async {
         guard Tor.isOnion(base) else { return }
-        let proof = await Task.detached(priority: .userInitiated) { Work.proof(for: bound) }.value
+        let proof = await Task.detached(priority: .userInitiated) { Work.header(for: bound) }.value
         request.setValue(proof, forHTTPHeaderField: "X-Pulshade-Pow")
     }
 
@@ -775,7 +976,7 @@ extension RelayClient {
     func latestRelease() async throws -> Release? {
         var request = URLRequest(url: base.appending(path: "v1/update/mac"))
         request.timeoutInterval = Tor.uses(base) ? 45 : 15
-        let (data, response) = try await load(request)
+        let (data, response) = try await load(request, limit: 1024 * 1024)
         let status = (response as? HTTPURLResponse)?.statusCode
         if status == 404 { return nil }
         guard status == 200, data.count <= 1024 * 1024 else { throw URLError(.badServerResponse) }
@@ -783,11 +984,11 @@ extension RelayClient {
     }
 
     /// The zipped app. Large, so it may take a few minutes over Tor.
-    func releaseArchive() async throws -> Data {
+    func releaseArchive(maxBytes: Int = 256 * 1024 * 1024) async throws -> Data {
         var request = URLRequest(url: base.appending(path: "v1/update/mac.zip"))
         request.timeoutInterval = 120
         await prove(&request, "update")
-        let (data, response) = try await load(request)
+        let (data, response) = try await load(request, limit: maxBytes)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
         return data
     }
@@ -876,7 +1077,7 @@ extension RelayClient {
         var request = URLRequest(url: base.appending(path: "v1/blob/\(id)"))
         request.timeoutInterval = max(40, 40 + Double(range.count) / 15_000)
         request.setValue("bytes=\(range.lowerBound)-\(range.upperBound)", forHTTPHeaderField: "Range")
-        let (data, response) = try await load(request)
+        let (data, response) = try await load(request, limit: 8 * 1024 * 1024)
         switch (response as? HTTPURLResponse)?.statusCode {
         case 206, 200:
             // A download asks for four pieces at a time (4 MiB). Anything much beyond that is a relay ignoring

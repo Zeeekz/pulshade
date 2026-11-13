@@ -3,12 +3,18 @@ import CryptoKit
 import SwiftUI
 
 /// The code two people compare in person. Both sides derive it from both identities, sorted,
-/// so it comes out identical on each screen, and differs if anyone sits in the middle.
+/// so it comes out identical on each screen, and differs if anyone sits in the middle. Each identity is its signing
+/// key's fingerprint together with its agreement key and a commitment to its post-quantum keys (`PQPin.commitment`), so
+/// swapping any of them changes the code. (Version 1 covered only the fingerprints and version 2 left out the post-quantum
+/// keys; their codes differ from these, so a pair on an older app never matches and is told so.)
 struct SafetyCode: Equatable {
     let bytes: [UInt8]
 
-    init(mine: String, theirs: String) {
-        bytes = Array(SHA256.hash(data: Data(("pulshade.safety.v1" + [mine, theirs].sorted().joined()).utf8)))
+    /// `minePQ` and `theirsPQ` are the keys' commitments, empty for keys not known yet (a code made then never matches one
+    /// made with them, and a pulse check isn't offered).
+    init(mine: String, mineAgreement: Data, minePQ: Data, theirs: String, theirsAgreement: Data, theirsPQ: Data) {
+        let ids = [mine + "|" + mineAgreement.hex + "|" + minePQ.hex, theirs + "|" + theirsAgreement.hex + "|" + theirsPQ.hex].sorted()
+        bytes = Array(SHA256.hash(data: Data(("pulshade.safety.v3" + ids.joined(separator: ";")).utf8)))
     }
 
     private static let emojiSet = Array("🌙⭐️🔥🌊⚡️🍀🌸🍄🐺🦊🐙🦋🐝🦉🐬🌵🌈❄️🍒🍋🥑🎧🎲🎯🚀🛸⚓️🔮💎🗝🧲🪐🌋🗻🏝🎈🎸🥁🎺🧩🪁🛹🧊🍩🍿🌶🧀🥨🦖🐉🦄🐢🦜🐠🌻🌴🪸🕯💡📡🛰🧭⏳🔔").map(String.init)
@@ -36,5 +42,5 @@ struct SafetyCode: Equatable {
     }
 
     /// What the QR code carries.
-    var scanText: String { "pshv1:" + Data(bytes.prefix(20)).hex }
+    var scanText: String { "pshv3:" + Data(bytes.prefix(20)).hex }
 }

@@ -16,7 +16,5 @@ func testDirectory(_ prefix: String) -> URL {
     model.callAudio = false
     model.trafficShaping = false
     model.cutOffOnLock = false
-    // Most tests are about groups that send each member a copy; the ones about shared mailboxes switch it back on.
-    model.sharedGroupsEnabled = false
     return model
 }

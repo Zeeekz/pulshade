@@ -11,7 +11,7 @@ struct LinkLoginFlow: View {
     @State private var scanner = QRScanner()
     @State private var scanning = false
     @State private var pasted = ""
-    @State private var style = LockStyle.remembered
+    @State private var style = LockStyle.remembered.forChoosing
     @State private var passcode = ""
     @State private var confirm = ""
     @State private var finishing = false
@@ -22,6 +22,7 @@ struct LinkLoginFlow: View {
             switch linker.stage {
             case .idle, .failed: entry.transition(.opacity)
             case .waiting: waiting.transition(.opacity)
+            case .confirming: confirming.transition(.opacity)
             case .received: passcodeStep.transition(.push(from: .trailing))
             }
         }
@@ -118,19 +119,56 @@ struct LinkLoginFlow: View {
         }
     }
 
+    /// The account has arrived but isn't taken until the digits match the ones the other device shows, which proves
+    /// it came from the device you approved on and not from someone who saw the code.
+    private var confirming: some View {
+        OnboardingPage(title: "Check the digits",
+                       subtitle: linker.senderConfirms
+                           ? "Your other device now shows digits. They must be exactly these."
+                           : "Your other device is an older version and can't show digits to check.",
+                       back: leave) {
+            VStack(spacing: 16) {
+                if linker.senderConfirms, let digits = linker.confirmation {
+                    Text(digits).font(.system(size: 28, weight: .semibold, design: .monospaced)).foregroundStyle(Ink.text)
+                    Text("If they differ, someone else answered first: don't continue.")
+                        .font(.system(size: 12, weight: .medium)).foregroundStyle(.orange).multilineTextAlignment(.center)
+                } else {
+                    Text("Update PULSHADE on your other device to check them. Only go on if you started this just now and are sure it was your device.")
+                        .font(.system(size: 12, weight: .medium)).foregroundStyle(.orange).multilineTextAlignment(.center)
+                }
+            }
+            .padding(.top, 20)
+        } actions: {
+            if linker.senderConfirms {
+                Button("They match") { linker.confirm() }.buttonStyle(PrimaryButtonStyle())
+            } else {
+                Button("Continue without checking") { linker.confirm() }.buttonStyle(SecondaryButtonStyle())
+            }
+            Button("They don't match, cancel") {
+                linker.cancel()
+                linker.offer()
+            }
+            .buttonStyle(SecondaryButtonStyle())
+        }
+    }
+
     private var passcodeStep: some View {
         OnboardingPage(title: "Choose a \(style.noun)",
                        subtitle: "You're logged in as \(linker.bundle?.profile.displayName ?? "you"). This \(style.noun) locks PULSHADE on this device.",
                        back: leave) {
             VStack(spacing: 12) {
                 Avatar(image: linker.bundle?.profile.avatar, seed: "", size: 72).padding(.bottom, 8)
-                LockStylePicker(style: $style)
+                LockStylePicker(style: $style, options: LockStyle.forNewSecret)
                 if let length = style.length {
                     PinSetup(length: length, passcode: $passcode, confirm: $confirm, onDone: finish)
                 } else {
                     PasscodeField(placeholder: "Passcode", text: $passcode, onSubmit: finish)
                     PasscodeField(placeholder: "Confirm passcode", text: $confirm, onSubmit: finish)
                         .modifier(Shake(trigger: shake))
+                }
+                if let advice = LockStyle.guidance(for: passcode, style: style) {
+                    Text(advice).font(.system(size: 12)).foregroundStyle(Ink.faint).multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         } actions: {
@@ -173,7 +211,7 @@ struct LinkDeviceSheet: View {
         SheetBody(width: 420) {
             VStack(spacing: 16) {
                 SheetHeader(symbol: "qrcode", title: "Link a new device")
-                if model.pendingLink != nil {
+                if model.pendingLink != nil || model.linkConfirmation != nil {
                     LinkApproval()
                 } else if scanning {
                     CameraPreview(session: scanner.session)
@@ -219,6 +257,7 @@ struct LinkDeviceSheet: View {
                 }
             }
             .animation(.snappy, value: model.pendingLink?.request.deviceID)
+            .onDisappear { model.linkConfirmation = nil }
         }
         .onAppear { if code.isEmpty { code = model.makeLinkCode() } }
         .onChange(of: scanner.found) { _, text in
@@ -250,6 +289,10 @@ struct LinkedDevicesCard: View {
                     Image(systemName: "rectangle.on.rectangle").foregroundStyle(Ink.dim).frame(width: 22)
                     Text(device.name ?? "Linked device").foregroundStyle(Ink.text)
                     Spacer()
+                    if device.unconfirmed == true {
+                        Button("It's mine") { model.confirmLinkedDevice(device.id) }
+                            .font(.system(size: 11, weight: .semibold)).buttonStyle(.plain).foregroundStyle(theme.accent)
+                    }
                     Text(device.session == nil ? "Connecting…" : "Linked")
                         .font(.system(size: 11)).foregroundStyle(device.session == nil ? Ink.faint : theme.accent)
                     Menu {
@@ -264,6 +307,12 @@ struct LinkedDevicesCard: View {
                     .accessibilityLabel("More for \(device.name ?? "linked device")")
                     .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
                 }
+            }
+            if !model.unconfirmedDevices.isEmpty {
+                Divider().overlay(Ink.line)
+                Label("A device you didn't link from here has joined your account. If you didn't link it yourself, someone has your recovery code or a copy of your keys: choose Stop syncing for it, then change your passcode and burn.", systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 12)).foregroundStyle(Color.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Divider().overlay(Ink.line)
             Button { linking = true } label: {

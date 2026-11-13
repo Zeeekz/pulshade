@@ -206,7 +206,7 @@ public enum ProfileLinkKind: String, Codable, CaseIterable, Sendable {
     static let hidden: Set<UInt32> = [0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0x2060, 0xFEFF, 0x00AD, 0x061C,
                                               0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069]
 
-    static func hasHidden(_ s: String) -> Bool {
+    public static func hasHidden(_ s: String) -> Bool {
         let bad: Set<Unicode.GeneralCategory> = [.control, .format, .unassigned, .privateUse, .surrogate, .lineSeparator, .paragraphSeparator]
         return s.unicodeScalars.contains {
             bad.contains($0.properties.generalCategory) || hidden.contains($0.value) || $0.properties.isVariationSelector
@@ -242,7 +242,7 @@ public enum ProfileLinkKind: String, Codable, CaseIterable, Sendable {
         return clean.string
     }
 
-    static func isPlainHost(_ host: String) -> Bool {
+    public static func isPlainHost(_ host: String) -> Bool {
         let labels = host.split(separator: ".", omittingEmptySubsequences: false)
         // The last part must be a real ending (has a letter): "192.168.0.1" and "0x7f.0.0.1" are not names.
         guard let last = labels.last, last.contains(where: \.isLetter), !last.hasPrefix("0x") else { return false }

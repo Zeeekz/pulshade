@@ -124,6 +124,7 @@ targets:
       - path: ios/Notify
         excludes: ["*.plist", "*.entitlements"]
       - path: Sources/Pulshade/Core/EnvelopeCore.swift
+      - path: Sources/Pulshade/Core/EnvelopePQ.swift
       - path: Sources/Pulshade/Core/LockedDelivery.swift
       - path: Sources/Pulshade/Core/HelperStore.swift
     entitlements:

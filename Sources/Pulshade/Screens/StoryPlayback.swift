@@ -410,7 +410,10 @@ final class LibraryPicker: NSObject, PHPickerViewControllerDelegate {
         var configuration = PHPickerConfiguration(photoLibrary: .shared())
         configuration.filter = videosOnly ? .videos : .any(of: [.images, .videos])
         configuration.selectionLimit = 1
-        configuration.preferredAssetRepresentationMode = .current
+        // `.compatible`, not `.current`: iOS then turns an HDR, Dolby Vision or otherwise unusual clip into an ordinary
+        // one before the app sees it, instead of handing over the original for the app to decode. A clip that is
+        // already ordinary comes through as it is.
+        configuration.preferredAssetRepresentationMode = .compatible
         let controller = PHPickerViewController(configuration: configuration)
         let picker = LibraryPicker()
         picker.done = done

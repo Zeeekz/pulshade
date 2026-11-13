@@ -25,6 +25,9 @@ struct PeerCard: Codable, Equatable {
     var device: Data?
     /// All their devices, when known (in group rosters).
     var devices: [DeviceCard]?
+    /// Their post-quantum keys, signed by both signing keys (see `PQCard`). Hello and request cards carry it; apps from
+    /// before leave it out, and nothing is read from them any more.
+    var pq: PQCard? = nil
 
     /// Every device this card describes.
     var allDevices: [DeviceCard] {
@@ -74,28 +77,6 @@ struct ClipInfo: Codable, Equatable {
     var seconds: Double
 }
 
-struct GroupInfo: Codable, Equatable {
-    var id: UUID
-    var kind: ConversationKind
-    var title: String
-    var avatar: Data?
-    /// The people the recipient should know about, minus the sender and the recipient. In a channel,
-    /// followers only get the admins; admins get everyone.
-    var roster: [PeerCard]
-    var about: String?
-    /// Signing key of the owner.
-    var owner: Data?
-    /// Signing keys of the admins besides the owner.
-    var admins: [Data]?
-    /// Signing keys of the moderators. Absent from apps that don't know the role.
-    var mods: [Data]?
-    var postPolicy: PostPolicy?
-    var version: Int?
-    /// The recipient's own introduction mailboxes, by device id (hex). Only the recipient gets these keys; the
-    /// other members only get where to write.
-    var intros: [String: Data]?
-}
-
 /// Everything that can travel inside an envelope.
 ///
 /// Only the session setup cases travel bare. Everything people actually say goes inside
@@ -133,6 +114,9 @@ extension Payload {
 enum Payload: Codable, Equatable {
     /// First message on a new invite: "this is me, write back here, and here's a handshake".
     case hello(PeerCard, SessionInit)
+    /// "These are my post-quantum keys", to a contact made before they existed (or one that lost them): sent in the one
+    /// classical envelope still allowed, and answered with the other side's.
+    case pqIntro(PQCard)
     /// A friend request to a public profile: like hello, with a note, and nothing happens until accepted.
     case request(PeerCard, SessionInit, note: String)
     case sessionInit(SessionInit)
@@ -153,7 +137,6 @@ enum Payload: Codable, Equatable {
     /// The messages reached the device (`read` nil or false), or were seen in the open chat. Older apps ignore
     /// `read`, so a read receipt still counts as delivered there.
     case receipt(ids: [UUID], read: Bool? = nil)
-    case group(GroupInfo)
     /// Over a 1:1 chat: you're being added to a group that shares one mailbox (see `GroupInvite`). Only sent to apps
     /// that said they take part in those.
     case groupInvite(GroupInvite)
@@ -177,16 +160,15 @@ enum Payload: Codable, Equatable {
     /// In a group's mailbox: an invite to be friends for one member (`to`, their group key), sealed so only they can open
     /// it (a `FriendInviteBody`). Apps from before ignore it.
     case friendAsk(to: Data, sealed: Data)
-    /// Over the keys two group members who aren't friends share: an invite to be friends. Apps from before ignore it.
-    case friendInvite(code: String, note: String?)
     /// In a group's mailbox, from an admin: these people were just invited (their names, as the admin knows them), so
     /// everyone sees it at once instead of when each one's app answers. Apps from before ignore it.
     case membersAdded(names: [String])
     /// In a group's mailbox: a member's own card with their picture (the settings carry it without).
     case memberCard(MemberCard)
     /// A story, or a new version of one already sent (same id, edited text or lifetime). `lasts` is in seconds;
-    /// older apps leave it out, meaning a day.
-    case story(id: UUID, style: StoryStyle, date: Date, lasts: TimeInterval? = nil)
+    /// older apps leave it out, meaning a day. `loops` is a video that plays again from the start when it ends; older
+    /// apps ignore it and play it once.
+    case story(id: UUID, style: StoryStyle, date: Date, lasts: TimeInterval? = nil, loops: Bool? = nil)
     case storyRemoved(id: UUID)
     /// Every story the sender had up is taken back, when their device was wiped (Detach) and doesn't remember which
     /// they were. Builds from before can't read it and leave it, so their copies run out with the day.
@@ -229,17 +211,21 @@ enum Payload: Codable, Equatable {
     case burn
     /// "Request accepted: from now on, write to this mailbox instead of my public one."
     case accepted(sendID: Data)
-    /// "You reached this device of mine through a group introduction: write to it here from now on."
-    case moved(DeviceCard)
     /// Between your own devices only: keep each other up to date.
     case sync(SyncEvent)
-    /// The sender deleted this chat (nil for your direct chat with them). For groups and channels
-    /// it only counts from the owner.
+    /// The sender deleted this chat: nil for your direct chat with them. In a group's own mailbox it carries the group's id
+    /// and only counts from the owner.
     case chatDeleted(conversation: UUID?)
     /// The sender left a group or channel.
     case left(conversation: UUID)
-    /// An admin removed you from a group or channel.
-    case removed(conversation: UUID)
+    /// Over a 1:1 chat, from a follower of a channel to the staff member who invited them: "I'm leaving this channel".
+    /// Only that staff member's phone knows which roster entry the sender is, and it acts only if the sender (by the
+    /// chat's own session, never by anything in here) is a follower it invited to this channel. Apps from before ignore it.
+    case channelLeave(group: UUID)
+    /// Over a 1:1 chat, from a follower to the staff member who invited them: "the channel moved on while I was away and
+    /// I never got the new key; the newest epoch I hold is `epoch`". Answered with an ordinary invite, sealed by the chat,
+    /// at most once every ten minutes per follower. Apps from before ignore it.
+    case channelKeyWanted(group: UUID, epoch: Int)
     /// The sender logged out of the device this came from: stop sending to it.
     case deviceRemoved
     /// The sender erased their account: forget them completely, with everything they ever sent.
@@ -259,6 +245,25 @@ enum Payload: Codable, Equatable {
 
     /// Signals that are worthless late: only the newest one waiting for a mailbox is kept, and one that fails
     /// to send is dropped, not retried.
+    var isRequest: Bool { if case .request = self { true } else { false } }
+    var isIntroduction: Bool { if case .pqIntro = self { true } else { false } }
+    var isRatchet: Bool { if case .ratchet = self { true } else { false } }
+
+    /// The post-quantum card this payload carries, if it is one of the three that may travel in a classical envelope.
+    var introducedCard: PQCard? {
+        switch self {
+        case let .hello(card, _), let .request(card, _, _): card.pq
+        case let .pqIntro(card): card
+        default: nil
+        }
+    }
+    var carriesPQCard: Bool {
+        switch self {
+        case .hello, .request, .pqIntro: true
+        default: false
+        }
+    }
+
     var isEphemeral: Bool {
         switch self {
         case .typing, .presence: true
@@ -284,7 +289,7 @@ enum Payload: Codable, Equatable {
     /// The story this carries, so its upload can be followed.
     var storyID: UUID? {
         switch self {
-        case let .story(id, _, _, _): id
+        case let .story(id, _, _, _, _): id
         case let .storyPart(id, _, _, _): id
         default: nil
         }
@@ -393,6 +398,10 @@ struct ContactCard: Codable, Equatable {
     var hidden: Bool
     var awaitingAcceptance: Bool
     var persona: UUID?
+    /// Their post-quantum keys as this device pinned them.
+    var pq: PQPin? = nil
+    /// What the invite that added them committed their post-quantum keys to, for a device that hasn't got the keys yet.
+    var pqCommit: Data? = nil
 }
 
 /// A group, channel or list as your other devices should know it (without its messages).
@@ -422,7 +431,8 @@ enum SyncEvent: Codable, Equatable {
     case hello
     /// A group that shares one mailbox, as this account is in it: its settings and the epochs' keys. Only between your
     /// own devices, which share the group key (it comes from the account's seed), each with a chain of its own.
-    case sharedGroup(persona: UUID?, settings: GroupSettings, epochs: [GroupEpoch], staffKey: Data? = nil)
+    /// `inviter` is the account that invited this one (so a follower's other devices know whom to tell they left).
+    case sharedGroup(persona: UUID?, settings: GroupSettings, epochs: [GroupEpoch], staffKey: Data? = nil, inviter: String? = nil)
     case sent(ConvoRef, WireMessage)
     case reaction(message: UUID, emoji: String?)
     case unsend(ids: [UUID])

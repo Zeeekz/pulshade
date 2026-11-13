@@ -25,7 +25,7 @@ is never written to its disk. Here is every kind of thing, in plain words:
 
 | What | Where it is kept | How long | Can we read it? |
 | --- | --- | --- | --- |
-| **Messages** (text, receipts, calls' set-up) | The server's memory, and a sealed journal on its disk | Until the other person's phone collects it, or 7 days (the journal is rewritten within minutes of collection and the old file overwritten) | No. Sealed on your phone with keys only you and they have. |
+| **Messages** (text, receipts, calls' set-up) | The server's disk, sealed in segments that each have a key of their own (the server keeps no second copy of messages in its memory; typing and presence signals are the only things it holds in memory alone) | Until the other person's phone collects it, or 7 days. When it is collected, the key of any segment with nothing else waiting in it is forgotten and its file is overwritten and deleted at once; a segment that still holds someone else's waiting mail is rewritten without the collected mail within a minute or so | No. Sealed on your phone with keys only you and they have. |
 | **Files and chat videos you send** (files up to 100 MB; videos a few MB) | The server's disk, in pieces | Erased the moment the other person's phone has downloaded it, or when you delete the message, or after 7 days at most | No. Sealed on your phone with a key that travels only inside the encrypted message, and sealed a second time by the server with a key of its own. Its name and type are inside the encrypted message, so we don't even know those. |
 | **Video stories** (a few MB) | The server's disk, one copy for everyone | Until the story's timer runs out (then overwritten and erased), or sooner if you delete the story | No. The same two layers of encryption. |
 | **Sealed backup** (profile, contacts, groups and settings; never chats themselves or the keys for any chat, so mail sent while you were logged out can't be opened afterwards) | The server's disk | Until you switch it off, Burn, or 180 days without an update | No. Sealed with a key only your recovery code makes. |
@@ -34,9 +34,9 @@ is never written to its disk. Here is every kind of thing, in plain words:
 | **Public @handle and profile** (only if you choose one) | The server's disk | Until you let it go | Yes, it is public by your choice. |
 | **Collectibles you own** | The server's disk | While they exist | They're not secret: the item, its number and a hash of its code. |
 | **The server's own records and keys** (handle directory, held handles, moderation lists, collectible records, announcements; its push, pet-signing and onion keys) | The server's disk | While the service runs | Only the server, which needs them to work. Sealed with its storage key, which is held in memory only and never written to the disk; after a reboot the server stays locked until we unlock it. The admin password is kept only as a hash. |
-| **Wake-up token** (only if you turn on "Wake when locked") | The server's memory, and a sealed file on its disk | While it's on (gone within seconds of turning it off; dropped after 7 days without a renewal) | It is a device token and nothing else. |
+| **Wake-up token** (on iPhone while "Wake when locked" is on, which is the default) | The server's memory, and a sealed file on its disk | While it's on (gone within seconds of turning it off; dropped after 7 days without a renewal) | It is a device token and nothing else. |
 
-Photos, voice notes and text travel inside the encrypted message itself, so they wait like any message: in the server's memory and in its sealed journal on disk.
+Photos, voice notes and text travel inside the encrypted message itself, so they wait like any message: sealed on the server's disk, until collected.
 
 A file you are sent is erased from the server as soon as your phone has it. Your phone does not keep received files:
 you open it once, from memory, and "Save a copy" is how you keep it. A chat video is kept in your chat.
@@ -63,7 +63,7 @@ it is, what it's called or who it is for.
 see your recovery code, your passcode, your keys or your contacts.
 
 **Messages and calls.** These are encrypted on your device before they leave it. Our server only passes on sealed
-envelopes, padded to a few fixed sizes. We can't read them. Envelopes wait in the server's memory and in a journal on its disk, every record sealed with a key that is never written to the disk. They are deleted once collected (the journal is rewritten within minutes and the old file overwritten) or after 7 days, and are not logged.
+envelopes, padded to a few fixed sizes. We can't read them. Envelopes wait on the server's disk, sealed in segment files that each have a key of their own (the keys are kept in a file sealed with a key that is never written to the disk), and recent ones also in its memory. They are deleted once collected (the file that held them is overwritten and removed at once, or, if it still holds someone else's waiting mail, rewritten without the collected mail within a minute or so) or after 7 days, and are not logged.
 
 **Files.** A file you send is encrypted on your device in pieces, with a fresh key that is sent only inside the
 end-to-end encrypted message, and uploaded once to our server, which seals it again and keeps it on its disk until
@@ -145,8 +145,7 @@ word it for each region.]
 - **Law enforcement and other legal requests.** We can only hand over what we hold, and what we hold is sealed or
   public, as the table above shows. We have no message content, no account identity, no phone numbers or emails, no
   contact lists and no request logs to give. If a lawful order arrives we will review it, answer it only as far as the
-  law requires, and tell the person it concerns whenever we are allowed to and can reach them. [Decide whether to
-  publish a transparency report.]
+  law requires, and tell the person it concerns whenever we are allowed to and can reach them.
 - **Nobody else.** We don't sell, rent or share your information with advertisers or data brokers.
 
 ## What we don't do
@@ -156,14 +155,25 @@ word it for each region.]
 - We don't build profiles of you. Over Tor we can't link your personas to each other; on Fast they connect from the same
   IP address, which we don't record.
 - We don't ask for your phone number, email address, name or contacts.
-- The app talks only to Pulshade's servers.
+- The app has no connection to any analytics or advertising service. What it does connect to besides Pulshade's server is
+  listed under "Outside the app" below: Apple's push service, the sites behind link previews you turn on, the
+  addresses of the Snowflake bridge if you choose it, and any link you tap, which opens in your browser.
 
 ## Outside the app
 
 - Wherever you download Pulshade from, such as the App Store or our website, sees your IP address and what you
   download. Apple also checks the app when a Mac first opens it. These services have their own policies.
-- If you turn on "Wake when locked" on iPhone, notifications go through Apple's service: Apple sees your device token
-  and when a notification is delivered, never message contents, and Pulshade's server keeps your token, in memory and in a sealed file on its disk, linked to your mailboxes while it's on. Pulshade recommends leaving this off if you need the strongest anonymity.
+- "Wake when locked" on iPhone is on by default (you can turn it off in Settings → Notifications). While it is on,
+  the app asks Apple's push service for a device token, outside Tor, and notifications go through Apple's service:
+  Apple sees your device token and when a notification is delivered, never message contents, and Pulshade's server
+  keeps your token, in memory and in a sealed file on its disk, linked to your mailboxes while it's on. Pulshade
+  recommends turning this off if you need the strongest anonymity.
+- Link previews are off by default. When you turn them on, your device fetches the page you link to (and its picture)
+  from that site, over Tor if Tor is on, otherwise directly, so the site sees that fetch. The people you send the preview
+  to never contact it.
+- If you choose the Snowflake bridge, the app reaches the bridge through a content-delivery network's front and uses
+  public STUN servers to set up the connection, and those see your IP address (Tor itself still carries your traffic).
+- A link you tap in a message opens in your browser or another app, which has its own policy.
 - Your phone or computer may keep its own records of notifications and app use, which we can't control. By default,
   notifications say only "New message".
 
@@ -199,9 +209,14 @@ no accounts, can't tell who is a child. If you think a child is using Pulshade, 
 If we change this policy we'll update the date above, add a line to the list below and tell people in the app's
 announcements. The code and documentation show what the app does at any time.
 
+- **Build 14:** waiting messages are no longer limited by the server's memory. They wait on its disk, sealed in segments
+  that each have a key of their own, and a segment with nothing waiting in it has its key forgotten and is overwritten and
+  deleted as soon as the last message in it is collected (before, collected mail was cleared out of one journal file every
+  ten minutes). If the share of the disk for waiting mail is ever full, the server turns new mail away and keeps what
+  waits; before, it dropped the oldest.
 - **Build 10:** waiting messages are now also kept in a journal on the server's disk, every record sealed with a key that
   is never written to the disk, so a restart, crash or reboot no longer loses them; collected mail is overwritten in the
-  journal within minutes. They used to be in memory only, never on the disk. Wake-up tokens are kept the same way, only for people who turn on "Wake when locked". Calls and rate-limit counts
+  journal within minutes. They used to be in memory only, never on the disk. Wake-up tokens are kept the same way, only for phones with "Wake when locked" on. Calls and rate-limit counts
   are still memory only.
 - **Build 10:** the server's own records and keys are sealed with a key that is never written to its disk; the admin
   password is kept only as a hash; what Fast means for your IP address, and that the web proxy keeps no access log;

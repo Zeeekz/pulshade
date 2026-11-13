@@ -23,6 +23,10 @@ struct LinkBundle: Codable {
     var publicInvites: [OpenInvite]?
     /// Requests waiting for an answer.
     var requests: [FriendRequest]?
+    /// Set by a device that shows a confirmation code (`LinkCrypto.confirmCode`) once it has sent this. A new device
+    /// then asks you to compare it before it takes the account; one that finds this missing says it can't check.
+    /// Older builds ignore it.
+    var confirms: Bool?
 }
 
 /// The QR code: a one-time secret, the mailbox to answer on, and which relay to use.
@@ -132,20 +136,30 @@ struct ChatLink: Equatable {
     }
 }
 
-/// A one-time chat link as twelve digits to read out or type, so no link has to be sent over another app.
+/// A one-time chat link as twenty digits to read out or type, so no link has to be sent over another app.
 /// The link waits on the relay, sealed, in a mailbox only the digits lead to, and the first device to type
-/// them takes it. The digits are stretched slowly, like a passcode, so trying them all would take years.
+/// them takes it. The digits are stretched slowly, like a passcode, and there are 10^20 of them (about 66 bits), so
+/// anyone who can see the sealed link on the relay can't find the digits by trying them offline. Codes of twelve
+/// digits (about 40 bits, from apps before this) are no longer used: they could be, with enough hardware.
 struct ChatCode: Equatable {
-    static let length = 12
+    static let length = 20
+    /// The length before, recognised only to say the code is from an older version.
+    static let oldLength = 12
     let digits: String
 
     static func make() -> ChatCode {
-        ChatCode(digits: String(format: "%012llu", UInt64.random(in: 0..<1_000_000_000_000)))
+        ChatCode(digits: (0..<length).map { _ in String(Int.random(in: 0..<10)) }.joined())
+    }
+
+    /// A code from an app that still made twelve digits: its owner needs to update and make a new one.
+    static func isOutdated(_ text: String) -> Bool {
+        let digits = text.filter(\.isNumber)
+        return digits.count == oldLength && text.allSatisfy { $0.isNumber || " -".contains($0) }
     }
 
     private init(digits: String) { self.digits = digits }
 
-    /// Twelve digits, with any spaces or dashes in between.
+    /// Twenty digits, with any spaces or dashes in between.
     init?(_ text: String) {
         let digits = text.filter(\.isNumber)
         guard digits.count == Self.length, text.allSatisfy({ $0.isNumber || " -".contains($0) }) else { return nil }
@@ -161,7 +175,7 @@ struct ChatCode: Equatable {
 
     /// The mailbox and seal behind the digits. Slow on purpose (a fraction of a second): run it off the main thread.
     func keys() -> (receiveKey: Data, seal: SymmetricKey) {
-        let master = Vault.stretch(digits, salt: Data("pulshade.chatcode.v1".utf8), iterations: 600_000)
+        let master = Vault.stretch(digits, salt: Data("pulshade.chatcode.v2".utf8), iterations: 600_000)
         func derive(_ label: String) -> SymmetricKey {
             HKDF<SHA256>.deriveKey(inputKeyMaterial: master, info: Data(label.utf8), outputByteCount: 32)
         }
@@ -216,6 +230,20 @@ enum LinkCrypto {
     }
 }
 
+extension LinkCrypto {
+    /// Eight digits both devices show once the account has been sent. They come from the key exchange between the
+    /// two devices and the code's secret, so they only match when the device that sent the account is the one
+    /// you approved on: someone who merely saw the code can't make them match.
+    static func confirmCode(_ shared: SharedSecret, secret: Data) -> String {
+        let ikm = shared.withUnsafeBytes { Data($0) } + secret
+        let key = HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: ikm), info: Data("pulshade.link.confirm".utf8),
+                                         outputByteCount: 4)
+        let number = key.withUnsafeBytes { $0.reduce(UInt32(0)) { $0 << 8 | UInt32($1) } } % 100_000_000
+        let digits = String(format: "%08d", number)
+        return digits.prefix(4) + " " + digits.suffix(4)
+    }
+}
+
 /// What this device calls itself when it asks to be linked. Just the kind of device: the name you gave it
 /// often includes your own.
 @MainActor var deviceDisplayName: String {
@@ -241,10 +269,15 @@ extension LinkRequest {
 @MainActor
 @Observable
 final class DeviceLinker {
-    enum Stage: Equatable { case idle, waiting, received, failed(String) }
+    /// `confirming`: an account has arrived but isn't taken until the code on screen matches the one on the other device.
+    enum Stage: Equatable { case idle, waiting, confirming, received, failed(String) }
 
     private(set) var stage: Stage = .idle
     private(set) var bundle: LinkBundle?
+    /// The digits to compare with the device that sent the account, while `stage` is `confirming`.
+    private(set) var confirmation: String?
+    /// Whether the device that sent the account can show the same digits (builds from before it can't).
+    var senderConfirms: Bool { bundle?.confirms == true }
     private(set) var code: LinkCode?
     /// The code this device shows while it waits to be scanned.
     private(set) var joinCode: String?
@@ -295,6 +328,13 @@ final class DeviceLinker {
         task?.cancel()
         stage = .idle
         bundle = nil
+        confirmation = nil
+    }
+
+    /// The digits match (or the sender is a build that can't show them and you chose to go on).
+    func confirm() {
+        guard stage == .confirming, bundle != nil else { return }
+        stage = .received
     }
 
     private func run(_ code: LinkCode, _ request: LinkRequest) async {
@@ -321,11 +361,12 @@ final class DeviceLinker {
             if let envelopes = try? await relay.fetch([bundleMailbox.receiveKey]), !envelopes.isEmpty {
                 // The mailbox's send id is in the join QR code, so anyone can drop junk into it. Try every
                 // envelope and keep waiting past ones that don't open rather than failing on the first.
-                let bundle = envelopes.lazy.compactMap { self.open($0.blob, secret: secret) }.first
+                let opened = envelopes.lazy.compactMap { self.open($0.blob, secret: secret) }.first
                 try? await relay.ack(envelopes)
-                if let bundle {
+                if let (bundle, confirmation) = opened {
                     self.bundle = bundle
-                    stage = .received
+                    self.confirmation = confirmation
+                    stage = .confirming
                     return
                 }
             }
@@ -334,11 +375,12 @@ final class DeviceLinker {
         if !Task.isCancelled { stage = .failed("Timed out. Try again.") }
     }
 
-    private func open(_ blob: Data, secret: Data) -> LinkBundle? {
+    private func open(_ blob: Data, secret: Data) -> (LinkBundle, String)? {
         guard blob.count > 32, let theirs = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: blob.prefix(32)),
               let shared = try? ephemeral.sharedSecretFromKeyAgreement(with: theirs),
               let box = try? ChaChaPoly.SealedBox(combined: blob.dropFirst(32)),
-              let plain = try? ChaChaPoly.open(box, using: LinkCrypto.bundleKey(shared, secret: secret)) else { return nil }
-        return try? JSONDecoder.pulshade.decode(LinkBundle.self, from: plain)
+              let plain = try? ChaChaPoly.open(box, using: LinkCrypto.bundleKey(shared, secret: secret)),
+              let bundle = try? JSONDecoder.pulshade.decode(LinkBundle.self, from: plain) else { return nil }
+        return (bundle, LinkCrypto.confirmCode(shared, secret: secret))
     }
 }

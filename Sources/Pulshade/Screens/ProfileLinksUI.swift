@@ -77,7 +77,7 @@ struct ProfileLinkList: View {
                 if !socials.isEmpty { linkTiles(socials) }
                 if !wallets.isEmpty { card("Wallets", wallets) }
             }
-            .frame(maxWidth: 340)
+            .frame(maxWidth: .infinity)
             .confirmationDialog("Leave Pulshade?", isPresented: Binding(get: { asking != nil }, set: { if !$0 { asking = nil } }),
                                 presenting: asking) { link in
                 Button("Open \(link.domain ?? "link")") { if let url = link.url { Platform.open(url) } }

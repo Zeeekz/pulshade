@@ -100,7 +100,7 @@ private struct PhoneMainView: View {
             Tab(value: Section.settings) {
                 SettingsView().background(Ink.base)
             } label: {
-                Label { Text("Account") } icon: { accountIcon }
+                Label { Text("Me") } icon: { accountIcon }
             }
         }
         .tint(model.theme.accent)
@@ -493,7 +493,6 @@ private struct ChatList: View {
     @State private var confirmClear = false
     @State private var scanningCode = false
     /// The burn sheet, which only goes ahead once BURN is typed.
-    @State private var burningAccount = false
     /// How tall the search bar and stories are together, so the list can snap past them.
     @State private var storiesHeight: CGFloat = 0
     /// Where the story strip is on screen, kept out of view state: it changes with every scroll frame.
@@ -511,16 +510,12 @@ private struct ChatList: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Lock and burn on the left, scan and a new chat on the right, and the title between them.
+            // Lock on the left, scan and a new chat on the right, and the title between them.
             HStack(spacing: 8) {
                 Button { Haptics.tick(); model.lock() } label: { Image(systemName: "lock.fill") }
                     .buttonStyle(BarButtonStyle())
                     .help("Lock Pulshade")
                     .accessibilityLabel("Lock")
-                Button { burningAccount = true } label: { Image(systemName: "flame.fill") }
-                    .buttonStyle(BarButtonStyle(tint: AnyShapeStyle(Burn.gradient)))
-                    .help("Burn your account")
-                    .accessibilityLabel("Burn")
                 Spacer(minLength: 4)
                 Menu {
                     Button("Clear all chats…", role: .destructive) { confirmClear = true }
@@ -612,7 +607,6 @@ private struct ChatList: View {
                 })
             #endif
         }
-        .sheet(isPresented: $burningAccount) { BurnSheet() }
         .confirmationDialog(confirmDelete?.deleteWarning.title ?? "",
                             isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } }),
                             titleVisibility: .visible, presenting: confirmDelete) { c in

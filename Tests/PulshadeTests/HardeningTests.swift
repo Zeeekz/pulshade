@@ -158,4 +158,22 @@ import PulshadeShared
         #expect(!adopted.notifications && !adopted.pushWake && !adopted.pushRequests && !adopted.allowForwarding)
         #expect(adopted.lockedDelivery == false)
     }
+
+    @Test func collectingWhileLockedIsOffUnlessChosenByHand() throws {
+        #expect(SecuritySettings().lockedDeliveryChosen == false)
+        // A vault written when it was automatic (nothing saved) comes back off, even on the fast connection.
+        var fast = SecuritySettings()
+        fast.tor = false
+        let old = try JSONDecoder().decode(SecuritySettings.self, from: try JSONEncoder().encode(fast))
+        #expect(old.lockedDelivery == nil && old.lockedDeliveryChosen == false)
+        // Someone who turned it on keeps it, and someone who turned it off keeps that.
+        var chosen = fast
+        chosen.lockedDeliveryChosen = true
+        let on = try JSONDecoder().decode(SecuritySettings.self, from: try JSONEncoder().encode(chosen))
+        #expect(on.lockedDeliveryChosen == true)
+        chosen.lockedDeliveryChosen = false
+        let off = try JSONDecoder().decode(SecuritySettings.self, from: try JSONEncoder().encode(chosen))
+        #expect(off.lockedDeliveryChosen == false)
+        #expect(LockedDeliveryWarning.confirm.contains("pretend to be you"))
+    }
 }

@@ -197,7 +197,7 @@ struct CreateFlow: View {
     @State private var step: Step = .profile
     @State private var identity = Identity.generate()
     @State private var profile = Profile()
-    @State private var style = LockStyle.remembered
+    @State private var style = LockStyle.remembered.forChoosing
     @State private var passcode = ""
     @State private var confirm = ""
     @State private var problem: String?
@@ -235,7 +235,7 @@ struct CreateFlow: View {
                            : "It locks and encrypts PULSHADE on this device. Use at least 6 characters.",
                        step: (1, 3), back: stepBack) {
             VStack(spacing: 12) {
-                LockStylePicker(style: $style).padding(.bottom, 4)
+                LockStylePicker(style: $style, options: LockStyle.forNewSecret).padding(.bottom, 4)
                 if let length = style.length {
                     PinSetup(length: length, passcode: $passcode, confirm: $confirm, onDone: next).padding(.top, 8)
                 } else {
@@ -243,6 +243,10 @@ struct CreateFlow: View {
                     PasscodeField(placeholder: "Confirm passcode", text: $confirm, onSubmit: next)
                         .modifier(Shake(trigger: shake))
                     StrengthBar(passcode: passcode).padding(.top, 4)
+                }
+                if let advice = LockStyle.guidance(for: passcode, style: style) {
+                    Text(advice).font(.system(size: 12)).foregroundStyle(Ink.faint).multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 if let problem {
                     ProblemText(problem)
@@ -320,7 +324,7 @@ struct RestoreFlow: View {
     var back: () -> Void
 
     @State private var code = ""
-    @State private var style = LockStyle.remembered
+    @State private var style = LockStyle.remembered.forChoosing
     @State private var passcode = ""
     @State private var pinConfirm = ""
     @State private var shake = 0
@@ -374,7 +378,7 @@ struct RestoreFlow: View {
                         .padding(14)
                 }
                 .modifier(Shake(trigger: shake))
-                LockStylePicker(style: $style)
+                LockStylePicker(style: $style, options: LockStyle.forNewSecret)
                     .onChange(of: style) { _, _ in passcode = ""; pinConfirm = "" }
                 if let length = style.length {
                     PinSetup(length: length, passcode: $passcode, confirm: $pinConfirm, onDone: lookUp)
@@ -862,6 +866,9 @@ struct PinSetup: View {
                 note = "Those didn't match. Start again."
                 self.first = nil
                 withAnimation(.default) { shake += 1 }
+            } else if LockStyle.isPattern(entry) {
+                note = "Easy to guess: pick digits that aren't a pattern."
+                withAnimation(.default) { shake += 1 }
             } else {
                 first = entry
                 note = nil
@@ -956,7 +963,8 @@ struct RecoveryCodeGrid: View {
                     .animation(.snappy.delay(Double(i) * 0.03), value: code)
             }
         }
-        .textSelection(.enabled)
+        // Never offered for copying: clipboards sync between devices and keep history.
+        .textSelection(.disabled)
     }
 }
 
@@ -1011,6 +1019,9 @@ struct PrivacyChoice: View {
                     toggle("Notifications", $s.notifications, "Banners for new messages.")
                     #if os(iOS)
                     toggle("Wake a locked iPhone", $s.pushWake, "Apple wakes your phone for new mail. Apple learns when, never what for.")
+                    if s.pushWake {
+                        toggle("Collect messages when locked", $s.lockedDeliveryChosen, Self.lockedCollectionWarning)
+                    }
                     #endif
                     choice("On the lock screen", $s.notificationContent, NotificationContent.allCases.map { ($0, $0.label) },
                            "How much a notification shows: nothing, who it's from, or the message.")
@@ -1038,6 +1049,9 @@ struct PrivacyChoice: View {
     private func group<C: View>(_ title: String, footer: String? = nil, @ViewBuilder _ content: () -> C) -> some View {
         SettingsGroup(title, footer: footer) { content() }
     }
+
+    /// Shared with Settings (`LockedDeliveryWarning`), so both say the same thing.
+    private static var lockedCollectionWarning: String { LockedDeliveryWarning.short }
 
     private func toggle(_ title: String, _ value: Binding<Bool>, _ detail: String) -> some View {
         VStack(alignment: .leading, spacing: 0) {

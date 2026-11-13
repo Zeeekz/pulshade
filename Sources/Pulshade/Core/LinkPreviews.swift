@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(PulshadeShared)
+import PulshadeShared
+#endif
 
 /// Builds link previews on the sender's device. The receiver only ever sees what's inside the
 /// encrypted message; it never fetches anything, so the site never learns who read it.
@@ -9,6 +12,20 @@ enum LinkPreviews {
     static func isWebLink(_ text: String) -> Bool {
         guard text.count <= 2_000, let url = URL(string: text), let scheme = url.scheme?.lowercased() else { return false }
         return (scheme == "http" || scheme == "https") && url.host != nil
+    }
+
+    /// The address a tapped link is allowed to open: a plain host name (no look-alike letters, no address, no
+    /// `user@`, no port, no hidden characters) over https. A plain http link opens as https, never unencrypted.
+    static func openable(_ url: URL?) -> URL? {
+        guard let url, url.absoluteString.count <= 2_000, !ProfileLinkKind.hasHidden(url.absoluteString),
+              let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https",
+              var parts = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              parts.user == nil, parts.password == nil, parts.port == nil,
+              let host = parts.host?.lowercased(), ProfileLinkKind.isPlainHost(host) else { return nil }
+        parts.scheme = "https"
+        parts.host = host
+        parts.fragment = nil
+        return parts.url
     }
 
     /// The first web link in some text.
@@ -56,7 +73,7 @@ enum LinkPreviews {
     /// Fetches the page over Tor (unless Tor is turned off) on a lane of its own, so the site sees a Tor exit
     /// rather than you, and can't be matched to your relay traffic. Only the page and one picture are fetched.
     static func fetch(_ url: URL) async -> LinkPreview? {
-        guard let session = session(for: url) else { return nil }
+        guard let session = session(for: url), await isPublic(url) else { return nil }
         defer {
             session.invalidateAndCancel()
             // The next preview gets new circuits, so one site can't tie your previews together.
@@ -68,14 +85,44 @@ enum LinkPreviews {
         let meta = Meta(html: String(decoding: data, as: UTF8.self))
         var image: Data?
         if let src = meta.image, let imageURL = URL(string: src, relativeTo: page)?.absoluteURL, isWebLink(imageURL.absoluteString),
-           let host = imageURL.host()?.lowercased(), !Invite.isLocal(host),
+           let host = imageURL.host()?.lowercased(), !Invite.isLocal(host), await isPublic(imageURL),
            let (raw, _) = await get(imageURL, in: session, limit: 3 * 1024 * 1024),
-           let picture = PlatformImage(data: raw) {
+           let picture = PlatformImage.checked(raw) {
             image = cleanJPEG(picture, maxSide: 600)
         }
         let site = meta.site ?? page.host()?.replacingOccurrences(of: "www.", with: "")
         guard meta.title != nil || image != nil else { return nil }
         return LinkPreview(url: url.absoluteString, title: meta.title.map { String($0.prefix(200)) }, site: site, image: image)
+    }
+
+    /// With Tor off the connection is made from here, so a name that points into your own network (or this
+    /// machine) is refused too, not only an address that says so. Over Tor the exit does the looking up, and a
+    /// private address is out of its reach.
+    static func isPublic(_ url: URL) async -> Bool {
+        guard let host = url.host()?.lowercased(), !Invite.isLocal(host) else { return false }
+        if Tor.uses(url) { return true }
+        return await Task.detached { resolvesToPublicAddresses(host) }.value
+    }
+
+    /// Every address the name resolves to must be public. Names that don't resolve are refused.
+    nonisolated static func resolvesToPublicAddresses(_ host: String) -> Bool {
+        var hints = addrinfo(ai_flags: 0, ai_family: AF_UNSPEC, ai_socktype: SOCK_STREAM, ai_protocol: 0,
+                             ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
+        var found: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &found) == 0, let first = found else { return false }
+        defer { freeaddrinfo(found) }
+        var node: UnsafeMutablePointer<addrinfo>? = first
+        var any = false
+        while let current = node {
+            var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard let addr = current.pointee.ai_addr,
+                  getnameinfo(addr, current.pointee.ai_addrlen, &buffer, socklen_t(buffer.count), nil, 0, NI_NUMERICHOST) == 0
+            else { return false }
+            if Invite.isLocal(String(cString: buffer)) { return false }
+            any = true
+            node = current.pointee.ai_next
+        }
+        return any
     }
 
     /// Over Tor when it's on, like everything else. Nil when the link points into your own network.
@@ -115,8 +162,7 @@ enum LinkPreviews {
         static let shared = Redirects()
         func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                         newRequest request: URLRequest) async -> URLRequest? {
-            guard let url = request.url, isWebLink(url.absoluteString), let host = url.host()?.lowercased(),
-                  !Invite.isLocal(host) else { return nil }
+            guard let url = request.url, isWebLink(url.absoluteString), await isPublic(url) else { return nil }
             return request
         }
     }

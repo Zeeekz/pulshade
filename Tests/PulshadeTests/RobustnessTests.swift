@@ -42,7 +42,7 @@ struct RobustnessTests {
     @Test func everyByteOfASealedEnvelopeMatters() throws {
         let me = Identity.generate(), them = Identity.generate()
         let payload = Payload.typing(conversation: nil)
-        let blob = try Envelope.seal(payload, from: them, to: me.card.agreement)
+        let blob = try Envelope.seal(payload, from: them, to: me.recipient)
         for i in blob.indices {
             var broken = blob
             broken[i] ^= 0x01
@@ -78,7 +78,6 @@ struct RobustnessTests {
         for _ in 0..<300 {
             let junk = bytes(Int.random(in: 0...300, using: &rng), &rng)
             _ = try? decoder.decode(Payload.self, from: junk)
-            _ = try? decoder.decode(GroupInfo.self, from: junk)
             _ = try? decoder.decode(Attachment.self, from: junk)
             _ = try? decoder.decode(Message.self, from: junk)
         }

@@ -3,7 +3,7 @@
 Pulshade exists to keep people safe, so a security hole is the most important kind of bug. Thank you for looking.
 
 Pulshade has **not yet had an independent audit**. The ratchet, the handshake and the envelopes are our own code
-following published designs, and the README's "Known limits" lists what we already know falls short.
+following published designs, and "Known limits in full" in docs/how-it-works.md lists what we already know falls short.
 
 ## Reporting a vulnerability
 
@@ -32,7 +32,7 @@ Anything that breaks a promise the README makes, for example:
 
 ## What doesn't
 
-- the limits already listed under "Known limits" in the README (unless you've found a way to make one worse)
+- the limits already listed under "Known limits in full" in docs/how-it-works.md (unless you've found a way to make one worse)
 - attacks that need an unlocked device in hand, or malware already running as the user
 - someone you chat with keeping, copying or photographing what you sent them
 - running a modified copy of the app or relay yourself

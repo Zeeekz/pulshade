@@ -22,12 +22,20 @@ struct HelperBundle: Codable, Equatable {
         /// The mailbox this phone reads them on: mail from anyone else in it isn't theirs.
         var receiveKey: Data
         var devices: [Device]
+        /// Their post-quantum keys, pinned. Without them the helper sends this friend nothing: it has no classical way left.
+        var pq: PQPin? = nil
+        /// They have this account's post-quantum card already, so the note needn't carry it.
+        var hasCard: Bool? = nil
     }
 
     /// This account's signing and agreement keys (raw), the two an envelope needs. Not the seed: no recovery code,
     /// no storage key, nothing that opens the vault or a chat.
     var signing: Data
     var agreement: Data
+    /// The seeds of this account's ML-KEM and ML-DSA keys (see `PQKeys`), which an envelope needs as well now. Nil in a
+    /// bundle written before them: the helper then does nothing until the app has written a new one.
+    var pqKem: Data? = nil
+    var pqSig: Data? = nil
     /// This device's id, so their app knows which device has it.
     var device: Data
     /// The relay, reached directly: the helper can't run Tor.
@@ -92,12 +100,14 @@ enum LockedDelivery {
     /// them yet. Anything else (an unknown sender, a key setup, something already confirmed) is left alone.
     static func notes(for mail: [Mail], bundle: HelperBundle, confirmed: Set<Data>, now: Date = Date()) -> [Note] {
         guard bundle.confirms != false, let agreement = try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: bundle.agreement),
-              let signing = try? Curve25519.Signing.PrivateKey(rawRepresentation: bundle.signing) else { return [] }
+              let signing = try? Curve25519.Signing.PrivateKey(rawRepresentation: bundle.signing),
+              let kem = bundle.pqKem, let sig = bundle.pqSig, let pq = try? PQKeys(kemSeed: kem, sigSeed: sig) else { return [] }
         var byDevice: [Data: (friend: HelperBundle.Friend, digests: [Data])] = [:]
         var order: [Data] = []
         for item in mail {
             let digest = digest(of: item.blob)
-            guard !confirmed.contains(digest), let header = try? EnvelopeCore.open(item.blob, agreement: agreement),
+            guard !confirmed.contains(digest), let opened = try? EnvelopeCore.openPQ(item.blob, agreement: agreement, pq: pq, known: { bundle.friends[fingerprint(of: $0)]?.pq }),
+                  case let header = opened.header,
                   let friend = bundle.friends[fingerprint(of: header.signer)], friend.receiveKey == item.receiveKey,
                   friend.agreementKey == header.agreement, isChatMessage(header.body) else { continue }
             // Their device by the id it gave; an app too old to give one has only the one device.
@@ -109,9 +119,11 @@ enum LockedDelivery {
         }
         return order.compactMap { sendID in
             guard let entry = byDevice[sendID],
-                  let blob = try? EnvelopeCore.seal(body: collectedBody(entry.digests), framed: false, signing: signing,
-                                                    agreement: agreement, device: bundle.device, caps: 0, at: now,
-                                                    to: entry.friend.agreementKey) else { return nil }
+                  let pin = entry.friend.pq,
+                  let blob = try? EnvelopeCore.sealPQ(body: collectedBody(entry.digests), signing: signing, agreement: agreement, pq: pq,
+                                                      sign: true, introduce: entry.friend.hasCard != true, device: bundle.device, caps: 0,
+                                                      at: now, to: EnvelopeRecipient(agreement: entry.friend.agreementKey, pq: pin))
+            else { return nil }
             return Note(sendID: sendID, blob: blob, digests: entry.digests)
         }
     }
@@ -128,4 +140,12 @@ enum LockedDelivery {
         let json: [String: Any] = ["collected": ["digests": digests.map { $0.base64EncodedString() }]]
         return (try? JSONSerialization.data(withJSONObject: json)) ?? Data()
     }
+}
+
+/// What the switch for collecting while locked tells you, in plain words. The same text in setup, in Settings and in
+/// the confirmation, so none of them says less than the others.
+enum LockedDeliveryWarning {
+    static let short = "Off is safer. On, your phone keeps this account's signing keys where it can reach them while locked. Someone who pulls the Keychain off a phone that has been unlocked since it started could pretend to be you and read your future messages. Past messages stay safe."
+    static let title = "Collect messages when locked?"
+    static let confirm = "To collect mail while the phone is locked, a small helper needs your account's signing and agreement keys (with their post-quantum halves) and your friends' mailbox keys in the iPhone Keychain, readable once the phone has been unlocked since it started.\n\nIf someone who has your phone, or a copy of it, gets those out of the Keychain, they could pretend to be you and read the messages you receive from then on. Messages you already have stay safe, because their keys are in your vault, behind your passcode.\n\nLeave this off if that worries you. Turning it off again removes the keys from the helper."
 }

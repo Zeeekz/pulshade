@@ -76,7 +76,7 @@ encryption, and may keep it after Pulshade clears them, which it does whenever i
 
 **What's on the disk outside the vault.** A few things have to be readable before the passcode, and nothing in them
 is about your account: the theme, the menu bar icon and the screen-protection switches (so the lock screen looks
-right) and the Tor switch, in the system's preferences file; the bridge choice, in `bridges.sealed`, sealed with a
+right), in the system's preferences file; the Tor switch and the bridge choice, in `bridges.sealed`, sealed with a
 Keychain key of its own because private bridge lines are worth hiding; and Tor's own state and cache of relay lists,
 in `Application Support/Pulshade/tor` and `Caches/Pulshade/tor`, so later launches connect faster and keep the same
 guard. Detach keeps the network ones, since the device still has to reach the server. Burn removes all of them, the
@@ -101,13 +101,20 @@ Every message then gets its own key, used once and deleted, and every reply mixe
 - *Healing:* after a theft, the next round of replies locks the thief out again.
 - *Quantum resistance:* traffic recorded now can't be opened later by breaking X25519, because the session root also
   depends on ML-KEM.
-- *Post-quantum refresh:* after 50 messages or a day, a side offers a fresh ML-KEM-768 key, and the other side's
-  next reply answers it; that secret goes into the root alongside the reply's X25519. So someone who breaks X25519
-  later is locked out again at the next refresh, not only before the handshake (like Apple's PQ3).
+- *Sparse post-quantum ratchet:* both sides keep offering fresh ML-KEM-768 keys and answering the other's, but in small
+  erasure-coded pieces, one in every message, always the same size (random filler when there is nothing to send), so no
+  message is bigger and sizes show nothing. Once an answer is complete and both sides know it, the secret goes into the
+  root key at the next new chain. In a back-and-forth chat that is a new post-quantum secret about every 35 to 40
+  messages, so someone who breaks X25519 later is locked out again soon, not only before the handshake (like Signal's
+  triple ratchet). An app from before it is told to update first and nothing is exchanged until it does.
 
 **Envelopes.** Each ratchet message is then sealed twice. The outer seal uses a fresh X25519 key and
 ChaCha20-Poly1305, padded to fixed sizes, and hides your agreement key. The inner seal mixes in an X25519 exchange
-between your identity key and the recipient's. Only you could have made it, so the recipient knows it's from you,
+between your identity key and the recipient's. Both seals also mix in an ML-KEM-768 secret for the recipient's
+post-quantum key (also made from the seed), so breaking X25519 later doesn't reveal who wrote to whom. Key setup and
+other control messages are signed with ML-DSA as well as Ed25519, and both must check out; once a contact's
+post-quantum keys are known, nothing classical is accepted from them, so it can't be downgraded. The first envelope
+each way, which has to introduce the keys, is the one exception; an app from before is told to update. Only you could have made it, so the recipient knows it's from you,
 but the recipient could have made it too, so it proves nothing to anyone else: nothing you say is signed. Your
 signing key vouches once for your agreement key, never for a message. Each persona writes with its own device id,
 and anything sent outside a ratchet session (introductions, erasing) is stamped and counted once, so it can't be
@@ -168,9 +175,9 @@ all: every collectible is taken back from everyone, backup codes stop working, a
 at #1. Apps drop them, and take the one shown after your name off, the next time they check.
 
 **One-time chats.** New chat → one-time chat makes a throwaway identity for both sides that ends after the time you
-pick, and works for the first person in. Share it as a QR code, a link, or a 12-digit code to read out or type, so
+pick, and works for the first person in. Share it as a QR code, a link, or a 20-digit code to read out or type, so
 nothing has to go through another app. The code's link waits on the server sealed in a mailbox only the digits lead
-to (stretched like a passcode, so trying them all would take years), padded to a fixed size, and is deleted when
+to (stretched like a passcode; with 10^20 possible codes, trying them all offline is out of reach), padded to a fixed size, and is deleted when
 someone takes it or the chat ends.
 
 **Public profiles and requests.** Profiles are private unless you claim a @handle (per persona). The server keeps a
@@ -192,7 +199,9 @@ people's requests are dropped silently. A request from someone who's already you
 chat on their side, so it reconnects them straight away.
 
 **Pulse check.** Both people see the same ten emoji (60 bits), 30 digits, colours and QR code, derived from both
-identities. Scanning the other screen with the camera, or confirming the emoji match, marks the contact verified.
+identities: each one's signing-key fingerprint together with its agreement key, so swapping either key changes the code.
+An invite carries the signing key's signature over the agreement key, and an invite without a valid one is refused (an
+app from before this is told to update). Scanning the other screen with the camera, or confirming the emoji match, marks the contact verified.
 
 **Removing a contact.** Removing someone takes them off every one of your devices, with their keys, mailboxes and
 stories, and tells their app to forget you and your chat, the same message a burner sends when it burns, so the
@@ -228,9 +237,9 @@ sealed for up to 7 days and can't tell who reads it over Tor. The owner of an ol
 details. The trade-off: a stolen group key reads that group until its key next changes, and group messages show
 "sent" rather than ticking per member.
 
-**Groups, channels and broadcasts.** In the older format groups and channels fan out one envelope per member (newer
-groups and channels share one mailbox instead, and a channel's followers can't see who else follows: only its staff
-keep that list, in a mailbox of their own); members who aren't your
+**Groups, channels and broadcasts.** Groups and channels share one mailbox (a channel's followers can't see who else
+follows: only its staff keep that list, in a mailbox of their own). A group saved from the older format, where every
+message went out as one envelope per member, stays on the device as read-only history. Members who aren't your
 contacts are kept as hidden peers, used only inside that group. Each has an owner, optional admins and a posting
 rule (everyone, admins, or owner only). Changes carry a version number and only count when they come from an admin.
 Admins add people from their contacts and remove members; only the owner appoints admins, changes the posting rule
@@ -239,29 +248,16 @@ Mod tag, posting when only admins can, and taking ordinary members out (never ad
 nothing else. Everyone else only accepts a mod's update if it removes members and changes nothing besides. Channel followers only learn who can post, not who
 else follows. A broadcast is the same message sent privately to each person.
 
-Members who don't know each other first meet through introduction mailboxes. Whoever sends out the group's details
-makes one for each member's device, gives that device its key privately, and gives the other members only where to
-write. Nobody is ever given the mailbox a member uses with the owner. What arrives there is sealed to the member, so
-whoever made it can't read it. After the first hello, the member opens a mailbox just for that person and tells them
-to write there instead. If the group was made before its owner had heard from a member's device (someone added a
-moment earlier), that member is told its mailbox again once the owner knows the device.
-
-A group's details also name each member's keys and mailbox, and those names are only the group's word: an owner
-or admin who wanted to interfere could put a member's signing key beside an agreement key or mailbox of their
-own. That cannot read what you say to that member, because a message is only sealed once a session opens, and a
-session only opens when the other side answers with an envelope signed by the member's own identity key. What a
-poisoned card can do is stop you reaching that member, and show the attacker the introduction card (your profile
-and public keys) that is sent first. Checking the safety code out of band, or meeting in person, settles it. A
-later version can have each member sign their own card, which would close even that.
-
 **Linked devices.** One account, several devices, like Signal. Your identity keys are shared between your devices,
 but each device has its own id, its own mailboxes and its own ratchet session with every contact device, so no
 message key is ever used twice. Linking: the logged-in device shows a QR code holding a one-time secret and a
 mailbox; the new device answers with a fresh key; you approve it; and the account (keys, contacts, groups, personas,
 settings) is sent encrypted to that key mixed with the secret, with message history following over the new device's
 session. Only the first device to answer a code counts, and both devices show six digits to compare before you
-approve. The new device then introduces itself to every contact, calling itself just "Mac" or "iPhone". People send
-to all your devices; what you do on one is synced to the others through an encrypted session between them.
+approve. The new device then introduces itself to every contact, calling itself just "Mac" or "iPhone". A contact's
+chat gets a line, "<name>'s account added a new device", when a device they didn't have before appears, and one of your
+own devices that another of your devices linked (not this one) is marked in your device list until you confirm or stop
+syncing it. People send to all your devices; what you do on one is synced to the others through an encrypted session between them.
 
 **Link previews.** Off by default. When on, the sender's device builds them while you type and sends them inside the
 encrypted message, like Signal: the person receiving it never contacts the website. The sender's device fetches the
@@ -282,7 +278,7 @@ a contact once said. Every code you scan or open asks before it does anything, a
 app can never link a device; that only works from the camera. The code is open, so anyone can check what the app and
 the server do; a build someone makes themselves uses its own server, and isn't Pulshade.
 
-**The server (relay).** A small Rust program. No accounts and no request logs (it prints only start-up and error lines, none naming an address or a mailbox). Envelopes are held in memory, and in a journal on the server's disk with every record sealed by its storage key, and deleted on pickup or after 7 days; their ids are random, so they don't reveal how busy it is. Wake-up registrations (which device token to wake for which mailbox, only for phones that turned "Wake when locked" on) are kept the same way, in a sealed file that is rewritten within seconds of a change and drops a phone as soon as it turns the setting off. Waiting envelopes survive a restart, a crash and a reboot: each deposit and each removal is appended to the sealed journal as it happens, and the file is rewritten (the old one overwritten and removed) every ten minutes when mail has left and straight after a burn, so collected mail does not linger. On a disk that writes new blocks elsewhere overwriting only helps; what makes old bytes unreadable is that they are sealed and the key is held only in memory. The handle directory, held handles, moderation
+**The server (relay).** A small Rust program. No accounts and no request logs (it prints only start-up and error lines, none naming an address or a mailbox). A waiting envelope is written to the server's disk before the sender is told it was taken, sealed, in a segment file with a key of its own (the keys are kept in an index sealed by the server's storage key), and the server keeps no copy beside it in memory (a message collected a moment after it lands is read back from the disk). It is deleted on pickup or after 7 days; their ids are random, so they don't reveal how busy it is. How much can wait is limited by the mail's share of the disk (2 GiB unless set otherwise) and, per mailbox, by a byte cap; a full share turns new mail away (the sender keeps it and tries again) and never drops mail that is already waiting. Wake-up registrations (which device token to wake for which mailbox, only for phones that turned "Wake when locked" on) are kept the same way, in a sealed file that is rewritten within seconds of a change and drops a phone as soon as it turns the setting off. Waiting envelopes survive a restart, a crash and a reboot. When a phone has collected an envelope it is marked gone; a segment with nothing left waiting in it has its key forgotten and its file overwritten with random bytes and deleted at once (within a fraction of a second), and one kept alive by a single slow reader is rewritten without the collected mail once most of it is gone, and after a burn or a recall straight away. On a disk that writes new blocks elsewhere overwriting only helps; what makes old bytes unreadable is that they are sealed, the segment's key is forgotten, and the storage key is held only in memory. The handle directory, held handles, moderation
 lists and accounts' sealed backups (no chats) are saved to disk too, the first three sealed with the same storage
 key, as are the push key, the pet signing key and the onion service's key (Arti's own keystore is kept in memory, and
 the relay hands it the unsealed key at start). On a Mac that key is in the Keychain. On the Linux server it is never
@@ -342,12 +338,20 @@ kept in memory only.
 
 ## Known limits in full
 
+- **Group keys are replaced when someone leaves and after at most 7 days or 1,000 posts of use, not per message.** A
+  stolen group key reads that epoch's messages (and a member's sending chain from its start in it); an admin's device
+  starts a new epoch once the current one is 7 days old or 1,000 posts long, once something has been said in it, and
+  epochs are let go a week after the next begins. Between those, a stolen epoch key reads everything in it, as in
+  other messengers' groups.
 - **Not yet audited.** The ratchet, the handshake and the envelopes are our own implementation of published designs.
   They pass our tests, but they need an independent audit before anyone relies on them.
-- **Post-quantum keys refresh every 50 messages or a day, not on every reply.** Between refreshes, healing after a
-  theft relies on X25519 alone. The messages carrying a refresh are larger (8 KB rather than 2 KB), so someone
-  watching sizes can tell roughly when one happens. Signal's triple ratchet spreads its keys across many small
-  messages to avoid that; Pulshade doesn't yet. A chat with someone on an older version never refreshes.
+- **A new post-quantum secret arrives about every 35 to 40 messages, not on every reply.** Between them, healing after
+  a theft relies on X25519 alone. Pulshade's exchange is its own design in the spirit of Signal's triple ratchet, not
+  that protocol, and is not audited. A one-sided stream of messages does not advance it.
+- **Groups that share a mailbox have no per-message forward secrecy against a stolen epoch key.** Epochs are short (a
+  removal, or 7 days or 1,000 posts), and old keys go a week after the next epoch begins, but whoever holds an epoch key
+  can work out any sender's chain in it. Fixing that needs each sender to seal its chain to every member, which costs a
+  message per member per sender per epoch; the design is written down in `docs/groups-design.md`.
 - **Signatures are gone from messages, not from the directory.** Public profiles, handle claims and admin actions are
   signed, because they're meant to be checked by anyone.
 - **Disappearing messages and deleted stories trust the other device.** A modified app could ignore the timer or the
@@ -367,16 +371,28 @@ kept in memory only.
   The built-in bridges are public, so a determined censor can block them; your own private bridges are the strongest.
 - **Outside the app, your IP address still reaches** wherever you downloaded it, and Apple when a Mac first checks the
   app is notarized. Neither learns who you are on Pulshade or who you talk to.
-- **One operator.** The official app only uses Pulshade's servers, which can see when and how much traffic flows
-  (never what it says, or who you are behind Tor). A modified app could still point at them; that's held back by rate
-  limits and the terms of use, not by anything the code can prove.
-- **iPhone:** messages arrive while the app is open, unless **Wake when locked** is on, since waking a closed app needs
+- **One operator.** The official app sends your messages and account traffic only to Pulshade's servers, which can see when and how much traffic flows
+  (never what it says, or who you are behind Tor). Apple's push service, sites behind link previews you turn on and a
+  Snowflake bridge's front are contacted separately, and links you tap open in the browser. A modified app could still
+  point at other servers; that's held back by rate limits and the terms of use, not by anything the code can prove.
+- **A short or guessable passcode is guessable.** New passcodes need at least 6 characters (a 4-digit PIN is no
+  longer offered; an existing one is flagged in Settings to change). The Secure Enclave key that is mixed into the vault
+  key is not behind a Face ID or passcode prompt of its own, so on a phone that is unlocked an attacker with the device
+  only needs your passcode. "Wipe after wrong guesses" is off unless chosen, counts across restarts, and only stops
+  someone typing guesses on the phone; it can't stop an attacker who works on a copy of the files, and a slip can wipe
+  your own device (Detach, recoverable by the recovery code from the sealed backup, never chats).
+- **A new device is announced, not approved.** When a contact's account adds a device, their chat says so and all
+  later messages are sent to it as well. There is no way to hold messages until you approve it: that would break
+  multi-device for everyone. Compare the Pulse check again if the line surprises you.
+- **Collecting messages while locked is off by default, and for a reason.** It lets a small notification helper take
+  short mail off the server while the iPhone is locked, so friends get their second tick. To do that it keeps this
+  account's signing and agreement keys, and your friends' mailbox keys, in the Keychain, readable once the phone has
+  been unlocked since it started. Someone who can extract the Keychain from such a phone could pretend to be you and
+  read your future messages. Past messages stay safe: their keys are in the vault, behind your passcode. Turn it on
+  only if you accept that; turning it off removes those keys from the helper. Settings and setup say the same in
+  plain words.
+- **iPhone:** messages arrive while the app is open, unless **Wake when locked** is on (it is by default), since waking a closed app needs
   Apple's push service (see [wake-up pushes](push-notifications.md)). Blank screenshots
   rely on iOS behaviour Apple doesn't document; if an update changes it, screenshots would show the app again.
-- **Groups in the older format cap out at 300 members.** Every message goes out as one envelope per member. Groups that
-  share one mailbox take 5,000, and so do channels whose followers all run a recent app. Any group or channel with someone on an
-  older app still uses the older format.
-- **A group's member list is only as trustworthy as its admins.** The keys and mailboxes in a group's details are
-  asserted by whoever sent them. A poisoned card can't read your messages to that member (a session only opens on
-  an answer signed by the member's own identity key), but it can stop you reaching them. Check the safety code
-  when it matters.
+- **A group or channel can only hold people whose app is recent enough.** Groups take 5,000 members, and so do channels.
+  Someone on an app from before shared mailboxes is told to update first; there is no older format to put them in.

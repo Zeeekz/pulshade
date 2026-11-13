@@ -9,7 +9,7 @@ enum EnvelopeCore {
     private static let version: UInt8 = 2
     private static let outerInfo = Data("pulshade.envelope.v2.outer".utf8)
     private static let innerInfo = Data("pulshade.envelope.v2.inner".utf8)
-    private static let bindLabel = Data("pulshade.keys.v1".utf8)
+    static let bindLabel = Data("pulshade.keys.v1".utf8)
     private static let buckets = [2_048, 8_192, 32_768, 131_072, 524_288, 2_097_152]
 
     private struct Inner: Codable {
@@ -35,6 +35,17 @@ enum EnvelopeCore {
         var sentAt: Date
         var caps: UInt8
         var body: Data
+    }
+
+    /// The signing key's signature over an agreement key: "these two keys are the same person". Envelopes carry it,
+    /// and so do invites, so neither can pair one account's signing key with someone else's agreement key.
+    static func bind(signing: Curve25519.Signing.PrivateKey, agreement: Data) throws -> Data {
+        try signing.signature(for: bindLabel + agreement)
+    }
+
+    static func bindIsValid(_ bind: Data, signing: Data, agreement: Data) -> Bool {
+        guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: signing) else { return false }
+        return key.isValidSignature(bind, for: bindLabel + agreement)
     }
 
     static func seal(body: Data, framed: Bool, signing: Curve25519.Signing.PrivateKey,

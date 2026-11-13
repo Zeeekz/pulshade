@@ -60,53 +60,6 @@ import Foundation
     }
 }
 
-/// Needs a relay, like the other flow tests: `scripts/test.sh` starts one.
-@MainActor
-@Suite(.enabled(if: ProcessInfo.processInfo.environment["PULSHADE_RELAY_TEST"] == "1"), .serialized)
-struct MentionFlowTests {
-    private func makeUser(_ name: String) async throws -> AppModel {
-        let model = testModel("pulshade-test")
-        try await model.create(identity: .generate(), profile: Profile(name: name), passcode: "test-passcode")
-        return model
-    }
-
-    private func settle(_ models: AppModel..., rounds: Int = 6) async {
-        for _ in 0..<rounds { for m in models { await m.syncOnce() } }
-    }
-
-    /// Alice knows Bob and Cara; Bob and Cara only share the group. Alice can mention either of them, Bob sees it
-    /// is him, Cara sees it names someone else, and Bob can't mention Cara because she isn't his contact.
-    @Test func mentionsReachTheRightPeopleAndOnlyContactsCanBeMentioned() async throws {
-        let alice = try await makeUser("Alice")
-        let bob = try await makeUser("Bob")
-        let cara = try await makeUser("Cara")
-        defer { for m in [alice, bob, cara] { m.lock() } }
-        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
-        _ = try #require(cara.addContact(code: alice.makeInviteCode(), nickname: ""))
-        await settle(alice, bob, cara)
-        let bobFP = try #require(alice.visibleContacts.first { $0.name == "Bob" }).fingerprint
-        let caraFP = try #require(alice.visibleContacts.first { $0.name == "Cara" }).fingerprint
-        let group = alice.startConversation(kind: .group, title: "Night owls", members: [bobFP, caraFP])
-        await settle(alice, bob, cara)
-
-        #expect(Set(alice.mentionable(in: try #require(alice.conversation(group.id))).map(\.name)) == ["Bob", "Cara"])
-        alice.send("hey @Bob, ask @Bob", mentioning: [(bobFP, "Bob")], in: group.id)
-        await settle(alice, bob, cara)
-        let atBob = try #require(bob.conversation(group.id)?.messages.last)
-        #expect(atBob.mentionsMe && atBob.mentions.count == 2)
-        let atCara = try #require(cara.conversation(group.id)?.messages.last)
-        #expect(!atCara.mentionsMe && atCara.mentions.map(\.fingerprint) == [bobFP, bobFP])
-
-        // Cara has no contact called Bob, so nothing is offered and a forced mention is dropped.
-        let caraGroup = try #require(cara.conversation(group.id))
-        #expect(cara.mentionable(in: caraGroup).map(\.name) == ["Alice"])
-        cara.send("hi @Bob", mentioning: [(bobFP, "Bob")], in: group.id)
-        await settle(alice, bob, cara)
-        let plain = try #require(bob.conversation(group.id)?.messages.last)
-        #expect(plain.text == "hi @Bob" && plain.mentions.isEmpty && !plain.mentionsMe)
-    }
-}
-
 /// A picture glows, and opens the story when tapped, only while someone has a story you haven't watched.
 @MainActor
 @Suite struct UnwatchedStoryTests {

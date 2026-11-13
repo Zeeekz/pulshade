@@ -3,13 +3,12 @@ import Foundation
 @testable import Pulshade
 
 /// Channels that share one mailbox, end to end through a real relay (see scripts/test.sh): followers hold the channel's key
-/// but are in nobody's list, the staff keep a hidden roster to rekey from, and an older channel moves over by itself.
+/// but are in nobody's list, and the staff keep a hidden roster to rekey from.
 @MainActor
 @Suite(.enabled(if: ProcessInfo.processInfo.environment["PULSHADE_RELAY_TEST"] == "1"), .serialized)
 struct SharedChannelFlowTests {
     private func makeUser(_ name: String) async throws -> AppModel {
         let model = testModel("pulshade-channel")
-        model.sharedGroupsEnabled = true
         try await model.create(identity: .generate(), profile: Profile(name: name), passcode: "test-passcode")
         return model
     }
@@ -89,6 +88,22 @@ struct SharedChannelFlowTests {
         #expect(Set(alice.conversation(channel.id)?.members ?? []) == [bobFP, caraFP])
     }
 
+    /// A follower deleting a channel only removes it from their own device (staff take them out of the roster); the owner
+    /// deleting it removes it for the followers.
+    @Test func aFollowerDeletingKeepsItForOthersAndTheOwnerDeletingRemovesItForAll() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let channel = alice.startConversation(kind: .channel, title: "Drops", members: [bobFP, caraFP])
+        await until([alice, bob, cara]) { joined(channel.id, bob, cara) && alice.conversation(channel.id)?.shared?.roster?.live.count == 2 }
+        bob.delete(channel.id)
+        await settle(alice, bob, cara)
+        #expect(bob.conversation(channel.id) == nil)
+        #expect(alice.conversation(channel.id) != nil && cara.conversation(channel.id) != nil, "the channel stays for the others")
+        alice.delete(channel.id)
+        await until([alice, bob, cara]) { cara.conversation(channel.id) == nil }
+        #expect(cara.conversation(channel.id) == nil)
+    }
+
     @Test func aFollowerTakenOutCantReadWhatFollows() async throws {
         let (alice, bob, cara, bobFP, caraFP) = try await trio()
         defer { for m in [alice, bob, cara] { m.lock() } }
@@ -143,30 +158,6 @@ struct SharedChannelFlowTests {
         await settle(alice, bob, cara)
         #expect(alice.conversation(channel.id)?.messages.last?.text == "after")
         #expect(cara.conversation(channel.id)?.messages.last?.text == "admin post")
-    }
-
-    @Test func anOlderChannelMovesOverByItselfAndHidesItsFollowers() async throws {
-        let (alice, bob, cara, bobFP, caraFP) = try await trio()
-        defer { for m in [alice, bob, cara] { m.lock() } }
-        alice.sharedChannelsEnabled = false
-        let channel = alice.startConversation(kind: .channel, title: "Drops", members: [bobFP, caraFP])
-        #expect(channel.shared == nil, "made the old way")
-        alice.send("old drop", in: channel.id)
-        await until([alice, bob, cara]) { bob.conversation(channel.id)?.messages.count == 1 && cara.conversation(channel.id)?.messages.count == 1 }
-        #expect(bob.conversation(channel.id)?.shared == nil, "the old way")
-
-        alice.sharedChannelsEnabled = true
-        alice.moveGroupsOver()
-        await until([alice, bob, cara]) { joined(channel.id, bob, cara) }
-        #expect(alice.conversation(channel.id)?.shared?.settings.members.count == 1)
-        #expect(bob.conversation(channel.id)?.members.count == 1, "now only the owner is listed")
-        #expect(bob.conversation(channel.id)?.messages.first?.text == "old drop", "the history stays")
-        alice.send("new drop", in: channel.id)
-        await until([alice, bob, cara]) {
-            bob.conversation(channel.id)?.messages.last?.text == "new drop" && cara.conversation(channel.id)?.messages.last?.text == "new drop"
-        }
-        #expect(bob.conversation(channel.id)?.messages.last?.text == "new drop")
-        #expect(cara.conversation(channel.id)?.messages.last?.text == "new drop")
     }
 
     @Test func anAdminLetGoLosesTheRosterMailbox() async throws {

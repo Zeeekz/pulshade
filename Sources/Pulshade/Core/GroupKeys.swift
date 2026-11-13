@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import os
 
 // Groups that share one mailbox on the relay (see docs/groups-design.md).
 //
@@ -145,9 +146,21 @@ struct MemberCard: Codable, Equatable {
               name.count <= 64, name.utf8.count <= 256, (avatar?.count ?? 0) <= Self.maxAvatar, avatarHash.map({ $0.count == 32 }) ?? true else { return false }
         // A picture, when it comes, must be the one the signed hash names.
         if let avatar, avatarHash != Data(SHA256.hash(data: avatar)) { return false }
-        return key.isValidSignature(signature, for: Self.signable(group: group, signingKey: signingKey, agreementKey: agreementKey,
-                                                                  name: name, avatarHash: avatarHash, color: color))
+        let signed = Self.signable(group: group, signingKey: signingKey, agreementKey: agreementKey,
+                                   name: name, avatarHash: avatarHash, color: color)
+        // A big group's settings carry every card, and each new version brings them all again: a card that has already
+        // checked out (same bytes, same signature) isn't checked twice. Only passes are remembered, in memory only.
+        let digest = Data(SHA256.hash(data: signed + signature))
+        if Self.checked.withLock({ $0.contains(digest) }) { return true }
+        guard key.isValidSignature(signature, for: signed) else { return false }
+        Self.checked.withLock {
+            if $0.count >= 20_000 { $0.removeAll() }
+            $0.insert(digest)
+        }
+        return true
     }
+
+    private static let checked = OSAllocatedUnfairLock(initialState: Set<Data>())
 }
 
 /// Everything about a group: its look, who is in it, who may do what, and which epoch it is in. One signed document,
@@ -246,8 +259,15 @@ struct GroupSettings: Codable, Equatable {
     /// Whether `next` may replace this version: signed by its signer, numbered one on, well-formed, for the same group,
     /// and every change in it is one its signer may make.
     func accepts(_ next: GroupSettings) -> Bool {
-        guard groupNumberRange.contains(next.version), next.group == group, next.kind == kind, next.version == version + 1, next.signatureIsValid, next.wellFormed(),
-              next.epoch == epoch || next.epoch == epoch + 1, isMember(next.signer) else { return false }
+        // The cheap checks first (numbers, signer's place and role, what changed), the signature and the cards, which
+        // cost a signature check each, only for a version that could be accepted at all.
+        guard groupNumberRange.contains(next.version), next.group == group, next.kind == kind, next.version == version + 1,
+              next.epoch == epoch || next.epoch == epoch + 1, isMember(next.signer), allowsChange(to: next) else { return false }
+        return next.signatureIsValid && next.wellFormed()
+    }
+
+    /// Whether `next`'s signer is allowed the change from this version to it. Says nothing of the signature.
+    private func allowsChange(to next: GroupSettings) -> Bool {
         let who = next.signer
         // Judged by the roles in the version it changes, not the one it brings.
         if who == owner { return next.owner == owner }
@@ -727,15 +747,17 @@ struct SharedGroup: Codable, Equatable {
     /// After a follower was taken out: the epoch then, until a newer one exists without them (tried again until it does).
     var rekeyAfter: Int?
     var rekeyTried: Date?
+    /// After followers left: the time the one new epoch for all of them is made (leaves close together share it).
+    var rekeyDue: Date?
+    /// As staff of a channel: people who followed through its code and are waiting to be let in (an hourly limit was
+    /// reached), by account fingerprint.
+    var joinWaiting: [String]?
     /// As the owner of a channel: followers asked to become staff, by account fingerprint, until they answer.
     var staffInvited: [String: Date]?
     /// The staff the roster was last sealed to, so a new admin gets a copy.
     var rosterStaff: [Data]?
     /// As an admin: people invited over a 1:1 chat whose card hasn't come back yet, by account fingerprint.
     var invited: [String: Date] = [:]
-    /// As an admin: people added whose app is too old to take part yet, by account fingerprint, with when. Each is
-    /// invited as soon as their app says it can.
-    var awaitingUpdate: [String: Date]?
     /// As an admin: who joined through this device, by account fingerprint, as which member. Only on this device:
     /// nobody else in the group learns who a member is outside it.
     var knownAs: [String: String] = [:]
@@ -745,6 +767,10 @@ struct SharedGroup: Codable, Equatable {
     /// Someone has said something in the current epoch (as far as this device has read). A newcomer is then given a
     /// new epoch, so they can't read it; several joining in a quiet spell share one.
     var chatInEpoch = false
+    /// How many chat posts this device has seen in the current epoch (its own and others'), for a new epoch by count.
+    var chatsInEpoch: Int?
+    /// When an admin device last tried to start a new epoch because the current one had grown old or long.
+    var rotationTried: Date?
     /// Epoch keys handed out (a new epoch's) but not yet named by settings this device took. Kept until settings with
     /// the matching check arrive; two admins starting one at once leave two here, and the settings decide.
     var candidates: [GroupEpoch] = []

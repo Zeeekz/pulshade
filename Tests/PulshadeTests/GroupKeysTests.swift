@@ -63,6 +63,46 @@ struct GroupKeysTests {
         #expect(key.flatMap { GroupSeal.inner(o, messageKey: $0) } == Data("other device".utf8))
     }
 
+    /// What a reader keeps after reading holds no key of a message it has opened, and a late or repeated message can't be
+    /// opened by what is left: the sender's chain only moves forward and each key is used once.
+    @Test func aReaderKeepsNoKeyOfWhatItHasRead() throws {
+        let epoch = GroupEpoch.fresh(number: 1)
+        let me = keys(.random(32))
+        var chain = epoch.chainStart(for: me.publicKey, device: GroupSeal.deviceTag(dev))
+        var blobs: [Data] = []
+        var messageKeys: [Data] = []
+        var probe = chain
+        for i in 0..<5 {
+            blobs.append(try GroupSeal.seal(Data("m\(i)".utf8), group: group, epoch: epoch, keys: me, device: dev, chain: &chain))
+            messageKeys.append(probe.step().messageKey)
+            probe = probe.step().next
+        }
+        var reader = GroupReader()
+        // Read 0, 1, 4 (2 and 3 are late).
+        for i in [0, 1, 4] {
+            let outer = try GroupSeal.outer(blobs[i], group: group, epoch: epoch)
+            let maybe = reader.messageKey(epoch: epoch, sender: outer.sender, device: outer.device, index: outer.index)
+            let key = try #require(maybe)
+            #expect(GroupSeal.inner(outer, messageKey: key) == Data("m\(i)".utf8))
+        }
+        let held = reader.chains.values.map(\.key) + Array(reader.skipped.values)
+        for i in [0, 1, 4] { #expect(!held.contains(messageKeys[i]), "No key of a message already read is kept") }
+        #expect(reader.skipped.count == 2, "Only the two late ones wait, a bounded set")
+        // The late ones still open, in any order, and once.
+        for i in [3, 2] {
+            let outer = try GroupSeal.outer(blobs[i], group: group, epoch: epoch)
+            let maybe = reader.messageKey(epoch: epoch, sender: outer.sender, device: outer.device, index: outer.index)
+            let key = try #require(maybe)
+            #expect(GroupSeal.inner(outer, messageKey: key) == Data("m\(i)".utf8))
+            let again = reader.messageKey(epoch: epoch, sender: outer.sender, device: outer.device, index: outer.index)
+            #expect(again == nil)
+        }
+        #expect(reader.skipped.isEmpty)
+        // Beyond the bound, a sender can't make a reader keep more.
+        let tooFar = reader.messageKey(epoch: epoch, sender: me.publicKey, device: Data.random(8), index: GroupReader.maxSkip + 5)
+        #expect(tooFar == nil)
+    }
+
     @Test func theRelayAndOtherEpochsSeeNothingAndNobodyCanSignAsSomeoneElse() throws {
         let epoch = GroupEpoch.fresh(number: 1)
         let me = keys(.random(32)), mallory = keys(.random(32))

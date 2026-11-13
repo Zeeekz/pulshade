@@ -43,6 +43,8 @@ final class AppModel {
     var burnPending = false
     /// What to tell the person about a Burn, shown over every screen even after the wipe.
     var burnNotice: String?
+    /// After approving: the digits the new device must show too. Cleared when you say they match, or cancel.
+    var linkConfirmation: String?
     @ObservationIgnored let burnStore: BurnOrderStore
     @ObservationIgnored private var burnTask: Task<Void, Never>?
     /// How far a file's upload or download has got (0...1), by message. In memory only: a phone keeps no file.
@@ -177,6 +179,14 @@ final class AppModel {
         burnStore = BurnOrderStore(file: vault.directory.deletingLastPathComponent().appendingPathComponent(vault.directory.lastPathComponent + "-burn-order.sealed"),
                                    service: "app.pulshade.burn-order." + vault.directory.lastPathComponent)
         phase = vault.exists ? .locked : .welcome
+        #if os(iOS)
+        // iOS keeps Keychain items when an app is deleted. A fresh install with no vault must not inherit keys left
+        // by a deleted one (the notification helper's bundle and inbox, sealed files' keys).
+        if vault.claimFreshInstall() {
+            HelperStore.clear()
+            FileKeys.forgetAll()
+        }
+        #endif
         Ink.source = { [weak self] in self?.theme ?? .dark }
         guard watchSystem else { return }
         resumeBurnCleanup()
@@ -415,6 +425,7 @@ final class AppModel {
     }
 
     func create(identity: Identity, profile: Profile, passcode: String) async throws {
+        guard passcode.count >= LockStyle.minimumLength else { throw PasscodeSetupError.tooShort }
         let vault = vault
         try await Task.detached { try vault.create(identity, passcode: passcode) }.value
         self.identity = identity
@@ -430,6 +441,7 @@ final class AppModel {
     /// Opens the account on this device from its recovery code. With the backup a log out left behind,
     /// it carries on exactly where it stopped; without one, it starts empty.
     func restore(seed: Data, passcode: String, from backup: AppData? = nil) async throws {
+        guard passcode.count >= LockStyle.minimumLength else { throw PasscodeSetupError.tooShort }
         let identity = try Identity(seed: seed)
         let vault = vault
         let stored = backup == nil ? try storedData(identity) : AppData()
@@ -497,45 +509,6 @@ final class AppModel {
     /// of minutes meanwhile, not only when another unreadable message happens to arrive.
     struct Unreadable { var fingerprint: String; var persona: UUID?; var device: Data; var since: Date }
     private(set) var unreadable: [String: Unreadable] = [:]
-    /// Contacts who wrote from a device of theirs this device doesn't know (by persona and fingerprint), and when last:
-    /// their messages wait unread until that device introduces itself. Memory only, for the key status in group info.
-    @ObservationIgnored private(set) var strangeDevices: [String: Date] = [:]
-
-    /// How things stand between this device and someone in an older-style group: whether it can write to them, whether
-    /// keys are ready or being asked for, and whether anything from them couldn't be read. Nil for yourself and for
-    /// groups that share one mailbox (members there need no keys with each other).
-    func keyStatus(of fingerprint: String, in convo: Conversation) -> String? {
-        guard fingerprint != "me", convo.kind != .direct, convo.shared == nil else { return nil }
-        guard let c = contact(fingerprint, in: convo.persona) else { return "Not met yet" }
-        var parts: [String] = [c.hidden ? "Group only" : "Friend"]
-        let devices = c.devices
-        let reachable = devices.filter { $0.sendID.count == 32 }
-        if reachable.isEmpty { return (parts + ["no address for them"]).joined(separator: " · ") }
-        parts.append(devices.count == 1 ? "1 device" : "\(devices.count) devices")
-        let ready = reachable.filter { $0.session != nil }.count
-        let asked = reachable.compactMap { $0.handshake?.startedAt }.min()
-        if ready == reachable.count {
-            parts.append("keys ready")
-            if let asked { parts.append("new keys asked \(asked.formatted(date: .abbreviated, time: .shortened))") }
-        } else if let asked {
-            parts.append("asked for keys \(asked.formatted(date: .abbreviated, time: .shortened))")
-        } else if reachable.contains(where: { $0.awaitingHello == true }) {
-            parts.append("waiting for their hello")
-        } else {
-            parts.append(ready == 0 ? "no keys" : "keys ready on \(ready) of \(reachable.count)")
-        }
-        if reachable.contains(where: { $0.id.isEmpty }) { parts.append("a device with no id") }
-        let waiting = devices.reduce(0) { $0 + $1.pending.count }
-        if waiting > 0 { parts.append("\(waiting) waiting to send") }
-        if let since = unreadable.values.filter({ $0.fingerprint == fingerprint && $0.persona == convo.persona }).map(\.since).min() {
-            parts.append("can't open theirs since \(since.formatted(date: .omitted, time: .shortened))")
-        }
-        if let last = strangeDevices["\(convo.persona?.uuidString ?? "main")|\(fingerprint)"] {
-            parts.append("wrote from an unknown device at \(last.formatted(date: .omitted, time: .shortened))")
-        }
-        return parts.joined(separator: " · ")
-    }
-
     private func retryUnreadable() {
         guard !unreadable.isEmpty else { return }
         for (key, item) in unreadable {
@@ -818,16 +791,84 @@ final class AppModel {
         "\(data.contacts[i].persona?.uuidString ?? "main")|\(data.contacts[i].fingerprint)|\(data.contacts[i].devices[d].id.hex)"
     }
 
+    /// Counts a wrong guess (kept across restarts) and, if the person chose "wipe after wrong attempts" and this one
+    /// reaches it, wipes this device exactly as Detach does: nothing is sent, and the recovery code brings back what the
+    /// sealed backup holds. Every wrong guess is counted the same, whichever slots exist.
+    private func noteWrongGuess() {
+        failedAttempts += 1
+        if WipeAfterFailures.reached(failedAttempts) { wipeNow() }
+    }
+
+    #if DEBUG
+    /// Tests only: stands in for the vault's unlock, to inject failures that aren't a wrong passcode.
+    var unlockHook: (@Sendable (String) throws -> Vault.Opened)?
+    #endif
+
+    /// Opens the vault with a passcode off the main thread. Only a thrown `VaultError.wrongPasscode` means the guess was
+    /// wrong; any other error (Keychain trouble, a damaged or missing file) says nothing about the guess.
+    private func openVault(_ passcode: String) async throws -> Vault.Opened {
+        let vault = vault
+        #if DEBUG
+        if let hook = unlockHook { return try await Task.detached { try hook(passcode) }.value }
+        #endif
+        return try await Task.detached { try vault.unlock(passcode: passcode) }.value
+    }
+
+    /// Wrong guesses since the last right one, for the "wipe after" setting's screen.
+    var wrongGuesses: Int { failedAttempts }
+
+    /// "Wipe after wrong attempts": 0 is off. Only from the real account, so a decoy can't turn it off.
+    var wipeAfterAttempts: Int { WipeAfterFailures.limit }
+
+    func setWipeAfterAttempts(_ n: Int) {
+        guard isPrimary, WipeAfterFailures.choices.contains(n) else { return }
+        WipeAfterFailures.limit = n
+    }
+
+    /// Whether the real account is still behind a 4-digit PIN, which is shorter than a new one may be.
+    var hasShortPIN: Bool { isPrimary && LockStyle.remembered == .pin4 }
+
+    /// Puts the real account behind a new passcode. The current one is checked first, and opens the same account in the
+    /// same slot; nothing else about the lock file changes, so a decoy or panic passcode keeps working.
+    func changePasscode(current: String, to new: String) async throws {
+        guard isPrimary, phase == .unlocked, let identity else { return }
+        guard new.count >= LockStyle.minimumLength else { throw PasscodeSetupError.tooShort }
+        let vault = vault, slot = slot
+        let opened: Vault.Opened
+        do {
+            opened = try await openVault(current)
+        } catch VaultError.wrongPasscode {
+            noteWrongGuess()
+            throw PasscodeSetupError.wrongCurrent
+        }
+        // Any other failure propagates uncounted: it isn't a wrong guess.
+        guard case let .identity(who, at) = opened, at == slot, who.fingerprint == identity.fingerprint else {
+            noteWrongGuess()
+            throw PasscodeSetupError.wrongCurrent
+        }
+        guard current != new, !(await Task.detached { vault.passcodeInUse(new) }.value) else { throw PasscodeSetupError.inUse }
+        try await Task.detached { try vault.setSlot(slot, identity: identity, passcode: new) }.value
+        failedAttempts = 0
+    }
+
     func unlock(passcode: String) async -> Bool {
         // Each wrong guess makes the next one wait longer.
         if failedAttempts > 2 {
             try? await Task.sleep(for: .seconds(min(30, 1 << min(failedAttempts - 2, 5))))
         }
         if covered {
-            let vault = vault
-            let opened = try? await Task.detached { try vault.unlock(passcode: passcode) }.value
-            guard case let .identity(who, at)? = opened, at == slot, who.fingerprint == identity?.fingerprint else {
-                failedAttempts += 1
+            let opened: Vault.Opened
+            do {
+                opened = try await openVault(passcode)
+            } catch VaultError.wrongPasscode {
+                noteWrongGuess()
+                return false
+            } catch {
+                // Keychain trouble or a damaged file isn't a wrong guess: no count, no wipe.
+                return false
+            }
+            guard case let .identity(who, at) = opened, at == slot, who.fingerprint == identity?.fingerprint else {
+                noteWrongGuess()
                 return false
             }
             uncover()
@@ -836,7 +877,7 @@ final class AppModel {
         dataUnreadable = false
         do {
             let vault = vault
-            let opened = try await Task.detached { try vault.unlock(passcode: passcode) }.value
+            let opened = try await openVault(passcode)
             switch opened {
             case let .identity(identity, slot):
                 let stored = try storedData(identity)
@@ -872,8 +913,8 @@ final class AppModel {
             await bindToDevice(passcode: passcode)
             return true
         } catch {
-            // A right passcode that found unreadable data isn't a wrong guess.
-            if !dataUnreadable { failedAttempts += 1 }
+            // Only a passcode that opened nothing is a wrong guess. Unreadable data, Keychain errors and the like aren't.
+            if case VaultError.wrongPasscode = error { noteWrongGuess() }
             return false
         }
     }
@@ -919,13 +960,16 @@ final class AppModel {
         moveToOnionRelay()
         forgetUnusableRelays()
         purgeExpired()
-        data.seenEnvelopes = data.seenEnvelopes.filter { $0.value > Date().addingTimeInterval(-Self.replayWindow) }
+        pruneLinkOffers()
+        data.seenEnvelopes = data.seenEnvelopes.filter { $0.value > Date().addingTimeInterval(-Self.seenRetention) }
         // Unused contact invites die with the relay's 7-day retention.
         data.invites.removeAll { $0.channel == nil && !$0.isPublic && $0.createdAt < Date().addingTimeInterval(-7 * 24 * 3600) }
         data.invites.removeAll { ($0.retiresAt ?? .distantFuture) < Date() }
         // A choice saved before Tor was turned on can't take effect: the helper would connect directly.
         if data.security.tor { data.security.lockedDelivery = false }
         UserDefaults.standard.set(data.theme, forKey: "pulshade.theme")
+        // Contacts from before post-quantum keys are introduced to them, once.
+        introducePQToContacts()
         // Written straight away: a new account must have its file before anything else happens.
         save()
         settleSaves()
@@ -1120,7 +1164,7 @@ final class AppModel {
         failedAttempts = 0
         AnnouncementWatch.forget()
         // The few display settings kept outside the vault, so the lock screen can look right.
-        for key in ["pulshade.theme", "pulshade.menuBar", "pulshade.blockCapture", "pulshade.blur"] {
+        for key in ["pulshade.theme", "pulshade.menuBar", "pulshade.blockCapture", "pulshade.blur", LockStyle.key, LockStyle.legacyKey] {
             UserDefaults.standard.removeObject(forKey: key)
         }
         if leavingNoTrace {
@@ -1172,7 +1216,6 @@ final class AppModel {
         clipWaiting = [:]
         lastMend = [:]
         requestNotes = [:]
-        movedOffIntro = []
         mailboxBackoff = [:]
     }
 
@@ -1231,16 +1274,9 @@ final class AppModel {
         for convo in data.conversations where convo.kind == .group || convo.kind == .channel {
             let mine = convo.messages.filter(\.isMine).map(\.id)
             guard !mine.isEmpty else { continue }
-            if convo.shared != nil {
-                for start in stride(from: 0, to: mine.count, by: 200) {
-                    postIfShared(.unsend(ids: Array(mine[start..<min(start + 200, mine.count)])), in: convo.id)
-                }
-                continue
-            }
-            for member in audience(convo) where !member.isSelf {
-                for start in stride(from: 0, to: mine.count, by: 200) {
-                    enqueue(.unsend(ids: Array(mine[start..<min(start + 200, mine.count)])), to: member)
-                }
+            guard convo.shared != nil else { continue }
+            for start in stride(from: 0, to: mine.count, by: 200) {
+                postIfShared(.unsend(ids: Array(mine[start..<min(start + 200, mine.count)])), in: convo.id)
             }
         }
     }
@@ -1281,6 +1317,34 @@ final class AppModel {
                                        muted: conversation(Conversation.announcementsID)?.muted ?? false))
     }
 
+    /// Whether the last write of the vault failed, set by the save queue itself so a reader on the main actor sees the
+    /// outcome of every write that has finished, not only the ones whose follow-up has had its turn. While it's set,
+    /// nothing sealed under the ratchet leaves the device (see `flush`).
+    private final class SaveHealth: @unchecked Sendable {
+        private let lock = NSLock()
+        private var failed = false
+        private var writing = 0
+        var lastWriteFailed: Bool { lock.withLock { failed } }
+        func record(failed value: Bool) { lock.withLock { failed = value } }
+        /// Writes handed to the save queue and not finished yet.
+        var writesInFlight: Int { lock.withLock { writing } }
+        func started() { lock.withLock { writing += 1 } }
+        func finished() { lock.withLock { writing -= 1 } }
+    }
+    @ObservationIgnored private let saveHealth = SaveHealth()
+
+    /// Tests: writes handed to the save queue that haven't finished.
+    var saveWritesInFlight: Int { saveHealth.writesInFlight }
+
+    /// Tests: how long each write on the save queue is held before it starts, to catch a send that doesn't wait for it.
+    @ObservationIgnored var saveDelayForTesting: TimeInterval = 0
+
+    /// Tests: whether a write has failed and nothing since has landed.
+    var lastSaveFailed: Bool { saveHealth.lastWriteFailed }
+
+    /// Tests: make the next writes fail or succeed.
+    @ObservationIgnored var failSavesForTesting = false
+
     /// Starts writing whatever is waiting, in the background.
     private func flushSave() {
         saveTimer?.cancel()
@@ -1290,10 +1354,19 @@ final class AppModel {
         saveGeneration += 1
         let generation = saveGeneration
         let vault = vault
+        let health = saveHealth
+        let failing = failSavesForTesting
+        let delay = saveDelayForTesting
+        health.started()
         Self.saveQueue.async { [weak self] in
+            defer { health.finished() }
+            if delay > 0 { Thread.sleep(forTimeInterval: delay) }
             do {
+                if failing { throw VaultError.corrupt }
                 try vault.save(data, with: identity)
+                health.record(failed: false)
             } catch {
+                health.record(failed: true)
                 // A failed write keeps the waiting copy so a later save retries it, rather than losing every
                 // change since the last successful write — unless something newer is already queued, or the
                 // vault was wiped in the meantime.
@@ -1327,6 +1400,7 @@ final class AppModel {
 
     /// Drops a waiting write and lets any under way finish, so nothing lands after the vault's files are wiped.
     private func discardSaves() {
+        saveHealth.record(failed: false)
         saveTimer?.cancel()
         saveTimer = nil
         unsaved = nil
@@ -1450,8 +1524,8 @@ final class AppModel {
             save()
         }
         let relay = data.invites.first { $0.receiveKey == receiveKey }?.relay
-        return Invite(kind: channel == nil ? .contact : .channel, signingKey: me.card.signing,
-                      agreementKey: me.card.agreement, sendID: Mailbox.sendID(for: receiveKey), relay: relay).code
+        return (try? Invite(kind: channel == nil ? .contact : .channel, identity: me,
+                            sendID: Mailbox.sendID(for: receiveKey), relay: relay).code) ?? ""
     }
 
     /// Accepts someone's invite: opens a mailbox for them and says hello.
@@ -1461,11 +1535,14 @@ final class AppModel {
         guard identity != nil, let invite = Invite(code: code), !myFingerprints.contains(invite.fingerprint) else { return nil }
         let known = contact(invite.fingerprint, in: owner)
         if let known, !known.hidden, invite.kind == .contact { return known }
+        // Keys already pinned for this signing key must be the ones the invite commits to: they come from the same seed.
+        if let pinned = known?.pq, pinned.commitment != invite.pqHash { return nil }
 
         let mailbox = Mailbox.make()
         var contact = known ?? Contact(fingerprint: invite.fingerprint, signingKey: invite.signingKey,
                                        agreementKey: invite.agreementKey, sendID: invite.sendID)
         contact.persona = owner
+        contact.pqCommit = invite.pqHash
         contact.relay = invite.relay
         contact.nickname = nickname
         contact.receiveKey = mailbox.receiveKey
@@ -1539,7 +1616,8 @@ final class AppModel {
         guard let keys = me(persona) else { return nil }
         let profile = profile(for: persona)
         return PeerCard(name: profile.name, avatar: profile.avatar, color: profile.color,
-                        signingKey: keys.card.signing, agreementKey: keys.card.agreement, sendID: sendID, device: deviceID(for: persona))
+                        signingKey: keys.card.signing, agreementKey: keys.card.agreement, sendID: sendID, device: deviceID(for: persona),
+                        pq: keys.pqCard)
     }
 
     /// The notes of a profile that one contact is sent: the ones for everyone and the ones chosen for them, checked
@@ -1599,22 +1677,17 @@ final class AppModel {
             return existing
         }
         let name = kind == .direct ? (contact(members.first ?? "", in: owner)?.displayName ?? displayName(members.first ?? "")) : title
-        // Groups always share one mailbox now. Anyone whose app can't take part yet is invited once it can.
-        if kind == .group, sharedGroupsEnabled, let shared = startSharedGroup(title: name, members: members, avatar: avatar, persona: owner) {
+        // Groups and channels always share one mailbox (a channel keeps its followers out of its settings, see GroupRoster).
+        // Whoever's app can't take part is refused before this is called (see `membersNeedingUpdate`), never put in an older format.
+        if kind == .group || kind == .channel,
+           let shared = startSharedGroup(title: name, members: members, avatar: avatar, persona: owner, kind: kind) {
             return shared
         }
-        // So do channels, with the followers kept out of its settings (see GroupRoster).
-        if kind == .channel, sharedGroupsEnabled, sharedChannelsEnabled,
-           let shared = startSharedGroup(title: name, members: members, avatar: avatar, persona: owner, kind: .channel) {
-            return shared
-        }
-        var convo = Conversation(kind: kind, title: name, avatar: avatar, members: members)
+        // No account to make a group with: nothing is made, and what comes back isn't kept anywhere.
+        var convo = Conversation(kind: kind, title: name, avatar: avatar, members: kind == .group || kind == .channel ? [] : members)
         convo.persona = owner
+        guard kind == .direct || kind == .broadcast else { return convo }
         withAnimation(.snappy) { data.conversations.insert(convo, at: 0) }
-        if kind == .group || kind == .channel, let i = index(of: convo.id) {
-            data.conversations[i].version = 1
-            sendInfo(data.conversations[i], to: members)
-        }
         if kind != .direct { syncConversation(convo.id) }
         save()
         return convo
@@ -1645,9 +1718,6 @@ final class AppModel {
         // Only people of this group that are your contacts can be mentioned.
         let allowed = Set(mentionable(in: convo).map(\.fingerprint))
         message.mentions = Mention.locate(picks.filter { allowed.contains($0.fingerprint) }, in: trimmed)
-        // A group message is confirmed member by member, so it starts with nobody having confirmed it. One in a shared
-        // mailbox is "sent" once it's there: nobody confirms it one by one.
-        if convo.kind == .group, convo.shared == nil { message.deliveredTo = [] }
         withAnimation(.snappy(duration: 0.4)) { data.conversations[i].messages.append(message) }
 
         var wire = WireMessage(id: message.id, conversation: sharedID(convo), kind: convo.kind == .broadcast ? .direct : convo.kind,
@@ -1775,10 +1845,6 @@ final class AppModel {
     /// way that apps from before files still use.
     @ObservationIgnored var relayClipsEnabled = true
 
-    /// Whether new groups share one mailbox when everyone's app can. Tests switch it off to follow the older way.
-    @ObservationIgnored var sharedGroupsEnabled = true
-    /// Whether new channels (and older ones, by the owner's phone) share one mailbox when every follower's app can.
-    @ObservationIgnored var sharedChannelsEnabled = true
     /// Shared groups whose outbox is being posted right now.
     @ObservationIgnored var groupFlushing: Set<UUID> = []
     /// When each group mailbox was last read to the end in this run, by group and epoch: a post that hasn't come back is
@@ -1812,6 +1878,12 @@ final class AppModel {
     @ObservationIgnored var joinAdmits: [UUID: [Date]] = [:]
     /// As an admin: when a missed key was last sent again to each member (by member key, hex).
     @ObservationIgnored var keyResent: [String: Date] = [:]
+    /// When a follower of a channel was last sent the current key because they asked (by channel and key), so a flood of asks is answered once.
+    @ObservationIgnored var channelKeyAnswered: [String: Date] = [:]
+    /// When the envelope being handled was sent (as its sender signed it), for the few payloads that mustn't act on a stale copy.
+    @ObservationIgnored var handlingSentAt: Date?
+    /// When each channel let someone in through its code lately, for its hourly limit.
+    @ObservationIgnored var channelAdmits: [UUID: [Date]] = [:]
     /// People from groups this device has asked to be friends this session, so the button says so.
     var friendAsked: Set<String> = []
 
@@ -2002,7 +2074,6 @@ final class AppModel {
         var message = Message(sender: "me", text: "", date: now, expiresAt: convo.disappearAfter.map { now.addingTimeInterval($0) }, reply: reply)
         message.attachment = a
         message.noForward = noForwardFlag
-        if convo.kind == .group { message.deliveredTo = [] }
         withAnimation(.snappy(duration: 0.4)) { data.conversations[i].messages.append(message) }
         fileProgress[message.id] = 0
         fileFailed[message.id] = nil
@@ -2258,7 +2329,7 @@ final class AppModel {
         guard !bytes.isEmpty, bytes.count <= Self.maxMediaBytes else { return false }
         switch message.awaiting {
         case .photo:
-            guard PlatformImage(data: bytes) != nil else { return false }
+            guard PlatformImage.checked(bytes) != nil else { return false }
             withAnimation(.snappy) {
                 data.conversations[at.convo].messages[at.message].image = bytes
                 data.conversations[at.convo].messages[at.message].awaiting = nil
@@ -2283,7 +2354,7 @@ final class AppModel {
         case let .video(have, caption) where have.isEmpty:
             withAnimation(.snappy) { data.stories[i].style = .video(bytes, caption: caption) }
         case let .image(have, caption) where have.isEmpty:
-            guard bytes.count <= Self.maxMediaBytes, PlatformImage(data: bytes) != nil else { return false }
+            guard bytes.count <= Self.maxMediaBytes, PlatformImage.checked(bytes) != nil else { return false }
             withAnimation(.snappy) { data.stories[i].style = .image(bytes, caption: caption) }
         default:
             return false
@@ -2373,9 +2444,11 @@ final class AppModel {
         convo.kind == .group || convo.kind == .channel ? convo.wireID : nil
     }
 
-    /// Who receives conversation-level signals (reactions, unsends, timers). Broadcasts fan out privately.
+    /// Who receives conversation-level signals (reactions, unsends, timers) one by one: the other person in a direct chat, or
+    /// the people on a broadcast list. A group or channel has one mailbox for everyone and sends nothing to its members one by one.
     private func audience(_ convo: Conversation) -> [Contact] {
-        convo.members.compactMap { contact($0, in: convo.persona) }
+        guard convo.kind == .direct || convo.kind == .broadcast else { return [] }
+        return convo.members.compactMap { contact($0, in: convo.persona) }
     }
 
     /// Who you can @-mention in a chat: members of a group that are your own contacts, by name. Someone in the
@@ -2502,7 +2575,7 @@ final class AppModel {
     }
 
     func setDisappearing(_ seconds: TimeInterval?, in id: Conversation.ID) {
-        guard let i = index(of: id), data.conversations[i].disappearAfter != seconds else { return }
+        guard let i = index(of: id), !data.conversations[i].isOldFormat, data.conversations[i].disappearAfter != seconds else { return }
         if data.conversations[i].shared != nil {
             // In a shared group the timer is part of its settings, which only admins change.
             guard data.conversations[i].amAdmin else { return }
@@ -2514,8 +2587,8 @@ final class AppModel {
         }
         applyTimer(seconds, at: i)
         let convo = data.conversations[i]
-        if convo.kind == .direct || convo.kind == .group {
-            for member in audience(convo) { enqueue(.disappearing(conversation: sharedID(convo), seconds: seconds), to: member) }
+        if convo.kind == .direct {
+            for member in audience(convo) { enqueue(.disappearing(conversation: nil, seconds: seconds), to: member) }
         }
         sync(.disappearing(ref(convo), seconds: seconds))
         save()
@@ -2584,15 +2657,16 @@ final class AppModel {
             for member in audience(convo) { enqueue(.chatDeleted(conversation: nil), to: member) }
         case .group, .channel:
             let signal: Payload = convo.amOwner ? .chatDeleted(conversation: convo.wireID) : .left(conversation: convo.wireID)
-            if convo.shared != nil {
-                // Posted straight away: the chat is about to go from this device, outbox and all.
-                if let i = index(of: id), let client = client(nil, lane: Outgoing.lane(for: convo.persona)) {
-                    post(signal, at: i)
-                    let waiting = data.conversations[i].shared?.outbox ?? []
-                    Task { for item in waiting { _ = try? await client.depositGroup(item.blob, to: item.sendID, days: item.days, wake: item.wake) } }
-                }
-            } else {
-                for member in audience(convo) { enqueue(signal, to: member) }
+            if isFollower(convo) {
+                // A follower says nothing in the channel; the staff member who invited them is told over that chat, so
+                // they are taken out and the next key isn't sent to them.
+                _ = noticeToInviter(.channelLeave(group: convo.wireID), of: convo)
+            // Posted straight away: the chat is about to go from this device, outbox and all. A group in the older format
+            // has no mailbox to tell: it is only removed from this device.
+            } else if convo.shared != nil, let i = index(of: id), let client = client(nil, lane: Outgoing.lane(for: convo.persona)) {
+                post(signal, at: i)
+                let waiting = data.conversations[i].shared?.outbox ?? []
+                Task { for item in waiting { _ = try? await client.depositGroup(item.blob, to: item.sendID, days: item.days, wake: item.wake) } }
             }
         }
         sync(.deleted(ref(convo)))
@@ -2676,7 +2750,7 @@ final class AppModel {
     }
 
     private func storyPayload(_ story: Story) -> Payload {
-        .story(id: story.id, style: story.style, date: RelayClock.relay(story.date), lasts: story.lifetime)
+        .story(id: story.id, style: story.style, date: RelayClock.relay(story.date), lasts: story.lifetime, loops: story.loops)
     }
 
     /// Whether every device of a contact reads framed messages, so a clip can go to them in fewer, fuller pieces.
@@ -2690,7 +2764,7 @@ final class AppModel {
         guard case let .image(photo, caption) = story.style, photo.count > Self.mediaInline, photo.count <= Self.maxMediaBytes,
               readsMediaBlobs(contact) else { return false }
         enqueue(.story(id: story.id, style: .image(Data(), caption: caption), date: RelayClock.relay(story.date),
-                       lasts: story.lifetime), to: contact)
+                       lasts: story.lifetime, loops: story.loops), to: contact)
         if withPhoto {
             deliverClip(photo, id: story.id, to: contact, known: story.clipBlob, lifetime: story.lifetime ?? StoryLifetime.day.rawValue,
                         only: wanted, kind: .photo)
@@ -2704,7 +2778,7 @@ final class AppModel {
         if sendStoryPhotoApart(story, to: contact, withPhoto: withClip) { return }
         guard case let .video(clip, caption) = story.style else { enqueue(storyPayload(story), to: contact); return }
         enqueue(.story(id: story.id, style: .video(Data(), caption: caption), date: RelayClock.relay(story.date),
-                       lasts: story.lifetime), to: contact)
+                       lasts: story.lifetime, loops: story.loops), to: contact)
         guard withClip else { return }
         if readsAttachments(contact) {
             deliverClip(clip, id: story.id, to: contact, known: story.clipBlob, lifetime: story.lifetime ?? StoryLifetime.day.rawValue)
@@ -2722,7 +2796,7 @@ final class AppModel {
         if sendStoryPhotoApart(story, to: contact, withPhoto: true, only: wanted) { return }
         guard case let .video(clip, caption) = story.style, !clip.isEmpty else { enqueue(storyPayload(story), to: contact); return }
         enqueue(.story(id: story.id, style: .video(Data(), caption: caption), date: RelayClock.relay(story.date),
-                       lasts: story.lifetime), to: contact)
+                       lasts: story.lifetime, loops: story.loops), to: contact)
         if readsAttachments(contact) {
             deliverClip(clip, id: story.id, to: contact, known: story.clipBlob, lifetime: story.lifetime ?? StoryLifetime.day.rawValue)
             return
@@ -2893,11 +2967,14 @@ final class AppModel {
         }
     }
 
-    func postStory(_ style: StoryStyle, audience: StoryAudience = .everyone, lifetime: TimeInterval = StoryLifetime.day.rawValue) {
+    /// `loops` makes a video story play again from the start when it ends, for you and for everyone who sees it.
+    func postStory(_ style: StoryStyle, audience: StoryAudience = .everyone, lifetime: TimeInterval = StoryLifetime.day.rawValue,
+                   loops: Bool = false) {
         var story = Story(author: "me", style: style)
         story.persona = activePersona
         story.audience = audience
         story.lifetime = lifetime
+        if case .video = style, loops { story.loops = true }
         story.delivery = StoryDelivery()
         data.storyChoices[choiceKey(activePersona)] = StoryChoice(audience: audience, lifetime: lifetime)
         withAnimation(.snappy) { data.stories.insert(story, at: 0) }
@@ -2928,9 +3005,10 @@ final class AppModel {
 
     /// Changes a story you posted: its words, who sees it and how long it lasts (from when it was posted). A photo
     /// or clip stays the same one. People taken out of the audience lose it, and everyone in it gets the new version.
-    func editStory(_ id: Story.ID, style: StoryStyle, audience: StoryAudience, lifetime: TimeInterval) {
+    func editStory(_ id: Story.ID, style: StoryStyle, audience: StoryAudience, lifetime: TimeInterval, loops: Bool = false) {
         guard let i = data.stories.firstIndex(where: { $0.id == id && $0.author == "me" }) else { return }
         let before = self.audience(of: data.stories[i])
+        if case .video = data.stories[i].style { data.stories[i].loops = loops ? true : nil }
         switch (data.stories[i].style, style) {
         case let (.image(photo, _), .image(_, caption)): data.stories[i].style = .image(photo, caption: caption)
         case let (.video(clip, _), .video(_, caption)): data.stories[i].style = .video(clip, caption: caption)
@@ -3994,6 +4072,14 @@ final class AppModel {
                            device: request.device ?? request.card.device ?? Data())
         peer.color = request.card.color
         peer.persona = request.persona
+        if let old = contact(request.fingerprint, in: request.persona) {
+            peer.nickname = old.nickname
+            peer.addedAt = old.addedAt
+            peer.verified = old.verified && old.agreementKey == request.card.agreementKey
+            peer.pqCommit = old.pqCommit
+        }
+        peer.pq = request.card.pq?.verified(signer: request.card.signingKey, agreement: request.card.agreementKey)
+        if let pin = peer.pq, !pinMatchesInvite(pin, contact: peer) { peer.pq = nil }
         peer.relay = Invite.allowedRelay(request.card.relay)
         upsert(peer)
         withAnimation(.snappy) { data.requests.removeAll { $0.id == id } }
@@ -4364,7 +4450,7 @@ final class AppModel {
 
     // MARK: Decoy & panic
 
-    enum PasscodeSetupError: Error { case inUse, tooShort }
+    enum PasscodeSetupError: Error { case inUse, tooShort, wrongCurrent }
 
     /// In a decoy, these show what the decoy pretended to set up, so its settings look like the real thing.
     var hasDecoy: Bool { isPrimary ? data.decoySeed != nil : data.facade.decoy }
@@ -4545,7 +4631,10 @@ final class AppModel {
     private func sendPending(contact i: Int) {
         for d in data.contacts[i].devices.indices {
             guard var session = data.contacts[i].devices[d].session, session.canSend,
+                  data.contacts[i].devices[d].needsUpdate != true,
                   !data.contacts[i].devices[d].pending.isEmpty else { continue }
+            // Nothing is sent to someone whose post-quantum keys aren't known (they are asked for), or whose app has none.
+            guard data.contacts[i].pq != nil || data.contacts[i].isSelf else { sendPQIntro(contact: i); continue }
             let pending = data.contacts[i].devices[d].pending
             data.contacts[i].devices[d].pending = []
             for item in pending {
@@ -4565,6 +4654,54 @@ final class AppModel {
             }
             data.contacts[i].devices[d].session = session
         }
+    }
+
+    /// Whether keys may be pinned for a contact: if the invite that added them committed to their post-quantum keys, only keys
+    /// that match it. Without such an invite (a public handle, a group, a request) the first verified card is what there is.
+    private func pinMatchesInvite(_ pin: PQPin, contact: Contact?) -> Bool {
+        guard let commit = contact?.pqCommit else { return true }
+        return pin.commitment == commit
+    }
+
+    /// Sends this account's post-quantum card to a contact that hasn't got it: the way their keys are asked for, since they
+    /// answer an introduction with theirs. Once per contact; a classical introduction is answered whenever one arrives.
+    private func sendPQIntro(contact i: Int, force: Bool = false) {
+        let c = data.contacts[i]
+        guard c.pqCardSent != true || force, !c.isSelf, !c.devices.isEmpty, c.tooOld == nil, let me = me(c.persona) else { return }
+        seal(.pqIntro(me.pqCard), contact: i, device: 0)
+    }
+
+    /// Every contact made before post-quantum keys, once after an update: introduces this account to it, and gets theirs back
+    /// if their app has them. The contact, its chat and its session all stay as they were.
+    func introducePQToContacts() {
+        for i in data.contacts.indices where data.contacts[i].pq == nil && !data.contacts[i].hidden && !data.contacts[i].awaitingAcceptance {
+            sendPQIntro(contact: i)
+        }
+    }
+
+    /// When this device last answered a contact's classical introduction with its own card (memory only).
+    @ObservationIgnored private var introRepliedAt: [String: Date] = [:]
+    private static let introReplyGap: TimeInterval = 600
+
+    /// Whether a contact's classical introduction may be answered now, and notes that it was.
+    private func introReplyDue(_ fp: String, _ persona: UUID?) -> Bool {
+        let key = "\(persona?.uuidString ?? "main")|\(fp)"
+        if let last = introRepliedAt[key], Date().timeIntervalSince(last) < Self.introReplyGap { return false }
+        introRepliedAt[key] = Date()
+        return true
+    }
+
+    /// A classical envelope from a contact who has post-quantum keys or never will (an app from before): refused, and the person
+    /// is told once a day to ask them to update, by name.
+    private func noteTooOld(_ signer: Data, persona: UUID?) {
+        guard let i = contactIndex(Identity.fingerprint(of: signer), persona), !data.contacts[i].isSelf else { return }
+        if let last = data.contacts[i].tooOld, Date().timeIntervalSince(last) < 24 * 3600 { return }
+        data.contacts[i].tooOld = Date()
+        if let c = data.conversations.firstIndex(where: { $0.kind == .direct && $0.members == [data.contacts[i].fingerprint] && $0.persona == persona }) {
+            data.conversations[c].messages.append(Message(sender: "system", text: "\(data.contacts[i].displayName) needs to update Pulshade before you can message each other.",
+                                                          date: Date()))
+        }
+        save()
     }
 
     /// This device, as a contact should reach it: its id and the mailbox it reads them on.
@@ -4638,8 +4775,33 @@ final class AppModel {
                       collapse: String? = nil, story: UUID? = nil, viewReport: UUID? = nil, rings: Bool = false, framed: Bool = false,
                       wakes: Bool = false) {
         let c = data.contacts[i]
-        guard c.devices.indices.contains(d), let me = me(c.persona),
-              let blob = try? Envelope.seal(payload, from: me, device: deviceID(for: c.persona), to: c.agreementKey, framed: framed) else { return }
+        guard c.devices.indices.contains(d), let me = me(c.persona) else { return }
+        let blob: Data
+        var introduces = false
+        if let pin = c.pq ?? (c.isSelf ? me.pq.pin : nil) {
+            // Their post-quantum keys are known: version 3. Ours go along until they're known to have them.
+            let introduce = c.pqCardSent != true && !c.isSelf
+            guard let sealed = try? Envelope.seal(payload, from: me, device: deviceID(for: c.persona),
+                                                  to: EnvelopeRecipient(agreement: c.agreementKey, pq: pin), framed: framed,
+                                                  introduce: introduce) else { return }
+            blob = sealed
+            if introduce { data.contacts[i].pqCardSent = true }
+            // Key setup and other control messages now carry a signature, so they are bigger than the messages sent beside them
+            // and must still go first and on the ordinary lane.
+            introduces = introduce || !payload.isRatchet
+        } else if payload.carriesPQCard {
+            // Nothing is known of their post-quantum keys, and this is what carries ours: the one classical envelope left.
+            guard let sealed = try? Envelope.sealIntroduction(payload, from: me, device: deviceID(for: c.persona), to: c.agreementKey)
+            else { return }
+            blob = sealed
+            data.contacts[i].pqCardSent = true
+            introduces = true
+        } else {
+            // Not to anyone whose keys are unknown: nothing classical goes out. Their keys are asked for (by sending ours);
+            // a message that was waiting stays where it is (`sendPending`).
+            sendPQIntro(contact: i)
+            return
+        }
         let sendID = c.devices[d].sendID
         // Only the newest of these waits for a mailbox.
         if ephemeral { data.outbox.removeAll { $0.ephemeral == true && $0.sendID == sendID } }
@@ -4650,6 +4812,7 @@ final class AppModel {
         var outgoing = Outgoing(sendID: sendID, blob: blob, relay: c.relay, message: message, ephemeral: ephemeral ? true : nil,
                                 story: story, viewReport: viewReport, lane: c.persona == nil ? nil : Outgoing.lane(for: c.persona), rings: rings ? true : nil,
                                 wakes: asksToWake ? true : nil)
+        if introduces { outgoing.introduces = true }
         // A signal is let go by the relay if it isn't collected soon, so a device that's away doesn't come back to a
         // pile of "typing" and "I'm here"; the newest of a kind replaces the one before.
         if ephemeral { outgoing.life = Self.signalLife }
@@ -4730,9 +4893,6 @@ final class AppModel {
     static let deferredMailLimit: TimeInterval = 10 * 60
     /// How long a message waits for its receipt before it is sent again, then again after the next wait, and so on.
     static var resendGaps: [TimeInterval] = [90, 300, 900, 2700, 7200]
-    /// How long a group message is sent again to members whose device hasn't confirmed it. Long enough for a slow
-    /// phone, short enough that a group whose receipts are off can't keep rewriting it for a day.
-    static var groupResendWindow: TimeInterval = 60 * 60
     /// When each of your messages was last sent again, and how many times, while the app is open.
     @ObservationIgnored private var resentAt: [UUID: (at: Date, count: Int)] = [:]
     @ObservationIgnored private var lastDueCheck = Date.distantPast
@@ -4850,23 +5010,16 @@ final class AppModel {
         if dueOnly { resentAt = resentAt.filter { $0.value.at > cutoff } }
         for i in data.conversations.indices {
             let convo = data.conversations[i]
-            guard convo.kind == .direct || convo.kind == .group, convo.shared == nil else { continue }
+            // Groups keep their own mail (see `KeptPost`); only a direct chat is sent again from here.
+            guard convo.kind == .direct else { continue }
             let now = Date()
             let lost = convo.messages.filter { message in
-                guard message.isMine, !message.isVideo, message.date > cutoff,
-                      message.expiresAt.map({ $0 > now }) ?? true,
-                      !dueOnly || resendIsDue(message) else { return false }
-                guard convo.kind == .group else { return message.status == .sent }
-                // A group keeps trying the members who can't confirm (an older build) for the window, even after
-                // the tick has caught up on the ones that can.
-                guard now.timeIntervalSince(message.date) < Self.groupResendWindow else { return false }
-                return message.status == .sent || !unconfirmedRecipients(message, in: convo).isEmpty
+                message.isMine && !message.isVideo && message.date > cutoff && (message.expiresAt.map { $0 > now } ?? true)
+                    && (!dueOnly || resendIsDue(message)) && message.status == .sent
             }
             guard !lost.isEmpty else { continue }
             for message in lost {
-                let missing = unconfirmedRecipients(message, in: convo)
-                // Every member's device has it: let the tick catch up even if the last receipt arrived quietly.
-                if convo.kind == .group, missing.isEmpty { setStatus(.delivered, for: [message.id]); continue }
+                let missing = audience(convo)
                 guard !missing.isEmpty else { continue }
                 resentAt[message.id] = (Date(), (resentAt[message.id]?.count ?? 0) + 1)
                 let wire = wireForResend(message, in: convo)
@@ -4896,9 +5049,12 @@ final class AppModel {
         for c in data.contacts where c.persona == nil && !c.isSelf && !c.awaitingAcceptance && !data.blocked.contains(c.fingerprint) {
             guard let key = c.receiveKey, !c.devices.isEmpty, friends[c.fingerprint] == nil else { continue }
             friends[c.fingerprint] = HelperBundle.Friend(agreementKey: c.agreementKey, receiveKey: key,
-                                                         devices: c.devices.map { .init(id: $0.id, sendID: $0.sendID) })
+                                                         devices: c.devices.map { .init(id: $0.id, sendID: $0.sendID) },
+                                                         pq: c.pq, hasCard: c.pqCardSent)
         }
+        let pq = me.pq
         return HelperBundle(signing: me.signingKey.rawRepresentation, agreement: me.agreementKey.rawRepresentation,
+                            pqKem: pq.kemSeed, pqSig: pq.sigSeed,
                             device: deviceID(for: nil), relay: relay, friends: friends,
                             confirms: data.security.deliveryReceipts)
     }
@@ -4947,8 +5103,18 @@ final class AppModel {
     /// account open: a decoy never writes, and with a decoy or panic passcode set up there's no bundle at all.
     private func refreshHelper() {
         #if os(iOS)
-        guard phase == .unlocked, isPrimary, let identity, Date().timeIntervalSince(helperChecked) >= 10 else { return }
+        guard phase == .unlocked, isPrimary, identity != nil, Date().timeIntervalSince(helperChecked) >= 10 else { return }
         helperChecked = Date()
+        reconcileHelper()
+        #endif
+    }
+
+    /// The part of `refreshHelper` that decides what the Keychain should hold (apart from where it runs), so tests reach it on
+    /// a Mac too. With the setting off (including every account saved before it was a choice, which counts as off), the bundle
+    /// with the account's keys and the confirmed digests are removed, once what the helper had taken off the relay has been read.
+    /// If they can't be removed, it is tried again on the next pass instead of being taken as done.
+    func reconcileHelper() {
+        guard phase == .unlocked, isPrimary, let identity else { return }
         let bundle = lockedDeliveryOn ? helperBundle(identity) : nil
         guard !helperKnown || bundle != helperWritten else { return }
         if let bundle {
@@ -4958,10 +5124,10 @@ final class AppModel {
             // bundle goes: mail still waiting in the inbox stays for the next drain.
             drainHelperInbox()
             HelperStore.clearDelivery()
+            if HelperStore.load() != nil || !HelperStore.confirmed().isEmpty { return }
         }
         helperWritten = bundle
         helperKnown = true
-        #endif
     }
 
     // MARK: Messages that didn't send
@@ -5016,58 +5182,20 @@ final class AppModel {
         if convo.shared != nil {
             // Still waiting to go in the outbox: it goes from there. Otherwise posted again (members ignore a repeat).
             if !(convo.shared?.outbox.contains { $0.message == id } ?? false) { postIfShared(.message(wire), in: conversation, message: id) }
-        } else {
+        } else if !convo.isOldFormat {
             for member in audience(convo) { enqueue(.message(wire), to: member, message: id) }
         }
         save()
         kick()
     }
 
-    /// Who still needs a message of yours. A direct chat has one person; a group only the members whose device
-    /// hasn't confirmed it. A nil `deliveredTo` (a message from before this) counts as nobody having confirmed.
-    func unconfirmedRecipients(_ message: Message, in convo: Conversation) -> [Contact] {
-        guard convo.shared == nil else { return [] }
-        let recipients = audience(convo)
-        guard convo.kind == .group else { return recipients }
-        let confirmed = Set(message.deliveredTo ?? [])
-        return recipients.filter { !confirmed.contains($0.fingerprint) }
-    }
-
-    /// The members a group message's tick can wait for: those whose app said it answers group messages. A build
-    /// from before never does, so it isn't waited on. Empty until a device has said anything, and then one receipt
-    /// is all there is to go on (see `noteDelivery`).
-    private func requiredConfirmations(_ convo: Conversation) -> Set<String> {
-        guard convo.kind == .group else { return [] }
-        return Set(audience(convo).filter { contact in
-            contact.devices.contains { $0.readsGroupReceipts == true }
-        }.map(\.fingerprint))
-    }
-
-    /// A device has the message. In a group that's one member of many: the message stays "sent" until every
-    /// member whose app answers group messages has confirmed, so one quiet member can't hide it from the rest.
-    /// A build from before that never answers isn't waited on. Read ticks stay for direct chats; a group's
-    /// receipt only says it arrived.
+    /// A device has the message. A direct chat's tick follows its receipts (read ones too, when they're on). A group's mail
+    /// is "sent" once it's in the mailbox: nobody confirms it one by one.
     func noteDelivery(of id: UUID, by fingerprint: String, read: Bool) {
         for c in data.conversations.indices {
-            guard let m = data.conversations[c].messages.firstIndex(where: { $0.id == id && $0.isMine }) else { continue }
-            let convo = data.conversations[c]
-            if convo.kind == .group {
-                let expected = Set(audience(convo).map(\.fingerprint))
-                guard expected.contains(fingerprint) else { return }
-                var confirmed = Set(data.conversations[c].messages[m].deliveredTo ?? [])
-                confirmed.insert(fingerprint)
-                data.conversations[c].messages[m].deliveredTo = confirmed.sorted()
-                let required = requiredConfirmations(convo)
-                if required.isEmpty {
-                    // Nothing is known to answer yet (older builds, or devices that haven't sent anything since):
-                    // one receipt is all there is to go on.
-                    if !confirmed.isEmpty { setStatus(.delivered, for: [id]) }
-                } else if required.isSubset(of: confirmed) {
-                    setStatus(.delivered, for: [id])
-                }
-            } else {
-                setStatus(read ? .read : .delivered, for: [id])
-            }
+            guard data.conversations[c].messages.contains(where: { $0.id == id && $0.isMine }) else { continue }
+            guard data.conversations[c].kind == .direct || data.conversations[c].kind == .broadcast else { continue }
+            setStatus(read ? .read : .delivered, for: [id])
             return
         }
     }
@@ -5168,8 +5296,6 @@ final class AppModel {
         if let d = data.contacts[i].devices.firstIndex(where: { $0.id == id }) { return d }
         if !id.isEmpty, let d = data.contacts[i].devices.firstIndex(where: { $0.id.isEmpty }) {
             data.contacts[i].devices[d].id = id
-            // A group made before this was known filed their introduction mailbox under no id: see `refileIntros`.
-            introsStale = true
             return d
         }
         if id.isEmpty, data.contacts[i].devices.count == 1 { return 0 }
@@ -5184,9 +5310,37 @@ final class AppModel {
         }
         // More than anyone owns: the oldest makes way, so a contact can't grow the list without end.
         if data.contacts[i].devices.count >= Self.maxDevicesPerContact { data.contacts[i].devices.removeFirst() }
-        data.contacts[i].devices.append(DeviceLink(id: id, sendID: sendID))
+        // A device we haven't met, from an account we already had one for: its messages from now on go to it as well,
+        // so say so where the person would see it (their chat, or the list of your own devices).
+        let announce = !data.contacts[i].devices.isEmpty && !id.isEmpty
+        var link = DeviceLink(id: id, sendID: sendID)
+        if announce && data.contacts[i].isSelf { link.unconfirmed = true }
+        data.contacts[i].devices.append(link)
+        if announce && !data.contacts[i].isSelf { noteNewDevice(of: data.contacts[i]) }
         return data.contacts[i].devices.count - 1
     }
+
+    /// A line in the chat with a contact whose account just added a device we hadn't seen. Their messages and ours
+    /// reach it from now on, as with any device of theirs, which matters most when it isn't theirs.
+    private func noteNewDevice(of contact: Contact) {
+        // A friend always has a chat to say it in, even one you haven't written in yet. Someone known only from a
+        // group has none, and isn't told about.
+        guard !contact.hidden, !contact.awaitingAcceptance else { return }
+        let convo = startConversation(kind: .direct, title: "", members: [contact.fingerprint], persona: .some(contact.persona))
+        guard let c = index(of: convo.id) else { return }
+        data.conversations[c].messages.append(Message(sender: "system", text: "\(contact.displayName)'s account added a new device",
+                                                      date: Date()))
+    }
+
+    /// Says the device that introduced itself as yours is yours, so the warning goes.
+    func confirmLinkedDevice(_ id: Data) {
+        guard let i = selfIndex, let d = data.contacts[i].devices.firstIndex(where: { $0.id == id }) else { return }
+        data.contacts[i].devices[d].unconfirmed = nil
+        save()
+    }
+
+    /// Devices of your own account that introduced themselves without this device approving them.
+    var unconfirmedDevices: [DeviceLink] { linkedDevices.filter { $0.unconfirmed == true } }
 
     /// Whether a hello was sent before the other device answered ours: the two started at once, ours won and theirs
     /// got here after our session was already open. Taking it would replace that session with one they no longer have
@@ -5263,7 +5417,7 @@ final class AppModel {
                 let count = held?.ask == ask.ephemeral ? held!.count : 0
                 guard count < 3, now.timeIntervalSince(held?.at ?? .distantPast) > Self.nudgeAfter else { continue }
                 nudges[key] = (ask.ephemeral, count + 1, now)
-                let header = RatchetHeader(dh: Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation, pn: 0, n: 0)
+                let header = RatchetHeader(dh: Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation, pn: 0, n: 0, v: RatchetHeader.version)
                 seal(.ratchet(RatchetMessage(header: header, ciphertext: .random(64))), contact: i, device: d, collapse: "nudge")
             }
         }
@@ -5393,9 +5547,6 @@ final class AppModel {
             let lane = invite.isPublic ? "public-" + name(invite.persona) : name(invite.persona)
             lanes[Lane(relay: invite.relay, name: lane), default: []].insert(invite.receiveKey)
         }
-        for convo in data.conversations {
-            for intro in convo.introsMine { lanes[Lane(relay: intro.relay, name: name(convo.persona)), default: []].insert(intro.receiveKey) }
-        }
         for offer in data.linkOffers { lanes[Lane(relay: nil, name: "link"), default: []].insert(offer.receiveKey) }
         // A persona whose only mail is in shared groups still needs its lane: the group mailboxes ride along on it.
         for convo in data.conversations where convo.shared.map({ !$0.gone }) == true {
@@ -5516,7 +5667,6 @@ final class AppModel {
     private func housekeep() async {
         drainHelperInbox()
         tendSharedGroups()
-        moveGroupsOver()
         tendJoinLinks()
         tendStoryUpload()
         refreshPush()
@@ -5530,8 +5680,9 @@ final class AppModel {
         // An app left open for days would otherwise keep every envelope digest it ever saw. Only assign when
         // something has actually aged out: writing redraws every view that reads the data.
         let stale = Date().addingTimeInterval(-Self.replayWindow)
-        if data.seenEnvelopes.contains(where: { $0.value <= stale }) {
-            data.seenEnvelopes = data.seenEnvelopes.filter { $0.value > stale }
+        let staleSeen = Date().addingTimeInterval(-Self.seenRetention)
+        if data.seenEnvelopes.contains(where: { $0.value <= staleSeen }) {
+            data.seenEnvelopes = data.seenEnvelopes.filter { $0.value > staleSeen }
         }
         if data.sentDigests.contains(where: { $0.value.at <= stale }) {
             data.sentDigests = data.sentDigests.filter { $0.value.at > stale }
@@ -5540,7 +5691,6 @@ final class AppModel {
         resendOverdueMessages()
         noteUnsent()
         refreshHelper()
-        if introsStale { refileIntros() }
         resendUnconfirmedStories()
         resendUnconfirmedViews()
         finishDepartures()
@@ -5607,7 +5757,7 @@ final class AppModel {
             if item.story != nil { return "Story pieces" }
             if item.viewReport != nil { return "Story views" }
             if item.rings == true { return "Calls" }
-            if item.message != nil { return item.blob.count > Self.smallEnvelope ? "Photos and videos" : "Messages" }
+            if item.message != nil { return item.isBulk ? "Photos and videos" : "Messages" }
             if item.wakes == true { return "Friend requests" }
             return "Receipts and updates"
         }
@@ -5933,12 +6083,28 @@ final class AppModel {
     /// One fetch at a time: two overlapping ones could both collect, and handle, the same envelope.
     private var syncing = false
 
+    /// Whether what's about to be sent may go: whatever sealing it moved on (a ratchet, a group's chain) has to be on the
+    /// disk before it leaves, and the nonces follow from that state alone, so a state rolled back to one already used
+    /// would seal a new message under a nonce and key already spent. Whenever envelopes are waiting this starts any write that
+    /// is queued and waits for the save queue to drain, so a write the debounce has already started counts too (it may still
+    /// be under way, and its outcome isn't known until it ends). If the last write failed, this writes again now with
+    /// everything as it stands, and if it still isn't on the disk it says no: the envelopes stay queued and go on a later
+    /// pass, once a write has landed. The write itself happens off the main thread; this only waits for it.
+    func stateIsOnDiskBeforeSending() async -> Bool {
+        let waiting = !data.outbox.isEmpty || data.conversations.contains { !($0.shared?.outbox.isEmpty ?? true) }
+        guard waiting else { return true }
+        if saveHealth.lastWriteFailed { save() }
+        await settleSavesAsync()
+        return !saveHealth.lastWriteFailed
+    }
+
     /// Sends queued envelopes: the oldest waiting one of each mailbox (so what's written to one mailbox goes out in
     /// order), the smallest first, and a new one is started the moment another finishes. A story to thirty people
     /// doesn't go out one slow round trip after another, and a short message never waits behind its photos.
     /// One that fails holds up only its own mailbox, and a relay that's down only its own envelopes. A large one
     /// that fails (a slow upload, not a relay that's gone) doesn't stop the small ones behind it.
     private func flush() async {
+        guard await stateIsOnDiskBeforeSending() else { return }
         await flushSharedGroups()
         let owner = identity?.fingerprint
         var down: Set<String> = []
@@ -5968,9 +6134,9 @@ final class AppModel {
                 if let backoff = mailboxBackoff[item.sendID], now < backoff.until { continue }
                 // Photos and story pieces go on a connection of their own, so a big upload neither crowds out the short
                 // messages nor takes their connection down with it when it fails.
-                let lane = (item.lane ?? Outgoing.lane(for: nil)) + (item.blob.count > Self.smallEnvelope ? Self.bulkSuffix : "")
+                let lane = (item.lane ?? Outgoing.lane(for: nil)) + (item.isBulk ? Self.bulkSuffix : "")
                 guard !down.contains(relay), !held.contains(item.sendID), !heldLanes.contains(lane) else { continue }
-                if item.blob.count > Self.smallEnvelope {
+                if item.isBulk {
                     guard !heldBig.contains(item.sendID), !seenBig.contains(item.sendID),
                           !sendingBigMail.contains(item.sendID) else { continue }
                     seenBig.insert(item.sendID)
@@ -5981,10 +6147,10 @@ final class AppModel {
                 guard let client = client(item.relay, lane: lane) else { continue }
                 // A lane without a working route finds one first, once: not for every item that's waiting.
                 if Tor.uses(client.base), !client.isEstablished, routeFinding.contains(lane) { continue }
-                if best == nil || item.blob.count < best!.item.blob.count { best = (item, client, lane) }
+                if best == nil || item.weight < best!.item.weight { best = (item, client, lane) }
             }
             guard let best else { return nil }
-            let big = best.item.blob.count > Self.smallEnvelope
+            let big = best.item.isBulk
             let bigInFlight = sendingBig.count
             if big ? bigInFlight >= Self.bigUploads : sendingIDs.count >= Self.sendLanes + Self.bigUploads { return nil }
             return best
@@ -5999,7 +6165,7 @@ final class AppModel {
                     if findsRoute { routeFinding.insert(lane) }
                     tried.insert(item.id)
                     sendingIDs.insert(item.id)
-                    if item.blob.count > Self.smallEnvelope {
+                    if item.isBulk {
                         sendingBig.insert(item.id)
                         sendingBigMail.insert(item.sendID)
                     } else {
@@ -6117,7 +6283,7 @@ final class AppModel {
         return min(2 * 60, 30 * pow(2, Double(steps)))
     }
     /// Under this an envelope is a short message or a receipt.
-    private static let smallEnvelope = 32_768
+    private static var smallEnvelope: Int { Outgoing.smallEnvelope }
     /// Added to a sending lane's name for the connection that carries the big uploads.
     private static let bulkSuffix = "|bulk"
     /// Photos and the like sent at once. They share a connection, so more only makes each of them slower.
@@ -6153,24 +6319,8 @@ final class AppModel {
     private func persona(forMailbox receiveKey: Data) -> UUID?? {
         if let c = data.contacts.first(where: { $0.receiveKey == receiveKey }) { return .some(c.persona) }
         if let invite = data.invites.first(where: { $0.receiveKey == receiveKey }) { return .some(invite.persona) }
-        if let convo = data.conversations.first(where: { $0.introsMine.contains { $0.receiveKey == receiveKey } }) {
-            return .some(convo.persona)
-        }
         return nil
     }
-
-    /// Someone reached this device through a group introduction: give them a mailbox only they write to, so the
-    /// introduction one, which the whole group knows, carries nothing more from them.
-    private func moveOffIntro(_ fp: String, _ persona: UUID?) {
-        let key = fp + (persona?.uuidString ?? "")
-        guard !movedOffIntro.contains(key), let i = contactIndex(fp, persona), !data.contacts[i].isSelf,
-              data.contacts[i].devices.contains(where: { $0.session != nil }) else { return }
-        movedOffIntro.insert(key)
-        enqueue(.moved(myDevice(for: i)), to: data.contacts[i])
-    }
-
-    /// Who's been given a private mailbox since launch, so it's said once.
-    @ObservationIgnored private var movedOffIntro: Set<String> = []
 
     /// A friend still writing to your public request mailbox never heard that you accepted (the answer was lost, or
     /// reached a handshake their side had since started again). Tell them again, so they move to their own mailbox and
@@ -6207,21 +6357,60 @@ final class AppModel {
             receiveLinkRequest(envelope.blob, offer: offer)
             return .handled
         }
-        guard let persona = persona(forMailbox: envelope.receiveKey), let me = me(persona),
-              let opened = try? Envelope.openFull(envelope.blob, with: me) else { return .junk }
+        guard let persona = persona(forMailbox: envelope.receiveKey), let me = me(persona) else { return .junk }
+        let opened: Envelope.Opened
+        do {
+            opened = try Envelope.openFull(envelope.blob, with: me,
+                                           known: { [self] in $0 == me.card.signing ? me.pq.pin : contact(Identity.fingerprint(of: $0), in: persona)?.pq })
+        } catch let EnvelopeRefusal.classical(signer, sentAt) {
+            // Only a recent one says anything: an old classical envelope can be replayed by the relay or anyone who kept a copy,
+            // and must not put "needs to update" under a friend's name or stop this account introducing itself.
+            let age = RelayClock.now.timeIntervalSince(sentAt)
+            if age < Self.replayWindow, age > -24 * 3600 { noteTooOld(signer, persona: persona) }
+            return .junk
+        } catch { return .junk }
         let payload = opened.payload, signer = opened.signer, device = opened.device
         let fp = Identity.fingerprint(of: signer)
+        // Keys the envelope introduced are pinned now; one sealed to ours shows they have our card.
+        if let known = contactIndex(fp, persona) {
+            if data.contacts[known].pq == nil, let pin = opened.introduced {
+                // Held to what their invite committed to: anything else isn't the person who made the invite.
+                guard pinMatchesInvite(pin, contact: data.contacts[known]) else { return .junk }
+                data.contacts[known].pq = pin
+                // What was waiting for their keys goes now, and your other devices are told them.
+                sendPending(contact: known)
+                syncContact(fp, persona)
+            }
+            if opened.postQuantum, data.contacts[known].pqCardSent != true { data.contacts[known].pqCardSent = true }
+            if data.contacts[known].tooOld != nil { data.contacts[known].tooOld = nil }
+        }
         // Anything outside a ratchet session could be sent again by the relay. Each one counts once, and only
         // while the relay could still be holding it.
-        if case .ratchet = payload {} else {
-            let digest = Data(SHA256.hash(data: envelope.blob).prefix(16)).hex
+        // The digest is only written down once the sender is someone this account knows (a contact, or the invite the
+        // mailbox belongs to): anyone with a public key can seal an envelope to this account, and each one counted
+        // before that would grow the table, and make a real envelope for a contact not yet added look like a repeat.
+        let replayDigest = Data(SHA256.hash(data: envelope.blob).prefix(16)).hex
+        let isRatchet: Bool = { if case .ratchet = payload { return true } else { return false } }()
+        if !isRatchet {
             let age = RelayClock.now.timeIntervalSince(opened.sentAt)
-            guard age < Self.replayWindow, age > -24 * 3600, data.seenEnvelopes[digest] == nil else { return .junk }
-            data.seenEnvelopes[digest] = Date()
+            guard age < Self.replayWindow, age > -24 * 3600, data.seenEnvelopes[replayDigest] == nil else { return .junk }
+        }
+        func markSeen() { if !isRatchet { noteSeen(replayDigest) } }
+
+        if case let .pqIntro(card) = payload {
+            guard let known = contactIndex(fp, persona), let pin = card.verified(signer: signer, agreement: opened.agreement),
+                  data.contacts[known].pq == pin else { return .junk }
+            markSeen()
+            // Sent in a classical envelope: they haven't got ours, so they get it now. At most once in a while per contact: a
+            // reply carries a whole card, and an introduction sent again must not make this device answer each time.
+            if !opened.postQuantum, introReplyDue(fp, persona) { sendPQIntro(contact: known, force: true) }
+            save()
+            return .handled
         }
 
         if case .erased = payload {
             // Signed by their identity key, so only they can erase themselves from here.
+            if contactIndex(fp, persona) != nil { markSeen() }
             eraseTraces(of: fp)
             return .handled
         }
@@ -6231,14 +6420,28 @@ final class AppModel {
             // binding covers that one, not whatever a payload chooses to claim.
             guard card.signingKey == signer, card.agreementKey == opened.agreement,
                   let invite = data.invites.first(where: { $0.receiveKey == envelope.receiveKey && !$0.isPublic }) else { return .junk }
-            acceptHello(card, request, fingerprint: fp, device: device, via: invite)
+            guard let pin = card.pq?.verified(signer: signer, agreement: opened.agreement) ?? opened.introduced,
+                  contact(fp, in: invite.persona)?.pq == nil || contact(fp, in: invite.persona)?.pq == pin,
+                  pinMatchesInvite(pin, contact: contact(fp, in: invite.persona)) else { return .junk }
+            markSeen()
+            acceptHello(card, request, fingerprint: fp, device: device, via: invite, pq: pin)
             noteReads(opened, from: fp, persona: invite.persona)
+            // Following through a channel's code: invited into its mailbox now that their app's abilities are known (when
+            // their app can take part), up to the hourly limit.
+            if let channelID = invite.channel, let c = index(of: channelID), data.conversations[c].shared != nil {
+                admitFromCode([fp], at: c)
+                save()
+            }
             return .handled
         }
         if case let .request(card, request, note) = payload {
             guard card.signingKey == signer, card.agreementKey == opened.agreement, !data.blocked.contains(fp),
                   card.relay == nil || Invite.allowedRelay(card.relay) != nil,
+                  let pin = card.pq?.verified(signer: signer, agreement: opened.agreement),
+                  contact(fp, in: persona)?.pq == nil || contact(fp, in: persona)?.pq == pin,
+                  pinMatchesInvite(pin, contact: contact(fp, in: persona)),
                   let invite = data.invites.first(where: { $0.receiveKey == envelope.receiveKey && $0.isPublic }) else { return .junk }
+            markSeen()
             var incoming = FriendRequest(fingerprint: fp, card: card, handshake: request, note: String(note.prefix(280)),
                                          persona: invite.persona)
             incoming.device = device
@@ -6246,8 +6449,11 @@ final class AppModel {
             if let known = contactIndex(fp, invite.persona), !data.contacts[known].hidden {
                 // Already a friend: they've lost the chat on their side (a reinstall, a detach), and their identity
                 // key signed this, so it's them. Reconnect now, rather than leave each side waiting on the other.
-                if !data.contacts[known].awaitingAcceptance { reconnect(incoming, keeping: data.contacts[known]) }
-                return .handled
+                // A request in a classical envelope (they have lost our keys too, so it can't be sealed to them) is not
+                // trusted that far: it could be forged by someone who has broken X25519 and Ed25519. It waits for you
+                // to accept it, like a stranger's, and what you set for them is kept (`acceptRequest`).
+                if data.contacts[known].awaitingAcceptance { return .handled }
+                if opened.postQuantum { reconnect(incoming, keeping: data.contacts[known]); return .handled }
             }
             // The same request sent again (the relay may have lost the first): already here, so no second banner.
             if data.requests.contains(where: { $0.fingerprint == fp && $0.persona == invite.persona && $0.handshake == request }) { return .handled }
@@ -6264,9 +6470,10 @@ final class AppModel {
         // A message from someone this persona doesn't know yet. Kept rather than acknowledged: the contact
         // may arrive a moment later (a group's roster, a hello in the same fetch).
         guard let i = contactIndex(fp, persona) else { return .retry }
-        noteReads(opened, from: fp, persona: persona)
-        let viaIntro = data.conversations.contains { $0.introsMine.contains { $0.receiveKey == envelope.receiveKey } }
-        defer { if viaIntro { moveOffIntro(fp, persona) } }
+        markSeen()
+        // The notification helper's note (`.collected`) says caps 0 because it knows nothing of what the app reads: taking that
+        // as the truth would mark the friend's device as needing an update (bit 7 absent) until its next real envelope.
+        if case .collected = payload {} else { noteReads(opened, from: fp, persona: persona) }
         let viaRequestMailbox = data.invites.contains { $0.isPublic && $0.receiveKey == envelope.receiveKey }
         defer { if viaRequestMailbox { remindAccepted(fp, persona) } }
 
@@ -6425,15 +6632,18 @@ final class AppModel {
         case let .ratchet(message):
             // A message from a device this account hasn't met yet (its hello may be right behind in the same
             // fetch). Kept rather than acknowledged, so it can be read once the device is known.
-            guard let d = deviceIndex(i, device) else {
-                strangeDevices["\(persona?.uuidString ?? "main")|\(fp)"] = Date()
-                return .retry
+            guard let d = deviceIndex(i, device) else { return .retry }
+            // A build from before the sparse post-quantum ratchet: its messages aren't read, and the chat tells whose app
+            // has to update. Not a broken session, so no new keys are started over it.
+            if message.header.v != RatchetHeader.version || data.contacts[i].devices[d].needsUpdate == true {
+                if data.contacts[i].devices[d].needsUpdate != true { data.contacts[i].devices[d].needsUpdate = true }
+                return .handled
             }
             let keptKey = sessionKey(contact: i, device: d)
             // The very same ciphertext again (the relay sent it twice, or its sender sent it again after a dropped
             // connection): already read, so nothing to do. Without this it can't be opened a second time, which looked
             // like the two phones being out of step and started new keys over a healthy chat.
-            let readBefore = Data(SHA256.hash(data: envelope.blob).prefix(16)).hex
+            let readBefore = replayDigest
             if data.seenEnvelopes[readBefore] != nil { return .handled }
             var plain: Data?
             if var session = data.contacts[i].devices[d].session, let opened = try? session.decrypt(message) {
@@ -6463,9 +6673,11 @@ final class AppModel {
             // newer app) still counts and doesn't leave the session behind.
             unreadable[keptKey] = nil
             deadSpareFrom[keptKey] = nil
-            data.seenEnvelopes[readBefore] = Date()
+            noteSeen(readBefore)
             guard let inner = try? Payload.fromWire(plain), !inner.isSetup else { return .handled }
+            handlingSentAt = opened.sentAt
             handle(inner, from: fp, persona: persona, device: device)
+            handlingSentAt = nil
             // The first message in lets a new session start sending. Look them up again: handling it may
             // have removed them (a burned burner, say).
             if let i = contactIndex(fp, persona) { sendPending(contact: i) }
@@ -6500,6 +6712,10 @@ final class AppModel {
         if (data.contacts[i].devices[d].readsChannels == true) != opened.readsChannels {
             data.contacts[i].devices[d].readsChannels = opened.readsChannels ? true : nil
         }
+        // Said on everything it sends, so a device that updates is let in again by its next envelope.
+        if (data.contacts[i].devices[d].needsUpdate == true) != !opened.readsPostQuantumRatchet {
+            data.contacts[i].devices[d].needsUpdate = opened.readsPostQuantumRatchet ? nil : true
+        }
     }
 
     static let maxAvatarBytes = 512 * 1024
@@ -6508,6 +6724,24 @@ final class AppModel {
 
     /// Longer than the relay keeps anything (seven days).
     static let replayWindow: TimeInterval = 8 * 24 * 3600
+    /// How long a seen envelope's digest is kept. The age check uses the relay's clock, which a hostile relay can
+    /// move by up to `RelayClock`'s 7-day limit to make an old envelope look young, so digests outlive that too.
+    static let seenRetention: TimeInterval = replayWindow + 7 * 24 * 3600
+
+    /// The most envelope digests kept. Far more than a busy account sees in the retention time; past it the oldest go
+    /// first, so what an outsider can make this table hold is bounded whatever they send.
+    @ObservationIgnored var maxSeenEnvelopes = 50_000
+
+    private func noteSeen(_ digest: String) {
+        data.seenEnvelopes[digest] = Date()
+        guard data.seenEnvelopes.count > maxSeenEnvelopes else { return }
+        let keep = maxSeenEnvelopes * 9 / 10
+        let newest = data.seenEnvelopes.sorted { $0.value > $1.value }.prefix(keep)
+        data.seenEnvelopes = Dictionary(uniqueKeysWithValues: newest.map { ($0.key, $0.value) })
+    }
+
+    /// Tests: how many envelope digests are kept.
+    var seenEnvelopeCount: Int { data.seenEnvelopes.count }
 
     private func handle(_ payload: Payload, from fp: String, persona: UUID?, device: Data) {
         guard var sender = contact(fp, in: persona) else { return }
@@ -6519,12 +6753,14 @@ final class AppModel {
             acceptGroupInvite(invite, from: sender)
         case let .groupJoin(group, card):
             acceptGroupJoin(group, card: card, from: sender)
-        case let .friendInvite(code, note):
-            // Only from someone you share a group with; a friend already is one.
-            guard sender.hidden, !sender.isSelf else { break }
-            noteFriendInvite(FriendInviteBody(code: code, note: note), from: fp, persona: persona,
-                             group: data.conversations.first { $0.kind == .group && $0.persona == persona && $0.members.contains(fp) }?.id)
-        case .groupSettings, .groupRekey, .groupLinks, .groupRoster, .groupKeyWanted, .groupCatchUp, .memberCard, .friendAsk, .membersAdded:
+        case let .channelLeave(group):
+            // From a follower, over the chat they were invited in; who they are comes from this chat's session.
+            guard !sender.isSelf else { break }
+            followerLeft(group, from: sender)
+        case let .channelKeyWanted(group, held):
+            guard !sender.isSelf else { break }
+            answerKeyRequest(group, held: held, from: sender)
+        case .groupSettings, .groupRekey, .groupLinks, .groupRoster, .groupKeyWanted, .groupCatchUp, .memberCard, .friendAsk, .membersAdded, .left:
             // Only ever said in a group's own mailbox.
             break
         case .deviceRemoved:
@@ -6532,7 +6768,7 @@ final class AppModel {
             data.contacts[i].devices.removeAll { $0.id == device }
         case .erased:
             eraseTraces(of: fp)
-        case .hello, .request, .sessionInit, .deviceHello, .sessionAccept, .spareAccept, .ratchet, .collected:
+        case .hello, .request, .pqIntro, .sessionInit, .deviceHello, .sessionAccept, .spareAccept, .ratchet, .collected:
             break
         case let .sync(event):
             // Only your own devices may tell this one what you did.
@@ -6569,14 +6805,14 @@ final class AppModel {
             upsert(sender)
             refreshDirectTitle(fp)
         case let .message(wire):
+            // A message for a group or channel only comes in that group's own mailbox (see `receiveGroupMail`), never one by one.
+            guard wire.conversation == nil else { break }
             deliver(wire, from: sender)
         case let .receipt(ids, read):
             // With read receipts off you don't see other people's either.
             let seen = read == true && data.security.readReceipts
             withAnimation(.smooth) { for id in ids { noteDelivery(of: id, by: fp, read: seen) } }
-        case let .group(info):
-            joinGroup(info, from: sender)
-        case let .story(id, style, date, lasts):
+        case let .story(id, style, date, lasts, loops):
             // Already taken back: a late or repeated copy mustn't bring it back. And only a friend's: someone you only
             // share a group with doesn't get to show you stories, whatever their app sends.
             guard removedStories["\(fp)|\(id)"] == nil, !sender.hidden, !sender.awaitingAcceptance else { break }
@@ -6596,6 +6832,7 @@ final class AppModel {
                 }
                 data.stories[i].style = style
                 data.stories[i].lifetime = lifetime
+                data.stories[i].loops = loops == true ? true : nil
                 if !data.stories[i].isLive { data.stories.remove(at: i); break }
                 acknowledgeStory(id, author: fp, persona: persona)
                 // Sent again because pieces went missing: what's here now may complete it. The story arriving again
@@ -6609,6 +6846,7 @@ final class AppModel {
             if !story.isReady { clipActivity[ClipKey(id, persona)] = Date() }
             story.persona = persona
             story.lifetime = lifetime
+            story.loops = loops == true ? true : nil
             if story.isLive { withAnimation(.snappy) { data.stories.append(story) } }
             assembleClip(id, persona: persona)
             acknowledgeStory(id, author: fp, persona: persona)
@@ -6715,8 +6953,9 @@ final class AppModel {
                 online[key] = nil
             }
         case let .disappearing(shared, seconds):
-            guard let i = conversationIndex(shared, from: sender, create: true),
-                  data.conversations[i].kind != .channel, data.conversations[i].disappearAfter != seconds else { break }
+            // Only in a direct chat: a group's timer is part of its settings.
+            guard shared == nil, let i = conversationIndex(shared, from: sender, create: true),
+                  data.conversations[i].disappearAfter != seconds else { break }
             // An unknown or out-of-range value is ignored, not applied as "turn the timer off".
             let valid: TimeInterval?
             if let seconds {
@@ -6729,29 +6968,9 @@ final class AppModel {
         case .burn:
             forget(sender)
         case let .chatDeleted(shared):
-            guard let i = conversationIndex(shared, from: sender) else { break }
-            let c = data.conversations[i]
-            if c.kind == .direct || c.owner == fp {
-                removeLocally(c.id)
-            } else {
-                // Only the owner can delete for everyone; from anyone else it means they left.
-                dropMember(fp, at: i)
-            }
-        case let .left(shared):
-            guard let i = conversationIndex(shared, from: sender) else { break }
-            dropMember(fp, at: i)
-        case let .removed(shared):
-            guard let i = conversationIndex(shared, from: sender) else { break }
-            let c = data.conversations[i]
-            // Only someone allowed to take me out: the owner anyone, an admin a plain member or mod, a mod a plain member.
-            guard c.canRemove("me", by: fp) else { break }
+            // Only a direct chat is deleted this way. A group's owner deletes it in the group's own mailbox.
+            guard shared == nil, let i = conversationIndex(nil, from: sender) else { break }
             removeLocally(data.conversations[i].id)
-        case let .moved(card):
-            // They opened a mailbox just for us after we said hello through a group introduction.
-            guard card.id == device, card.sendID.count == 32, let i = contactIndex(fp, persona),
-                  let d = deviceIndex(i, device) else { break }
-            data.contacts[i].devices[d].sendID = card.sendID
-            syncContact(fp, persona)
         case let .accepted(sendID):
             // They accepted our request: switch to the private mailbox they opened for us.
             guard sender.awaitingAcceptance, sendID.count == 32 else { break }
@@ -6766,12 +6985,13 @@ final class AppModel {
     }
 
     private func acceptHello(_ card: PeerCard, _ request: SessionInit, fingerprint fp: String, device: Data,
-                             via invite: OpenInvite) {
+                             via invite: OpenInvite, pq: PQPin) {
         let persona = invite.persona
         let known = contact(fp, in: persona)
         var peer = known ?? Contact(fingerprint: fp, signingKey: card.signingKey,
                                     agreementKey: card.agreementKey, sendID: card.sendID, device: device)
         peer.persona = persona
+        peer.pq = pq
         peer.relay = invite.relay
         peer.name = String(card.name.prefix(64))
         peer.avatar = card.avatar
@@ -6787,17 +7007,8 @@ final class AppModel {
             peer.hidden = known?.hidden ?? true
             upsert(peer)
             answer()
-            guard let i = index(of: channelID) else { return }
-            // A channel that shares one mailbox invites them into it (when their app can take part; otherwise once it can).
-            if data.conversations[i].shared != nil {
-                self.invite([fp], at: i)
-                save()
-                return
-            }
-            if !data.conversations[i].members.contains(fp) { data.conversations[i].members.append(fp) }
-            data.conversations[i].version &+= 1
-            let c = data.conversations[i]
-            sendInfo(c, to: [fp] + c.admins.filter { $0 != "me" } + (c.amOwner ? [] : [c.owner]))
+            // The channel invites them into its mailbox once what their app reads is known (`noteReads`, right after this).
+            save()
         } else {
             peer.hidden = false
             peer.receiveKey = invite.receiveKey
@@ -6810,10 +7021,48 @@ final class AppModel {
         }
     }
 
+    /// How many people a channel's code lets in on its own in an hour. The rest wait (kept, and let in as the hour allows),
+    /// so someone with the code can't make staff send an invite and rekey for a crowd of throwaway accounts at once.
+    static var channelAdmitsPerHour = 60
+
+    /// Invites people who followed through a channel's code, up to the hourly limit; the rest wait their turn, earliest first.
+    /// Only people who are new count: someone already in the roster, or invited within the hour, or already waiting is
+    /// skipped (one identity saying hello again and again uses no more of the limit and sends nothing more). The waiting list
+    /// keeps its earliest entries when it is full, so a flood of throwaway accounts can't push real joiners out. Called with no
+    /// one new, it lets in whoever is waiting as the hour allows.
+    private func admitFromCode(_ fingerprints: [String], at i: Int) {
+        guard let shared = data.conversations[i].shared else { return }
+        let id = data.conversations[i].id
+        let now = Date()
+        let known = Set(shared.roster?.live.map { Identity.fingerprint(of: $0.signingKey) } ?? [])
+        let live = Set(shared.knownAs.filter { known.contains($0.value) }.keys)
+        func settled(_ fp: String) -> Bool {
+            live.contains(fp) || shared.invited[fp].map { now.timeIntervalSince($0) < 3600 } == true
+        }
+        var seen = Set<String>()
+        var queue = (shared.joinWaiting ?? []).filter { !settled($0) && seen.insert($0).inserted }
+        for fp in fingerprints where !settled(fp) && seen.insert(fp).inserted { queue.append(fp) }
+        let recent = (channelAdmits[id] ?? []).filter { now.timeIntervalSince($0) < 3600 }
+        let room = max(0, Self.channelAdmitsPerHour - recent.count)
+        let go = Array(queue.prefix(room))
+        var rest = Array(queue.dropFirst(room))
+        channelAdmits[id] = recent + go.map { _ in now }
+        if !go.isEmpty {
+            // Whoever the invite refused for good (an app too old) is dropped; whoever it simply had no room for waits.
+            let refused = Set(invite(go, at: i))
+            let invited = data.conversations[i].shared?.invited ?? [:]
+            let persona = data.conversations[i].persona
+            let unplaced = go.filter { !refused.contains($0) && invited[$0] == nil && contact($0, in: persona) != nil }
+            rest = unplaced + rest
+        }
+        data.conversations[i].shared?.joinWaiting = rest.isEmpty ? nil : Array(rest.prefix(GroupRoster.Body.maxEntries))
+    }
+
     /// The conversation a signal from `sender` belongs to: a shared group/channel id, or their direct chat.
     private func conversationIndex(_ shared: UUID?, from sender: Contact, create: Bool = false) -> Int? {
         if let shared {
-            guard let found = groupIndex(shared, persona: sender.persona),
+            // Never one kept in the older format: nothing is read for it any more.
+            guard let found = groupIndex(shared, persona: sender.persona), !data.conversations[found].isOldFormat,
                   data.conversations[found].members.contains(sender.fingerprint) else { return nil }
             return found
         }
@@ -6840,8 +7089,7 @@ final class AppModel {
         if wire.conversation != nil, !data.conversations[i].canPost(sender.fingerprint) { return }
         guard !data.conversations[i].messages.contains(where: { $0.id == wire.id }) else {
             // Sent again because the relay may have lost it: say again that it's here, so their tick catches up.
-            // This matters to groups too, which have no read ticks but still need to be told the message landed.
-            queueReceipt(wire.id, to: sender)
+            if wire.conversation == nil { queueReceipt(wire.id, to: sender) }
             return
         }
         let date = dated(wire.date)
@@ -6850,15 +7098,17 @@ final class AppModel {
         let mine = myFingerprint(in: data.conversations[i])
         let reply = wire.reply.map {
             ReplyRef(id: $0.id, author: $0.author == mine ? "me" : $0.author, snippet: String($0.snippet.prefix(120)),
-                     picture: $0.picture.flatMap { $0.count <= ReplyRef.maxPicture && PlatformImage(data: $0) != nil ? $0 : nil })
+                     picture: $0.picture.flatMap { $0.count <= ReplyRef.maxPicture && PlatformImage.checked($0) != nil ? $0 : nil })
         }
         let preview = wire.preview.flatMap { p in
             !LinkPreviews.isWebLink(p.url) ? nil  // only plain http(s) links
                 : LinkPreview(url: p.url, title: p.title.map { String($0.prefix(200)) }, site: p.site.map { String($0.prefix(80)) },
                               image: p.image.flatMap { $0.count <= 400_000 ? $0 : nil })
         }
+        // A picture too big to decode is left off; the words stay.
+        let picture = wire.image.flatMap { ImageLimits.isReasonable($0) || $0.isEmpty ? $0 : nil }
         var message = Message(id: wire.id, sender: sender.fingerprint, text: String(wire.text.prefix(20_000)),
-                              image: wire.image, voice: wire.voice, date: date, status: .delivered, expiresAt: expires,
+                              image: picture, voice: wire.voice, date: date, status: .delivered, expiresAt: expires,
                               reply: reply, preview: preview)
         // Shown only if it's really theirs: a collectible is checked against their key, a note card is just a title.
         message.collectible = wire.collectible.flatMap { $0.isGenuine(for: sender.signingKey) ? $0 : nil }
@@ -6903,14 +7153,11 @@ final class AppModel {
         if Self.isPending(message) { assembleClip(wire.id, persona: data.conversations[i].persona) }
         if openConversation != data.conversations[i].id || !appActive { data.conversations[i].unread += 1 }
         notify(message, at: i)
+        // Only a direct chat has ticks (a group's mail is "sent" once it's in the mailbox). Seen straight away when the chat
+        // is open in front of you.
         if wire.conversation == nil {
-            // Seen straight away when the chat is open in front of you.
             let seen = openConversation == data.conversations[i].id && appActive && sendsReadReceipts(data.conversations[i])
             queueReceipt(wire.id, to: sender, read: seen)
-        } else {
-            // A group or channel message has no read tick. The receipt only says it arrived, so the sender
-            // stops sending it again (see resendUnconfirmedMessages).
-            queueReceipt(wire.id, to: sender)
         }
     }
 
@@ -6967,7 +7214,8 @@ final class AppModel {
     private func applyUnsend(_ ids: [UUID], from sender: Contact) {
         let ids = Set(ids)
         for i in data.conversations.indices
-        where data.conversations[i].messages.contains(where: { ids.contains($0.id) && $0.sender == sender.fingerprint }) {
+        where !data.conversations[i].isOldFormat
+            && data.conversations[i].messages.contains(where: { ids.contains($0.id) && $0.sender == sender.fingerprint }) {
             withAnimation(.easeOut(duration: 0.38)) {
                 data.conversations[i].messages.removeAll { ids.contains($0.id) && $0.sender == sender.fingerprint }
             }
@@ -6983,7 +7231,8 @@ final class AppModel {
 
     private func applyReaction(_ emoji: String?, to messageID: UUID, from sender: Contact) {
         for i in data.conversations.indices
-        where data.conversations[i].persona == sender.persona && data.conversations[i].members.contains(sender.fingerprint) {
+        where data.conversations[i].persona == sender.persona && !data.conversations[i].isOldFormat
+            && data.conversations[i].members.contains(sender.fingerprint) {
             guard let m = data.conversations[i].messages.firstIndex(where: { $0.id == messageID }) else { continue }
             let clean = emoji.map { String($0.prefix(8)) }
             withAnimation(.snappy) { data.conversations[i].messages[m].reactions[sender.fingerprint] = clean }
@@ -6991,124 +7240,24 @@ final class AppModel {
         }
     }
 
-    /// A group or channel arrived or changed. New ones are joined. A change to one you're in counts only from its
-    /// owner, an admin or (in a group) a mod, only if it's newer, and only for what that role may do: the owner
-    /// anything, an admin everything but who the owner, admins and mods are and the posting rule, a mod only
-    /// taking ordinary members out. Who may change it is decided before anything is touched.
-    func joinGroup(_ info: GroupInfo, from sender: Contact) {
-        let persona = sender.persona
-        let mine = me(persona)?.card.signing
-        func fingerprint(_ key: Data) -> String { key == mine ? "me" : Identity.fingerprint(of: key) }
-        // This device's introduction mailbox, from whoever runs the group.
-        // Filed under no id when whoever runs the group hadn't heard from this device yet: then that one is ours.
-        let intro = (info.intros?[deviceID(for: persona).hex] ?? info.intros?[""]).flatMap {
-            $0.count == 32 ? IntroMailbox(receiveKey: $0, relay: sender.relay) : nil
-        }
-        func keep(_ intro: IntroMailbox?, at i: Int) {
-            guard let intro, !data.conversations[i].introsMine.contains(intro) else { return }
-            data.conversations[i].introsMine.append(intro)
-            // A few are plenty: each is polled, and registered for wake-ups.
-            if data.conversations[i].introsMine.count > 8 { data.conversations[i].introsMine.removeFirst() }
-        }
-
-        // Who the group says is in it, worked out without changing anything.
-        let cards = info.roster.prefix(Conversation.maxMembers).filter { $0.signingKey != mine }
-        var members: [String] = [sender.fingerprint]
-        for card in cards {
-            let fp = Identity.fingerprint(of: card.signingKey)
-            if !members.contains(fp) { members.append(fp) }
-        }
-        let owner = info.owner.map(fingerprint) ?? sender.fingerprint
-        let admins = (info.admins ?? []).map(fingerprint).filter { $0 != owner }
-        let mods = info.mods.map { $0.map(fingerprint).filter { $0 != owner && !admins.contains($0) } }
-        let version = info.version ?? 0
-        /// Meets the people in the group we only know from it. A contact we already have keeps the devices we
-        /// know: what a group says about someone else's devices isn't theirs to say.
-        func meetMembers() {
-            for card in cards {
-                let fp = Identity.fingerprint(of: card.signingKey)
-                guard contactIndex(fp, persona) == nil else { continue }
-                var peer = Contact(fingerprint: fp, name: String(card.name.prefix(64)), avatar: card.avatar,
-                                   signingKey: card.signingKey, agreementKey: card.agreementKey,
-                                   sendID: card.sendID, hidden: true)
-                peer.devices = card.allDevices.filter { $0.sendID.count == 32 }.map { DeviceLink(id: $0.id, sendID: $0.sendID) }
-                peer.color = card.color
-                peer.persona = persona
-                peer.relay = Invite.allowedRelay(card.relay)
-                upsert(peer)
-            }
-        }
-
-        if let i = groupIndex(info.id, persona: persona) {
-            let current = data.conversations[i]
-            let fromOwner = current.owner == sender.fingerprint
-            let fromAdmin = current.isAdmin(sender.fingerprint)
-            let fromMod = current.kind == .group && current.mods.contains(sender.fingerprint)
-            guard current.persona == persona, fromAdmin || fromMod else { return }
-            // The introduction mailbox that comes with an update, whether or not the update itself counts.
-            keep(intro, at: i)
-            // Newer, but not so far ahead that nothing after it could count: from anyone but the owner, the next few.
-            guard version > current.version, fromOwner || version <= current.version + 8 else { return }
-            let gone = current.members.filter { !members.contains($0) }
-            if fromOwner {
-                guard owner == current.owner else { return }
-            } else {
-                // Nobody else can change who the owner, admins and mods are, or the posting rule, or take the owner
-                // or an admin out; a mod can't take another mod out.
-                guard owner == current.owner, Set(admins) == Set(current.admins),
-                      Set(mods ?? current.mods) == Set(current.mods),
-                      (info.postPolicy ?? current.postPolicy) == current.postPolicy,
-                      gone.allSatisfy({ current.canRemove($0, by: sender.fingerprint) }) else { return }
-                if !fromAdmin {
-                    // A mod's update is only ever members taken out: nothing added, and none of the details.
-                    guard !gone.isEmpty, members.allSatisfy({ current.members.contains($0) }) else { return }
-                }
-            }
-            meetMembers()
-            if fromAdmin {
-                data.conversations[i].title = String(info.title.prefix(80))
-                data.conversations[i].avatar = info.avatar
-                data.conversations[i].about = info.about.map { String($0.prefix(500)) }
-            }
-            data.conversations[i].admins = admins
-            data.conversations[i].mods = mods ?? current.mods
-            data.conversations[i].postPolicy = info.postPolicy ?? current.postPolicy
-            data.conversations[i].members = members
-            data.conversations[i].version = version
-            return
-        }
-        meetMembers()
-        // Another persona of this device may be in it too: each keeps its own copy.
-        let place = newGroupPlace(info.id, persona: persona)
-        var convo = Conversation(id: place.id, kind: info.kind, title: String(info.title.prefix(80)), avatar: info.avatar,
-                                 members: members)
-        convo.groupID = place.groupID
-        convo.persona = persona
-        convo.about = info.about.map { String($0.prefix(500)) }
-        convo.owner = owner
-        convo.admins = admins
-        convo.mods = mods ?? []
-        convo.postPolicy = info.postPolicy ?? (info.kind == .channel ? .admins : .everyone)
-        convo.version = version
-        convo.introsMine = intro.map { [$0] } ?? []
-        withAnimation(.snappy) { data.conversations.insert(convo, at: 0) }
-    }
-
-    private func dropMember(_ fingerprint: String, at i: Int) {
-        data.conversations[i].members.removeAll { $0 == fingerprint }
-        data.conversations[i].admins.removeAll { $0 == fingerprint }
-        data.conversations[i].mods.removeAll { $0 == fingerprint }
-        data.conversations[i].introsMade[fingerprint] = nil
-    }
-
     // MARK: - Group & channel management
 
     /// Whether you can post here right now.
     func canPost(in convo: Conversation) -> Bool {
         switch convo.kind {
-        case .direct, .broadcast: true
-        case .group, .channel: convo.canPost("me") && !(convo.shared.map { $0.joining || $0.gone } ?? false)
+        case .direct: peerNeedingUpdate(in: convo) == nil
+        case .broadcast: true
+        // A group or channel kept in the older format (a copy sent to each member) can still be read, but nothing goes in it.
+        case .group, .channel: !convo.isOldFormat && convo.canPost("me") && !(convo.shared.map { $0.joining || $0.gone } ?? false)
         }
+    }
+
+    /// In a chat with one friend: their name, if their app is from before the sparse post-quantum ratchet and has to update
+    /// before anything can go either way.
+    func peerNeedingUpdate(in convo: Conversation) -> String? {
+        guard convo.kind == .direct else { return nil }
+        let behind = friendsNeedingUpdate(persona: convo.persona)
+        return convo.members.first { behind.contains($0) }.map { displayName($0) }
     }
 
     /// In a channel you run: everyone who isn't an admin.
@@ -7116,32 +7265,6 @@ final class AppModel {
         convo.members.filter { !convo.isAdmin($0) }
     }
 
-    private func signingKey(_ fingerprint: String, in persona: UUID?) -> Data? {
-        fingerprint == "me" ? me(persona)?.card.signing : contact(fingerprint, in: persona)?.signingKey
-    }
-
-    /// The group as one recipient should see it. Channel followers only learn who can post.
-    func info(for convo: Conversation, to recipient: String) -> GroupInfo {
-        let persona = convo.persona
-        let people: [String]
-        if convo.kind == .channel && !convo.isAdmin(recipient) {
-            people = ([convo.owner] + convo.admins).filter { $0 != "me" && $0 != recipient }
-        } else {
-            people = convo.members.filter { $0 != recipient }
-        }
-        let roster = people.compactMap { contact($0, in: persona) }.map { member in
-            let devices = introDevices(of: member, in: convo.id)
-            return PeerCard(name: member.name, avatar: Self.thumbnail(member.avatar, side: 96), color: member.color, signingKey: member.signingKey,
-                            agreementKey: member.agreementKey, sendID: devices.first?.sendID ?? Data(), relay: member.relay,
-                            devices: devices)
-        }
-        if let them = contact(recipient, in: persona) { _ = introDevices(of: them, in: convo.id) }
-        return GroupInfo(id: convo.wireID, kind: convo.kind, title: convo.title, avatar: Self.thumbnail(convo.avatar, side: 320), roster: roster,
-                         about: convo.about, owner: signingKey(convo.owner, in: persona),
-                         admins: convo.admins.compactMap { signingKey($0, in: persona) },
-                         mods: convo.mods.compactMap { signingKey($0, in: persona) }, postPolicy: convo.postPolicy,
-                         version: convo.version, intros: index(of: convo.id).flatMap { data.conversations[$0].introsMade[recipient] })
-    }
 
     /// A picture shrunk for a group announcement. Every member's avatar and the group's own travel in each
     /// announcement, and full-size ones make it hundreds of kilobytes, many times any message, which is the
@@ -7178,63 +7301,13 @@ final class AppModel {
     }
     private static var thumbnailCache: [String: Data] = [:]
 
-    /// Where the other members first reach `member`: a mailbox made for each of their devices, kept as long as
-    /// the group is. Never the mailbox they use with you, which only the two of you should know.
-    private func introDevices(of member: Contact, in convoID: UUID) -> [DeviceCard] {
-        guard let i = index(of: convoID) else { return [] }
-        var made = data.conversations[i].introsMade[member.fingerprint] ?? [:]
-        let cards = member.devices.map { device in
-            let key = made[device.id.hex] ?? Mailbox.make().receiveKey
-            made[device.id.hex] = key
-            return DeviceCard(id: device.id, sendID: Mailbox.sendID(for: key))
-        }
-        data.conversations[i].introsMade[member.fingerprint] = made
-        return cards
-    }
-
-    /// Set when a contact's device id was just learnt, and at unlock, so `refileIntros` runs on the next beat.
-    @ObservationIgnored private var introsStale = true
-
-    /// Puts right the introduction mailboxes of groups you run that were made before you knew a member's device id
-    /// (you'd added them a moment earlier and they hadn't written back). Each was filed under no id, and their app
-    /// looks its own up by id, so it never found it: nobody else in the group could reach them, and they saw only
-    /// what you wrote. Once the id is known the mailbox is filed under it and the member is told again. The mailbox
-    /// itself doesn't change, so what the others were given for them still holds.
-    private func refileIntros() {
-        introsStale = false
-        for i in data.conversations.indices where data.conversations[i].amAdmin {
-            let convo = data.conversations[i]
-            for (fp, made) in convo.introsMade {
-                guard let key = made[""], let member = contact(fp, in: convo.persona),
-                      let id = member.devices.map(\.id.hex).first(where: { !$0.isEmpty && made[$0] == nil }) else { continue }
-                data.conversations[i].introsMade[fp]?[""] = nil
-                data.conversations[i].introsMade[fp]?[id] = key
-                sendInfo(data.conversations[i], to: [fp])
-            }
-        }
-    }
-
-    private func sendInfo(_ convo: Conversation, to recipients: [String]) {
-        for fp in Set(recipients) where fp != "me" {
-            guard let peer = contact(fp, in: convo.persona) else { continue }
-            enqueue(.group(info(for: convo, to: fp)), to: peer)
-        }
-    }
-
     /// Bumps the version and tells everyone who needs to know.
-    private func publishChange(_ i: Int, alsoTell extra: [String] = [], channelAdminsOnly: Bool = false) {
-        if data.conversations[i].shared != nil { publishSharedChange(i); return }
-        data.conversations[i].version &+= 1
-        let c = data.conversations[i]
-        let everyone = c.members
-        let admins = c.members.filter { c.isAdmin($0) }
-        sendInfo(c, to: (c.kind == .channel && channelAdminsOnly ? admins : everyone) + extra)
-        syncConversation(c.id)
-        save()
+    private func publishChange(_ i: Int) {
+        if data.conversations[i].shared != nil { publishSharedChange(i) }
     }
 
     func updateDetails(_ id: Conversation.ID, title: String, about: String, avatar: Data?) {
-        guard let i = index(of: id), data.conversations[i].amAdmin else { return }
+        guard let i = index(of: id), data.conversations[i].shared != nil, data.conversations[i].amAdmin else { return }
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         data.conversations[i].title = trimmed.isEmpty ? data.conversations[i].title : String(trimmed.prefix(80))
         data.conversations[i].about = about.isEmpty ? nil : String(about.prefix(500))
@@ -7243,14 +7316,15 @@ final class AppModel {
     }
 
     func setPostPolicy(_ id: Conversation.ID, _ policy: PostPolicy) {
-        guard let i = index(of: id), data.conversations[i].amOwner else { return }
+        guard let i = index(of: id), data.conversations[i].shared != nil, data.conversations[i].amOwner else { return }
         data.conversations[i].postPolicy = policy
         publishChange(i)
     }
 
     /// Only the owner appoints or removes admins.
     func setAdmin(_ id: Conversation.ID, _ fingerprint: String, _ on: Bool) {
-        guard let i = index(of: id), data.conversations[i].amOwner, data.conversations[i].members.contains(fingerprint) else { return }
+        guard let i = index(of: id), data.conversations[i].shared != nil, data.conversations[i].amOwner,
+              data.conversations[i].members.contains(fingerprint) else { return }
         // A follower of a channel that shares one mailbox has no card: they're asked for one first, and made an admin when
         // they answer.
         if on, let shared = data.conversations[i].shared, shared.settings.kind == .channel,
@@ -7271,38 +7345,27 @@ final class AppModel {
 
     /// Only the owner appoints or removes mods, and only in groups. An admin is already more than a mod.
     func setMod(_ id: Conversation.ID, _ fingerprint: String, _ on: Bool) {
-        guard let i = index(of: id), data.conversations[i].amOwner, data.conversations[i].kind == .group,
+        guard let i = index(of: id), data.conversations[i].shared != nil, data.conversations[i].amOwner, data.conversations[i].kind == .group,
               data.conversations[i].members.contains(fingerprint), !data.conversations[i].isAdmin(fingerprint) else { return }
         data.conversations[i].mods.removeAll { $0 == fingerprint }
         if on { data.conversations[i].mods.append(fingerprint) }
         publishChange(i)
     }
 
-    /// Adds contacts (of this chat's persona) to a group or channel.
-    func addMembers(_ id: Conversation.ID, _ fingerprints: [String]) {
-        guard let i = index(of: id), data.conversations[i].amAdmin else { return }
-        if data.conversations[i].shared != nil {
-            invite(fingerprints.filter { !data.conversations[i].members.contains($0) }, at: i)
-            return
-        }
-        let persona = data.conversations[i].persona
-        let room = max(0, Conversation.maxMembers - data.conversations[i].members.count)
-        let new = Array(fingerprints.filter { !data.conversations[i].members.contains($0) && contact($0, in: persona) != nil }.prefix(room))
-        guard !new.isEmpty else { return }
-        data.conversations[i].members += new
-        publishChange(i, alsoTell: new, channelAdminsOnly: true)
+    /// Adds contacts (of this chat's persona) to a group or channel, and gives back the ones whose app is too old to take
+    /// part: they aren't added, and the caller says so (see `membersNeedingUpdate`).
+    @discardableResult
+    func addMembers(_ id: Conversation.ID, _ fingerprints: [String]) -> [String] {
+        guard let i = index(of: id), data.conversations[i].shared != nil, data.conversations[i].amAdmin else { return [] }
+        return invite(fingerprints.filter { !data.conversations[i].members.contains($0) }, at: i)
     }
 
     /// Owners can remove anyone; admins can remove people who aren't admins; mods only ordinary members.
     func removeMember(_ id: Conversation.ID, _ fingerprint: String) {
-        guard let i = index(of: id) else { return }
+        guard let i = index(of: id), data.conversations[i].shared != nil else { return }
         let c = data.conversations[i]
-        guard c.canRemove(fingerprint, by: "me"),
-              let peer = contact(fingerprint, in: c.persona) else { return }
-        if c.shared != nil { removeSharedMember(fingerprint, at: i); return }
-        enqueue(.removed(conversation: c.wireID), to: peer)
-        dropMember(fingerprint, at: i)
-        publishChange(i, channelAdminsOnly: true)
+        guard c.canRemove(fingerprint, by: "me"), contact(fingerprint, in: c.persona) != nil else { return }
+        removeSharedMember(fingerprint, at: i)
     }
 
     func role(of fingerprint: String, in convo: Conversation) -> String? {
@@ -7353,10 +7416,11 @@ extension AppModel {
     func syncConversation(_ id: Conversation.ID) {
         guard let c = conversation(id), c.kind != .direct else { return }
         if let shared = c.shared {
-            sync(.sharedGroup(persona: c.persona, settings: shared.settings, epochs: shared.readable, staffKey: shared.staffKey))
+            sync(.sharedGroup(persona: c.persona, settings: shared.settings, epochs: shared.readable, staffKey: shared.staffKey, inviter: shared.ownerAccount))
             return
         }
-        sync(.conversation(card(of: c)))
+        // Only a broadcast list is carried to your other devices by a card; a group's settings are its own.
+        if c.kind == .broadcast { sync(.conversation(card(of: c))) }
     }
 
     func ref(_ convo: Conversation) -> ConvoRef {
@@ -7368,7 +7432,7 @@ extension AppModel {
         ContactCard(fingerprint: c.fingerprint, name: c.name, nickname: c.nickname, avatar: c.avatar, banner: c.banner, color: c.color,
                     verified: c.verified, signingKey: c.signingKey, agreementKey: c.agreementKey,
                     devices: c.devices.map { DeviceCard(id: $0.id, sendID: $0.sendID) }, relay: c.relay, hidden: c.hidden,
-                    awaitingAcceptance: c.awaitingAcceptance, persona: c.persona)
+                    awaitingAcceptance: c.awaitingAcceptance, persona: c.persona, pq: c.pq, pqCommit: c.pqCommit)
     }
 
     private func card(of c: Conversation) -> ConversationCard {
@@ -7400,6 +7464,20 @@ extension AppModel {
             data.contacts[i].verified = card.verified
             data.contacts[i].hidden = card.hidden
             data.contacts[i].awaitingAcceptance = card.awaitingAcceptance
+            // Another of your devices pinned these (only ever from a card that verified): the same account's keys.
+            var learned = false
+            if data.contacts[i].pqCommit == nil, data.contacts[i].pq == nil, let commit = card.pqCommit, commit.count == PQPin.commitmentSize {
+                data.contacts[i].pqCommit = commit
+            }
+            if data.contacts[i].pq == nil, let pin = card.pq, pin.isWellFormed, pinMatchesInvite(pin, contact: data.contacts[i]) {
+                data.contacts[i].pq = pin
+                learned = true
+            }
+            // Devices that were waiting for the keys to say hello start now.
+            if learned {
+                for d in data.contacts[i].devices.indices where data.contacts[i].devices[d].session == nil && data.contacts[i].devices[d].handshake == nil
+                    && !card.awaitingAcceptance { startHandshake(contact: i, device: d) }
+            }
             for device in card.devices {
                 let known = data.contacts[i].devices.contains { (!device.id.isEmpty && $0.id == device.id) || $0.sendID == device.sendID }
                 if !known {
@@ -7420,13 +7498,19 @@ extension AppModel {
         c.relay = card.relay
         c.awaitingAcceptance = card.awaitingAcceptance
         c.persona = card.persona
+        if let commit = card.pqCommit, commit.count == PQPin.commitmentSize { c.pqCommit = commit }
+        if let pin = card.pq, pin.isWellFormed, pinMatchesInvite(pin, contact: c) { c.pq = pin }
         upsert(c)
         // Say hello from this device, unless we're still waiting for them to accept a request.
-        guard !card.awaitingAcceptance, let i = contactIndex(c.fingerprint, c.persona) else { return }
+        // Without their post-quantum keys nothing can be sealed to them yet: the device that has them tells this one (above).
+        guard !card.awaitingAcceptance, c.pq != nil, let i = contactIndex(c.fingerprint, c.persona) else { return }
         for d in data.contacts[i].devices.indices { startHandshake(contact: i, device: d) }
     }
 
     private func adopt(_ card: ConversationCard) {
+        // Only a direct chat or a broadcast list comes by card. A group or channel in the older format isn't brought to this
+        // device any more, and a shared one comes with its settings and keys (see `historyForNewDevice`).
+        guard card.kind == .direct || card.kind == .broadcast else { return }
         if let i = card.kind == .direct ? index(of: card.id) : groupIndex(card.group ?? card.id, persona: card.persona) {
             guard card.version >= data.conversations[i].version else { return }
             data.conversations[i].title = card.title
@@ -7511,8 +7595,11 @@ extension AppModel {
             guard (card.kind == .direct ? conversation(card.id) : groupIndex(card.group ?? card.id, persona: card.persona)
                     .map { data.conversations[$0] })?.shared == nil else { break }
             adopt(card)
-        case let .sharedGroup(persona, settings, epochs, staffKey):
+        case let .sharedGroup(persona, settings, epochs, staffKey, inviter):
             adoptSharedGroup(persona: persona, settings: settings, epochs: epochs)
+            if let inviter, let i = groupIndex(settings.group, persona: persona), data.conversations[i].shared?.ownerAccount == nil {
+                data.conversations[i].shared?.ownerAccount = inviter
+            }
             if let key = staffKey, key.count == 32, let i = groupIndex(settings.group, persona: persona), data.conversations[i].shared?.staffKey != key,
                data.conversations[i].shared?.settings.kind == .channel {
                 data.conversations[i].shared?.staffKey = key
@@ -7650,10 +7737,20 @@ extension AppModel {
 
     // MARK: Linking a new device (the device that's already logged in)
 
+    /// How long a link code can be answered or approved.
+    static let linkOfferLife: TimeInterval = 15 * 60
+
+    /// Codes that have run out are dropped, so a QR code seen long ago can't be answered or approved any more.
+    func pruneLinkOffers() {
+        let before = data.linkOffers.count
+        data.linkOffers.removeAll { Date().timeIntervalSince($0.createdAt) > Self.linkOfferLife }
+        if data.linkOffers.count != before { save() }
+    }
+
     /// A fresh QR code for linking a new device.
     func makeLinkCode() -> String {
+        pruneLinkOffers()
         let offer = LinkOffer(receiveKey: Mailbox.make().receiveKey, secret: .random(32))
-        data.linkOffers.removeAll { $0.createdAt < Date().addingTimeInterval(-15 * 60) }
         data.linkOffers.append(offer)
         save()
         return LinkCode(secret: offer.secret, sendID: Mailbox.sendID(for: offer.receiveKey), relay: data.relay).text
@@ -7661,11 +7758,12 @@ extension AppModel {
 
     /// A device that scanned the code and is waiting for you to approve it.
     var pendingLink: (offer: LinkOffer, request: LinkRequest)? {
-        guard let offer = data.linkOffers.last(where: { $0.request != nil }), let request = offer.request else { return nil }
+        guard let offer = data.linkOffers.last(where: { $0.request != nil && Date().timeIntervalSince($0.createdAt) <= Self.linkOfferLife }),
+              let request = offer.request else { return nil }
         return (offer, request)
     }
 
-    enum ScanResult { case device, contact(Contact), chat(Conversation.ID), expired, unknown, refused }
+    enum ScanResult { case device, contact(Contact), chat(Conversation.ID), expired, unknown, refused, outdated }
 
     /// What a code would do, shown for a yes before anything happens.
     struct CodePreview: Equatable {
@@ -7699,7 +7797,7 @@ extension AppModel {
         if JoinCode(code) != nil && fromLink { return .refused }
         if acceptJoinCode(code) { return .device }
         if Invite(code: code) != nil, let contact = addContact(code: code, nickname: "") { return .contact(contact) }
-        return .unknown
+        return Invite.isOutdated(code) ? .outdated : .unknown
     }
 
     /// A code shown by a new device: it waits to be approved like any device that scanned yours.
@@ -7719,7 +7817,7 @@ extension AppModel {
     /// The first device to answer a code is the only one: anyone who saw the code afterwards can't take its place.
     func receiveLinkRequest(_ blob: Data, offer i: Int) {
         let offer = data.linkOffers[i]
-        guard offer.request == nil, let box = try? ChaChaPoly.SealedBox(combined: blob),
+        guard offer.request == nil, Date().timeIntervalSince(offer.createdAt) <= Self.linkOfferLife, let box = try? ChaChaPoly.SealedBox(combined: blob),
               let plain = try? ChaChaPoly.open(box, using: LinkCrypto.requestKey(offer.secret)),
               let request = try? JSONDecoder().decode(LinkRequest.self, from: plain),
               request.deviceID.count == 16, request.ephemeral.count == 32 else { return }
@@ -7746,10 +7844,12 @@ extension AppModel {
                                 conversations: data.conversations.map(card(of:)),
                                 theme: data.theme, relay: data.relay, inviteRelay: data.inviteRelay, security: data.security,
                                 blocked: data.blocked, siblings: siblings,
-                                publicInvites: data.invites.filter(\.isPublic), requests: data.requests)
+                                publicInvites: data.invites.filter(\.isPublic), requests: data.requests, confirms: true)
         guard let plain = try? JSONEncoder.pulshade.encode(bundle),
               let sealed = try? ChaChaPoly.seal(plain, using: LinkCrypto.bundleKey(shared, secret: offer.secret)).combined else { return }
         data.outbox.append(Outgoing(sendID: request.bundleSendID, blob: ephemeral.publicKey.rawRepresentation + sealed, relay: offer.relay))
+        // Shown here until the new device's own digits have been compared; in memory only.
+        linkConfirmation = LinkCrypto.confirmCode(shared, secret: offer.secret)
 
         var link = DeviceLink(id: request.deviceID, sendID: request.selfSendID)
         link.name = String(request.name.prefix(60))
@@ -7771,6 +7871,12 @@ extension AppModel {
         let now = Date()
         var events: [SyncEvent] = []
         for convo in data.conversations {
+            // A group or channel that shares one mailbox first, so the messages that follow have somewhere to go.
+            if let shared = convo.shared {
+                events.append(.sharedGroup(persona: convo.persona, settings: shared.settings, epochs: shared.readable, staffKey: shared.staffKey, inviter: shared.ownerAccount))
+            }
+            // One in the older format is not carried to a new device: it can't be used there either.
+            guard !convo.isOldFormat else { continue }
             var chunk: [Message] = []
             var size = 0
             for message in convo.messages where (message.expiresAt ?? .distantFuture) > now {
@@ -7793,6 +7899,7 @@ extension AppModel {
 
     /// Sets this device up as another device of the account in the bundle, then introduces it to everyone.
     func finishLink(_ bundle: LinkBundle, deviceID: Data, selfMailbox: Mailbox, relay: String, passcode: String) async throws {
+        guard passcode.count >= LockStyle.minimumLength else { throw PasscodeSetupError.tooShort }
         let identity = try Identity(seed: bundle.seed)
         let vault = vault
         try await Task.detached { try vault.create(identity, passcode: passcode) }.value
@@ -8136,7 +8243,7 @@ extension AppModel {
             guard let client = client(nil, lane: "backup") else { throw LeaveError.offline }
             let sealed = try Self.sealedBackup(of: data, with: identity)
             let (key, sig, ts) = backupProof("pulshade.backup.put.v1", identity, body: sealed)
-            try await client.putBackup(sealed, key: key, sig: sig, ts: ts, forgetHash: forgetHash)
+            try await client.putBackup(sealed, key: key, sig: sig, ts: ts, forgetHash: forgetHash(for: identity))
         } catch {
             startSync()
             throw LeaveError.offline
@@ -8145,9 +8252,18 @@ extension AppModel {
 
     // MARK: Keeping the backup fresh
 
-    /// A hash of the panic passcode's delete-only token, sent with each backup so the relay can honour it.
-    private var forgetHash: Data? {
-        data.panicSeed.map { Data(SHA256.hash(data: Self.forgetToken(landingSeed: $0))) }
+    /// A hash of the panic passcode's delete-only token, sent with each backup so the relay can honour it. Always
+    /// sent: with no panic passcode it is a stand-in no one holds a token for, the same for every upload of this
+    /// account (as a real one is), so the relay can't tell from the header whether a panic passcode exists.
+    private func forgetHash(for identity: Identity) -> Data {
+        if let seed = data.panicSeed { return Data(SHA256.hash(data: Self.forgetToken(landingSeed: seed))) }
+        return Self.decoyForgetHash(for: identity)
+    }
+
+    static func decoyForgetHash(for identity: Identity) -> Data {
+        let stand = HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: identity.seed),
+                                           info: Data("pulshade.backup.forget.standin.v1".utf8), outputByteCount: 32).bytes
+        return Data(SHA256.hash(data: stand))
     }
 
     /// What goes in a backup: everything but chats, and not the two fields that track the backup itself.
@@ -8241,7 +8357,7 @@ extension AppModel {
         if digest == data.backupDigest, !week { return true }
         guard let sealed = try? AES.GCM.seal(Self.padded(plain), using: identity.backupKey).combined else { return false }
         let (key, sig, ts) = backupProof("pulshade.backup.put.v1", identity, body: sealed)
-        do { try await client.putBackup(sealed, key: key, sig: sig, ts: ts, forgetHash: forgetHash) } catch {
+        do { try await client.putBackup(sealed, key: key, sig: sig, ts: ts, forgetHash: forgetHash(for: identity)) } catch {
             // Try again in a while.
             scheduleBackup(after: 300...900)
             return false
@@ -8631,14 +8747,24 @@ struct PersonaFlash: Identifiable, Equatable {
 /// is kept as a hidden contact with no devices, so everything that shows names, roles and messages works as it does
 /// for other groups, and nothing is ever sent to them one by one.
 extension AppModel {
-    /// Whether a new group of these people can share one mailbox: every device of every one of them says its app
-    /// takes part. Channels keep sending each follower their own copy for now (their followers mustn't see each other).
-    func canShareMailbox(_ fingerprints: [String], persona: UUID?, kind: ConversationKind) -> Bool {
-        guard sharedGroupsEnabled, kind == .group || (kind == .channel && sharedChannelsEnabled) else { return false }
-        return fingerprints.allSatisfy { fp in
-            guard let c = contact(fp, in: persona) else { return false }
-            return takes(c, kind)
-        }
+    /// Which of these people can't be put in a group or channel because their app is too old to take part: every device of
+    /// theirs has to say it can. Nobody is ever put in a group in an older format instead, so the person making the group
+    /// is told to ask them to update Pulshade first.
+    func membersNeedingUpdate(_ fingerprints: [String], persona: UUID?, kind: ConversationKind) -> [String] {
+        fingerprints.filter { fp in contact(fp, in: persona).map { !takes($0, kind) } ?? true }
+    }
+
+    /// Friends with a device whose app is from before the sparse post-quantum ratchet: nothing is exchanged with them until
+    /// they update Pulshade. Names, for the chat to say so.
+    func friendsNeedingUpdate(persona: UUID?) -> [String] {
+        data.contacts.filter { $0.persona == persona && !$0.isSelf && !$0.hidden && $0.devices.contains { $0.needsUpdate == true } }
+            .map(\.fingerprint)
+    }
+
+    /// What to tell someone who tried to add people whose app is too old.
+    func needsUpdateMessage(_ fingerprints: [String]) -> String {
+        let names = fingerprints.map { displayName($0) }
+        return "\(Self.list(names)) \(names.count == 1 ? "needs" : "need") to update Pulshade first."
     }
 
     /// Whether a contact's app takes part in groups that share one mailbox (every device of theirs says so).
@@ -8654,25 +8780,6 @@ extension AppModel {
     /// Whether a contact's app can be in a shared mailbox of this kind.
     func takes(_ contact: Contact, _ kind: ConversationKind) -> Bool {
         kind == .channel ? takesChannels(contact) : takesSharedGroups(contact)
-    }
-
-    /// Your contacts added to a shared group whose app is too old to take part yet.
-    func contactsAwaitingUpdate(in convo: Conversation) -> [String] {
-        guard let waiting = convo.shared?.awaitingUpdate, convo.shared?.gone == false else { return [] }
-        return waiting.sorted { $0.value < $1.value }.map(\.key).filter { contact($0, in: convo.persona) != nil }
-    }
-
-    /// In an older-style group you own: the members whose app can't take part in the new format yet, so it can't move.
-    func holdingBackNewFormat(_ convo: Conversation) -> [String] {
-        guard convo.kind == .group || convo.kind == .channel, convo.amOwner, convo.shared == nil else { return [] }
-        return convo.members.filter { fp in contact(fp, in: convo.persona).map { takes($0, convo.kind) } != true }
-    }
-
-    /// The owner's phone moves its older-style groups to the new format by itself, one at a time, as soon as everyone
-    /// in each one can take part.
-    func moveGroupsOver() {
-        guard sharedGroupsEnabled else { return }
-        if let convo = data.conversations.first(where: { canUpgrade($0) }) { upgradeToSharedMailbox(convo.id) }
     }
 
     /// Your contacts invited to a shared group whose app hasn't answered yet, oldest first.
@@ -8746,36 +8853,30 @@ extension AppModel {
 
     /// Sends each of `fingerprints` (contacts of the group's persona whose apps take part) what they need to join.
     /// Whoever adds starts a new epoch first when anything has been said in the current one, so a newcomer reads from
-    /// when they joined and nothing before.
-    private func invite(_ fingerprints: [String], at i: Int) {
+    /// when they joined and nothing before. Gives back the ones whose app is too old to take part: they are not invited, and
+    /// nothing is kept to invite them later.
+    @discardableResult
+    private func invite(_ fingerprints: [String], at i: Int) -> [String] {
         guard var shared = data.conversations[i].shared, !shared.gone, let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID),
-              shared.settings.isAdmin(keys.publicKey) else { return }
+              shared.settings.isAdmin(keys.publicKey) else { return [] }
         let persona = data.conversations[i].persona
         let everyone = fingerprints.compactMap { contact($0, in: persona) }
         let kind = shared.settings.kind
         let people = everyone.filter { takes($0, kind) }
-        // Their app can't take part yet: invited as soon as it can.
-        let later = everyone.filter { !takes($0, kind) && shared.invited[$0.fingerprint] == nil }
-        if !later.isEmpty {
-            var waiting = shared.awaitingUpdate ?? [:]
-            for person in later { waiting[person.fingerprint] = waiting[person.fingerprint] ?? Date() }
-            shared.awaitingUpdate = waiting
-            data.conversations[i].shared = shared
-        }
-        guard !people.isEmpty else { save(); return }
+        let tooOld = everyone.filter { !takes($0, kind) && shared.invited[$0.fingerprint] == nil }.map(\.fingerprint)
+        guard !people.isEmpty else { return tooOld }
         // In a channel the followers are in the roster, not the settings.
         let held = kind == .channel ? (shared.roster?.live.count ?? 0) : shared.settings.members.count
         let room = (kind == .channel ? GroupRoster.Body.maxEntries : GroupSettings.maxMembers) - held - shared.invited.count
-        guard room > 0 else { return }
+        guard room > 0 else { return tooOld }
         if shared.chatInEpoch {
             startEpoch(at: i, without: [])
-            guard let updated = data.conversations[i].shared else { return }
+            guard let updated = data.conversations[i].shared else { return tooOld }
             shared = updated
         }
-        guard let epoch = shared.current else { return }
+        guard let epoch = shared.current else { return tooOld }
         let added = Array(people.prefix(room))
         for person in added {
-            shared.awaitingUpdate?[person.fingerprint] = nil
             shared.invited[person.fingerprint] = Date()
             shared.invitedEpoch[person.fingerprint] = epoch.number
             enqueue(.groupInvite(GroupInvite(settings: shared.settings, epoch: epoch)), to: person)
@@ -8792,6 +8893,7 @@ extension AppModel {
             }
         }
         save()
+        return tooOld
     }
 
     /// How long an invite waits for an answer. Past it the invite is dropped and, if its key is still the group's, a new
@@ -8811,35 +8913,39 @@ extension AppModel {
 
     // MARK: Being invited
 
-    /// An invite over a chat with someone you know. A new group is joined straight away; a group you're already in under
-    /// the old way moves over only when its owner invites you. Either way, the card goes back to whoever invited.
+    /// An invite over a chat with someone you know. The group is joined straight away, and the card goes back to whoever invited.
     func acceptGroupInvite(_ invite: GroupInvite, from sender: Contact) {
         let s = invite.settings
-        guard sharedGroupsEnabled, s.kind == .group || (s.kind == .channel && sharedChannelsEnabled), s.signatureIsValid, s.wellFormed(),
+        guard s.kind == .group || s.kind == .channel, s.signatureIsValid, s.wellFormed(),
               s.isAdmin(s.signer), s.epoch == invite.epoch.number, invite.epoch.isValid, s.epochCheck == invite.epoch.check, !sender.isSelf,
               let keys = memberKeys(sender.persona, group: s.group),
               let card = s.kind == .channel && invite.staff != true && !s.isMember(memberKeys(sender.persona, group: s.group)?.publicKey ?? Data())
                 ? followerCard(sender.persona, group: s.group) : myCard(sender.persona, group: s.group) else { return }
+        var quiet = false
         if let i = groupIndex(s.group, persona: sender.persona) {
             if var shared = data.conversations[i].shared {
                 // Invited again (an answer that went astray, or added back after missing a key): taken only if it is the
                 // settings held, the next version and one its signer may make, or a later one the owner signed.
                 // Anything else could be someone rewriting the group.
                 guard s == shared.settings || shared.settings.accepts(s) || shared.settings.acceptsJump(s) else { return }
+                // A channel this account follows takes (and answers) an invite only from the staff member who invited them:
+                // anyone else holding the settings and key (another follower, say) must not get this follower's card, nor
+                // be able to change anything here.
+                // Someone else's copy still refreshes the keys (settings and epoch are checked above), but changes nothing else.
+                if s.kind == .channel, !s.isMember(keys.publicKey), shared.ownerAccount != sender.fingerprint { quiet = true }
                 shared.previous = s == shared.settings ? shared.previous : shared.settings
                 install(invite.epoch, in: &shared)
                 shared.settings = s
                 shared.gone = false
                 shared.missedKey = false
+                shared.keyAskedAt = nil
+                if let pending = shared.pendingSettings, pending.version <= s.version { shared.pendingSettings = nil }
                 shared.joining = !s.isMember(keys.publicKey)
                 data.conversations[i].shared = shared
             } else {
-                // Moving an old-style group over: only its owner can, and only a group.
-                guard data.conversations[i].kind == s.kind, data.conversations[i].owner == sender.fingerprint else { return }
-                data.conversations[i].shared = SharedGroup(settings: s, epochs: [invite.epoch], joining: !s.isMember(keys.publicKey))
-                data.conversations[i].shared?.ownerAccount = sender.fingerprint
-                data.conversations[i].introsMine = []
-                data.conversations[i].introsMade = [:]
+                // The same group id as one saved in the older format here: that copy stays as it is, read-only. Nothing moves
+                // it over any more, so the owner starts the group again.
+                return
             }
             applySharedSettings(at: i)
         } else {
@@ -8862,7 +8968,7 @@ extension AppModel {
             data.conversations[i].shared?.cursors["0"] = nil
             data.conversations[i].shared?.reader.forget(epoch: 0)
         }
-        if !s.isMember(keys.publicKey) { enqueue(.groupJoin(group: s.group, card: card), to: sender) }
+        if !s.isMember(keys.publicKey), !quiet { enqueue(.groupJoin(group: s.group, card: card), to: sender) }
         if let i = groupIndex(s.group, persona: sender.persona) { syncConversation(data.conversations[i].id) }
         save()
     }
@@ -8880,6 +8986,7 @@ extension AppModel {
         }
         var epoch = epoch
         epoch.from = nil
+        if epoch.number > (shared.epochs.last?.number ?? 0) { shared.chatsInEpoch = nil }
         shared.epochs.append(epoch)
         shared.epochs.sort { $0.number < $1.number }
         // Earlier hand-outs are done with; another key for this same epoch is kept, in case its settings win.
@@ -8892,6 +8999,15 @@ extension AppModel {
               let asked = shared.invited[sender.fingerprint] ?? shared.staffInvited?[sender.fingerprint],
               Date().timeIntervalSince(asked) < Self.inviteLife, card.verified(group: group),
               let keys = memberKeys(sender.persona, group: group), shared.settings.isAdmin(keys.publicKey) else { return }
+        // A key an admin banned doesn't come in through an old invitation: the ask is dropped and nothing is added.
+        if shared.links?.bans.contains(card.signingKey) == true {
+            shared.invited[sender.fingerprint] = nil
+            shared.invitedEpoch[sender.fingerprint] = nil
+            shared.staffInvited?[sender.fingerprint] = nil
+            data.conversations[i].shared = shared
+            save()
+            return
+        }
         let wasStaffInvite = shared.invited[sender.fingerprint] == nil
         let previousKnown = shared.knownAs[sender.fingerprint]
         shared.invited[sender.fingerprint] = nil
@@ -8933,6 +9049,137 @@ extension AppModel {
         next.members.append(card.withoutAvatar)
         if publishSettings(next, at: i), let avatar = card.avatar { noteAvatar(avatar, of: card, at: i) }
     }
+
+    // MARK: A follower leaving, or asking for a key it missed
+
+    /// Whether this account follows the channel (holds its key, is in nobody's list) rather than being staff.
+    func isFollower(_ convo: Conversation) -> Bool {
+        guard convo.kind == .channel, let shared = convo.shared, !shared.gone,
+              let keys = memberKeys(convo.persona, group: convo.wireID) else { return false }
+        return !shared.settings.isMember(keys.publicKey)
+    }
+
+    /// The staff member who invited this follower, if their chat can still carry a message from here: a known contact (hidden
+    /// or not: someone who followed through a channel code is a hidden contact on both sides) with a device to write to.
+    private func inviterContact(of convo: Conversation) -> Contact? {
+        guard let account = convo.shared?.ownerAccount, let inviter = contact(account, in: convo.persona), !inviter.isSelf,
+              inviter.devices.contains(where: { !$0.sendID.isEmpty || $0.session != nil }) else { return nil }
+        return inviter
+    }
+
+    /// Whether a notice from this follower can be sent to the staff member who invited them (the details sheet says so
+    /// plainly when it can't, before they leave).
+    func canTellInviter(_ convo: Conversation) -> Bool { inviterContact(of: convo) != nil }
+
+    /// Says something to the staff member who invited this follower, over their chat: the only one who can tell which
+    /// account a roster entry is. It waits there until the chat can deliver. False if that chat is gone, so the caller can say so.
+    @discardableResult
+    private func noticeToInviter(_ payload: Payload, of convo: Conversation) -> Bool {
+        guard let inviter = inviterContact(of: convo), let c = contactIndex(inviter.fingerprint, inviter.persona) else { return false }
+        // Asking twice while the first still waits adds nothing.
+        if case let .channelKeyWanted(group, _) = payload {
+            for d in data.contacts[c].devices.indices {
+                data.contacts[c].devices[d].pending.removeAll {
+                    if case let .channelKeyWanted(g, _) = $0.payload { g == group } else { false }
+                }
+            }
+        }
+        enqueue(payload, to: inviter)
+        return true
+    }
+
+    /// This follower missed a new key and can ask for it again: ten minutes apart (the staff phone answers a follower at
+    /// most once in ten minutes whatever is sent).
+    func canAskForKey(_ convo: Conversation) -> Bool {
+        guard isFollower(convo), let shared = convo.shared, shared.missedKey, canTellInviter(convo) else { return false }
+        return Date().timeIntervalSince(shared.keyAskedAt ?? .distantPast) > Self.keyAskCooldown
+    }
+
+    static let keyAskCooldown: TimeInterval = 600
+
+    /// Asks the staff member who invited this follower for the key of the epoch it missed, over their chat.
+    func askForKeyAgain(_ id: Conversation.ID) {
+        guard let i = index(of: id), let convo = conversation(id), canAskForKey(convo), let shared = convo.shared else { return }
+        let held = shared.epochs.map(\.number).max() ?? 0
+        guard noticeToInviter(.channelKeyWanted(group: convo.wireID, epoch: held), of: convo) else { return }
+        data.conversations[i].shared?.keyAskedAt = Date()
+        save()
+    }
+
+    /// The roster entry of the follower this device invited under the account that is writing, in the channel named: only
+    /// someone this phone itself admitted, who is still in the roster, and not staff. Whatever the message says plays no part.
+    private func followerEntry(of sender: Contact, group: UUID) -> (index: Int, card: MemberCard)? {
+        guard let i = groupIndex(group, persona: sender.persona), let shared = data.conversations[i].shared,
+              shared.settings.kind == .channel, !shared.gone, let keys = memberKeys(sender.persona, group: group),
+              shared.settings.isAdmin(keys.publicKey), let known = shared.knownAs[sender.fingerprint],
+              let card = shared.roster?.live.first(where: { Identity.fingerprint(of: $0.signingKey) == known }),
+              !shared.settings.isMember(card.signingKey) else { return nil }
+        return (i, card)
+    }
+
+    /// How long after a follower leaves the channel's next epoch is made, so followers who leave close together share one
+    /// (every new epoch costs the staff a copy of the key for each follower left, and each follower who was away a question).
+    static var leaveRekeyWindow: TimeInterval = 600
+    /// A new epoch with everyone still in is started once the current one is this old, or this many chat posts long.
+    static var epochMaxAge: TimeInterval = 7 * 86_400
+    static var epochMaxChats = 1_000
+    /// An admin device whose attempt didn't take waits this long before another.
+    static var rotationRetry: TimeInterval = 3_600
+    /// How soon a new epoch for someone taken out that couldn't be made is tried again.
+    static var rekeyRetry: TimeInterval = 30
+
+    /// A follower says they are leaving: gone from the roster at once (so no later key is sealed to them), and the channel
+    /// moves to a new epoch without them together with anyone else who leaves in the next few minutes. A removal always
+    /// ends in a new epoch: the maintenance pass keeps trying (`rekeyAfter`) until the settings name one. Said again, or
+    /// by someone else, it finds no live entry and does nothing; one older than the entry (a stale copy after they were
+    /// added again) is dropped.
+    private func followerLeft(_ group: UUID, from sender: Contact) {
+        guard let (i, card) = followerEntry(of: sender, group: group), var shared = data.conversations[i].shared else { return }
+        if let sent = handlingSentAt,
+           let added = shared.roster?.entries.first(where: { $0.card.signingKey == card.signingKey })?.added,
+           sent < added.addingTimeInterval(-600) { return }
+        shared.roster = (shared.roster ?? .init(entries: [], removed: [])).merged(
+            with: .init(entries: [], removed: [.init(key: card.signingKey, at: Date())]), group: group)
+        // A mark left from an epoch that has since moved on is stale (the maintenance pass clears it lazily): this leave
+        // needs a new epoch of its own.
+        if shared.rekeyAfter.map({ shared.settings.epoch > $0 }) ?? true {
+            shared.rekeyAfter = shared.settings.epoch
+            shared.rekeyDue = Date().addingTimeInterval(Self.leaveRekeyWindow)
+        }
+        data.conversations[i].shared = shared
+        publishRoster(at: i)
+        applySharedSettings(at: i)
+        save()
+    }
+
+    /// A follower asks for the current key, because the channel moved on while they were away. Answered with the same
+    /// invite that admitted them (settings and the current epoch's key), over their own chat, so no other follower sees
+    /// anything. Only if they are still in the roster and the epoch they hold is older than the current one, and once every
+    /// ten minutes however many requests come.
+    private func answerKeyRequest(_ group: UUID, held: Int, from sender: Contact) {
+        guard let (i, card) = followerEntry(of: sender, group: group), let shared = data.conversations[i].shared,
+              let current = shared.current, held >= 0, held < current.number, shared.settings.epoch == current.number else { return }
+        let limit = group.uuidString + card.signingKey.hex
+        guard Date().timeIntervalSince(channelKeyAnswered[limit] ?? .distantPast) > 600 else { return }
+        channelKeyAnswered[limit] = Date()
+        enqueue(.groupInvite(GroupInvite(settings: shared.settings, epoch: current)), to: sender)
+    }
+
+#if DEBUG
+    /// For tests: lets people who followed through the channel's code in, as a hello would.
+    func admitFromCodeForTests(_ fingerprints: [String], in id: Conversation.ID) {
+        if let i = index(of: id) { admitFromCode(fingerprints, at: i) }
+    }
+
+    /// For tests: says something over a chat the way this device would.
+    func sendForTests(_ payload: Payload, to contact: Contact) { enqueue(payload, to: contact) }
+
+    /// For tests: takes in a payload as if it had arrived over that contact's chat (the sender is the one named, as the
+    /// session would have said).
+    func receiveForTests(_ payload: Payload, from contact: Contact) {
+        handle(payload, from: contact.fingerprint, persona: contact.persona, device: contact.devices.first?.id ?? Data())
+    }
+#endif
 
     // MARK: A channel's followers
 
@@ -9026,6 +9273,7 @@ extension AppModel {
         shared.roster = (shared.roster ?? .init(entries: [], removed: [])).merged(
             with: .init(entries: [], removed: [.init(key: key, at: Date())]), group: data.conversations[i].wireID)
         shared.rekeyAfter = shared.settings.epoch
+        shared.rekeyDue = nil
         data.conversations[i].shared = shared
         startEpoch(at: i, without: [])
         publishRoster(at: i)
@@ -9158,6 +9406,7 @@ extension AppModel {
         install(next, in: &shared)
         shared.settings = settings
         shared.chatInEpoch = false
+        shared.chatsInEpoch = nil
         data.conversations[i].shared = shared
         applySharedSettings(at: i)
         syncConversation(data.conversations[i].id)
@@ -9197,34 +9446,6 @@ extension AppModel {
         if wasAdmin, shared.settings.kind == .channel { rotateStaffKey(at: i) }
     }
 
-    // MARK: Moving an old group over
-
-    /// Whether the owner can move this group to one shared mailbox now: everyone in it runs an app that can.
-    func canUpgrade(_ convo: Conversation) -> Bool {
-        (convo.kind == .group || (convo.kind == .channel && !convo.isAnnouncements)) && convo.amOwner && convo.shared == nil
-            && canShareMailbox(convo.members, persona: convo.persona, kind: convo.kind)
-    }
-
-    /// The owner moves a group to one shared mailbox: same chat and history, everyone invited again over the chats they
-    /// already have, and back in as their apps answer.
-    func upgradeToSharedMailbox(_ id: Conversation.ID) {
-        guard let i = index(of: id), canUpgrade(data.conversations[i]) else { return }
-        let convo = data.conversations[i]
-        guard let shared = freshSharedGroup(id: id, persona: convo.persona, title: convo.title, about: convo.about, avatar: convo.avatar,
-                                            postPolicy: convo.postPolicy, disappearAfter: convo.disappearAfter, kind: convo.kind) else { return }
-        // The channel's admins are asked to join its staff; everyone else follows.
-        let staff = convo.kind == .channel ? convo.admins.filter { $0 != "me" } : []
-        let members = convo.members.filter { !staff.contains($0) }
-        data.conversations[i].shared = shared
-        data.conversations[i].introsMade = [:]
-        data.conversations[i].introsMine = []
-        applySharedSettings(at: i)
-        invite(members, at: i)
-        for admin in staff { promoteFollower(admin, at: i) }
-        syncConversation(id)
-        save()
-    }
-
     // MARK: Posting
 
     /// Says something to a shared group: sealed once, posted once. False when this isn't a shared group (the caller
@@ -9250,7 +9471,10 @@ extension AppModel {
         guard let plain = try? payload.wire(framed: false),
               let blob = try? GroupSeal.seal(plain, group: data.conversations[i].wireID, epoch: epoch, keys: keys, device: tag, chain: &chain) else { return }
         shared.chains[String(epoch.number)] = chain
-        if payload.isChat { shared.chatInEpoch = true }
+        if payload.isChat {
+            shared.chatInEpoch = true
+            if epoch.number == shared.current?.number { shared.chatsInEpoch = (shared.chatsInEpoch ?? 0) + 1 }
+        }
         if payload.isEphemeral { shared.outbox.removeAll { $0.ephemeral } }
         var about = message
         if about == nil, case let .clipBlob(id, _) = payload { about = id }
@@ -9499,6 +9723,17 @@ extension AppModel {
                 data.conversations[i].shared?.postedTo = shared.postedTo
             }
             let staff = shared.settings.isAdmin(keys.publicKey) || shared.settings.mods.contains(keys.publicKey)
+            // An epoch's key opens everything said in it, and is kept for a week after the next one begins. So an admin's
+            // device starts a new epoch, with everyone still in, once the current one is old or long and something was
+            // said in it. Quiet groups keep theirs. Two admins doing it together settle like two removals.
+            if shared.settings.isAdmin(keys.publicKey), shared.chatInEpoch, !shared.joining, let current = shared.current,
+               shared.settings.epoch == current.number, shared.wantRemoved.isEmpty, shared.rekeyAfter == nil,
+               now.timeIntervalSince(current.started) >= Self.epochMaxAge || (shared.chatsInEpoch ?? 0) >= Self.epochMaxChats,
+               now.timeIntervalSince(shared.rotationTried ?? .distantPast) > Self.rotationRetry {
+                data.conversations[i].shared?.rotationTried = now
+                startEpoch(at: i, without: [])
+                continue
+            }
             // Taken out by this device, but a competing change won and they're back in: done again. Watched for a while
             // after it seemed to work, since the competing change can arrive later.
             let settled = shared.wantRemoved.filter { key, at in
@@ -9521,10 +9756,22 @@ extension AppModel {
             if staff, let after = shared.rekeyAfter {
                 if shared.settings.epoch > after {
                     data.conversations[i].shared?.rekeyAfter = nil
-                } else if now.timeIntervalSince(shared.rekeyTried ?? .distantPast) > 30 {
+                    data.conversations[i].shared?.rekeyDue = nil
+                } else if let due = shared.rekeyDue {
+                    // Followers who left: one new epoch for all of them once the window is over.
+                    if now >= due {
+                        data.conversations[i].shared?.rekeyDue = nil
+                        data.conversations[i].shared?.rekeyTried = now
+                        startEpoch(at: i, without: [])
+                    }
+                } else if now.timeIntervalSince(shared.rekeyTried ?? .distantPast) > Self.rekeyRetry {
                     data.conversations[i].shared?.rekeyTried = now
                     startEpoch(at: i, without: [])
                 }
+            }
+            // People who followed through the channel's code while its hourly limit was reached are let in as room comes.
+            if staff, shared.settings.kind == .channel, let waiting = shared.joinWaiting, !waiting.isEmpty {
+                admitFromCode([], at: i)
             }
             // Asks to join the staff that nobody answered run out, like invites.
             if let asks = shared.staffInvited, asks.contains(where: { now.timeIntervalSince($0.value) > Self.inviteLife }) {
@@ -9545,14 +9792,6 @@ extension AppModel {
             }
             for (fp, at) in shared.invited where now.timeIntervalSince(at) > Self.inviteLife {
                 cancelInvite(fp, in: data.conversations[i].id)
-            }
-            // Someone added before their app could take part: invited now that it can (or let go after a month).
-            if let waiting = shared.awaitingUpdate, !waiting.isEmpty, shared.settings.isAdmin(keys.publicKey) {
-                let persona = data.conversations[i].persona
-                let ready = waiting.keys.filter { fp in contact(fp, in: persona).map(takesSharedGroups) == true }
-                let stale = waiting.filter { now.timeIntervalSince($0.value) > 30 * 86_400 }.map(\.key)
-                for fp in stale { data.conversations[i].shared?.awaitingUpdate?[fp] = nil }
-                if !ready.isEmpty { invite(ready, at: i) }
             }
             // Once in, and in each new epoch while the group is small, this device posts its card with its picture, so
             // members (and newcomers) can show it. In a big group only when the picture changes.
@@ -9616,7 +9855,10 @@ extension AppModel {
         if number == 0 {
             guard case .groupRoster = payload else { return }
         }
-        if payload.isChat, number == shared.current?.number { shared.chatInEpoch = true }
+        if payload.isChat, number == shared.current?.number {
+            shared.chatInEpoch = true
+            shared.chatsInEpoch = (shared.chatsInEpoch ?? 0) + 1
+        }
         data.conversations[i].shared = shared
         let fp = Identity.fingerprint(of: outer.sender)
         deposited = mail.deposited
@@ -9830,10 +10072,10 @@ extension Payload {
         return false
     }
 
-    /// An invite (to a group, or to be friends): worth waking a locked phone for, so it's taken up at once.
+    /// An invite to a group: worth waking a locked phone for, so it's taken up at once.
     var isInvite: Bool {
         switch self {
-        case .groupInvite, .friendInvite: true
+        case .groupInvite: true
         default: false
         }
     }
@@ -10461,7 +10703,7 @@ extension AppModel {
 
     /// Asks to join, as `persona`, with a key made for this group alone. The answer comes to a mailbox made for it.
     func askToJoin(_ preview: GroupPreview, note: String = "", persona: UUID?) {
-        guard sharedGroupsEnabled, !isInGroup(preview, persona: persona),
+        guard !isInGroup(preview, persona: persona),
               !data.joinAsks.contains(where: { $0.group == preview.group && $0.persona == persona && !$0.declined }),
               let keys = memberKeys(persona, group: preview.group), var card = myCard(persona, group: preview.group) else { return }
         if (card.avatar?.count ?? 0) > 16 * 1024 { card.avatar = nil }
@@ -10565,10 +10807,8 @@ extension AppModel {
 
 // MARK: - Friends from groups
 
-/// Becoming friends with someone you only share a group with. If their @handle is known, an ordinary request goes to it
-/// (every build takes those). Otherwise they're sent a one-time invite code for your account, sealed so only they can open
-/// it: through the group's mailbox to their key in that group, or over the keys you already share in an older-style group.
-/// Accepting it is the same as scanning the code. Nothing reaches anyone else in the group but that something was sent.
+/// Becoming friends with someone you only share a group with. They're sent a one-time invite code for your account, sealed
+/// so only they can open it, through the group's mailbox to their key in that group. Accepting it is the same as scanning the code. Nothing reaches anyone else in the group but that something was sent.
 extension AppModel {
     enum FriendState: Equatable { case me, friend, asked, canAsk, unknown }
 
@@ -10578,7 +10818,7 @@ extension AppModel {
         guard let c = contact(fingerprint, in: convo.persona) else { return .unknown }
         if !c.hidden && !c.awaitingAcceptance { return .friend }
         if c.awaitingAcceptance || friendAsked.contains(friendKey(fingerprint, convo.persona)) { return .asked }
-        return convo.kind == .group ? .canAsk : .unknown
+        return convo.kind == .group && convo.shared != nil ? .canAsk : .unknown
     }
 
     private func friendKey(_ fingerprint: String, _ persona: UUID?) -> String { "\(persona?.uuidString ?? "main")|\(fingerprint)" }
@@ -10591,18 +10831,6 @@ extension AppModel {
         friendAsked.insert(friendKey(fingerprint, convo.persona))
         let words = note.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmed = words.isEmpty ? nil : String(words.prefix(200))
-        // A known @handle: the ordinary request, which every build understands.
-        if let handle = c.handle, convo.shared == nil {
-            let persona = convo.persona
-            Task { [weak self] in
-                guard let self, let found = try? await self.findProfile(handle), found.fingerprint == fingerprint else {
-                    self?.sendFriendInvite(to: fingerprint, at: id, note: trimmed)
-                    return
-                }
-                self.sendRequest(to: found, note: trimmed ?? "", persona: .some(persona))
-            }
-            return
-        }
         sendFriendInvite(to: fingerprint, at: id, note: trimmed)
     }
 
@@ -10611,15 +10839,11 @@ extension AppModel {
         let persona = data.conversations[i].persona
         let code = makeInviteCode(persona: .some(persona))
         guard !code.isEmpty else { return }
-        if data.conversations[i].shared != nil {
-            guard let keys = memberKeys(persona, group: data.conversations[i].wireID),
-                  let body = try? JSONEncoder.pulshade.encode(FriendInviteBody(code: code, note: note)),
-                  let sealed = try? EnvelopeCore.seal(body: body, framed: false, signing: keys.signing, agreement: keys.agreement,
-                                                     device: Data(), caps: 0, at: RelayClock.now, to: c.agreementKey) else { return }
-            post(.friendAsk(to: c.signingKey, sealed: sealed), at: i)
-        } else {
-            enqueue(.friendInvite(code: code, note: note), to: c)
-        }
+        guard data.conversations[i].shared != nil, let keys = memberKeys(persona, group: data.conversations[i].wireID),
+              let body = try? JSONEncoder.pulshade.encode(FriendInviteBody(code: code, note: note)),
+              let sealed = try? EnvelopeCore.seal(body: body, framed: false, signing: keys.signing, agreement: keys.agreement,
+                                                 device: Data(), caps: 0, at: RelayClock.now, to: c.agreementKey) else { return }
+        post(.friendAsk(to: c.signingKey, sealed: sealed), at: i)
         save()
     }
 

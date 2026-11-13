@@ -10,6 +10,30 @@ import PhotosUI
 typealias PlatformImage = UIImage
 #endif
 
+/// How big a picture that arrived may be before it is refused unread. A small file can claim billions of pixels
+/// (a compressed picture inflates enormously), and decoding one would use all the memory there is.
+enum ImageLimits {
+    static let maxPixels = 50_000_000
+
+    /// Reads only the picture's header: false when it has no readable size or is over `maxPixels`.
+    static func isReasonable(_ data: Data) -> Bool {
+        guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
+              CGImageSourceGetCount(source) > 0,
+              let info = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = (info[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let height = (info[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+              width > 0, height > 0 else { return false }
+        return width <= maxPixels / height
+    }
+}
+
+extension PlatformImage {
+    /// A picture from bytes that came from outside, decoded only if its size is sane.
+    static func checked(_ data: Data) -> PlatformImage? {
+        ImageLimits.isReasonable(data) ? PlatformImage(data: data) : nil
+    }
+}
+
 /// Pictures already decoded, so a list that redraws doesn't decode every avatar again. Held in memory only, and
 /// emptied by the system when it needs the room.
 enum DecodedImages {
@@ -32,7 +56,7 @@ enum DecodedImages {
     static func image(_ data: Data, fit: CGFloat? = nil) -> PlatformImage? {
         let key = "\(data.count)-\(data.hashValue)-\(Int(fit ?? 0))" as NSString
         if let hit = cache.object(forKey: key), hit.data == data { return hit.image }
-        guard let made = PlatformImage(data: data) else { return nil }
+        guard let made = PlatformImage.checked(data) else { return nil }
         var shown = made
         #if os(iOS)
         let longest = max(made.size.width, made.size.height) * made.scale

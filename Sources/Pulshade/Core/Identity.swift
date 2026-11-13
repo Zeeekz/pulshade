@@ -44,6 +44,20 @@ struct Identity {
         Self.derive(SymmetricKey(data: seed), "pulshade.public-inbox.v1|\(handle.lowercased())")
     }
 
+    /// The post-quantum keys (ML-KEM-768 for envelopes, ML-DSA-65 for signatures), worked out from the seed like every other
+    /// key here: the same account on every device and after every recovery, with nothing extra to store, back up or wipe.
+    var pq: PQKeys {
+        let root = SymmetricKey(data: seed)
+        let kemSeed = HKDF<SHA256>.deriveKey(inputKeyMaterial: root, info: Data("pulshade.pq.envelope.kem.v1".utf8), outputByteCount: 64)
+        return try! PQKeys(kemSeed: kemSeed.withUnsafeBytes { Data($0) }, sigSeed: Self.derive(root, "pulshade.pq.signing.v1"))
+    }
+
+    /// The keys an envelope to this account is sealed to.
+    var recipient: EnvelopeRecipient { EnvelopeRecipient(agreement: card.agreement, pq: pq.pin) }
+
+    /// This account's post-quantum keys, signed by both signing keys (see `PQCard`).
+    var pqCard: PQCard { try! PQCard.make(signing: signingKey, agreement: card.agreement, keys: pq) }
+
     private static func derive(_ root: SymmetricKey, _ label: String) -> Data {
         HKDF<SHA256>.deriveKey(inputKeyMaterial: root, info: Data(label.utf8), outputByteCount: 32)
             .withUnsafeBytes { Data($0) }
@@ -87,22 +101,64 @@ struct Invite: Equatable {
     let kind: Kind
     let signingKey: Data
     let agreementKey: Data
+    /// The signing key's signature over the agreement key and `pqHash` (see `bindMessage`), so neither can be swapped by
+    /// someone who only changes a code. Checked when a code is read: a code without a valid one isn't an invite.
+    let bind: Data
+    /// A commitment to the post-quantum keys of whoever made the invite (`PQPin.commitment`). The first post-quantum card
+    /// that comes from them is accepted only if its keys match, so those keys don't rest on trust in whatever arrives first.
+    let pqHash: Data
     let sendID: Data
     /// The relay this invite's mailbox lives on. Nil means "use your default relay"; the official app refuses any but its own.
     let relay: String?
 
+    /// "psh3" carries the post-quantum commitment and a signature over it. "psh2" (signed, no commitment) and "psh1" (unsigned),
+    /// from apps before it, aren't accepted (see `isOutdated`).
+    private static let prefix = "psh3"
+    private static let oldPrefixes = ["psh1", "psh2"]
+
     var code: String {
         let tail = relay.map { Data($0.utf8) } ?? Data()
-        return "psh1" + Base32.encode(Data([kind.rawValue]) + signingKey + agreementKey + sendID + tail).lowercased()
+        return Self.prefix + Base32.encode(Data([kind.rawValue]) + signingKey + agreementKey + bind + pqHash + sendID + tail).lowercased()
     }
 
-    init(kind: Kind, signingKey: Data, agreementKey: Data, sendID: Data, relay: String? = nil) {
+    init(kind: Kind, signingKey: Data, agreementKey: Data, bind: Data, pqHash: Data, sendID: Data, relay: String? = nil) {
         self.kind = kind
         self.signingKey = signingKey
         self.agreementKey = agreementKey
+        self.bind = bind
+        self.pqHash = pqHash
         self.sendID = sendID
         self.relay = relay
     }
+
+    /// What an invite's signing key signs: the agreement key and the post-quantum commitment, under a label of their own so
+    /// the signature can't be taken from (or used as) the one envelopes carry.
+    static func bindMessage(agreement: Data, pqHash: Data) -> Data {
+        Data("pulshade.invite.bind.v2".utf8) + agreement + pqHash
+    }
+
+    static func bindIsValid(_ bind: Data, signing: Data, agreement: Data, pqHash: Data) -> Bool {
+        guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: signing) else { return false }
+        return key.isValidSignature(bind, for: bindMessage(agreement: agreement, pqHash: pqHash))
+    }
+
+    /// An invite from this account, signed.
+    init(kind: Kind, identity: Identity, sendID: Data, relay: String? = nil) throws {
+        let card = identity.card
+        let pqHash = identity.pq.pin.commitment
+        self.init(kind: kind, signingKey: card.signing, agreementKey: card.agreement,
+                  bind: try identity.signingKey.signature(for: Self.bindMessage(agreement: card.agreement, pqHash: pqHash)),
+                  pqHash: pqHash, sendID: sendID, relay: relay)
+    }
+
+    /// A code from an app whose invites don't carry the post-quantum commitment: the person who made it needs to update
+    /// and send a new one.
+    static func isOutdated(_ code: String) -> Bool {
+        let text = scannedPayload(code).lowercased()
+        return oldPrefixes.contains { text.hasPrefix($0) }
+    }
+
+    static let outdatedNotice = "This invite is from an older version of PULSHADE. Ask them to update the app and send you a new one."
 
     /// Only http(s) addresses, so an invite can't point the app anywhere strange, and plain http only on this
     /// machine or your own network: anywhere else, someone on the way could read the mailbox keys a fetch carries.
@@ -191,21 +247,24 @@ struct Invite: Equatable {
 
     init?(code: String) {
         let clean = scannedPayload(code).lowercased()
-        guard clean.hasPrefix("psh1"), let raw = Base32.decode(String(clean.dropFirst(4)).uppercased()),
-              raw.count >= 97, let kind = Kind(rawValue: raw[raw.startIndex]) else { return nil }
+        guard clean.hasPrefix(Self.prefix), let raw = Base32.decode(String(clean.dropFirst(4)).uppercased()),
+              raw.count >= 177, let kind = Kind(rawValue: raw[raw.startIndex]) else { return nil }
         self.kind = kind
         signingKey = Data(raw.dropFirst(1).prefix(32))
         agreementKey = Data(raw.dropFirst(33).prefix(32))
-        sendID = Data(raw.dropFirst(65).prefix(32))
-        if raw.count > 97 {
+        bind = Data(raw.dropFirst(65).prefix(64))
+        pqHash = Data(raw.dropFirst(129).prefix(PQPin.commitmentSize))
+        sendID = Data(raw.dropFirst(145).prefix(32))
+        if raw.count > 177 {
             // An invite naming a relay that isn't Pulshade's own can't be used.
-            guard let named = Self.allowedRelay(String(data: Data(raw.dropFirst(97)), encoding: .utf8)) else { return nil }
+            guard let named = Self.allowedRelay(String(data: Data(raw.dropFirst(177)), encoding: .utf8)) else { return nil }
             relay = named
         } else {
             relay = nil
         }
         guard (try? Curve25519.Signing.PublicKey(rawRepresentation: signingKey)) != nil,
-              (try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: agreementKey)) != nil else { return nil }
+              (try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: agreementKey)) != nil,
+              Self.bindIsValid(bind, signing: signingKey, agreement: agreementKey, pqHash: pqHash) else { return nil }
     }
 
     var fingerprint: String { Identity.fingerprint(of: signingKey) }

@@ -98,7 +98,7 @@ private func text(_ d: Data) -> String { String(decoding: d, as: UTF8.self) }
         let secret = Payload.message(WireMessage(id: UUID(), conversation: nil, kind: .direct, text: "meet at 9",
                                                  image: nil, date: Date(timeIntervalSince1970: 1_800_000_000)))
         let inner = try alice.encrypt(JSONEncoder.pulshade.encode(secret))
-        let recorded = try Envelope.seal(.ratchet(inner), from: aliceID, to: bobID.card.agreement)
+        let recorded = try Envelope.seal(.ratchet(inner), from: aliceID, to: bobID.recipient)
 
         let (outer, _) = try Envelope.open(recorded, with: bobID)
         guard case let .ratchet(message) = outer else { Issue.record("expected ratchet payload"); return }
