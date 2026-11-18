@@ -7921,12 +7921,16 @@ extension AppModel {
                     // The same device on another mailbox: another of yours saw it change, and holds it again if it says so.
                     let moved = !device.id.isEmpty && data.contacts[i].devices[d].sendID != device.sendID
                     if moved { data.contacts[i].devices[d].sendID = device.sendID }
-                    // Held on another of your devices: held here too, unless you allowed it here (a move holds it anyway).
-                    // Allowed there: allowed here, and what it sent is read.
-                    if device.held == true, moved || data.contacts[i].devices[d].unconfirmed != false {
+                    // Other keys than the ones this device pinned: another of yours met a different device under this id, which
+                    // counts like a move. What it says about holding is about that device, so its "allowed" isn't taken here.
+                    let local = data.contacts[i].devices[d].keyPin
+                    let keyChanged = device.key != nil && local != nil && device.key != local
+                    // Held on another of your devices: held here too, unless you allowed it here (a move or new keys hold it
+                    // anyway). Allowed there, for the keys pinned here: allowed here, and what it sent is read.
+                    if device.held == true, moved || keyChanged || data.contacts[i].devices[d].unconfirmed != false {
                         data.contacts[i].devices[d].unconfirmed = true
                     }
-                    if device.held == false, data.contacts[i].devices[d].unconfirmed == true { release(contact: i, device: d) }
+                    if device.held == false, !keyChanged, data.contacts[i].devices[d].unconfirmed == true { release(contact: i, device: d) }
                     // Keys another of yours pinned, for a device this one hasn't had a handshake with yet.
                     if data.contacts[i].devices[d].keyPin == nil, let key = device.key, key.count == 32 {
                         data.contacts[i].devices[d].keyPin = key
