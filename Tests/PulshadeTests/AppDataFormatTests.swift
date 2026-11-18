@@ -21,7 +21,7 @@ struct AppDataFormatTests {
         _ = try JSONDecoder.pulshade.decode(AppData.self, from: JSONSerialization.data(withJSONObject: json))
         json["format"] = nil
         let old = try JSONDecoder.pulshade.decode(AppData.self, from: JSONSerialization.data(withJSONObject: json))
-        #expect(old.format == AppData.currentFormat, "and is saved at the current one from then on")
+        #expect(old.format == 0, "and keeps its own until the first unlock brings it up to date")
     }
 
     /// A member of a group that shares one mailbox is kept as a contact with no devices. Saved, that was an empty list,

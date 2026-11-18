@@ -1526,7 +1526,9 @@ struct AppData: Codable {
         guard written <= Self.currentFormat else {
             throw DecodingError.dataCorruptedError(forKey: .format, in: c, debugDescription: "Saved by a newer version of PULSHADE")
         }
-        format = Self.currentFormat
+        // Kept as written until the first unlock has brought it up to date (`AppModel.didUnlock`), which sets it to the
+        // current format.
+        format = written
         profile = try c.decodeIfPresent(Profile.self, forKey: .profile) ?? Profile()
         contacts = try c.decodeIfPresent([Contact].self, forKey: .contacts) ?? []
         invites = try c.decodeIfPresent([OpenInvite].self, forKey: .invites) ?? []

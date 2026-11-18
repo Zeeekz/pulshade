@@ -974,6 +974,8 @@ final class AppModel {
     #endif
 
     private func didUnlock() {
+        // Data a build before device keys saved (format 22 or older): its sessions are restarted once, below.
+        let fromBeforeDeviceKeys = data.format < 23
         unlockedAt = Date()
         deviceKeyCache = [:]
         // A decoy keeps no backup on the relay, but says it has one like any account with backups on.
@@ -1043,6 +1045,54 @@ final class AppModel {
                 for c in contacts(of: persona) { enqueue(profilePayload(persona, for: c.fingerprint), to: c) }
             }
         }
+        if fromBeforeDeviceKeys { restartSessionsFromBeforeDeviceKeys() }
+    }
+
+    /// Once, on the first unlock of data saved by a build before device keys (format 22 or older). Its ratchet sessions
+    /// mean something else by their post-quantum fields than this build does, and were opened with no device keys, so
+    /// none of the devices behind them is pinned: the first handshake after would pin whatever answered, unannounced.
+    /// So every session, with friends and with your own devices, is dropped (not kept to read late mail either) and a
+    /// fresh handshake goes to every known device; its keys are pinned by the device that really holds them. What
+    /// waits for a device stays waiting and goes on the new keys. Envelopes already sealed for a friend's or your own
+    /// device and not sent yet were sealed on the dropped keys, in a form this build's friends refuse: they go, and the
+    /// chat messages among them are queued again for the new keys. Spares left on the relay were signed in the old way
+    /// too, so new ones replace them.
+    private func restartSessionsFromBeforeDeviceKeys() {
+        var stale: [Data: (contact: Int, device: Int)] = [:]
+        for i in data.contacts.indices {
+            data.contacts[i].spare = nil
+            data.contacts[i].oldSpares = nil
+            for d in data.contacts[i].devices.indices { stale[data.contacts[i].devices[d].sendID] = (i, d) }
+        }
+        let dropped = data.outbox.filter { stale[$0.sendID] != nil && $0.story == nil && !sendingIDs.contains($0.id) }
+        let droppedIDs = Set(dropped.map(\.id))
+        data.outbox.removeAll { droppedIDs.contains($0.id) }
+        for item in dropped {
+            guard let id = item.message, let (i, d) = stale[item.sendID], !data.contacts[i].isSelf,
+                  let convo = directConversation(with: data.contacts[i].fingerprint, persona: data.contacts[i].persona),
+                  let message = convo.messages.first(where: { $0.id == id && $0.isMine && !$0.isVideo }),
+                  !data.contacts[i].devices[d].pending.contains(where: { $0.message == id }) else { continue }
+            data.contacts[i].devices[d].pending.append(PendingPayload(payload: .message(wireForResend(message, in: convo)), message: id))
+        }
+        for i in data.contacts.indices where !data.contacts[i].awaitingAcceptance {
+            for d in data.contacts[i].devices.indices {
+                data.contacts[i].devices[d].session = nil
+                data.contacts[i].devices[d].earlierAsks = nil
+                data.contacts[i].devices[d].acceptedHello = nil
+                data.contacts[i].devices[d].acceptedHelloAt = nil
+                data.contacts[i].devices[d].sessionAskAt = nil
+                data.contacts[i].devices[d].answeredAt = nil
+                data.contacts[i].devices[d].spareTakenAt = nil
+                data.contacts[i].devices[d].needsKeys = nil
+                // A link still waiting to learn its device's id is an invite not answered yet: its own ask stands.
+                guard !data.contacts[i].devices[d].id.isEmpty else { continue }
+                data.contacts[i].devices[d].handshake = nil
+                data.contacts[i].devices[d].awaitingHello = nil
+                startHandshake(contact: i, device: d)
+            }
+        }
+        data.format = AppData.currentFormat
+        save()
     }
 
     /// This build only talks to PULSHADE's own relay, so everyone it can reach collects their mail there. A contact,
@@ -3451,12 +3501,15 @@ final class AppModel {
     /// Pins the keys a device of contact `i` proved in a handshake. Keys other than the ones pinned make it a new device,
     /// whatever its id: a friend's is said in the chat and held when you ask before new devices; one of your own is listed
     /// as one to check, as when a device you didn't approve introduces itself.
+    /// A first pin where a session was already running is announced too: the keys that session was opened with were never
+    /// pinned, so nothing says these belong to the same device.
     private func pinDeviceKey(_ pin: Data, contact i: Int, device d: Int) {
         let old = data.contacts[i].devices[d].keyPin
         guard old != pin else { return }
+        let replacing = old == nil && data.contacts[i].devices[d].session != nil
         data.contacts[i].devices[d].keyPin = pin
         let isSelf = data.contacts[i].isSelf
-        if old != nil {
+        if old != nil || replacing {
             if isSelf {
                 data.contacts[i].devices[d].unconfirmed = true
             } else {
