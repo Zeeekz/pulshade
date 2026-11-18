@@ -452,7 +452,7 @@ enum SyncEvent: Codable, Equatable {
     /// The first message on a new session between two of your devices.
     case hello
     /// A group that shares one mailbox, as this account is in it: its settings and the epochs' keys. Only between your
-    /// own devices, which share the group key (it comes from the account's seed), each with a chain of its own.
+    /// own devices, which share the group key (it comes from the account's seed and group secret), each with a chain of its own.
     /// `inviter` is the account that invited this one (so a follower's other devices know whom to tell they left).
     case sharedGroup(persona: UUID?, settings: GroupSettings, epochs: [GroupEpoch], staffKey: Data? = nil, inviter: String? = nil)
     case sent(ConvoRef, WireMessage)
@@ -479,8 +479,10 @@ enum SyncEvent: Codable, Equatable {
     case requestReceived(FriendRequest)
     /// A request was accepted, declined or blocked on another device.
     case requestResolved(fingerprint: String, persona: UUID?)
-    /// One of your devices logged out.
+    /// One of your devices logged out, or was unlinked on another of yours.
     case deviceLoggedOut(Data)
+    /// A new group secret (`AppData.groupSecret`), made after a device was unlinked: every group moves to keys made with it.
+    case groupSecret(Data)
     /// The account was burned: wipe this device too, leaving no trace.
     case accountErased
     /// The account was detached from every device: say goodbye to contacts, then wipe this device.

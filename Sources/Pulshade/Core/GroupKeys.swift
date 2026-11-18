@@ -33,15 +33,22 @@ private func be32(_ n: UInt32) -> Data { withUnsafeBytes(of: n.bigEndian) { Data
 /// Epoch and version numbers that arrive from others are only taken in this range, so nothing can overflow on them.
 let groupNumberRange = 1..<Int(Int32.max)
 
-/// This account's keys in one group: made from the account's seed and the group's id, so every device of the account
-/// (and a recovered one) has the same, and they are tied to nothing outside the group.
+/// This account's keys in one group: made from the account's seed, the group's id and the account's group secret
+/// (`AppData.groupSecret`), so every device of the account (and a recovered one) has the same, and they are tied to
+/// nothing outside the group. The group secret is random, held only by the account's linked devices, and replaced when
+/// one is unlinked, so a device that was taken out can't work out the keys the account moves to. An empty secret is
+/// the seed alone, as accounts had before they first made one.
 struct GroupMemberKeys {
     let signing: Curve25519.Signing.PrivateKey
     let agreement: Curve25519.KeyAgreement.PrivateKey
     private let root: Data
 
-    init(seed: Data, group: UUID) {
-        root = derive(seed, "pulshade.group.member.v1", salt: bytes(group))
+    init(seed: Data, group: UUID, secret: Data? = nil) {
+        if let secret, !secret.isEmpty {
+            root = derive(seed, "pulshade.group.member.v2", salt: bytes(group) + secret)
+        } else {
+            root = derive(seed, "pulshade.group.member.v1", salt: bytes(group))
+        }
         signing = try! .init(rawRepresentation: derive(root, "signing"))
         agreement = try! .init(rawRepresentation: derive(root, "agreement"))
     }
@@ -332,9 +339,34 @@ struct GroupSettings: Codable, Equatable {
         return next.signatureIsValid && next.wellFormed()
     }
 
+    /// A member moving to new group keys (their account unlinked a device): `next` puts a card under a new key in place
+    /// of the signer's own, hands the signer's roles to it, and starts a new epoch, so whoever holds only the old keys
+    /// gets nothing from then on. Nothing else may change. The old and the new key, or nil if `next` isn't that.
+    func renewal(to next: GroupSettings) -> (old: Data, new: Data)? {
+        let who = next.signer
+        guard isMember(who), !next.isMember(who), next.epoch == epoch + 1 else { return nil }
+        let added = next.members.filter { !isMember($0.signingKey) }
+        guard added.count == 1, let card = added.first else { return nil }
+        let new = card.signingKey
+        func swap(_ key: Data) -> Data { key == who ? new : key }
+        var expected = self
+        expected.members = members.map { $0.signingKey == who ? card : $0 }
+        expected.owner = swap(owner)
+        expected.admins = admins.map(swap)
+        expected.mods = mods.map(swap)
+        expected.version = next.version
+        expected.epoch = next.epoch
+        expected.epochCheck = next.epochCheck
+        expected.signer = next.signer
+        expected.signature = next.signature
+        return expected == next ? (who, new) : nil
+    }
+
     /// Whether `next`'s signer is allowed the change from this version to it. Says nothing of the signature.
     private func allowsChange(to next: GroupSettings) -> Bool {
         let who = next.signer
+        // Any member may move to new keys of their own, roles and all.
+        if renewal(to: next) != nil { return true }
         // Judged by the roles in the version it changes, not the one it brings.
         if who == owner { return next.owner == owner }
         let removed = Set(members.map(\.signingKey)).subtracting(next.members.map(\.signingKey))
@@ -1082,6 +1114,10 @@ struct SharedGroup: Codable, Equatable {
     /// As staff of a channel: where each staff device's chain was (by `GroupReader.id`) when this device let a follower
     /// in, by the follower's account fingerprint. Nothing from before goes to them.
     var admittedAt: [String: [String: UInt32]]?
+    /// The account's group secret this group's keys are still made with (`AppData.groupSecret` from before it was
+    /// replaced; empty for the seed alone), until the settings move this account to keys made with the current one
+    /// (`GroupSettings.renewal`). Nil: the current one.
+    var memberSecret: Data?
     /// The tag this device signs its posts with: random, made the first time it posts, and never copied to another
     /// device (a backup or a newly linked device makes its own), so no two ever use the same chain.
     var myTag: Data?

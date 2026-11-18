@@ -1413,7 +1413,9 @@ struct AppData: Codable {
     /// (`DeviceLink.keyPin`). A handshake without device keys isn't taken, so devices on builds before can't talk to this one.
     /// 24: group chains are handed to each member device over pairwise sessions (`GroupPeer`), with no announce keys;
     /// groups saved before are set aside like those before 21.
-    static let currentFormat = 24
+    /// 25: the account's group secret (`groupSecret`), which group keys are made from and which is replaced when a
+    /// device is unlinked; a group can still be on the one before (`SharedGroup.memberSecret`).
+    static let currentFormat = 25
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []
@@ -1488,6 +1490,13 @@ struct AppData: Codable {
     var joinAsks: [JoinAsk] = []
     /// Invites to be friends from people you share a group with, until you answer.
     var friendInvites: [GroupFriendInvite] = []
+    /// Random bytes every linked device of the account holds, which group keys are made from with the seed
+    /// (`GroupMemberKeys`). Replaced when a device is unlinked, and every group then moves to keys made with the new one.
+    /// Nil: the seed alone (an account from before; its lead device makes one at unlock).
+    var groupSecret: Data?
+    /// When this device may move groups still on an older group secret to the current one: at once on the device that
+    /// made it, a while after on the others (so the one that made it goes first).
+    var groupRenewAfter: Date?
     init() {}
 
     /// The relay new identities use. A build can set `PulshadeRelay` in its Info.plist (the iPhone
@@ -1587,6 +1596,8 @@ struct AppData: Codable {
         bornAt = try? c.decodeIfPresent(Date.self, forKey: .bornAt)
         backupSavedAt = try? c.decodeIfPresent(Date.self, forKey: .backupSavedAt)
         backupDigest = try? c.decodeIfPresent(Data.self, forKey: .backupDigest)
+        groupSecret = try c.decodeIfPresent(Data.self, forKey: .groupSecret)
+        groupRenewAfter = try? c.decodeIfPresent(Date.self, forKey: .groupRenewAfter)
     }
 }
 

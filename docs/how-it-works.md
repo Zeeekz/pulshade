@@ -236,7 +236,9 @@ else a new key that person never gets; someone added doesn't get what was said b
 sealed for up to 7 days and can't tell who reads it over Tor. Each member's device keeps its own key chain in
 each group, started from fresh random bytes and moved on with every post, and hands its starting point to the other
 members' devices over private, post-quantum sessions; group keys are handed out sealed with post-quantum keys as well
-as classical ones. So someone who takes a member's phone can't open the group posts it had already read. The
+as classical ones. So someone who takes a member's phone can't open the group posts it had already read, and once you
+unlink that phone from another of your devices, every group you're in moves to new keys it can't work out, so it reads
+nothing said there from then on. The
 trade-off: group messages show "sent" rather than ticking per member.
 
 **Groups, channels and broadcasts.** Groups and channels share one mailbox (a channel's followers can't see who else

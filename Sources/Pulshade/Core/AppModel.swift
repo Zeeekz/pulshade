@@ -1956,6 +1956,8 @@ final class AppModel {
     @ObservationIgnored var joinAdmits: [UUID: [Date]] = [:]
     /// As an admin: when a missed key was last sent again to each member (by member key, hex).
     @ObservationIgnored var keyResent: [String: Date] = [:]
+    /// When this device last tried to move each group to keys made with the current group secret.
+    @ObservationIgnored var groupRenewTried: [UUID: Date] = [:]
     /// When a follower of a channel was last sent the current key because they asked (by channel and key), so a flood of asks is answered once.
     @ObservationIgnored var channelKeyAnswered: [String: Date] = [:]
     /// Groups with posts just held for want of a chain: asked for together, in one direct post, once a fetch is read.
@@ -7896,8 +7898,20 @@ extension AppModel {
     /// The other devices logged in to this account.
     var linkedDevices: [DeviceLink] { selfIndex.map { data.contacts[$0].devices } ?? [] }
 
+    /// Stops syncing with one of your devices (a lost or stolen phone, say). Your other devices are told to drop it too,
+    /// and every group moves to keys it can't work out (`renewGroupSecret`), so it reads nothing said there from then on.
     func unlinkDevice(_ id: Data) {
-        guard let i = selfIndex else { return }
+        guard let i = selfIndex, data.contacts[i].devices.contains(where: { $0.id == id }) else { return }
+        data.contacts[i].devices.removeAll { $0.id == id }
+        // Sent to the devices left, not the one taken out.
+        sync(.deviceLoggedOut(id))
+        renewGroupSecret()
+        save()
+    }
+
+    /// Another of your devices logged out, or unlinked one: it's dropped here too. That device moves the groups on.
+    private func forgetLinkedDevice(_ id: Data) {
+        guard id != data.deviceID, let i = selfIndex else { return }
         data.contacts[i].devices.removeAll { $0.id == id }
         save()
     }
@@ -8199,7 +8213,9 @@ extension AppModel {
         case let .requestResolved(fingerprint, persona):
             withAnimation(.snappy) { data.requests.removeAll { $0.fingerprint == fingerprint && $0.persona == persona } }
         case let .deviceLoggedOut(id):
-            unlinkDevice(id)
+            forgetLinkedDevice(id)
+        case let .groupSecret(secret):
+            adoptGroupSecret(secret)
         case .accountErased:
             destroyEverything(leavingNoTrace: true)
             Vault.scrubLeftovers()
@@ -8378,7 +8394,8 @@ extension AppModel {
                                 conversations: data.conversations.map(card(of:)),
                                 theme: data.theme, relay: data.relay, inviteRelay: data.inviteRelay, security: data.security,
                                 blocked: data.blocked, siblings: siblings,
-                                publicInvites: data.invites.filter(\.isPublic), requests: data.requests, confirms: true)
+                                publicInvites: data.invites.filter(\.isPublic), requests: data.requests, confirms: true,
+                                groupSecret: data.groupSecret)
         guard let plain = try? JSONEncoder.pulshade.encode(bundle),
               let sealed = try? ChaChaPoly.seal(plain, using: LinkCrypto.bundleKey(shared, secret: offer.secret)).combined else { return }
         data.outbox.append(Outgoing(sendID: request.bundleSendID, blob: ephemeral.publicKey.rawRepresentation + sealed, relay: offer.relay))
@@ -8456,6 +8473,7 @@ extension AppModel {
         fresh.blocked = bundle.blocked
         fresh.invites = bundle.publicInvites ?? []
         fresh.requests = bundle.requests ?? []
+        fresh.groupSecret = bundle.groupSecret.flatMap { $0.count == 32 ? $0 : nil }
         data = fresh
         adoptConnectionChoice()
 
@@ -9343,8 +9361,26 @@ extension AppModel {
         return Set(shared.knownAs.filter { convo.members.contains($0.value) }.map(\.key)).union(shared.invited.keys)
     }
 
+    /// This account's keys in a group: made with the group secret the group is on (`SharedGroup.memberSecret`), or the
+    /// current one. A group still marked as on an older secret whose settings already list the keys made with the current
+    /// one (another of your devices moved it on) gets those.
     func memberKeys(_ persona: UUID?, group: UUID) -> GroupMemberKeys? {
-        me(persona).map { GroupMemberKeys(seed: $0.seed, group: group) }
+        guard let me = me(persona) else { return nil }
+        if let i = groupIndex(group, persona: persona), let shared = data.conversations[i].shared, let held = shared.memberSecret {
+            let old = GroupMemberKeys(seed: me.seed, group: group, secret: held)
+            if !shared.settings.isMember(old.publicKey) {
+                let new = GroupMemberKeys(seed: me.seed, group: group, secret: data.groupSecret)
+                if shared.settings.isMember(new.publicKey) { return new }
+            }
+            return old
+        }
+        return GroupMemberKeys(seed: me.seed, group: group, secret: data.groupSecret)
+    }
+
+    /// The keys made with the current group secret, for a group still on an older one. Nil when it isn't.
+    private func renewedKeys(at i: Int) -> GroupMemberKeys? {
+        guard data.conversations[i].shared?.memberSecret != nil, let me = me(data.conversations[i].persona) else { return nil }
+        return GroupMemberKeys(seed: me.seed, group: data.conversations[i].wireID, secret: data.groupSecret)
     }
 
     /// This account's card in a group: the persona's name, picture and colour.
@@ -9563,8 +9599,25 @@ extension AppModel {
         shared.candidates.removeAll { $0.number < epoch.number || $0.key == epoch.key }
     }
 
-    /// A newcomer's card, back from someone this device invited: in it goes, for everyone.
+    /// A newcomer's card, back from someone this device invited: in it goes, for everyone. From a follower this device let
+    /// in, with no invite waiting, a card under a new key is their account moving to new group keys (it unlinked a
+    /// device): the new card takes the old one's place, and the channel moves to a new epoch the old key doesn't get.
     func acceptGroupJoin(_ group: UUID, card: MemberCard, from sender: Contact) {
+        if let i = groupIndex(group, persona: sender.persona), let shared = data.conversations[i].shared,
+           shared.invited[sender.fingerprint] == nil, shared.staffInvited?[sender.fingerprint] == nil,
+           let (_, old) = followerEntry(of: sender, group: group), old.signingKey != card.signingKey,
+           card.name.isEmpty, card.avatarHash == nil, card.verified(group: group), !shared.settings.isMember(card.signingKey),
+           shared.links?.bans.contains(card.signingKey) != true {
+            let previous = shared.knownAs[sender.fingerprint]
+            data.conversations[i].shared?.knownAs[sender.fingerprint] = card.fingerprint
+            addFollower(card, replacing: previous, at: i)
+            if data.conversations[i].shared?.rekeyAfter.map({ shared.settings.epoch > $0 }) ?? true {
+                data.conversations[i].shared?.rekeyAfter = shared.settings.epoch
+            }
+            data.conversations[i].shared?.rekeyDue = Date()
+            save()
+            return
+        }
         guard let i = groupIndex(group, persona: sender.persona), var shared = data.conversations[i].shared, !shared.gone,
               let asked = shared.invited[sender.fingerprint] ?? shared.staffInvited?[sender.fingerprint],
               Date().timeIntervalSince(asked) < Self.inviteLife, card.verified(group: group),
@@ -10047,6 +10100,128 @@ extension AppModel {
         if wasAdmin, shared.settings.kind == .channel { rotateStaffKey(at: i) }
     }
 
+    // MARK: New group keys after a device is unlinked
+
+    /// Makes a new group secret, tells the account's other devices, and moves every group to keys made with it
+    /// (`renewMemberKeys`). The device that was unlinked holds only the secret before, so it can't work out the new
+    /// keys: it is left out of every new epoch, and no member device hands it a chain again.
+    func renewGroupSecret() {
+        stampGroups(with: data.groupSecret ?? Data())
+        let secret = Data.random(32)
+        data.groupSecret = secret
+        data.groupRenewAfter = Date()
+        sync(.groupSecret(secret))
+        for i in data.conversations.indices { renewMemberKeys(at: i) }
+        save()
+    }
+
+    /// A new group secret from another of this account's devices. Groups move to it when that device's new settings
+    /// arrive, or, if they don't, from this device a little later.
+    private func adoptGroupSecret(_ secret: Data) {
+        guard secret.count == 32, secret != data.groupSecret else { return }
+        stampGroups(with: data.groupSecret ?? Data())
+        data.groupSecret = secret
+        data.groupRenewAfter = Date().addingTimeInterval(Self.groupRenewWait)
+        save()
+    }
+
+    /// How long a device that didn't make a new group secret waits before moving groups to it itself.
+    static let groupRenewWait: TimeInterval = 600
+
+    /// Marks every group not already marked as still on `secret`, before the current secret changes.
+    private func stampGroups(with secret: Data) {
+        for i in data.conversations.indices where data.conversations[i].shared != nil && data.conversations[i].shared?.memberSecret == nil {
+            data.conversations[i].shared?.memberSecret = secret
+        }
+    }
+
+    /// Moves this account in one group from keys made with an older group secret to keys made with the current one: a
+    /// new card under the new key in place of the old, with its roles, and a new epoch sealed to everyone but the old
+    /// key (`GroupSettings.renewal`). A channel's follower sends the new card to the staff member who invited them, who
+    /// does the same in the roster. False if it couldn't be done now (tried again later).
+    @discardableResult
+    private func renewMemberKeys(at i: Int) -> Bool {
+        let convo = data.conversations[i]
+        guard var shared = convo.shared, let held = shared.memberSecret, let me = me(convo.persona) else { return true }
+        let gid = convo.wireID
+        let old = GroupMemberKeys(seed: me.seed, group: gid, secret: held)
+        let new = GroupMemberKeys(seed: me.seed, group: gid, secret: data.groupSecret)
+        let s = shared.settings
+        if shared.gone || old.publicKey == new.publicKey || s.isMember(new.publicKey) {
+            data.conversations[i].shared?.memberSecret = nil
+            if !shared.gone, old.publicKey != new.publicKey { data.conversations[i].shared?.peers = nil }
+            return true
+        }
+        guard s.isMember(old.publicKey) else {
+            // A follower: the staff member who invited them puts the new card in the roster in place of the old.
+            guard s.kind == .channel else { return false }
+            let card = MemberCard.make(new, group: gid, name: "", avatar: nil, color: nil)
+            guard noticeToInviter(.groupJoin(group: gid, card: card), of: convo) else { return false }
+            data.conversations[i].shared?.memberSecret = nil
+            return true
+        }
+        guard let current = shared.current, groupNumberRange.contains(current.number + 1) else { return false }
+        let p = profile(for: convo.persona)
+        let card = MemberCard.make(new, group: gid, name: p.name, avatar: Self.thumbnail(p.avatar, side: 96), color: p.color)
+        let epoch = GroupEpoch.fresh(number: current.number + 1)
+        func swap(_ key: Data) -> Data { key == old.publicKey ? new.publicKey : key }
+        var next = s
+        next.members = s.members.map { $0.signingKey == old.publicKey ? card.withoutAvatar : $0 }
+        next.owner = swap(s.owner)
+        next.admins = s.admins.map(swap)
+        next.mods = s.mods.map(swap)
+        next.epoch = epoch.number
+        next.epochCheck = epoch.check
+        next.version = s.version + 1
+        next.sign(with: old)
+        guard s.accepts(next), next.fitsInMailbox else { return false }
+        // Sealed to the new card too, so this account's other devices can open it before their settings move.
+        let channel = s.kind == .channel
+        let readers = next.members + (channel ? (shared.roster?.live ?? []) : [])
+        let rekey = GroupRekey.make(epoch, group: s.group, for: readers, tagged: channel)
+        guard rekey.isReasonable, GroupSeal.fits(payload: (try? Payload.groupRekey(rekey).wire(framed: false).count) ?? Int.max) else { return false }
+        // Posted under the old key, which the settings held now list.
+        post(.groupRekey(rekey), at: i)
+        post(.groupSettings(next), at: i)
+        shared = data.conversations[i].shared ?? shared
+        shared.previous = shared.settings
+        install(epoch, in: &shared)
+        shared.settings = next
+        shared.chatInEpoch = false
+        shared.chatsInEpoch = nil
+        shared.memberSecret = nil
+        // Sessions were opened under the old keys; new ones are opened under the new as they're needed.
+        shared.peers = nil
+        shared.chainAsked = nil
+        shared.cardPostedEpoch = nil
+        data.conversations[i].shared = shared
+        applySharedSettings(at: i)
+        if channel {
+            // The staff mailbox's key and the roster: the old key opens neither from now on.
+            if next.owner == new.publicKey { rotateStaffKey(at: i) } else { publishRoster(at: i) }
+        }
+        syncConversation(convo.id)
+        save()
+        return true
+    }
+
+    /// Groups still on an older group secret are moved on, once this device may (`groupRenewAfter`), at most every ten
+    /// minutes each. An account that has no group secret yet gets one from its lead device.
+    private func tendGroupSecret() {
+        if data.groupSecret == nil, identity != nil, isLeadDevice(nil) {
+            renewGroupSecret()
+            return
+        }
+        guard Date() >= data.groupRenewAfter ?? .distantPast else { return }
+        let now = Date()
+        for i in data.conversations.indices where data.conversations[i].shared?.memberSecret != nil {
+            let id = data.conversations[i].id
+            guard now.timeIntervalSince(groupRenewTried[id] ?? .distantPast) > 600 else { continue }
+            groupRenewTried[id] = now
+            if renewMemberKeys(at: i) { groupRenewTried[id] = nil }
+        }
+    }
+
     // MARK: Posting
 
     /// Says something to a shared group: sealed once, posted once. False when this isn't a shared group (the caller
@@ -10323,6 +10498,7 @@ extension AppModel {
     /// state for epochs no longer read is let go, and this device's picture is posted where members haven't got it.
     func tendSharedGroups() {
         let now = Date()
+        tendGroupSecret()
         for i in data.conversations.indices {
             // Before the copy of the group below is taken: this changes it.
             tendKept(at: i)
@@ -10533,8 +10709,9 @@ extension AppModel {
         case let .groupRekey(rekey):
             // Kept as a candidate; the settings that follow say which key the group moves to.
             guard rekey.group == gid, groupNumberRange.contains(rekey.epoch), (1...7).contains(rekey.days),
-                  shared.settings.isAdmin(outer.sender) || shared.settings.mods.contains(outer.sender),
-                  rekey.epoch > (shared.current?.number ?? 0) - 1, var opened = rekey.open(with: keys),
+                  shared.settings.isMember(outer.sender),
+                  rekey.epoch > (shared.current?.number ?? 0) - 1,
+                  var opened = rekey.open(with: keys) ?? renewedKeys(at: i).flatMap({ rekey.open(with: $0) }),
                   !shared.candidates.contains(where: { $0.key == opened.key }) else { return }
             opened.from = outer.sender
             // Two at most from each member, sixteen in all: nobody can push out someone else's.
@@ -10672,7 +10849,10 @@ extension AppModel {
     /// admins changed the group at once: everyone keeps the same one). An epoch it moves to is used only if its key
     /// matches the check the settings carry.
     private func adoptSettings(_ next: GroupSettings, at i: Int) {
-        guard var shared = data.conversations[i].shared, let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID) else { return }
+        guard var shared = data.conversations[i].shared, var keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID) else { return }
+        // Another of this account's devices may have moved the group to keys made with the current group secret.
+        let renewed = renewedKeys(at: i)
+        func listed(_ s: GroupSettings) -> Bool { s.isMember(keys.publicKey) || renewed.map { s.isMember($0.publicKey) } == true }
         let held = shared.settings
         let competing = next.version == held.version && next != held
         if competing {
@@ -10686,7 +10866,7 @@ extension AppModel {
             guard let key = shared.candidates.first(where: { $0.number == next.epoch && $0.check == next.epochCheck }) else {
                 // Not being listed means being removed in a group, but a channel's followers are never listed: for them a key
                 // that doesn't come is all there is to go on.
-                if !next.isMember(keys.publicKey) && next.kind != .channel {
+                if !listed(next) && next.kind != .channel {
                     leftShared(at: i, note: "You were removed from this group")
                 } else if next.epoch > (shared.current?.number ?? 0) {
                     // Its key may still be on the way (read out of order): wait for it. If it never comes, this device
@@ -10701,6 +10881,22 @@ extension AppModel {
         }
         if !competing { shared.previous = held }
         shared.settings = next
+        if let renewed, next.isMember(renewed.publicKey) {
+            // The sessions were opened under the old keys: new ones are opened under the new.
+            shared.memberSecret = nil
+            shared.peers = nil
+            shared.chainAsked = nil
+            keys = renewed
+        }
+        // A member who moved to new keys is known by them from now on.
+        if let (old, new) = held.renewal(to: next) {
+            let oldFP = Identity.fingerprint(of: old), newFP = Identity.fingerprint(of: new)
+            for (account, fp) in shared.knownAs where fp == oldFP { shared.knownAs[account] = newFP }
+            if let at = shared.wantRemoved[old.hex] {
+                shared.wantRemoved[old.hex] = nil
+                shared.wantRemoved[new.hex] = at
+            }
+        }
         // Epochs past the one these settings name (from a change that lost) go back to being candidates.
         let later = shared.epochs.filter { $0.number > next.epoch }
         if !later.isEmpty {
@@ -10733,7 +10929,15 @@ extension AppModel {
     private func adoptSharedGroup(persona: UUID?, settings: GroupSettings, epochs: [GroupEpoch]) {
         guard settings.kind == .group || settings.kind == .channel, settings.signatureIsValid, settings.wellFormed(), !epochs.isEmpty,
               epochs.allSatisfy(\.isValid), epochs.contains(where: { $0.number == settings.epoch && $0.check == settings.epochCheck }),
-              let keys = memberKeys(persona, group: settings.group) else { return }
+              var keys = memberKeys(persona, group: settings.group) else { return }
+        if let i = groupIndex(settings.group, persona: persona), let renewed = renewedKeys(at: i), settings.isMember(renewed.publicKey),
+           settings.version >= (data.conversations[i].shared?.settings.version ?? 0) {
+            // Moved to keys made with the current group secret on another of this account's devices.
+            data.conversations[i].shared?.memberSecret = nil
+            data.conversations[i].shared?.peers = nil
+            data.conversations[i].shared?.chainAsked = nil
+            keys = renewed
+        }
         let joining = !settings.isMember(keys.publicKey)
         if let i = groupIndex(settings.group, persona: persona) {
             var shared = data.conversations[i].shared ?? SharedGroup(settings: settings, epochs: [], joining: joining)

@@ -27,6 +27,8 @@ struct LinkBundle: Codable {
     /// then asks you to compare it before it takes the account; one that finds this missing says it can't check.
     /// Older builds ignore it.
     var confirms: Bool?
+    /// The account's group secret (`AppData.groupSecret`), which group keys are made from.
+    var groupSecret: Data?
 }
 
 /// The QR code: a one-time secret, the mailbox to answer on, and which relay to use.
