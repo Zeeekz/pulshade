@@ -61,7 +61,7 @@ targets:
     info:
       path: ios/Info.plist
       properties:
-        CFBundleDisplayName: PULSHADE
+        CFBundleDisplayName: Pulshade
         PulshadeRelay: $(PULSHADE_RELAY)
         PulshadeRelayDirect: $(PULSHADE_RELAY_DIRECT)
         PulshadeRelayPin: $(PULSHADE_RELAY_PIN)
@@ -135,7 +135,7 @@ targets:
     info:
       path: ios/Notify/Info.plist
       properties:
-        CFBundleDisplayName: PULSHADE
+        CFBundleDisplayName: Pulshade
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         PulshadeRelayPin: $(PULSHADE_RELAY_PIN)
