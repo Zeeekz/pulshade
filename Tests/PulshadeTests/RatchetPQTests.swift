@@ -115,12 +115,14 @@ private func restart(_ r: Ratchet) throws -> Ratchet { try JSONDecoder().decode(
 
     @Test func theSecretReallyIsInTheRoot() throws {
         var (alice, bob) = try pair()
-        // Run until the first secret has been decapsulated on Alice's side and is waiting.
+        // Run until the first secret has been decapsulated on Alice's side and is waiting. It goes into her next sending
+        // chain, so it is looked for right after she reads Bob's message, before she writes her own.
         var steps = 0
         while steps < 200 {
+            _ = try alice.decrypt(bob.encrypt(Data("b".utf8)))
             let json = try JSONSerialization.jsonObject(with: saved(alice)) as! [String: Any]
             if let q = json["pq"] as? [String: Any], q["offerSecret"] != nil { break }
-            try talk(&alice, &bob, rounds: 1)
+            _ = try bob.decrypt(alice.encrypt(Data("a".utf8)))
             steps += 1
         }
         #expect(steps < 200)
@@ -130,14 +132,18 @@ private func restart(_ r: Ratchet) throws -> Ratchet { try JSONDecoder().decode(
         q["offerSecret"] = Data(repeating: 1, count: 32).base64EncodedString()
         json["pq"] = q
         var thief = try JSONDecoder().decode(Ratchet.self, from: JSONSerialization.data(withJSONObject: json))
-        var failures = 0
-        for i in 0..<12 {
-            let b = try bob.encrypt(Data("b\(i)".utf8))
-            if (try? thief.decrypt(b)) == nil { failures += 1 }
-            _ = try alice.decrypt(b)
-            _ = try bob.decrypt(alice.encrypt(Data("a\(i)".utf8)))
-        }
-        #expect(failures > 0, "Without the post-quantum secret, a chain that mixed it in doesn't open")
+        // And an exact copy, so a failure comes from the secret and not from the copying. Each copy picks its own random
+        // key at its next step, so they can follow Alice for one round only: the round her secret goes in.
+        var twin = try JSONDecoder().decode(Ratchet.self, from: saved(alice))
+        _ = try thief.encrypt(Data("t".utf8))
+        _ = try twin.encrypt(Data("t".utf8))
+        let a = try alice.encrypt(Data("a".utf8))
+        #expect(a.header.pm != nil, "Alice's new chain mixes her secret in")
+        _ = try bob.decrypt(a)
+        let b = try bob.encrypt(Data("b".utf8))
+        #expect(text(try twin.decrypt(b)) == "b", "The copy with the real secret reads Bob's answer")
+        #expect((try? thief.decrypt(b)) == nil, "Without the post-quantum secret, a chain that mixed it in doesn't open")
+        _ = try alice.decrypt(b)
     }
 
     @Test func survivesRestartsAtEveryStep() throws {

@@ -39,7 +39,7 @@ struct AppDataFormatTests {
     /// Fails when a field is added to what's saved without raising `AppData.currentFormat`. Change the lists below
     /// together with it.
     @Test func changingWhatIsSavedMeansRaisingTheFormat() throws {
-        #expect(AppData.currentFormat == 23)
+        #expect(AppData.currentFormat == 26)
         let app = keys(AppData())
         let profile = keys(Profile())
         #expect(app == Self.appKeys, "AppData's saved fields changed: raise AppData.currentFormat, then update this list")
@@ -48,12 +48,12 @@ struct AppDataFormatTests {
         #expect(contact == Self.contactKeys, "Contact's saved fields changed: raise AppData.currentFormat, then update this list")
     }
 
-    static let appKeys = ["activePersona", "announcementsSeen", "backupDigest", "backupSavedAt", "blobWipes", "blocked", "blockedNames", "bornAt", "chatBackground", "chatCodes", "clipParts", "contacts", "conversations", "decoySeed", "deviceID",
-                          "facade", "format", "friendInvites", "handlesTidied", "inviteRelay", "invites", "joinAsks", "linkOffers", "outbox", "panicSeed", "pendingBackupForget", "personas", "profile",
+    static let appKeys = ["activePersona", "announcementsSeen", "backupDigest", "backupSavedAt", "blobWipes", "blocked", "blockedNames", "bornAt", "chatBackground", "chatCodes", "clipParts", "contacts", "conversations", "decoySeed", "deviceID", "deviceKey",
+                          "facade", "format", "friendInvites", "groupRenewAfter", "groupSecret", "handlesTidied", "inviteRelay", "invites", "joinAsks", "linkOffers", "outbox", "panicSeed", "pendingBackupForget", "personas", "profile",
                           "profileShared", "relay", "requests", "security", "seenEnvelopes", "sentDigests", "stories", "storyChoices", "theme"]
     static let profileKeys = ["avatar", "badge", "banner", "bio", "collectibleCodes", "collectibles", "collectionCode", "color", "format", "handle", "links",
                               "moreHandles", "name", "notes", "updatedAt"]
-    static let contactKeys = ["addedAt", "agreementKey", "avatar", "awaitingAcceptance", "badge", "banner", "bio", "collectibles", "color", "departing", "devices",
-                              "fingerprint", "handle", "hidden", "isSelf", "links", "name", "nickname", "notes", "oldSpares", "persona", "pq", "pqCardSent", "pqCommit", "receiveKey", "relay",
+    static let contactKeys = ["addedAt", "agreementKey", "avatar", "awaitingAcceptance", "badge", "banner", "bio", "collectibles", "color", "contested", "departing", "devices",
+                              "fingerprint", "handle", "hidden", "isSelf", "links", "name", "nickname", "notes", "oldSpares", "persona", "pq", "pqCardSent", "pqCommit", "receiveKey", "relay", "revoked",
                               "signingKey", "spare", "toldPresence", "tooOld", "verified", "walletChangedAt", "wantsMyPresence"]
 }

@@ -508,8 +508,9 @@ struct ChannelLeaveAndKeyTests {
         alice.admitFromCodeForTests(Array(fps[0..<100]), in: id)
         alice.admitFromCodeForTests(Array(fps[100...]), in: id)
         let waiting = try #require(shared(alice, id)?.joinWaiting)
-        #expect(waiting.count == 1_500)
-        #expect(waiting.first == fps.first && waiting.last == fps[1_499], "the newest arrivals are the ones dropped")
+        let cap = GroupRoster.Body.maxEntries
+        #expect(waiting.count == cap)
+        #expect(waiting.first == fps.first && waiting.last == fps[cap - 1], "the newest arrivals are the ones dropped")
     }
 
     @Test func aLeaveAfterTheEpochMovedOnStillGetsItsOwnRekey() async throws {

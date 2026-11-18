@@ -74,18 +74,24 @@ import CryptoKit
         let mailbox = Mailbox.make()
         model.data.invites = [OpenInvite(receiveKey: mailbox.receiveKey)]
         let them = Identity.generate()
-        let (_, request) = try Handshake.start()
+        let (_, unsigned) = try Handshake.start()
+        // Every hello carries the asking device's keys, signed by its account, and the device's signature over it: both
+        // hellos below have them, so only the card decides.
+        let deviceKey = try DeviceKey(seed: .random(32), persona: nil), device = Data.random(16)
+        let request = try Handshake.signed(unsigned, by: deviceKey, card: deviceKey.card(account: them, device: device),
+                                           HandshakeParties(from: them.card.signing, to: me.card.signing, device: device),
+                                           context: .hello)
 
         // A card pairing their signing key with a different agreement key is not the pair they proved.
         let bad = PeerCard(name: "Them", avatar: nil, color: nil, signingKey: them.card.signing,
                            agreementKey: .random(32), sendID: Mailbox.make().sendID, pq: them.pqCard)
-        let badBlob = try Envelope.sealIntroduction(.hello(bad, request), from: them, to: me.card.agreement)
+        let badBlob = try Envelope.sealIntroduction(.hello(bad, request), from: them, device: device, to: me.card.agreement)
         #expect(model.receive(RelayEnvelope(receiveKey: mailbox.receiveKey, id: 1, blob: badBlob)) == .junk)
 
         // The honest card names the key the envelope was actually sealed with.
         let good = PeerCard(name: "Them", avatar: nil, color: nil, signingKey: them.card.signing,
                             agreementKey: them.card.agreement, sendID: Mailbox.make().sendID, pq: them.pqCard)
-        let goodBlob = try Envelope.sealIntroduction(.hello(good, request), from: them, to: me.card.agreement)
+        let goodBlob = try Envelope.sealIntroduction(.hello(good, request), from: them, device: device, to: me.card.agreement)
         #expect(model.receive(RelayEnvelope(receiveKey: mailbox.receiveKey, id: 2, blob: goodBlob)) == .handled)
     }
 
@@ -178,7 +184,9 @@ import CryptoKit
         contacts[0]["devices"] = devices
         json["contacts"] = contacts
         let opened = try JSONDecoder.pulshade.decode(AppData.self, from: JSONSerialization.data(withJSONObject: json))
-        #expect(opened.format == AppData.currentFormat && opened.contacts.count == 1)
+        // It keeps the format it was written at until the first unlock brings it up to date (and then, being from before
+        // per-device keys, starts every chat session afresh: see `AppModel.didUnlock`).
+        #expect(opened.format == 19 && opened.contacts.count == 1)
         var restored = try #require(opened.contacts[0].devices[0].session)
         let sent = try restored.encrypt(Data("still here".utf8))
         #expect(String(decoding: try bob.decrypt(sent), as: UTF8.self) == "still here")

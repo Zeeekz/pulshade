@@ -1970,6 +1970,8 @@ final class AppModel {
     @ObservationIgnored var groupRenewTried: [UUID: Date] = [:]
     /// When a follower of a channel was last sent the current key because they asked (by channel and key), so a flood of asks is answered once.
     @ObservationIgnored var channelKeyAnswered: [String: Date] = [:]
+    /// When each follower's ask for a staff device's chain was last answered (by channel, follower and chain), a minute apart.
+    @ObservationIgnored var followerChainAnswered: [String: Date] = [:]
     /// Groups with posts just held for want of a chain: asked for together, in one direct post, once a fetch is read.
     @ObservationIgnored var chainAsksDue: Set<UUID> = []
     /// When the envelope being handled was sent (as its sender signed it), for the few payloads that mustn't act on a stale copy.
@@ -6969,8 +6971,11 @@ final class AppModel {
                 if data.contacts[known].awaitingAcceptance { return .handled }
                 if opened.postQuantum { reconnect(incoming, keeping: data.contacts[known]); return .handled }
             }
-            // The same request sent again (the relay may have lost the first): already here, so no second banner.
-            if data.requests.contains(where: { $0.fingerprint == fp && $0.persona == invite.persona && $0.handshake == request }) { return .handled }
+            // The same request sent again (the relay may have lost the first): already here, so no second banner. The same
+            // keys make it the same request: it is signed afresh each time it is sent, and a post-quantum signature comes out
+            // different every time.
+            if data.requests.contains(where: { $0.fingerprint == fp && $0.persona == invite.persona
+                && $0.handshake.ephemeral == request.ephemeral && $0.handshake.kem == request.kem }) { return .handled }
             withAnimation(.snappy) {
                 data.requests.removeAll { $0.fingerprint == fp && $0.persona == invite.persona }
                 data.requests.insert(incoming, at: 0)
@@ -8364,6 +8369,12 @@ extension AppModel {
             forgetLinkedDevice(id)
         case let .groupSecret(secret):
             adoptGroupSecret(secret)
+        case let .groupChains(persona, group, keys):
+            // From another of your own devices: members' chains only, never your own account's (each device has its own).
+            guard let i = groupIndex(group, persona: persona), let shared = data.conversations[i].shared, !shared.gone,
+                  let me = memberKeys(persona, group: data.conversations[i].wireID) else { break }
+            let members = keys.prefix(GroupDirectBody.maxEach).filter { $0.sender != me.publicKey && shared.settings.isMember($0.sender) }
+            if !members.isEmpty, takeChainKeys(Array(members), from: nil, at: i) { rereadHeldMail(at: i) }
         case .accountErased:
             destroyEverything(leavingNoTrace: true)
             Vault.scrubLeftovers()
@@ -10101,6 +10112,9 @@ extension AppModel {
         applySharedSettings(at: i)
         post(.groupSettings(next), at: i)
         syncConversation(data.conversations[i].id)
+        // Posts held because their sender wasn't listed yet (a newcomer asking for chains before its card was in) are
+        // read again now that it may be, as they are when someone else's settings arrive.
+        rereadHeldMail(at: i)
         save()
         return true
     }
@@ -10225,6 +10239,7 @@ extension AppModel {
         data.conversations[i].shared = shared
         applySharedSettings(at: i)
         syncConversation(data.conversations[i].id)
+        rereadHeldMail(at: i)
         save()
     }
 
@@ -10394,7 +10409,7 @@ extension AppModel {
         return true
     }
 
-    private func post(_ payload: Payload, at i: Int, message: UUID? = nil, inEpoch number: Int? = nil) {
+    private func post(_ payload: Payload, at i: Int, message: UUID? = nil, inEpoch number: Int? = nil, replay: Bool = false) {
         guard var shared = data.conversations[i].shared, !shared.gone, let epoch = number.flatMap({ shared.epoch($0) }) ?? shared.current,
               let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID) else { return }
         // Until an admin has put this device's card in, nothing it says would be taken: hold back everything but
@@ -10404,6 +10419,15 @@ extension AppModel {
         if shared.settings.kind == .channel, !shared.settings.isMember(keys.publicKey) { return }
         let tag = shared.myTag ?? .random(GroupSeal.deviceLength)
         shared.myTag = tag
+        if payload.goesWithoutChain {
+            guard epoch.number != 0, let plain = try? payload.wire(framed: false), GroupSeal.fits(payload: plain.count),
+                  let blob = try? GroupSeal.sealDirect(plain, group: data.conversations[i].wireID, epoch: epoch, keys: keys, device: tag) else { return }
+            shared.outbox.append(GroupOutgoing(sendID: epoch.sendID, days: epoch.days, blob: blob, message: nil, wake: payload.wakes,
+                                               ephemeral: false, epoch: epoch.number))
+            data.conversations[i].shared = shared
+            kick()
+            return
+        }
         // This device's chain in the epoch starts from random bytes of its own, and where it starts goes to every member
         // device this one has a session with, over that session, before the first post on it.
         let n = String(epoch.number)
@@ -10427,8 +10451,8 @@ extension AppModel {
         var about = message
         if about == nil, case let .clipBlob(id, _) = payload { about = id }
         shared.outbox.append(GroupOutgoing(sendID: epoch.sendID, days: epoch.days, blob: blob, message: message,
-                                           wake: payload.wakes, ephemeral: payload.isEphemeral, epoch: epoch.number, about: about,
-                                           catchUp: payload.isChat && !payload.isEphemeral))
+                                           wake: replay ? false : payload.wakes, ephemeral: payload.isEphemeral, epoch: epoch.number, about: about,
+                                           catchUp: replay ? nil : payload.isChat && !payload.isEphemeral, replay: replay ? true : nil))
         data.conversations[i].shared = shared
         kick()
     }
@@ -10605,11 +10629,27 @@ extension AppModel {
         catchUpWindow[id] = recent + [now]
         catchUpAnswered[sender.hex] = now
         catchUpSent[id] = sentToday + [(now, wanted.reduce(0) { $0 + $1.blob.count })]
-        for k in wanted.reversed() where !(data.conversations[i].shared?.outbox.contains(where: { $0.blob == k.blob }) ?? true) {
-            data.conversations[i].shared?.outbox.append(GroupOutgoing(sendID: k.sendID, days: k.days, blob: k.blob, message: nil, wake: false,
-                                                                       ephemeral: false, epoch: k.epoch, replay: true))
+        // Each goes again as a new post on this device's chain, not as the same bytes: whoever asked was handed this chain
+        // only from where it was when they first showed they held it (so a phone taken from them can't ask for what it
+        // already read), and an old post from before that would never open for them. It goes in its own epoch's mailbox,
+        // never a later one: a newcomer (who can ask too) holds no key of an epoch from before it was let in, so it reads
+        // none of what was said then. Everyone else already has the message and ignores the copy by its id.
+        for k in wanted.reversed() {
+            guard data.conversations[i].shared?.epoch(k.epoch) != nil, let payload = ownPayload(of: k, at: i) else { continue }
+            post(payload, at: i, message: nil, inEpoch: k.epoch, replay: true)
         }
         kick()
+    }
+
+    /// What one of this device's own kept posts said, opened again with the key its chain gave it.
+    private func ownPayload(of k: KeptPost, at i: Int) -> Payload? {
+        guard let shared = data.conversations[i].shared, let start = shared.chainStarts?[String(k.epoch)], k.index >= start.index,
+              k.index - start.index <= GroupReader.maxSkip, let epoch = shared.epoch(k.epoch),
+              let outer = try? GroupSeal.outer(k.blob, group: data.conversations[i].wireID, epoch: epoch), outer.index == k.index else { return nil }
+        var chain = start
+        while chain.index < k.index { chain = chain.step().next }
+        guard let plain = GroupSeal.inner(outer, messageKey: chain.step().messageKey) else { return nil }
+        return try? Payload.fromWire(plain)
     }
 
     /// Housekeeping for a group's kept posts: ones that are gone with their message or too old are let go, those the
@@ -10819,16 +10859,21 @@ extension AppModel {
             data.conversations[i].shared = shared
             return
         }
-        // A direct post: items for single devices, each sealed by its pairwise session. Needs no chain.
+        // A direct post: items for single devices, each sealed by its pairwise session, or the group's own settings and new
+        // keys (see `Payload.goesWithoutChain`). Needs no chain.
+        var unchained: Payload?
         if outer.isDirect {
             data.conversations[i].shared = shared
-            guard outer.inner.count <= GroupSeal.maxPadded, let payload = try? Payload.fromWire(outer.inner),
-                  case let .groupDirect(items) = payload else { return }
-            receiveDirect(items, from: outer.sender, device: outer.device, deposited: mail.deposited, at: i)
-            return
+            guard outer.inner.count <= GroupSeal.maxPadded, let payload = try? Payload.fromWire(outer.inner) else { return }
+            if case let .groupDirect(items) = payload {
+                receiveDirect(items, from: outer.sender, device: outer.device, deposited: mail.deposited, epoch: number, at: i)
+                return
+            }
+            guard payload.goesWithoutChain, number != 0 else { return }
+            unchained = payload
         }
         let messageKey: Data
-        switch shared.reader.messageKey(epoch: number, sender: outer.sender, device: outer.device, index: outer.index) {
+        switch unchained != nil ? GroupReader.Lookup.key(Data()) : shared.reader.messageKey(epoch: number, sender: outer.sender, device: outer.device, index: outer.index) {
         case .used:
             data.conversations[i].shared = shared
             return
@@ -10848,10 +10893,12 @@ extension AppModel {
         case let .key(key):
             messageKey = key
         }
-        guard let plain = GroupSeal.inner(outer, messageKey: messageKey), let payload = try? Payload.fromWire(plain) else {
+        guard let payload = unchained ?? GroupSeal.inner(outer, messageKey: messageKey).flatMap({ try? Payload.fromWire($0) }) else {
             data.conversations[i].shared = shared
             return
         }
+        // Settings and new keys only ever come without a chain: one sealed on a chain isn't taken.
+        if unchained == nil, payload.goesWithoutChain { data.conversations[i].shared = shared; return }
         if number == 0 {
             guard case .groupRoster = payload else { return }
         }
@@ -10903,6 +10950,8 @@ extension AppModel {
         case let .membersAdded(names):
             // Not shown to someone still joining: it's about them, or from before they were in.
             guard !ours, !shared.joining, shared.settings.isAdmin(outer.sender), (1...50).contains(names.count) else { return }
+            // Not shown to the one it's about: a newcomer can read its own epoch from the start, this notice included.
+            if let myName = shared.settings.card(keys.publicKey)?.name, !myName.isEmpty, names.contains(myName) { return }
             let clean = names.prefix(50).map { String($0.prefix(40)) }.filter { !$0.isEmpty }
             guard !clean.isEmpty else { return }
             let who = contact(fp, in: persona)?.displayName ?? "An admin"
@@ -11183,10 +11232,19 @@ extension AppModel {
         shared.settings.kind == .channel ? shared.settings.isAdmin(member) : shared.settings.isMember(member)
     }
 
+    /// Whether this device may open sessions with other members and ask them for their chains. A group's newcomer may
+    /// while still joining, so it has the chains of what is said in the meantime once the settings that list it come. That
+    /// gives nothing away: whoever is asked hands chains only to members its own settings list.
+    private func mayPairAsMe(_ me: Data, in shared: SharedGroup) -> Bool {
+        mayPair(me, in: shared) || (shared.joining && shared.settings.kind == .group)
+    }
+
     /// Where this device's chain in `epoch` may be handed to `peer` from, when it asks for `index`: never before the
     /// peer's floor. A device met for the first time starts where the chain is now if another device of the same member
-    /// has been handed it already (a newly linked device, or one made up by whoever took a member's phone, reads nothing
-    /// said before); if none has, no device of that member could read any of it, and the ask is answered as made.
+    /// has been handed it already (one made up by whoever took a member's phone reads nothing said before); if none has, no
+    /// device of that member could read any of it, and the ask is answered as made. A member's genuinely linked devices
+    /// pass what they are handed to each other (`SyncEvent.groupChains`), so floors hold against a phone once it is
+    /// unlinked and the group keys renewed, not while it is still linked.
     private func handOverFrom(_ index: UInt32, epoch: Int, to peer: GroupPeer, at i: Int) -> UInt32? {
         guard let shared = data.conversations[i].shared, let now = shared.chains[String(epoch)] else { return nil }
         let n = String(epoch)
@@ -11235,7 +11293,19 @@ extension AppModel {
             guard let from = handOverFrom(index, epoch: epoch, to: peer, at: i), let k = myChain(epoch: epoch, from: from, at: i) else { continue }
             out.append(k)
         }
-        if current { out += currentPositions(except: Set(out.map(\.epoch)), at: i) }
+        if current {
+            // A device just met gets each other epoch's chain (since the epoch they met in) from where it may start: the
+            // start of the epoch's chain, as any member in it could read, unless another device of the same member was handed
+            // it first (then from where it is now: see `handOverFrom`). Handed only where it is now, it could never open what this device posted in the
+            // epoch before they met, and asking later would find the floor already past it.
+            for k in currentPositions(except: Set(out.map(\.epoch)), at: i) {
+                // Only epochs since the two met: of an older one (from before a newcomer was in) nothing said before.
+                guard k.epoch >= (peer.metIn ?? Int.max) else { out.append(k); continue }
+                let start = data.conversations[i].shared?.chainStarts?[String(k.epoch)]?.index ?? k.index
+                let from = min(k.index, handOverFrom(start, epoch: k.epoch, to: peer, at: i) ?? k.index)
+                out.append(from < k.index ? (myChain(epoch: k.epoch, from: from, at: i) ?? k) : k)
+            }
+        }
         Self.noteHanded(out, to: &peer)
         return out
     }
@@ -11290,12 +11360,15 @@ extension AppModel {
 
     /// Posts direct items: in a channel in the staff mailbox (followers needn't see staff talk among themselves), in a
     /// group in the current epoch's. As many posts as it takes to fit.
-    private func postDirect(_ items: [GroupDirect], at i: Int, chainEpoch: Int? = nil) {
-        guard !items.isEmpty, var shared = data.conversations[i].shared, !shared.gone, !shared.joining,
+    private func postDirect(_ items: [GroupDirect], at i: Int, chainEpoch: Int? = nil, inEpoch asked: Int? = nil) {
+        guard !items.isEmpty, var shared = data.conversations[i].shared, !shared.gone,
               let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID),
-              shared.settings.isMember(keys.publicKey), let tag = shared.myTag else { return }
+              shared.settings.isMember(keys.publicKey) || mayPairAsMe(keys.publicKey, in: shared), let tag = shared.myTag else { return }
         let channel = shared.settings.kind == .channel
-        guard let epoch = (channel ? shared.staffEpoch : nil) ?? shared.current else { return }
+        // An answer goes where it was asked, if this device still reads that epoch: across a change of epoch the asker may
+        // not have the new key yet, and may be asking for the very chains that would give it.
+        let answered = channel ? nil : asked.flatMap { shared.epoch($0) }
+        guard let epoch = answered ?? (channel ? shared.staffEpoch : nil) ?? shared.current else { return }
         let gid = data.conversations[i].wireID
         let wake = items.contains { $0.hello != nil || $0.wants != nil }
         var batches = stride(from: 0, to: items.count, by: 300).map { Array(items[$0..<min($0 + 300, items.count)]) }
@@ -11318,8 +11391,8 @@ extension AppModel {
     /// one direct post (one item per device). A channel's follower asks the staff member who invited it, over their 1:1 chat.
     private func askForChains(_ wants: [GroupChainWant], at i: Int) {
         guard !wants.isEmpty, let shared = data.conversations[i].shared, !shared.gone,
-              !shared.joining || isFollower(data.conversations[i]),
-              let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID) else { return }
+              let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID),
+              !shared.joining || isFollower(data.conversations[i]) || mayPairAsMe(keys.publicKey, in: shared) else { return }
         let now = Date()
         var asked = (shared.chainAsked ?? [:]).filter { now.timeIntervalSince($0.value) < 86_400 }
         var due: [GroupChainWant] = []
@@ -11338,7 +11411,7 @@ extension AppModel {
             }
             return
         }
-        guard mayPair(keys.publicKey, in: shared) else { return }
+        guard mayPairAsMe(keys.publicKey, in: shared) else { return }
         let byDevice = Dictionary(grouping: due.filter { mayPair($0.sender, in: shared) }) { GroupPeer.id(member: $0.sender, device: $0.device) }
         var items: [GroupDirect] = []
         for (_, theirs) in byDevice.sorted(by: { $0.key < $1.key }) {
@@ -11408,10 +11481,10 @@ extension AppModel {
 
     /// Direct items in a post from `member`'s `device`: the ones for this device are taken in, and answered. At most
     /// `GroupDirect.maxForOneDevice` are looked at, and one ask for a session.
-    private func receiveDirect(_ items: [GroupDirect], from member: Data, device: Data, deposited: Date?, at i: Int) {
+    private func receiveDirect(_ items: [GroupDirect], from member: Data, device: Data, deposited: Date?, epoch number: Int, at i: Int) {
         guard let shared = data.conversations[i].shared, !shared.gone, let tag = shared.myTag,
               let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID),
-              mayPair(member, in: shared), mayPair(keys.publicKey, in: shared),
+              mayPair(member, in: shared), mayPairAsMe(keys.publicKey, in: shared),
               let card = shared.settings.card(member), !(member == keys.publicKey && device == tag) else { return }
         let gid = data.conversations[i].wireID
         let id = GroupPeer.id(member: member, device: device)
@@ -11445,8 +11518,17 @@ extension AppModel {
                     let failed = Date().timeIntervalSince(peer.failedAt ?? .distantPast) < GroupPeer.failedWindow
                     guard newer || failed else { continue }
                 }
-                // Both asked at once: the one whose key and device sort first is answered, the other let go.
-                if peer.pending != nil, (keys.publicKey + tag).hex < (member + device).hex { continue }
+                // Both asked at once: the one whose key and device sort first is answered, the other let go. What the one let
+                // go asked for still goes to them, once the session the other ask opens is there.
+                if peer.pending != nil, (keys.publicKey + tag).hex < (member + device).hex {
+                    let give = handOver(item.wants ?? [], current: false, to: &peer, at: i)
+                    if !give.isEmpty {
+                        peer.queued = Array(((peer.queued ?? []) + give).suffix(GroupDirectBody.maxEach))
+                        let peers = (data.conversations[i].shared?.peers ?? [:]).merging([id: peer]) { _, new in new }
+                        data.conversations[i].shared?.peers = peers
+                    }
+                    continue
+                }
                 guard let (session, accept) = try? GroupHandshake.accept(hello, group: gid, me: keys, myDevice: tag, them: card, theirDevice: device)
                 else { continue }
                 peer.session = session
@@ -11504,7 +11586,14 @@ extension AppModel {
             data.conversations[i].shared?.peers = peers
             if let body {
                 if let given = body.keys, !given.isEmpty {
-                    if takeChainKeys(given, from: (member, device), at: i) { took = true }
+                    if takeChainKeys(given, from: (member, device), at: i) {
+                        took = true
+                        // Your other devices get the same starting points (see `SyncEvent.groupChains`).
+                        let theirs = given.prefix(GroupDirectBody.maxEach).filter { $0.isValid && $0.sender == member && $0.device == device }
+                        if !theirs.isEmpty, member != keys.publicKey {
+                            sync(.groupChains(persona: data.conversations[i].persona, group: gid, keys: Array(theirs)))
+                        }
+                    }
                     if data.conversations[i].shared?.settings.kind == .channel { passOn(given, from: member, device: device, at: i) }
                 }
                 if let wants = body.wants, !wants.isEmpty, var p = data.conversations[i].shared?.peers?[id] {
@@ -11523,7 +11612,7 @@ extension AppModel {
                 }
             }
         }
-        postDirect(replies, at: i)
+        postDirect(replies, at: i, inEpoch: number)
         if took { rereadHeldMail(at: i) }
     }
 
@@ -11624,8 +11713,8 @@ extension AppModel {
         for want in Set(wants.prefix(16)) where want.isValid && want.epoch != 0 && shared.epoch(want.epoch) != nil
             && shared.settings.isAdmin(want.sender) {
             let limit = group.uuidString + sender.fingerprint + want.chainID
-            guard Date().timeIntervalSince(channelKeyAnswered[limit] ?? .distantPast) > 60 else { continue }
-            channelKeyAnswered[limit] = Date()
+            guard Date().timeIntervalSince(followerChainAnswered[limit] ?? .distantPast) > 60 else { continue }
+            followerChainAnswered[limit] = Date()
             let from = max(want.index, followerFloor(sender.fingerprint, chain: want.chainID, at: i))
             if want.sender == me.publicKey && want.device == shared.myTag {
                 if let k = myChain(epoch: want.epoch, from: from, at: i) { mine.append(k) }
@@ -11704,6 +11793,24 @@ extension Payload {
     var isInvite: Bool {
         switch self {
         case .groupInvite: true
+        default: false
+        }
+    }
+
+    /// The group's settings and the hand-out of a new epoch's key: posted under the epoch's outer layer only, signed by the
+    /// poster, never on a chain. Everyone in the epoch reads them at once, including a newcomer who has no chains yet (it
+    /// learns from them that it's in) and someone just removed (it learns it was). Neither says anything anyone wrote, the
+    /// settings are signed by whoever made them, and each copy of a new key is sealed to its reader inside.
+    ///
+    /// The same goes for leaving and for the owner deleting the group: the device that posts them lets the group go at once,
+    /// so nobody could ask it for a chain to read them by.
+    ///
+    /// The cost (see "Known trade-off" in docs/groups-design.md, section 21): those copies are sealed to keys a member keeps
+    /// while it is in the group, so whoever records the relay and later takes a member's keys can work out every epoch key
+    /// since, and with them who posted when and the settings. Never what anyone wrote: that stays on the chains.
+    var goesWithoutChain: Bool {
+        switch self {
+        case .groupSettings, .groupRekey, .left, .chatDeleted: true
         default: false
         }
     }

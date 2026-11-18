@@ -498,4 +498,9 @@ enum SyncEvent: Codable, Equatable {
     case history(conversation: UUID, messages: [Message])
     /// A call was answered or declined on one of your devices: the others stop ringing.
     case callHandled(UUID)
+    /// Where other members' chains start, as one of your devices was handed them: passed to your other devices, so a device
+    /// that asked later than its sibling still reads every post from where the sibling could. A member's phone hands a
+    /// device it meets after another of the same member only from where its chain is then (a made-up device reads nothing
+    /// said before), so without this the slower of your devices would always miss the post that made both ask.
+    case groupChains(persona: UUID?, group: UUID, keys: [GroupChainKey])
 }

@@ -292,10 +292,17 @@ struct GroupKeysTests {
         var fake = b
         fake.signature = Data(repeating: 1, count: 64)
         #expect(one.merged(with: .init(entries: [.init(card: fake, added: t0)], removed: []), group: group).live.count == 1)
-        // The size doesn't give the number away to within a power of two.
-        let small = GroupRoster.make(one, group: group, epoch: 1, staff: staff, keys: owner)!
-        let few = GroupRoster.Body(entries: (0..<3).map { _ in .init(card: a, added: t0) }, removed: [])
-        #expect(GroupRoster.make(few, group: group, epoch: 1, staff: staff, keys: owner)!.box.count == small.box.count)
+        // The size doesn't give the number away to within a power of two: the sealed list is always a power of two long
+        // (plus the seal's nonce and tag), and lists of three and four, close in size, look the same.
+        func boxSize(_ n: Int) -> Int {
+            let body = GroupRoster.Body(entries: (0..<n).map { _ in .init(card: a, added: t0) }, removed: [])
+            return GroupRoster.make(body, group: group, epoch: 1, staff: staff, keys: owner)!.box.count
+        }
+        for n in [1, 3, 4, 9] {
+            let padded = boxSize(n) - 28
+            #expect(padded >= 1_024 && padded & (padded - 1) == 0, "\(n) entries seal to a power of two")
+        }
+        #expect(boxSize(3) == boxSize(4))
     }
 
     @Test func aRosterCantBeMadeUnbeatableOrFilledWithTheDead() throws {
