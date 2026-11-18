@@ -71,19 +71,26 @@ Two people start a conversation by setting up a shared secret, the *session root
    - DH(initiator's throwaway key, responder's throwaway key)
    - the ML-KEM shared secret
 4. The session root is HKDF-SHA256 over those four, salted with a hash of the whole public transcript (both throwaway
-   keys, the ML-KEM public key, the ciphertext), with the label `pulshade.handshake.v1`. A different transcript gives
-   a different root.
+   keys, the ML-KEM public key, the ciphertext, and the pins of both devices' own keys), with the label
+   `pulshade.handshake.v1`. A different transcript gives a different root.
+5. Each half is also signed by the sending **device's own keys** ([section 6](#6-multi-device-and-personas)), Ed25519 and
+   ML-DSA-65, and carries that device's card (its public keys, signed by the account with both of its signing keys for
+   that device id). The signature covers both accounts, the device id, the device's pin, the throwaway key and a hash of
+   the ML-KEM key; the answer's also covers the asking device's pin, the ask it answers and the ciphertext. A half
+   without a card and signature that verify is dropped.
 
 What this gives:
 
-- **Who:** the two long-term DH steps mean only the real holders of both identity keys can compute the root. There is
-  no separate signature on the handshake.
+- **Who:** the two long-term DH steps mean only the real holders of both identity keys can compute the root, and the
+  device signatures mean only the device whose keys are pinned can open a session in its name
+  ([section 6](#6-multi-device-and-personas)).
 - **Forward secrecy:** the third DH uses two throwaway keys that are deleted once they are no longer needed; stealing
   identity keys later does not reveal the root. "No longer needed" is not immediate in every case. To finish a
   handshake whose answer arrives late, a device keeps the secret halves of up to its **3 latest unanswered asks** to
   each friend's device for up to **8 days**, keeps up to **4 sessions it replaced** after logging back in, and keeps a
   retired spare key's secret half for about **10 days** ([section 5](#5-spare-keys)). All of these sit in the encrypted
-  vault, and so in the sealed backup ([section 8](#8-sealed-backups)).
+  vault. The sealed backup ([section 8](#8-sealed-backups)) holds only the asks to people who haven't accepted yet;
+  spares and sessions never go in it.
 - **Quantum resistance:** an attacker who records the handshake and later breaks X25519 still lacks the ML-KEM secret.
 - The **responder speaks first**, and uses the initiator's throwaway key as its first ratchet key.
 - Crossed handshakes (both sides starting at once) are settled by comparing (fingerprint, device id): the lower one wins.
@@ -259,7 +266,7 @@ all come from HKDF over the X25519 exchange between the two friends' identity ke
 and its device id. So:
 
 - the relay cannot work out the slot or open it, and cannot tell whose it is;
-- every spare is padded to **one size (4 KB)**, whatever is inside;
+- every spare is padded to **one size (16 KB)**, whatever is inside (it carries the device's signed card);
 - each slot is read and written on its own connection at random times, so one person's spares are hard to tie together;
 - a spare is **used once**: whoever takes it erases it;
 - an unused spare is replaced every **5 to 10 days**; removing a friend erases yours for them; one nobody updates is
@@ -267,8 +274,9 @@ and its device id. So:
 - Spares are only made for friends whose app says it takes them.
 
 The relay can still see *that* a spare was written, read or erased, and when, and (in Fast mode) the IP address that did
-it. It cannot see who the friends are. The secret half of each spare lives in your encrypted vault, and so also in your
-sealed backup.
+it. It cannot see who the friends are. Each spare is signed by the device's own keys. Its secret half lives in your
+encrypted vault, and **not** in the sealed backup: a copy of the backup must not be able to finish a spare in your
+device's name. A friend who takes a spare the device no longer has is asked for new keys instead.
 
 **When both friends log back in at once.** Each may take the other's spare, so for a moment there are two new
 sessions. Both sides settle on the same one, the spare made by the "lower" side by a fixed comparison both make, as
@@ -283,6 +291,11 @@ ignored.
 **Devices.** One account can run on several devices. They **share the identity keys**, but each device has:
 
 - its own random **device id**;
+- its own long-term **device keys**, Ed25519 and ML-DSA-65 (`DeviceKeys.swift`), made on the device from 32 random
+  bytes that never leave it: they sit in the encrypted data file, sealed again with a key in this device's Keychain only
+  (never synced or backed up), and are left out of the sealed backup and the link bundle. The account signs the
+  device's public keys for its id (the device's *card*), and the device signs every handshake it takes part in
+  ([section 2](#2-the-handshake)). Each persona gets its own pair from the same bytes;
 - its own mailboxes. Each has a secret receive key; senders write to a hash of it, so knowing where to *send* does not
   let anyone *collect*. A fetch does hand the relay the receive keys themselves, and one fetch asks for all of a
   persona's mailboxes together, so the relay can tell roughly how many mailboxes (and so contacts) a persona has;
@@ -291,8 +304,18 @@ ignored.
 People send a copy to each of your devices. What you do on one (send, read, delete) is synced to the others through an
 encrypted session between your own devices.
 
+**Pinned device keys.** Contacts pin each device's keys (a hash of both public keys) the first time a handshake proves
+them, and your other devices are told the pins. A device whose keys later differ from the pinned ones, under the same id
+or a new one, is a **new device**: the chat says "<name>'s account added a new device", and with "Ask before a friend's
+new device gets my messages" on, nothing is sent to it and nothing it sends is read until you allow it. One of your own
+devices with new keys is listed as one to check. So someone who has a copy of a friend's account keys (their recovery
+code) still can't stand in for one of that friend's devices unannounced. Restoring an account from its recovery code
+makes new device keys, so friends see the restored device as new. A data file copied to another device can't open its
+device keys there and makes new ones too. Handshakes without device keys (builds before 17) are not taken.
+
 **Linking a new device.** The logged-in device shows a QR code holding a one-time secret and a mailbox. The new device
-answers with a fresh key. Both screens show six digits to compare; you approve. The account (keys, contacts, groups,
+answers with a fresh key and the pin of its own device keys. Both screens show six digits to compare; you approve. The
+approving device pins the new device's keys from that request, and sends the pins of your devices with the account. The account (keys, contacts, groups,
 personas, settings) is then sent encrypted to that key mixed with the one-time secret. Only the first device to answer a
 code counts. The consequence you should know: **a linked device holds your identity keys.** Losing one is as serious as
 losing the main phone for the identity (though not for past messages, since each device has its own ratchets).
@@ -495,7 +518,7 @@ So that Detach can be instant, the app keeps **one backup** of your account on t
 
 - **What is in it:** your profile, @handles, contacts, groups, personas and settings. **Not** in it: chat history,
   stories, requests, messages still waiting to be sent, any decoy or panic identity, **and (since build 13) any
-  session keys.** A recovered account opens new sessions with every contact (on their spare keys where they left
+  session keys**, nor (since build 17) the device's own keys or its spare keys. A recovered account opens new sessions with every contact (on their spare keys where they left
   one), so mail sent to you while you were detached can't be opened. The one exception is a contact who hasn't
   accepted yet, whose waiting ask has to stay.
 - **How it is sealed:** AES-256-GCM, with a key made from your seed (so only the recovery code can open it). The seed
@@ -516,9 +539,8 @@ Honest limits:
 
 - The backup no longer holds session keys, so a leaked recovery code with a stored copy shows no chat key that was ever
   used. It does show your contacts, groups and settings, and the recovery code on its own is still your whole identity
-  (someone holding it can take over the account and be sent new sessions). It also holds the secret halves of spare keys
-  ([section 2](#2-the-handshake)), which are made ahead and carry no message. Copies of old versions may linger on the
-  relay's disk or in storage snapshots, sealed.
+  (someone holding it can take over the account and be sent new sessions, though every friend sees those come from a new
+  device). Copies of old versions may linger on the relay's disk or in storage snapshots, sealed.
 - The relay can see *when* a backup was saved, its rough size, and (in Fast mode) the IP that saved it.
 
 ## 9. The blob store (big files)

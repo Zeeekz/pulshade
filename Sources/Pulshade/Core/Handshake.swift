@@ -13,9 +13,16 @@ import CryptoKit
 ///
 /// Recording the handshake and later stealing both identity keys, or breaking X25519 with a quantum
 /// computer, still isn't enough to recover the root.
+///
+/// Each side's device also signs its half with its own device keys (`DeviceKey`), and both devices' pins are part of the
+/// transcript the root is salted with, so a session belongs to those two devices and no other: someone with a copy of
+/// the account's keys but not the device's can't open one in that device's name.
 struct SessionInit: Codable, Equatable {
     var ephemeral: Data
     var kem: Data
+    /// The asking device's keys, signed by its account, and its signature over this ask (see `DeviceKey`).
+    var device: DeviceKeyCard? = nil
+    var sig: DeviceSignature? = nil
 }
 
 struct SessionAccept: Codable, Equatable {
@@ -23,6 +30,9 @@ struct SessionAccept: Codable, Equatable {
     var replyTo: Data
     var ephemeral: Data
     var kemCiphertext: Data
+    /// The answering device's keys, signed by its account, and its signature over this answer (see `DeviceKey`).
+    var device: DeviceKeyCard? = nil
+    var sig: DeviceSignature? = nil
 }
 
 /// The initiator's secrets while it waits for an answer. Deleted once the session opens.
@@ -30,6 +40,12 @@ struct PendingHandshake: Codable {
     var ephemeral: Data
     var kemSeed: Data
     var startedAt = Date()
+    /// The pin of this device's keys when it asked: they go into the session's root (see `Handshake`).
+    var pin: Data?
+
+    var publicKem: Data? {
+        (try? MLKEM768.PrivateKey(seedRepresentation: kemSeed, publicKey: nil))?.publicKey.rawRepresentation
+    }
 
     var publicEphemeral: Data? {
         try? Curve25519.KeyAgreement.PrivateKey(rawRepresentation: ephemeral).publicKey.rawRepresentation
@@ -47,7 +63,8 @@ enum Handshake {
     }
 
     /// Responder side. The responder speaks first, using the initiator's ephemeral as its first ratchet key.
-    static func accept(_ request: SessionInit, me: Identity, initiatorAgreement: Data) throws -> (Ratchet, SessionAccept) {
+    static func accept(_ request: SessionInit, me: Identity, initiatorAgreement: Data, initiatorPin: Data,
+                       responderPin: Data) throws -> (Ratchet, SessionAccept) {
         let theirEphemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: request.ephemeral)
         let theirIdentity = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: initiatorAgreement)
         let encapsulation = try MLKEM768.PublicKey(rawRepresentation: request.kem).encapsulate()
@@ -58,7 +75,7 @@ enum Handshake {
             + raw(ephemeral.sharedSecretFromKeyAgreement(with: theirEphemeral))
             + encapsulation.sharedSecret.withUnsafeBytes { Data($0) }
         let root = deriveRoot(ikm, initiatorEphemeral: request.ephemeral, responderEphemeral: ephemeral.publicKey.rawRepresentation,
-                              kem: request.kem, ciphertext: encapsulation.encapsulated)
+                              kem: request.kem, ciphertext: encapsulation.encapsulated, pins: initiatorPin + responderPin)
         let ad = associatedData(initiator: initiatorAgreement, responder: me.card.agreement)
         let ratchet = try Ratchet.sender(root: root, theirRatchet: request.ephemeral, ad: ad)
         return (ratchet, SessionAccept(replyTo: request.ephemeral, ephemeral: ephemeral.publicKey.rawRepresentation,
@@ -66,7 +83,8 @@ enum Handshake {
     }
 
     /// Initiator side, once the answer arrives.
-    static func complete(_ pending: PendingHandshake, _ answer: SessionAccept, me: Identity, responderAgreement: Data) throws -> Ratchet {
+    static func complete(_ pending: PendingHandshake, _ answer: SessionAccept, me: Identity, responderAgreement: Data,
+                         responderPin: Data) throws -> Ratchet {
         let ephemeral = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: pending.ephemeral)
         let kem = try MLKEM768.PrivateKey(seedRepresentation: pending.kemSeed, publicKey: nil)
         let theirEphemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: answer.ephemeral)
@@ -78,15 +96,16 @@ enum Handshake {
             + raw(ephemeral.sharedSecretFromKeyAgreement(with: theirEphemeral))
             + pq.withUnsafeBytes { Data($0) }
         let root = deriveRoot(ikm, initiatorEphemeral: ephemeral.publicKey.rawRepresentation, responderEphemeral: answer.ephemeral,
-                              kem: kem.publicKey.rawRepresentation, ciphertext: answer.kemCiphertext)
+                              kem: kem.publicKey.rawRepresentation, ciphertext: answer.kemCiphertext,
+                              pins: (pending.pin ?? Data()) + responderPin)
         let ad = associatedData(initiator: me.card.agreement, responder: responderAgreement)
         return Ratchet.receiver(root: root, ourRatchet: ephemeral, ad: ad)
     }
 
     private static func deriveRoot(_ ikm: Data, initiatorEphemeral: Data, responderEphemeral: Data,
-                                   kem: Data, ciphertext: Data) -> SymmetricKey {
-        // Salting with the whole public transcript ties the root to this exact exchange.
-        let transcript = Data(SHA256.hash(data: initiatorEphemeral + responderEphemeral + kem + ciphertext))
+                                   kem: Data, ciphertext: Data, pins: Data) -> SymmetricKey {
+        // Salting with the whole public transcript ties the root to this exact exchange, and to the two devices' keys.
+        let transcript = Data(SHA256.hash(data: initiatorEphemeral + responderEphemeral + kem + ciphertext + pins))
         return HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: ikm), salt: transcript, info: info, outputByteCount: 32)
     }
 

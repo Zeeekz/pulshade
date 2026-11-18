@@ -157,8 +157,8 @@ import CryptoKit
     @Test func dataSavedBeforeThePostQuantumRatchetMigratesInPlace() async throws {
         let a = Identity.generate(), b = Identity.generate()
         let (pending, request) = try Handshake.start()
-        var (bob, answer) = try Handshake.accept(request, me: b, initiatorAgreement: a.card.agreement)
-        var alice = try Handshake.complete(pending, answer, me: a, responderAgreement: b.card.agreement)
+        var (bob, answer) = try Handshake.accept(request, me: b, initiatorAgreement: a.card.agreement, initiatorPin: Data(), responderPin: Data())
+        var alice = try Handshake.complete(pending, answer, me: a, responderAgreement: b.card.agreement, responderPin: Data())
         _ = try alice.decrypt(bob.encrypt(Data("open".utf8)))
 
         var data = AppData()

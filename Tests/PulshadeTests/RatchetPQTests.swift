@@ -6,8 +6,8 @@ import CryptoKit
 private func pair() throws -> (alice: Ratchet, bob: Ratchet) {
     let a = Identity.generate(), b = Identity.generate()
     let (pending, request) = try Handshake.start()
-    let (bob, answer) = try Handshake.accept(request, me: b, initiatorAgreement: a.card.agreement)
-    let alice = try Handshake.complete(pending, answer, me: a, responderAgreement: b.card.agreement)
+    let (bob, answer) = try Handshake.accept(request, me: b, initiatorAgreement: a.card.agreement, initiatorPin: Data(), responderPin: Data())
+    let alice = try Handshake.complete(pending, answer, me: a, responderAgreement: b.card.agreement, responderPin: Data())
     return (alice, bob)
 }
 

@@ -6,8 +6,8 @@ import Foundation
 private func pair() throws -> (alice: Ratchet, bob: Ratchet, aliceID: Identity, bobID: Identity) {
     let a = Identity.generate(), b = Identity.generate()
     let (pending, request) = try Handshake.start()
-    let (bob, answer) = try Handshake.accept(request, me: b, initiatorAgreement: a.card.agreement)
-    let alice = try Handshake.complete(pending, answer, me: a, responderAgreement: b.card.agreement)
+    let (bob, answer) = try Handshake.accept(request, me: b, initiatorAgreement: a.card.agreement, initiatorPin: Data(), responderPin: Data())
+    let alice = try Handshake.complete(pending, answer, me: a, responderAgreement: b.card.agreement, responderPin: Data())
     return (alice, bob, a, b)
 }
 
@@ -80,13 +80,13 @@ private func text(_ d: Data) -> String { String(decoding: d, as: UTF8.self) }
     @Test func wrongIdentityCannotCompleteHandshake() throws {
         let a = Identity.generate(), b = Identity.generate(), mallory = Identity.generate()
         let (pending, request) = try Handshake.start()
-        var (bob, answer) = try Handshake.accept(request, me: b, initiatorAgreement: a.card.agreement)
+        var (bob, answer) = try Handshake.accept(request, me: b, initiatorAgreement: a.card.agreement, initiatorPin: Data(), responderPin: Data())
         // Alice thinks she's talking to Mallory: keys won't line up.
-        var alice = try Handshake.complete(pending, answer, me: a, responderAgreement: mallory.card.agreement)
+        var alice = try Handshake.complete(pending, answer, me: a, responderAgreement: mallory.card.agreement, responderPin: Data())
         #expect(throws: (any Error).self) { try alice.decrypt(bob.encrypt(Data("x".utf8))) }
         // A tampered post-quantum ciphertext breaks the session too.
         answer.kemCiphertext[answer.kemCiphertext.startIndex] ^= 1
-        var tampered = try Handshake.complete(pending, answer, me: a, responderAgreement: b.card.agreement)
+        var tampered = try Handshake.complete(pending, answer, me: a, responderAgreement: b.card.agreement, responderPin: Data())
         #expect(throws: (any Error).self) { try tampered.decrypt(bob.encrypt(Data("y".utf8))) }
     }
 

@@ -73,7 +73,7 @@ struct JoinCode {
 
     var text: String {
         let name = Data(String(request.name.prefix(40)).utf8)
-        let raw = secret + request.ephemeral + request.bundleSendID + request.selfSendID + request.deviceID
+        let raw = secret + request.ephemeral + request.bundleSendID + request.selfSendID + request.deviceID + request.keyPin
             + Data([UInt8(name.count)]) + name + Data(relay.utf8)
         return "pshjoin1" + Base32.encode(raw).lowercased()
     }
@@ -91,7 +91,7 @@ struct JoinCode {
         let clean = scannedPayload(text).lowercased()
         guard clean.hasPrefix("pshjoin1"), let decoded = Base32.decode(String(clean.dropFirst(8)).uppercased()) else { return nil }
         let raw = Data(decoded)
-        let fixed = 32 * 4 + 16
+        let fixed = 32 * 4 + 16 + 32
         guard raw.count > fixed else { return nil }
         let nameLength = Int(raw[raw.startIndex + fixed])
         guard raw.count > fixed + 1 + nameLength,
@@ -101,7 +101,7 @@ struct JoinCode {
         secret = raw.subdata(in: 0 ..< 32)
         request = LinkRequest(deviceID: raw.subdata(in: 128 ..< 144), name: name.isEmpty ? "New device" : name,
                               ephemeral: raw.subdata(in: 32 ..< 64), bundleSendID: raw.subdata(in: 64 ..< 96),
-                              selfSendID: raw.subdata(in: 96 ..< 128))
+                              selfSendID: raw.subdata(in: 96 ..< 128), keyPin: raw.subdata(in: 144 ..< 176))
         self.relay = relay
     }
 }
@@ -284,6 +284,8 @@ final class DeviceLinker {
     /// The relay the account arrived through, which this device then keeps using.
     private(set) var relay = AppData.defaultRelay
     let deviceID = Data.random(16)
+    /// The seed of this device's own keys (`DeviceKey`), made here so the request can carry their pin.
+    let deviceKeySeed = Data.random(32)
     let selfMailbox = Mailbox.make()
     private let bundleMailbox = Mailbox.make()
     private let ephemeral = Curve25519.KeyAgreement.PrivateKey()
@@ -294,7 +296,8 @@ final class DeviceLinker {
 
     private var request: LinkRequest {
         LinkRequest(deviceID: deviceID, name: deviceDisplayName, ephemeral: ephemeral.publicKey.rawRepresentation,
-                    bundleSendID: bundleMailbox.sendID, selfSendID: selfMailbox.sendID)
+                    bundleSendID: bundleMailbox.sendID, selfSendID: selfMailbox.sendID,
+                    keyPin: (try? DeviceKey(seed: deviceKeySeed, persona: nil).pin) ?? Data())
     }
 
     /// Uses a code from a logged-in device.

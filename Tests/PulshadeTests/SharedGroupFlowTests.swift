@@ -476,7 +476,7 @@ struct SharedGroupFlowTests {
         #expect(linker.stage == .received)
         let bundle = try #require(linker.bundle)
         let device = testModel("pulshade-shared-linked")
-        try await device.finishLink(bundle, deviceID: linker.deviceID, selfMailbox: linker.selfMailbox,
+        try await device.finishLink(bundle, deviceID: linker.deviceID, deviceKeySeed: linker.deviceKeySeed, selfMailbox: linker.selfMailbox,
                                     relay: linker.relay, passcode: "second-device")
         return device
     }

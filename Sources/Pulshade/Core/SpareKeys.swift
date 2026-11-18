@@ -96,9 +96,9 @@ enum SpareSlot {
     }
 }
 
-/// One spare this device made for a friend, with its secret half. Lives in the vault with the contact (and so in
-/// the sealed backup, which already holds chat keys: a spare that was handed out still works after this device is
-/// recovered).
+/// One spare this device made for a friend, with its secret half. Lives in the vault with the contact, but never in the
+/// sealed backup: it's signed by this device's own keys (`DeviceKey`), and a copy of the backup must not be able to
+/// finish one in this device's name. A friend who takes one this device no longer has is asked for new keys instead.
 struct SpareKey: Codable {
     var handshake: PendingHandshake
     var madeAt = Date()
@@ -115,8 +115,10 @@ struct SpareKey: Codable {
         return SpareSlot.Card(request: SessionInit(ephemeral: ephemeral, kem: kem.publicKey.rawRepresentation), madeAt: madeAt)
     }
 
-    static func make() -> SpareKey? {
-        guard let (handshake, _) = try? Handshake.start() else { return nil }
+    /// `pin`: this device's own keys, which sign the spare when it's left on the relay and go into the session it opens.
+    static func make(pin: Data) -> SpareKey? {
+        guard var (handshake, _) = try? Handshake.start() else { return nil }
+        handshake.pin = pin
         return SpareKey(handshake: handshake)
     }
 }

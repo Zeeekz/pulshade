@@ -133,6 +133,9 @@ struct DeviceLink: Codable {
     /// When something last arrived from this device. One that has been silent for a month while another of the same
     /// person's devices still talks is left out of sending (see `AppModel.isDormant`) until it's heard from again.
     var lastHeard: Date?
+    /// The pin of this device's own keys (`DeviceKeyCard.pin`), taken the first time it proved them in a handshake.
+    /// Keys that differ later make it a new device: said in the chat, and held if you ask before new devices.
+    var keyPin: Data?
 
     init(id: Data = Data(), sendID: Data) {
         self.id = id
@@ -392,6 +395,8 @@ struct LinkRequest: Codable, Equatable {
     var bundleSendID: Data
     /// The new device's mailbox for messages from your other devices.
     var selfSendID: Data
+    /// The pin of the new device's own keys (`DeviceKey`), so the device approving it knows them from the start.
+    var keyPin: Data
 }
 
 /// Someone who found your public profile and wants to talk. Nothing is set up until you accept.
@@ -1401,7 +1406,9 @@ struct AppData: Codable {
     /// (`Contact.pq`, `pqCommit`, `pqCardSent`, `tooOld`).
     /// 22: a ratchet session's post-quantum state no longer waits for the other side's word before mixing a secret in, and
     /// its sending chain can wait to be derived until the first message on it.
-    static let currentFormat = 22
+    /// 23: each device has keys of its own (`deviceKey`), and the keys of every device you know are pinned
+    /// (`DeviceLink.keyPin`). A handshake without device keys isn't taken, so devices on builds before can't talk to this one.
+    static let currentFormat = 23
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []
@@ -1418,6 +1425,9 @@ struct AppData: Codable {
     /// The decoy identity's seed, kept here (inside the real vault) so it can be removed cleanly later.
     /// This device's id, sent with every envelope so people can tell your devices apart.
     var deviceID = Data.random(16)
+    /// The seed of this device's own keys (`DeviceKey`), sealed with a key in this device's Keychain
+    /// (`Vault.sealDeviceSeed`). Never in the backup or anything sent to another device.
+    var deviceKey: Data?
     /// Links you're offering to new devices, waiting for them to scan.
     var linkOffers: [LinkOffer] = []
     /// Chat codes you made whose chats haven't ended yet.
@@ -1530,6 +1540,7 @@ struct AppData: Codable {
         security = try c.decodeIfPresent(SecuritySettings.self, forKey: .security) ?? SecuritySettings()
         decoySeed = try c.decodeIfPresent(Data.self, forKey: .decoySeed)
         deviceID = try c.decodeIfPresent(Data.self, forKey: .deviceID) ?? .random(16)
+        deviceKey = try c.decodeIfPresent(Data.self, forKey: .deviceKey)
         linkOffers = (try? c.decodeIfPresent([LinkOffer].self, forKey: .linkOffers)) ?? []
         chatCodes = (try? c.decodeIfPresent([ChatCodeOffer].self, forKey: .chatCodes)) ?? []
         blobWipes = (try? c.decodeIfPresent([BlobWipe].self, forKey: .blobWipes)) ?? []

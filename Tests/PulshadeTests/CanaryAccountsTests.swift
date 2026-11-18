@@ -186,7 +186,7 @@ struct CanaryAccountsTests {
         let bundle = try #require(linker.bundle)
         let macDir = base.appending(path: "L0-0")
         let mac = open(macDir, tally: tally)
-        try await mac.finishLink(bundle, deviceID: linker.deviceID, selfMailbox: linker.selfMailbox, relay: linker.relay, passcode: "second-device")
+        try await mac.finishLink(bundle, deviceID: linker.deviceID, deviceKeySeed: linker.deviceKeySeed, selfMailbox: linker.selfMailbox, relay: linker.relay, passcode: "second-device")
         mac.data.security.autoLockMinutes = 0
         devices["L0"] = Device(name: "L0", directory: macDir, model: mac, passcode: "second-device")
         // Friends learn of the new device as they hear from the account.

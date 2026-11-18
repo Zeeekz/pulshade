@@ -12,6 +12,8 @@ struct DeviceCard: Codable, Equatable {
     /// A friend's device, between your own devices only: true while it is held ("ask before new devices"), false once
     /// you allowed it on one of them, nil when it was never held (or from an app before this).
     var held: Bool? = nil
+    /// The pin of the device's own keys (`DeviceLink.keyPin`), as the device sending this card has it.
+    var key: Data? = nil
 }
 
 /// How to reach someone: their public keys and the send id of a mailbox they read.

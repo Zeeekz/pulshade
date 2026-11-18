@@ -692,9 +692,9 @@ final class AppModel {
                 continue
             }
             if let card = found[index], Date().timeIntervalSince(card.madeAt) < Self.spareMaxAge,
-               !answeredSpares.contains(card.request.ephemeral) {
+               !answeredSpares.contains(card.request.ephemeral),
+               acceptSession(card.request, contact: i, device: d, spare: true) {
                 answeredSpares.insert(card.request.ephemeral)
-                acceptSession(card.request, contact: i, device: d, spare: true)
                 // A hello of theirs sent before now crossed this answer: it isn't taken (see `.deviceHello`).
                 data.contacts[i].devices[d].spareTakenAt = RelayClock.now
             } else {
@@ -741,11 +741,19 @@ final class AppModel {
             data.contacts[i].oldSpares = (data.contacts[i].oldSpares ?? []) + [retired]
             data.contacts[i].spare = nil
         }
-        if data.contacts[i].spare == nil { data.contacts[i].spare = SpareKey.make() }
-        guard let spare = data.contacts[i].spare, let card = spare.card, let keys = mySpareKeys(contact: i),
-              let sealed = SpareSlot.seal(card, with: keys),
+        let persona = data.contacts[i].persona
+        guard let me = me(persona), let mine = deviceKey(for: persona) else { return }
+        // One made with keys this device no longer has is no use: a new one replaces it.
+        if data.contacts[i].spare?.handshake.pin != mine.card.pin { data.contacts[i].spare = nil }
+        if data.contacts[i].spare == nil { data.contacts[i].spare = SpareKey.make(pin: mine.card.pin) }
+        // Signed by this device's own keys, like any ask for keys.
+        let parties = HandshakeParties(from: me.card.signing, to: data.contacts[i].signingKey, device: deviceID(for: persona))
+        guard let spare = data.contacts[i].spare, var card = spare.card,
+              let signed = try? Handshake.signed(card.request, by: mine.key, card: mine.card, parties) else { return }
+        card.request = signed
+        guard let keys = mySpareKeys(contact: i), let sealed = SpareSlot.seal(card, with: keys),
               let client = client(data.contacts[i].relay, lane: Self.spareLane(keys)) else { return }
-        let fp = data.contacts[i].fingerprint, persona = data.contacts[i].persona, ephemeral = spare.handshake.ephemeral
+        let fp = data.contacts[i].fingerprint, ephemeral = spare.handshake.ephemeral
         save()
         Task { [weak self] in
             let (key, sig, ts) = SpareSlot.proof("pulshade.backup.put.v1", keys, body: sealed)
@@ -967,6 +975,7 @@ final class AppModel {
 
     private func didUnlock() {
         unlockedAt = Date()
+        deviceKeyCache = [:]
         // A decoy keeps no backup on the relay, but says it has one like any account with backups on.
         facadeWipeAfter = nil
         facadeBackupAt = isPrimary ? nil : Date().addingTimeInterval(-Double.random(in: 300...3000))
@@ -1214,6 +1223,7 @@ final class AppModel {
         unreadable = [:]
         resentAt = [:]
         identityCache = [:]
+        deviceKeyCache = [:]
         DecodedImages.forget()
         LinkPreviews.forgetLinked()
         StoryImages.forget()
@@ -1566,7 +1576,7 @@ final class AppModel {
         contact.receiveKey = mailbox.receiveKey
         // Following a channel doesn't make its owner one of your contacts.
         contact.hidden = invite.kind == .channel ? (known?.hidden ?? true) : false
-        guard let (handshake, request) = try? Handshake.start() else { return nil }
+        guard let (handshake, request) = signedHandshake(persona: owner, to: invite.signingKey) else { return nil }
         // The invite names one of their devices' mailboxes; its id arrives with their answer.
         var link = DeviceLink(sendID: invite.sendID)
         link.handshake = handshake
@@ -3373,6 +3383,84 @@ final class AppModel {
     private var identityCache: [UUID: Identity] = [:]
 
     /// The keys for one of your personas. Nil is your main identity.
+    /// This device's own keys and their card signed by the account, by persona ("main" for the main identity). Memory only.
+    @ObservationIgnored private var deviceKeyCache: [String: (key: DeviceKey, card: DeviceKeyCard)] = [:]
+
+    /// The seed of this device's own keys. A new one where the data file has none, or none this device's Keychain opens
+    /// (a file brought from another device, or one restored from the backup): to everyone, that's a new device.
+    private func deviceSeed() -> Data? {
+        if let sealed = data.deviceKey, let seed = vault.openDeviceSeed(sealed) { return seed }
+        let seed = Data.random(32)
+        guard let sealed = try? vault.sealDeviceSeed(seed) else { return nil }
+        data.deviceKey = sealed
+        deviceKeyCache = [:]
+        save()
+        return seed
+    }
+
+    /// This device's own keys as one persona uses them, and their card, signed by that persona for this device's id.
+    func deviceKey(for persona: UUID?) -> (key: DeviceKey, card: DeviceKeyCard)? {
+        let tag = persona?.uuidString ?? "main"
+        if let cached = deviceKeyCache[tag] { return cached }
+        guard let me = me(persona), let seed = deviceSeed(), let key = try? DeviceKey(seed: seed, persona: persona),
+              let card = try? key.card(account: me, device: deviceID(for: persona)) else { return nil }
+        deviceKeyCache[tag] = (key, card)
+        return (key, card)
+    }
+
+    /// A new ask for keys from `persona` to the account with signing key `to`, signed by this device's own keys.
+    private func signedHandshake(persona: UUID?, to: Data) -> (PendingHandshake, SessionInit)? {
+        guard let me = me(persona), let mine = deviceKey(for: persona), var (pending, request) = try? Handshake.start() else { return nil }
+        pending.pin = mine.card.pin
+        let parties = HandshakeParties(from: me.card.signing, to: to, device: deviceID(for: persona))
+        guard let signed = try? Handshake.signed(request, by: mine.key, card: mine.card, parties) else { return nil }
+        return (pending, signed)
+    }
+
+    /// Who a handshake signed by contact `i`'s device `device` is between.
+    private func theirParties(contact i: Int, device: Data) -> HandshakeParties? {
+        guard let me = me(data.contacts[i].persona) else { return nil }
+        return HandshakeParties(from: data.contacts[i].signingKey, to: me.card.signing, device: device)
+    }
+
+    /// The post-quantum keys that sign contact `i`'s devices: theirs as pinned, or your own account's.
+    private func accountPQ(contact i: Int) -> PQPin? {
+        data.contacts[i].pq ?? (data.contacts[i].isSelf ? me(data.contacts[i].persona)?.pq.pin : nil)
+    }
+
+    /// The pin of the keys contact `i`'s device `device` signed an ask with, if they check out. Nil: not taken.
+    private func askerPin(_ request: SessionInit, contact i: Int, device: Data) -> Data? {
+        guard let pq = accountPQ(contact: i), let parties = theirParties(contact: i, device: device) else { return nil }
+        return Handshake.devicePin(of: request, parties, accountPQ: pq)
+    }
+
+    /// The pin of the keys contact `i`'s device `device` signed its answer to `pending` with, if they check out.
+    private func answererPin(_ answer: SessionAccept, to pending: PendingHandshake, contact i: Int, device: Data) -> Data? {
+        guard let pq = accountPQ(contact: i), let parties = theirParties(contact: i, device: device),
+              let kem = pending.publicKem, let mine = pending.pin else { return nil }
+        return Handshake.devicePin(of: answer, parties, accountPQ: pq, askKem: kem, askerPin: mine)
+    }
+
+    /// Pins the keys a device of contact `i` proved in a handshake. Keys other than the ones pinned make it a new device,
+    /// whatever its id: a friend's is said in the chat and held when you ask before new devices; one of your own is listed
+    /// as one to check, as when a device you didn't approve introduces itself.
+    private func pinDeviceKey(_ pin: Data, contact i: Int, device d: Int) {
+        let old = data.contacts[i].devices[d].keyPin
+        guard old != pin else { return }
+        data.contacts[i].devices[d].keyPin = pin
+        let isSelf = data.contacts[i].isSelf
+        if old != nil {
+            if isSelf {
+                data.contacts[i].devices[d].unconfirmed = true
+            } else {
+                if data.security.holdNewDevices { data.contacts[i].devices[d].unconfirmed = true }
+                noteNewDevice(of: data.contacts[i])
+            }
+        }
+        // Your other devices pin it too.
+        if !isSelf { syncContact(data.contacts[i].fingerprint, data.contacts[i].persona) }
+    }
+
     func me(_ persona: UUID?) -> Identity? {
         guard let persona else { return identity }
         if let cached = identityCache[persona] { return cached }
@@ -4064,7 +4152,7 @@ final class AppModel {
         guard identity != nil, !myFingerprints.contains(profile.fingerprint),
               profile.relay == nil || Invite.allowedRelay(profile.relay) != nil else { return nil }
         if let known = contact(profile.fingerprint, in: persona), !known.awaitingAcceptance, !known.hidden { return known }
-        guard let (handshake, request) = try? Handshake.start() else { return nil }
+        guard let (handshake, request) = signedHandshake(persona: persona, to: profile.signingKey) else { return nil }
         let mailbox = Mailbox.make()
         var contact = Contact(fingerprint: profile.fingerprint, name: String(profile.name.prefix(64)), avatar: profile.avatar,
                               signingKey: profile.signingKey, agreementKey: profile.agreementKey, sendID: profile.sendID,
@@ -4095,11 +4183,21 @@ final class AppModel {
                            device: request.device ?? request.card.device ?? Data())
         peer.color = request.card.color
         peer.persona = request.persona
+        var newDevice = false
         if let old = contact(request.fingerprint, in: request.persona) {
             peer.nickname = old.nickname
             peer.addedAt = old.addedAt
             peer.verified = old.verified && old.agreementKey == request.card.agreementKey
             peer.pqCommit = old.pqCommit
+            // Keys pinned for their devices stay pinned: a request is no way round them. A device of theirs with other
+            // keys than before, or one never seen, is a new device like any other.
+            if let same = old.devices.first(where: { !$0.id.isEmpty && $0.id == peer.devices.first?.id }) {
+                peer.devices[0].keyPin = same.keyPin
+                peer.devices[0].unconfirmed = same.unconfirmed
+            } else if !peer.devices.isEmpty, old.devices.contains(where: { $0.keyPin != nil }) {
+                newDevice = true
+                if data.security.holdNewDevices { peer.devices[0].unconfirmed = true }
+            }
         }
         peer.pq = request.card.pq?.verified(signer: request.card.signingKey, agreement: request.card.agreementKey)
         if let pin = peer.pq, !pinMatchesInvite(pin, contact: peer) { peer.pq = nil }
@@ -4108,6 +4206,7 @@ final class AppModel {
         withAnimation(.snappy) { data.requests.removeAll { $0.id == id } }
         sync(.requestResolved(fingerprint: request.fingerprint, persona: request.persona))
         if let i = contactIndex(peer.fingerprint, peer.persona) {
+            if newDevice { noteNewDevice(of: data.contacts[i]) }
             acceptSession(request.handshake, contact: i, device: 0)
         }
         enqueue(.accepted(sendID: mailbox.sendID), to: peer)
@@ -4764,7 +4863,7 @@ final class AppModel {
 
     /// Opens a session with one device, introducing this device at the same time.
     private func startHandshake(contact i: Int, device d: Int) {
-        guard let (handshake, request) = try? Handshake.start() else { return }
+        guard let (handshake, request) = signedHandshake(persona: data.contacts[i].persona, to: data.contacts[i].signingKey) else { return }
         if let earlier = data.contacts[i].devices[d].handshake { keepEarlierAsk(earlier, contact: i, device: d) }
         data.contacts[i].devices[d].handshake = handshake
         data.contacts[i].devices[d].needsKeys = nil
@@ -4798,10 +4897,20 @@ final class AppModel {
     /// Answers a device's handshake. We speak first, so we say who we are straight away. `spare`: the ask is a spare key
     /// they left for us (see `SpareSlot`), so the answer also says which device this is, since they may not know it yet.
     /// `sentAt`: when they sent the ask, by their clock, where it's known.
-    private func acceptSession(_ request: SessionInit, contact i: Int, device d: Int, spare: Bool = false, sentAt: Date? = nil) {
-        guard let me = me(data.contacts[i].persona),
-              let (session, answer) = try? Handshake.accept(request, me: me,
-                                                             initiatorAgreement: data.contacts[i].agreementKey) else { return }
+    /// The ask must carry the asking device's keys, signed by its account, and its own signature over the ask; the keys
+    /// are pinned (`pinDeviceKey`), and the answer is signed by this device's keys in turn. Whether it was answered.
+    @discardableResult
+    private func acceptSession(_ request: SessionInit, contact i: Int, device d: Int, spare: Bool = false, sentAt: Date? = nil) -> Bool {
+        let persona = data.contacts[i].persona
+        guard let me = me(persona), let mine = deviceKey(for: persona),
+              let theirPin = askerPin(request, contact: i, device: data.contacts[i].devices[d].id),
+              let (session, answer) = try? Handshake.accept(request, me: me, initiatorAgreement: data.contacts[i].agreementKey,
+                                                             initiatorPin: theirPin, responderPin: mine.card.pin),
+              let signed = try? Handshake.signed(answer, by: mine.key, card: mine.card,
+                                                 HandshakeParties(from: me.card.signing, to: data.contacts[i].signingKey,
+                                                                  device: deviceID(for: persona)),
+                                                 askKem: request.kem, askerPin: theirPin) else { return false }
+        pinDeviceKey(theirPin, contact: i, device: d)
         // What they wrote on the keys this replaces, still on its way, stays readable for now.
         if let old = data.contacts[i].devices[d].session { keepRecovered(old, sessionKey(contact: i, device: d)) }
         data.contacts[i].devices[d].session = session
@@ -4816,7 +4925,7 @@ final class AppModel {
         data.contacts[i].devices[d].spareTakenAt = nil
         // New keys are in place: no more asking for them because of messages that were read with the old ones.
         unreadable[sessionKey(contact: i, device: d)] = nil
-        seal(spare ? .spareAccept(myDevice(for: i), answer) : .sessionAccept(answer), contact: i, device: d)
+        seal(spare ? .spareAccept(myDevice(for: i), signed) : .sessionAccept(signed), contact: i, device: d)
         let first: Payload = data.contacts[i].isSelf ? .sync(.hello) : profilePayload(data.contacts[i].persona, for: data.contacts[i].fingerprint)
         data.contacts[i].devices[d].pending.insert(PendingPayload(payload: first, message: nil), at: 0)
         // A held friend's device gets the empty opener now; the profile waits with the rest until you allow it.
@@ -4825,6 +4934,7 @@ final class AppModel {
         }
         sendPending(contact: i)
         resendUnconfirmed(contact: i, device: d)
+        return true
     }
 
     /// When each device last had what wasn't confirmed sent again because of new keys. Memory only.
@@ -6622,7 +6732,10 @@ final class AppModel {
                   let invite = data.invites.first(where: { $0.receiveKey == envelope.receiveKey && !$0.isPublic }) else { return .junk }
             guard let pin = card.pq?.verified(signer: signer, agreement: opened.agreement) ?? opened.introduced,
                   contact(fp, in: invite.persona)?.pq == nil || contact(fp, in: invite.persona)?.pq == pin,
-                  pinMatchesInvite(pin, contact: contact(fp, in: invite.persona)) else { return .junk }
+                  pinMatchesInvite(pin, contact: contact(fp, in: invite.persona)),
+                  let mine = self.me(invite.persona),
+                  Handshake.devicePin(of: request, HandshakeParties(from: signer, to: mine.card.signing, device: device), accountPQ: pin) != nil
+            else { return .junk }
             markSeen()
             acceptHello(card, request, fingerprint: fp, device: device, via: invite, pq: pin, sentAt: opened.sentAt)
             noteReads(opened, from: fp, persona: invite.persona)
@@ -6640,7 +6753,9 @@ final class AppModel {
                   let pin = card.pq?.verified(signer: signer, agreement: opened.agreement),
                   contact(fp, in: persona)?.pq == nil || contact(fp, in: persona)?.pq == pin,
                   pinMatchesInvite(pin, contact: contact(fp, in: persona)),
-                  let invite = data.invites.first(where: { $0.receiveKey == envelope.receiveKey && $0.isPublic }) else { return .junk }
+                  let invite = data.invites.first(where: { $0.receiveKey == envelope.receiveKey && $0.isPublic }),
+                  Handshake.devicePin(of: request, HandshakeParties(from: signer, to: me.card.signing, device: device), accountPQ: pin) != nil
+            else { return .junk }
             markSeen()
             // A stranger's card is kept in the vault until answered, so it is held to the sizes a profile may have.
             var kept = card
@@ -6688,7 +6803,8 @@ final class AppModel {
             // A device introducing itself (a new one, or one restarting its session). Signed by the account,
             // so it really is theirs. Every current app names its device: one that doesn't could take over another
             // device's place unannounced.
-            guard card.id == device, !device.isEmpty else { return .junk }
+            // Its own keys must sign it, under a card its account signed for this id: anything else isn't taken.
+            guard card.id == device, !device.isEmpty, askerPin(request, contact: i, device: device) != nil else { return .junk }
             let d = upsertDevice(i, id: card.id, sendID: card.sendID)
             // The same hello again (a relay redelivery) must not replace the session it already opened.
             if data.contacts[i].devices[d].session != nil && data.contacts[i].devices[d].acceptedHello == request.ephemeral {
@@ -6735,8 +6851,10 @@ final class AppModel {
             // asks again on waking, and the answer to the first ask is still the one they hold.
             let asks = [link.handshake].compactMap { $0 } + (link.earlierAsks ?? [])
             guard let pending = asks.first(where: { $0.publicEphemeral == answer.replyTo }),
-                  let session = try? Handshake.complete(pending, answer, me: me,
-                                                        responderAgreement: data.contacts[i].agreementKey) else { return .junk }
+                  let theirPin = answererPin(answer, to: pending, contact: i, device: link.id),
+                  let session = try? Handshake.complete(pending, answer, me: me, responderAgreement: data.contacts[i].agreementKey,
+                                                        responderPin: theirPin) else { return .junk }
+            pinDeviceKey(theirPin, contact: i, device: d)
             if link.handshake?.publicEphemeral != answer.replyTo {
                 // Never older than the answer behind the keys in use.
                 let broken = keysBroken(contact: i, device: d)
@@ -6779,11 +6897,15 @@ final class AppModel {
             // A device of theirs took the spare key this device left for them (see `SpareSlot`) and is already
             // writing on the session it opens. Signed by the account, so it's theirs.
             guard card.id == device, !card.id.isEmpty else { return .junk }
-            let d = upsertDevice(i, id: card.id, sendID: card.sendID)
             let spares = [data.contacts[i].spare].compactMap { $0 } + (data.contacts[i].oldSpares ?? [])
-            guard let used = spares.first(where: { $0.handshake.publicEphemeral == answer.replyTo }),
-                  let session = try? Handshake.complete(used.handshake, answer, me: me,
-                                                        responderAgreement: data.contacts[i].agreementKey) else {
+            let used = spares.first(where: { $0.handshake.publicEphemeral == answer.replyTo })
+            // Signed by the answering device's own keys, under a card its account signed: anything else isn't taken.
+            let theirPin = used.flatMap { answererPin(answer, to: $0.handshake, contact: i, device: device) }
+            if used != nil, theirPin == nil { return .junk }
+            let d = upsertDevice(i, id: card.id, sendID: card.sendID)
+            guard let used, let theirPin,
+                  let session = try? Handshake.complete(used.handshake, answer, me: me, responderAgreement: data.contacts[i].agreementKey,
+                                                        responderPin: theirPin) else {
                 // A spare this device no longer has (it was used already, or the account was recovered from a backup
                 // older than it): what they write on it can't be read here. Ask them for new keys instead, and expect
                 // what they already wrote on it to be unreadable for a while, without asking again over each one.
@@ -6791,6 +6913,7 @@ final class AppModel {
                 if data.contacts[i].devices[d].handshake == nil { startHandshake(contact: i, device: d) }
                 return .handled
             }
+            pinDeviceKey(theirPin, contact: i, device: d)
             // Each spare opens one session. The next one is made and left on the relay soon after.
             if data.contacts[i].spare?.handshake.publicEphemeral == answer.replyTo {
                 data.contacts[i].spare = nil
@@ -7704,7 +7827,7 @@ extension AppModel {
     private func card(of c: Contact) -> ContactCard {
         ContactCard(fingerprint: c.fingerprint, name: c.name, nickname: c.nickname, avatar: c.avatar, banner: c.banner, color: c.color,
                     verified: c.verified, signingKey: c.signingKey, agreementKey: c.agreementKey,
-                    devices: c.devices.map { DeviceCard(id: $0.id, sendID: $0.sendID, held: c.isSelf ? nil : $0.unconfirmed) },
+                    devices: c.devices.map { DeviceCard(id: $0.id, sendID: $0.sendID, held: c.isSelf ? nil : $0.unconfirmed, key: $0.keyPin) },
                     relay: c.relay, hidden: c.hidden,
                     awaitingAcceptance: c.awaitingAcceptance, persona: c.persona, pq: c.pq, pqCommit: c.pqCommit)
     }
@@ -7763,8 +7886,13 @@ extension AppModel {
                         data.contacts[i].devices[d].unconfirmed = true
                     }
                     if device.held == false, data.contacts[i].devices[d].unconfirmed == true { release(contact: i, device: d) }
+                    // Keys another of yours pinned, for a device this one hasn't had a handshake with yet.
+                    if data.contacts[i].devices[d].keyPin == nil, let key = device.key, key.count == 32 {
+                        data.contacts[i].devices[d].keyPin = key
+                    }
                 } else {
                     var link = DeviceLink(id: device.id, sendID: device.sendID)
+                    if let key = device.key, key.count == 32 { link.keyPin = key }
                     // A device new to this one: held if another of yours holds it, or if this one asks before new devices.
                     if device.held == true || (device.held == nil && data.security.holdNewDevices && !data.contacts[i].devices.isEmpty) {
                         link.unconfirmed = true
@@ -7781,7 +7909,12 @@ extension AppModel {
         var c = Contact(fingerprint: card.fingerprint, name: card.name, nickname: card.nickname, avatar: card.avatar,
                         signingKey: card.signingKey, agreementKey: card.agreementKey, sendID: Data(),
                         receiveKey: Mailbox.make().receiveKey, hidden: card.hidden)
-        c.devices = card.devices.map { var link = DeviceLink(id: $0.id, sendID: $0.sendID); link.unconfirmed = $0.held; return link }
+        c.devices = card.devices.map {
+            var link = DeviceLink(id: $0.id, sendID: $0.sendID)
+            link.unconfirmed = $0.held
+            if let key = $0.key, key.count == 32 { link.keyPin = key }
+            return link
+        }
         c.banner = card.banner
         c.color = card.color
         c.verified = card.verified
@@ -8110,7 +8243,7 @@ extension AppModel {
         guard offer.request == nil, Date().timeIntervalSince(offer.createdAt) <= Self.linkOfferLife, let box = try? ChaChaPoly.SealedBox(combined: blob),
               let plain = try? ChaChaPoly.open(box, using: LinkCrypto.requestKey(offer.secret)),
               let request = try? JSONDecoder().decode(LinkRequest.self, from: plain),
-              request.deviceID.count == 16, request.ephemeral.count == 32 else { return }
+              request.deviceID.count == 16, request.ephemeral.count == 32, request.keyPin.count == 32 else { return }
         withAnimation(.snappy) { data.linkOffers[i].request = request }
     }
 
@@ -8127,8 +8260,11 @@ extension AppModel {
         guard let shared = try? ephemeral.sharedSecretFromKeyAgreement(with: theirs) else { return }
 
         let me = data.contacts[selfIndex]
-        let siblings = [DeviceCard(id: data.deviceID, sendID: Mailbox.sendID(for: me.receiveKey ?? Data()), name: deviceDisplayName)]
-            + me.devices.map { DeviceCard(id: $0.id, sendID: $0.sendID, name: $0.name) }
+        // With the keys each one proved, this device's own first, so the new device knows them from the start.
+        guard let mine = deviceKey(for: nil) else { return }
+        let siblings = [DeviceCard(id: data.deviceID, sendID: Mailbox.sendID(for: me.receiveKey ?? Data()), name: deviceDisplayName,
+                                   key: mine.card.pin)]
+            + me.devices.map { DeviceCard(id: $0.id, sendID: $0.sendID, name: $0.name, key: $0.keyPin) }
         let bundle = LinkBundle(seed: identity.seed, profile: data.profile, personas: data.personas,
                                 contacts: data.contacts.filter { !$0.isSelf }.map(card(of:)),
                                 conversations: data.conversations.map(card(of:)),
@@ -8143,6 +8279,9 @@ extension AppModel {
 
         var link = DeviceLink(id: request.deviceID, sendID: request.selfSendID)
         link.name = String(request.name.prefix(60))
+        // The keys the new device made, as its request (which came through the code) named them: its handshake must
+        // prove these, or it shows as a device you didn't approve.
+        link.keyPin = request.keyPin
         // Message history and stories follow once the new device opens its session with this one.
         link.pending = historyForNewDevice().map { PendingPayload(payload: .sync($0), message: nil) }
         data.contacts[selfIndex].devices.removeAll { $0.id == request.deviceID }
@@ -8188,7 +8327,8 @@ extension AppModel {
     // MARK: Becoming a linked device (the new device)
 
     /// Sets this device up as another device of the account in the bundle, then introduces it to everyone.
-    func finishLink(_ bundle: LinkBundle, deviceID: Data, selfMailbox: Mailbox, relay: String, passcode: String) async throws {
+    func finishLink(_ bundle: LinkBundle, deviceID: Data, deviceKeySeed: Data, selfMailbox: Mailbox, relay: String,
+                    passcode: String) async throws {
         guard passcode.count >= LockStyle.minimumLength else { throw PasscodeSetupError.tooShort }
         let identity = try Identity(seed: bundle.seed)
         let vault = vault
@@ -8197,6 +8337,8 @@ extension AppModel {
         slot = 0
         var fresh = AppData()
         fresh.deviceID = deviceID
+        // The keys whose pin the request carried.
+        fresh.deviceKey = try vault.sealDeviceSeed(deviceKeySeed)
         fresh.profile = bundle.profile
         fresh.personas = bundle.personas
         fresh.theme = bundle.theme
@@ -8215,6 +8357,7 @@ extension AppModel {
         me.devices = bundle.siblings.map {
             var link = DeviceLink(id: $0.id, sendID: $0.sendID)
             link.name = $0.name
+            if let key = $0.key, key.count == 32 { link.keyPin = key }
             link.awaitingHello = $0.id == bundle.siblings.first?.id ? true : nil
             return link
         }
@@ -8581,6 +8724,13 @@ extension AppModel {
         // Nor story video still arriving, or the decoy and panic identities, which live only on the device
         // they were set up on.
         kept.clipParts = [:]
+        // Nor this device's own keys, which never leave it, nor the spares they signed: a copy of the backup must not be
+        // able to finish one in this device's name. A recovered account makes new ones, with new keys.
+        kept.deviceKey = nil
+        for c in kept.contacts.indices {
+            kept.contacts[c].spare = nil
+            kept.contacts[c].oldSpares = nil
+        }
         // Nor your own chat background photo: it's big, and the look falls back to the theme's until you set it again.
         kept.chatBackground.photo = nil
         kept.decoySeed = nil

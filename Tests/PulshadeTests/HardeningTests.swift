@@ -82,8 +82,8 @@ import PulshadeShared
         let them = Identity.generate(), me = Identity.generate()
         func ratchet() throws -> Ratchet {
             let (pending, request) = try Handshake.start()
-            let (_, answer) = try Handshake.accept(request, me: them, initiatorAgreement: me.card.agreement)
-            return try Handshake.complete(pending, answer, me: me, responderAgreement: them.card.agreement)
+            let (_, answer) = try Handshake.accept(request, me: them, initiatorAgreement: me.card.agreement, initiatorPin: Data(), responderPin: Data())
+            return try Handshake.complete(pending, answer, me: me, responderAgreement: them.card.agreement, responderPin: Data())
         }
         var known = Contact(fingerprint: them.fingerprint, name: "Kai", signingKey: them.card.signing,
                             agreementKey: them.card.agreement, sendID: Mailbox.make().sendID)

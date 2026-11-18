@@ -189,7 +189,7 @@ struct LinkLoginFlow: View {
         finishing = true
         LockStyle.remembered = style
         Task {
-            try? await model.finishLink(bundle, deviceID: linker.deviceID, selfMailbox: linker.selfMailbox,
+            try? await model.finishLink(bundle, deviceID: linker.deviceID, deviceKeySeed: linker.deviceKeySeed, selfMailbox: linker.selfMailbox,
                                         relay: linker.relay, passcode: passcode)
             finishing = false
         }

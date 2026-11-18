@@ -233,7 +233,7 @@ import PulshadeShared
         #expect(!code.isEmpty)
         var offer = model.data.linkOffers[0]
         offer.request = LinkRequest(deviceID: .random(16), name: "Phone", ephemeral: Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation,
-                                    bundleSendID: .random(32), selfSendID: .random(32))
+                                    bundleSendID: .random(32), selfSendID: .random(32), keyPin: .random(32))
         model.data.linkOffers[0] = offer
         #expect(model.pendingLink != nil)
         model.data.linkOffers[0].createdAt = Date().addingTimeInterval(-AppModel.linkOfferLife - 60)

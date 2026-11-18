@@ -56,6 +56,8 @@ struct Vault {
     private var biometricURL: URL { directory.appendingPathComponent("identity.bio") }
     private var lockKeys: FileKeys { FileKeys(directory: directory, file: "identity.lock") }
     private var biometricKeys: FileKeys { FileKeys(directory: directory, file: "identity.bio") }
+    /// Seals the seed of this device's own keys (`DeviceKey`) inside the data file.
+    private var deviceKeyKeys: FileKeys { FileKeys(directory: directory, file: "device.key") }
 
     var exists: Bool { FileManager.default.fileExists(atPath: lockURL.path) }
 
@@ -387,6 +389,33 @@ struct Vault {
                                        outputByteCount: 32)
     }
 
+    // MARK: Device keys
+
+    /// Seals the seed of this device's own keys with a key kept in this device's Keychain only (never synced, never in
+    /// a backup), made the first time it's needed. A copy of the data file, even with the recovery code, can't open it
+    /// anywhere else, so the device's keys can't be taken along with the account's.
+    func sealDeviceSeed(_ seed: Data) throws -> Data {
+        let key: SymmetricKey
+        if let held = deviceKeyKeys.load().last {
+            key = held
+        } else {
+            key = SymmetricKey(size: .bits256)
+            try deviceKeyKeys.store([key])
+        }
+        return try AES.GCM.seal(seed, using: key, authenticating: Data("pulshade.device.seed.v1".utf8)).combined!
+    }
+
+    /// The seed, or nil where this device's Keychain has no key that opens it (the data file came from somewhere else,
+    /// or the key went with a wipe).
+    func openDeviceSeed(_ sealed: Data) -> Data? {
+        guard let box = try? AES.GCM.SealedBox(combined: sealed) else { return nil }
+        for key in deviceKeyKeys.load().reversed() {
+            if let seed = try? AES.GCM.open(box, using: key, authenticating: Data("pulshade.device.seed.v1".utf8)),
+               seed.count == 32 { return seed }
+        }
+        return nil
+    }
+
     // MARK: Data
 
     /// Each identity's data file is named from its storage key, so names reveal nothing.
@@ -483,7 +512,9 @@ struct Vault {
         if leavingNoTrace {
             lockKeys.forget()
             biometricKeys.forget()
+            deviceKeyKeys.forget()
         } else {
+            if deviceKeyKeys.inUse { deviceKeyKeys.revoke() }
             if exists || lockKeys.inUse { lockKeys.revoke() }
             if hasBiometrics || biometricKeys.inUse { biometricKeys.revoke() }
         }
