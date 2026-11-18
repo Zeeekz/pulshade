@@ -123,7 +123,11 @@ enum HelperStore {
         return true
         #else
         guard var query = base(service, account) else { return false }
-        SecItemDelete(query as CFDictionary)
+        // Update in place first: delete-then-add is not atomic, and a crash (or the extension racing the app)
+        // between them would lose the bundle, a confirmed digest, or an envelope already off the relay.
+        let update = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if update == errSecSuccess { return true }
+        guard update == errSecItemNotFound else { return false }
         query[kSecValueData as String] = data
         query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         query[kSecAttrSynchronizable as String] = false

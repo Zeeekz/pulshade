@@ -15,7 +15,10 @@ struct Identity {
 
     static func generate() -> Identity {
         var bytes = Data(count: 32)
-        let status = bytes.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+        let status = bytes.withUnsafeMutableBytes { buffer in
+            guard let base = buffer.baseAddress else { return errSecParam }
+            return SecRandomCopyBytes(kSecRandomDefault, buffer.count, base)
+        }
         precondition(status == errSecSuccess, "System random generator failed")
         return try! Identity(seed: bytes)
     }

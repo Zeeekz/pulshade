@@ -201,8 +201,13 @@ final class ClipLoader: NSObject, AVAssetResourceLoaderDelegate, @unchecked Send
         // AVFoundation often asks for "everything to the end" and then reads only the start it needs, cancelling the
         // rest. Answering that in one go on this queue held everything up (and copied a whole big video) before it
         // could say it had enough. So the bytes go out in pieces from another queue, stopping when it cancels.
-        let start = Int(wanted.requestedOffset)
-        let end = wanted.requestsAllDataToEndOfResource ? bytes.count : min(bytes.count, start + wanted.requestedLength)
+        // AVFoundation parses a clip that came from someone else, so its offsets can't be trusted: clamp them
+        // rather than trapping on a negative or overflowing range.
+        let start = Int(max(0, min(wanted.requestedOffset, Int64(bytes.count))))
+        let length = max(0, Int(clamping: wanted.requestedLength))
+        let end = wanted.requestsAllDataToEndOfResource
+            ? bytes.count
+            : start + min(length, bytes.count - start)
         let bytes = bytes
         Self.sender.async {
             var offset = start

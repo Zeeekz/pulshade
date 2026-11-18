@@ -190,8 +190,11 @@ struct StoryTrimBar: View {
         for await result in generator.images(for: times) {
             guard !Task.isCancelled else { return }
             guard let image = try? result.image else { continue }
-            let i = Int((result.requestedTime.seconds / step).rounded(.down))
-            if (0..<Self.frameCount).contains(i) { frames[i] = image }
+            // A malformed clip can report a non-finite time; converting that to Int would trap.
+            guard step > 0, result.requestedTime.seconds.isFinite else { continue }
+            let index = (result.requestedTime.seconds / step).rounded(.down)
+            guard index >= 0, index < Double(Self.frameCount) else { continue }
+            frames[Int(index)] = image
         }
     }
 }

@@ -1,5 +1,8 @@
 import Foundation
 import CryptoKit
+#if canImport(PulshadeShared)
+import PulshadeShared
+#endif
 #if os(iOS)
 import UIKit
 #endif
@@ -97,11 +100,13 @@ struct JoinCode {
         guard raw.count > fixed else { return nil }
         let nameLength = Int(raw[raw.startIndex + fixed])
         guard raw.count > fixed + 1 + nameLength,
-              let name = String(data: raw.subdata(in: fixed + 1 ..< fixed + 1 + nameLength), encoding: .utf8),
               let relay = Invite.allowedRelay(String(data: raw.subdata(in: fixed + 1 + nameLength ..< raw.count), encoding: .utf8)),
               (try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: raw.subdata(in: 32 ..< 64))) != nil else { return nil }
+        // The name is shown in a security-approval sheet, so strip hidden characters and clamp it like any label.
+        let shown = String(data: raw.subdata(in: fixed + 1 ..< fixed + 1 + nameLength), encoding: .utf8) ?? ""
+        let name = ProfileLinkKind.cleanLabel(shown).flatMap { $0.isEmpty ? nil : $0 } ?? "New device"
         secret = raw.subdata(in: 0 ..< 32)
-        request = LinkRequest(deviceID: raw.subdata(in: 128 ..< 144), name: name.isEmpty ? "New device" : name,
+        request = LinkRequest(deviceID: raw.subdata(in: 128 ..< 144), name: name,
                               ephemeral: raw.subdata(in: 32 ..< 64), bundleSendID: raw.subdata(in: 64 ..< 96),
                               selfSendID: raw.subdata(in: 96 ..< 128), keyPin: raw.subdata(in: 144 ..< 176))
         self.relay = relay
@@ -115,7 +120,8 @@ struct ChatLink: Equatable {
     var endsAt: Date
 
     var text: String {
-        let seconds = UInt64(endsAt.timeIntervalSince1970)
+        // A negative or out-of-range date would trap the conversion; such a link can't be made anyway.
+        let seconds = UInt64(max(0, endsAt.timeIntervalSince1970))
         return "pshchat1" + Base32.encode(withUnsafeBytes(of: seconds.bigEndian) { Data($0) } + Data(invite.utf8)).lowercased()
     }
 
@@ -132,7 +138,12 @@ struct ChatLink: Equatable {
               raw.count > 8 else { return nil }
         let bytes = Data(raw)
         let seconds = bytes.prefix(8).reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
-        guard let invite = String(data: bytes.dropFirst(8), encoding: .utf8), Invite(code: invite)?.kind == .contact else { return nil }
+        // A link decides when its chat ends, and it comes from someone else: keep it within a plausible window
+        // (an already-expired one still parses so it can say so; one years away is refused) instead of trusting
+        // whatever it claims.
+        let now = UInt64(Date().timeIntervalSince1970)
+        guard seconds <= now + 8 * 24 * 60 * 60,
+              let invite = String(data: bytes.dropFirst(8), encoding: .utf8), Invite(code: invite)?.kind == .contact else { return nil }
         self.invite = invite
         endsAt = Date(timeIntervalSince1970: TimeInterval(seconds))
     }

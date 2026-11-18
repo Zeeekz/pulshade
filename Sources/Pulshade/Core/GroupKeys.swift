@@ -154,7 +154,8 @@ struct SenderChain: Codable, Equatable {
 
     /// The key for message `index`, and the chain after it.
     func step() -> (messageKey: Data, next: SenderChain) {
-        (hmac(key, 1), SenderChain(key: hmac(key, 2), index: index + 1))
+        // Never trap on an exhausted counter. 2^32 messages on one chain is unreachable in practice.
+        (hmac(key, 1), SenderChain(key: hmac(key, 2), index: index == .max ? index : index + 1))
     }
 }
 

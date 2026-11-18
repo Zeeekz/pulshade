@@ -554,6 +554,8 @@ struct ConversationView: View {
                                     .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Ink.line))
                                     .overlay(alignment: .topTrailing) {
                                         Button {
+                                            // `i` comes from a ForEach snapshot; a second tap can outlive a removal.
+                                            guard attachments.indices.contains(i) else { return }
                                             withAnimation(.snappy) { _ = attachments.remove(at: i) }
                                         } label: { Image(systemName: "xmark") }
                                             .buttonStyle(IconButtonStyle(size: 22)).offset(x: 6, y: -6)
@@ -721,6 +723,8 @@ struct ConversationView: View {
             videoDraft = nil
             return
         } else if attachments.isEmpty {
+            // Nothing but spaces: don't wipe the draft for a message that won't be sent.
+            if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return }
             model.send(draft, replyTo: replyingTo, preview: preview, mentioning: picks, in: id)
         } else {
             for (i, photo) in attachments.enumerated() {

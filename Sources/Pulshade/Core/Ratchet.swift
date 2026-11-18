@@ -131,7 +131,12 @@ struct Ratchet: Codable {
     static let maxSkip: UInt32 = 1000
     private static let maxStoredSkipped = 2000
     /// Tests move the clock.
+    #if DEBUG
+    /// Tests set this; a shipped build reads the clock directly and holds no mutable global here.
     nonisolated(unsafe) static var now: () -> Date = Date.init
+    #else
+    static let now: () -> Date = Date.init
+    #endif
 
     private init(dhs: Data, dhr: Data?, rk: Data, cks: Data?, ad: Data) {
         self.dhs = dhs
@@ -244,7 +249,8 @@ struct Ratchet: Codable {
     /// Keeps keys for messages that haven't arrived yet, so they can still be read out of order.
     private mutating func skip(until n: UInt32) throws {
         guard let start = ckr else { return }
-        guard n <= nr + Self.maxSkip else { throw RatchetError.tooManySkipped }
+        // Subtracting rather than adding to an attacker-influenced counter, so a huge `n` can't overflow.
+        if n > nr, n - nr > Self.maxSkip { throw RatchetError.tooManySkipped }
         var ck = start
         while nr < n {
             let (next, mk) = Self.kdfChain(ck)
@@ -276,7 +282,7 @@ struct Ratchet: Codable {
                 throw RatchetError.decryptFailed
             }
             receiving += Self.pqInput(secret, transcript: transcript, epoch: epoch)
-            q.takeEpoch += 1
+            q.takeEpoch &+= 1
             q.takeParts = []
             q.takeBlob = nil
             q.takeNext = 0
@@ -301,7 +307,7 @@ struct Ratchet: Codable {
         if let secret = q.offerSecret, let transcript = q.offerTranscript {
             sending += Self.pqInput(secret, transcript: transcript, epoch: q.offerEpoch)
             sendMix = q.offerEpoch
-            q.offerEpoch += 1
+            q.offerEpoch &+= 1
             q.offerSeed = nil
             q.offerNext = 0
             q.offerParts = []

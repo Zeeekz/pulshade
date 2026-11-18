@@ -102,8 +102,13 @@ final class CallMedia: @unchecked Sendable {
 
     init?(relay: String, invite: CallInvite, caller: Bool, withAudio: Bool, onEvent: @escaping @MainActor (Event) -> Void) {
         guard var parts = URLComponents(string: relay) else { return nil }
-        // Case-insensitive, so `HTTPS://…` can't fall through to an unencrypted `ws`.
-        parts.scheme = parts.scheme?.lowercased() == "https" ? "wss" : "ws"
+        // Fail closed: only a plain-http relay (local or onion, already vetted by `Invite.allowedRelay`) may
+        // become an unencrypted `ws`. Anything unexpected is refused rather than silently downgraded.
+        switch parts.scheme?.lowercased() ?? "" {
+        case "https", "wss": parts.scheme = "wss"
+        case "http", "ws": parts.scheme = "ws"
+        default: return nil
+        }
         parts.path = (parts.path.hasSuffix("/") ? String(parts.path.dropLast()) : parts.path) + "/v1/call/" + invite.room.hex
         // Each call on its own lane, so over Tor it gets its own circuit.
         guard let url = parts.url, let config = try? RelayClient.configuration(for: url, lane: "call|" + invite.room.hex) else { return nil }
@@ -216,7 +221,11 @@ final class CallMedia: @unchecked Sendable {
             let first = !heard
             heard = true
             lastHeard = Date()
-            if opened.0 == .audio && !withAudio { received.append(opened.1) }
+            if opened.0 == .audio && !withAudio {
+                // Only tests without audio use this; bound it so a participant can't grow it without limit.
+                received.append(opened.1)
+                if received.count > 64 { received.removeFirst(received.count - 64) }
+            }
             // They're still saying hello, so they haven't heard us yet: answer.
             let reply = opened.0 == .hello && answered < 20
             if reply { answered += 1 }

@@ -87,8 +87,9 @@ struct BurnOrderStore {
     var service: String
 
     private func key(create: Bool) -> SymmetricKey? {
+        // Never synced or restored to another device: this order can erase an account, so it must stay here.
         let match: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
-                                    kSecAttrAccount as String: "key"]
+                                    kSecAttrAccount as String: "key", kSecAttrSynchronizable as String: false]
         var query = match
         query[kSecReturnData as String] = true
         var found: AnyObject?

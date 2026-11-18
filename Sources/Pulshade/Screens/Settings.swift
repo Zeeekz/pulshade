@@ -1565,7 +1565,8 @@ private struct NetworkSettings: View {
 
     private static func ago(_ date: Date?, suffix: String = " ago") -> String {
         guard let date else { return "Not yet" }
-        let seconds = Int(Date().timeIntervalSince(date))
+        // Clamp before converting: a far-future date would not fit an Int and would trap.
+        let seconds = Int(min(max(Date().timeIntervalSince(date), 0), 1_000_000_000_000))
         if seconds < 5 { return "Just now" }
         if seconds < 60 { return "\(seconds) s" + suffix }
         if seconds < 3600 { return "\(seconds / 60) min" + suffix }

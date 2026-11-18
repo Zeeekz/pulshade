@@ -145,6 +145,9 @@ enum StoryImages {
     static func image(id: UUID, data: Data) -> PlatformImage? {
         let key = "\(id.uuidString)-\(data.count)" as NSString
         if let hit = cache.object(forKey: key) { return hit }
+        // A story comes from a contact: a tiny file may declare an enormous picture. Cap it before decoding,
+        // like every other received image.
+        guard ImageLimits.isReasonable(data) else { return nil }
         #if os(iOS)
         guard let raw = UIImage(data: data) else { return nil }
         let image = raw.preparingForDisplay() ?? raw
@@ -1971,16 +1974,19 @@ struct StoryViewer: View {
         clip = nil
         clock.progress = 0
         turnsForward = d > 0
+        // Take the next reel now, while the check above still holds: a second call during the sleep below
+        // would otherwise pass the same guard and drain an empty queue.
+        let next = d > 0 ? upcoming.removeFirst() : previousReels.removeLast()
         Task { @MainActor in
             // A moment for the direction to be drawn, then the change itself.
             try? await Task.sleep(for: .milliseconds(30))
             withAnimation(reduceMotion ? .easeInOut(duration: 0.2) : .smooth(duration: 0.45)) {
                 if d > 0 {
                     previousReels.append(reel)
-                    reel = upcoming.removeFirst()
+                    reel = next
                 } else {
                     upcoming.insert(reel, at: 0)
-                    reel = previousReels.removeLast()
+                    reel = next
                 }
                 gone = []
                 index = reel.firstIndex { !$0.seen } ?? 0

@@ -185,14 +185,29 @@ enum Bridges: String, CaseIterable, Codable {
             key = SymmetricKey(size: .bits256)
             try keys.store([key])
         }
-        let sealed = try AES.GCM.seal(JSONEncoder().encode(choice), using: key).combined!
+        guard let sealed = try AES.GCM.seal(JSONEncoder().encode(choice), using: key).combined else { return }
+        // This file names the bridges a censored network relies on, so keep it out of backups and, on iPhone, unreadable
+        // while the phone is locked until first unlock. It can be written before any vault exists, so it can't rely
+        // on the vault's folder settings.
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        var folder = file.deletingLastPathComponent()
+        try? folder.setResourceValues(values)
+        #if os(iOS)
+        try sealed.write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+        #else
         try sealed.write(to: file, options: [.atomic])
+        #endif
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
     }
 
     /// For Burn: the file, its Keychain key and any copy in the old preferences go.
     static func forget() {
         lock.withLock { cached = Saved() }
+        // Overwrite before removing: a plain delete leaves the sealed bytes to be recovered.
+        if let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize, size > 0, size <= 1_000_000 {
+            try? Data.random(size).write(to: file)
+        }
         try? FileManager.default.removeItem(at: file)
         keys.forget()
         UserDefaults.standard.removeObject(forKey: "pulshade.bridges")

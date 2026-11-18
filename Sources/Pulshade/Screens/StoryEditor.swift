@@ -64,7 +64,9 @@ struct StoryTextItem: View {
 
     var body: some View {
         let size = canvas.width * item.size
-        let ink = StoryInk.colors[item.color % StoryInk.colors.count]
+        let ink = StoryInk.colors[item.color < 0 ? (item.color % StoryInk.colors.count + StoryInk.colors.count)
+                                                   % StoryInk.colors.count
+                                                 : item.color % StoryInk.colors.count]
         let shown = item.text.isEmpty ? (hint ? "Type here" : "") : item.text
         let words = Text(shown)
             .font(item.face.font(size: size))
@@ -429,7 +431,9 @@ struct StoryTypingOverlay: View {
     /// it, so the block doesn't change shape when typing ends.
     private func field(_ item: StoryTextOverlay) -> some View {
         let size = canvasWidth * item.size
-        let ink = StoryInk.colors[item.color % StoryInk.colors.count]
+        let ink = StoryInk.colors[item.color < 0 ? (item.color % StoryInk.colors.count + StoryInk.colors.count)
+                                                   % StoryInk.colors.count
+                                                 : item.color % StoryInk.colors.count]
         // A trailing new line still takes a line of its own, as it does in the field.
         let measured = item.text.isEmpty ? "Type here" : item.text.hasSuffix("\n") ? item.text + " " : item.text
         return WidthLimit(limit: canvasWidth * 0.86) {
@@ -517,8 +521,11 @@ struct VerticalSlider: View {
     var range: ClosedRange<Double>
 
     var body: some View {
+        let span = range.upperBound - range.lowerBound
+        // A degenerate or non-finite range must not produce NaN/∞, which would trap the percentage below.
+        let t = span > 0 && value.isFinite ? min(max((value - range.lowerBound) / span, 0), 1) : 0
+        let percent = Int((t * 100).rounded())
         GeometryReader { geo in
-            let t = (value - range.lowerBound) / (range.upperBound - range.lowerBound)
             ZStack(alignment: .bottom) {
                 Capsule().fill(.white.opacity(0.3)).frame(width: 4)
                 Circle().fill(.white).frame(width: 22, height: 22)
@@ -533,7 +540,7 @@ struct VerticalSlider: View {
             })
         }
         .accessibilityElement()
-        .accessibilityValue("\(Int((value - range.lowerBound) / (range.upperBound - range.lowerBound) * 100)) percent")
+        .accessibilityValue("\(percent) percent")
         .accessibilityAdjustableAction { direction in
             let step = (range.upperBound - range.lowerBound) / 10
             value = min(max(value + (direction == .increment ? step : -step), range.lowerBound), range.upperBound)

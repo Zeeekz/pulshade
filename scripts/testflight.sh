@@ -7,6 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 build=${1:?Give the build number, higher than the last upload: ./scripts/testflight.sh 2}
+[[ "$build" =~ ^[0-9]+$ ]] || { echo "Build number must be a positive integer: $build"; exit 1; }
 [[ -f ios/Local.xcconfig ]] || { echo "Put your signing team in ios/Local.xcconfig: DEVELOPMENT_TEAM = <team id>"; exit 1; }
 
 # Friends' phones use the same relay the install script points a phone at.
@@ -19,6 +20,11 @@ pin="${PULSHADE_RELAY_PIN:-$(cat relay/relay-pin 2>/dev/null)}"
 direct="${PULSHADE_RELAY_DIRECT:-$(cat relay/direct-address 2>/dev/null)}"
 [[ -n "$pin" ]] || { echo "No relay pin (relay/relay-pin or PULSHADE_RELAY_PIN): refusing to upload a release without it."; exit 1; }
 [[ -n "$direct" ]] || { echo "No direct address (relay/direct-address or PULSHADE_RELAY_DIRECT): refusing to upload a release without it."; exit 1; }
+# A release with no admin/pet key would ship with collectible and report authenticity checks silently off.
+admin_key="${PULSHADE_ADMIN_KEY:-$(cat relay/admin-key.pub 2>/dev/null)}"
+pet_key="${PULSHADE_PET_KEY:-$(cat relay/pet-key.pub 2>/dev/null)}"
+[[ -n "$admin_key" ]] || { echo "No admin key (relay/admin-key.pub or PULSHADE_ADMIN_KEY): refusing to ship without it."; exit 1; }
+[[ -n "$pet_key" ]] || { echo "No pet key (relay/pet-key.pub or PULSHADE_PET_KEY): refusing to ship without it."; exit 1; }
 
 out=build/testflight
 rm -rf "$out"; mkdir -p "$out"
@@ -32,15 +38,13 @@ xcodebuild -project Pulshade.xcodeproj -scheme PulshadeiOS -configuration Releas
   -allowProvisioningUpdates CURRENT_PROJECT_VERSION="$build" \
   PULSHADE_RELAY="$relay" PULSHADE_RELAY_DIRECT="$direct" \
   PULSHADE_RELAY_PIN="$pin" \
-  PULSHADE_ADMIN_KEY="$(cat relay/admin-key.pub 2>/dev/null)" PULSHADE_PET_KEY="$(cat relay/pet-key.pub 2>/dev/null)" \
-  archive | grep -E "error:|ARCHIVE (SUCCEEDED|FAILED)"
+  PULSHADE_ADMIN_KEY="$admin_key" PULSHADE_PET_KEY="$pet_key" \
+  archive | tee "$out/archive.log" | grep -E "error:|ARCHIVE (SUCCEEDED|FAILED)"
 
 # Nothing that names you may leave this Mac: check the app before it goes up. It looks for your home folder, your
 # account name, and any words you list one per line in ios/name-check.txt (kept out of git).
 app="$out/Pulshade.xcarchive/Products/Applications/Pulshade.app"
-names="/Users/"
-[[ -n "${USER:-}" ]] && names="$names|(^|[^a-z])${USER}([^a-z]|$)"
-[[ -f ios/name-check.txt ]] && names="$names|$(grep -v '^$' ios/name-check.txt | paste -sd '|' -)"
+
 # The whole app, not just its program: its property lists, assets and anything else in the bundle. Not its signing,
 # though: the certificate and provisioning profile carry the developer account's name, which an individual account
 # can't avoid and TestFlight shows anyway, and Apple re-signs the app and drops the profile before testers get it.
@@ -53,7 +57,24 @@ find "$check" -name _CodeSignature -type d -prune -exec rm -rf {} +
 find "$check" -type f -print0 | while IFS= read -r -d '' f; do
   file -b "$f" | grep -q '^Mach-O' && codesign --remove-signature "$f" 2>/dev/null || true
 done
-found=$(grep -rlaiE "$names" "$check" 2>/dev/null | sed "s#$check/##" || true)
+# Literal strings, one per run: a username or a listed word must not be read as a regular expression.
+names=("/Users/")
+[[ -n "${USER:-}" ]] && names+=("$USER")
+if [[ -f ios/name-check.txt ]]; then
+  while IFS= read -r n; do [[ -n "$n" ]] && names+=("$n"); done < ios/name-check.txt
+fi
+found=""
+for name in "${names[@]}"; do
+  [[ -z "$name" ]] && continue
+  # A read error matters here: it could hide a leak, so it is not swallowed. Exit 1 is just "no match".
+  if hits=$(grep -rlaiF -- "$name" "$check"); then
+    found+="${hits//$check\//}"$'\n'
+  else
+    status=$?
+    [[ $status -eq 1 ]] || { echo "Name check couldn't read the app (grep exited $status)."; exit 1; }
+  fi
+done
+found=$(printf '%s' "$found" | sort -u | sed '/^$/d')
 rm -rf "$out/name-check"
 if [[ -n "$found" ]]; then
   echo "Found your name or home folder inside the app, in these files. Not uploading:"

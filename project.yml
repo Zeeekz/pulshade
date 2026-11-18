@@ -48,6 +48,12 @@ targets:
             ""|http://?*|https://?*) ;;
             *) echo "error: PULSHADE_RELAY must be an http(s) URL: $PULSHADE_RELAY"; exit 1 ;;
           esac
+          if [ "$CONFIGURATION" = "Release" ]; then
+            # Without these a release ships unpinned, or with collectible/report authenticity checks silently off.
+            [ -n "$PULSHADE_RELAY_PIN" ] || { echo "error: PULSHADE_RELAY_PIN is empty; a release build must pin its relay."; exit 1; }
+            [ -n "$PULSHADE_ADMIN_KEY" ] || { echo "error: PULSHADE_ADMIN_KEY is empty; a release build must carry it."; exit 1; }
+            [ -n "$PULSHADE_PET_KEY" ] || { echo "error: PULSHADE_PET_KEY is empty; a release build must carry it."; exit 1; }
+          fi
     # Push: Xcode swaps "development" for "production" when it signs a build for TestFlight or the App Store.
     entitlements:
       path: ios/Pulshade.entitlements
@@ -88,8 +94,8 @@ targets:
         # fetch: iOS wakes the app now and then to check for announcements (AnnouncementWatch).
         UIBackgroundModes: [audio, fetch, voip, remote-notification]
         BGTaskSchedulerPermittedIdentifiers: [app.pulshade.ios.announcements, app.pulshade.ios.upload]
-        NSFaceIDUsageDescription: Unlock PULSHADE with Face ID.
-        NSLocalNetworkUsageDescription: Reach a PULSHADE relay running on your own network.
+        NSFaceIDUsageDescription: Unlock Pulshade with Face ID.
+        NSLocalNetworkUsageDescription: Reach a Pulshade relay running on your own network.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
           # An onion relay can use plain http: Tor already encrypts it end to end.

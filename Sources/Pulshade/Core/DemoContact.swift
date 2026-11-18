@@ -3,13 +3,15 @@ import Foundation
 
 /// A copy of Pulshade on a Mac that acts as a contact who always answers, for App Review to chat with.
 ///
-/// On only when launched with `PULSHADE_DEMO_CONTACT=1` (with `PULSHADE_PROFILE` keeping its identity apart from yours).
+/// On only when launched with `PULSHADE_DEMO_CONTACT=1` and `PULSHADE_PROFILE=review`, so the real profile can never
+/// be put into demo mode.
 /// It takes every friend request, says hello once, answers every message in a one-to-one chat after a moment, says
 /// hello once in a group it joins and answers there only when mentioned, turns calls down, and never locks itself.
 /// Nothing in the app shows it, and nothing but ordinary Pulshade messages leaves the Mac.
 @MainActor
 final class DemoContact {
     static let isOn = ProcessInfo.processInfo.environment["PULSHADE_DEMO_CONTACT"] == "1"
+        && ProcessInfo.processInfo.environment["PULSHADE_PROFILE"] == "review"
     static let shared = DemoContact()
 
     static let welcome = "Hi! I'm the Pulshade demo contact. Messages between us are end-to-end encrypted. "

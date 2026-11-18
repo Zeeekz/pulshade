@@ -415,7 +415,10 @@ private struct ProfileSharedLinks: View {
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Ink.line))
         .confirmationDialog("Leave Pulshade?", isPresented: Binding(get: { asking != nil }, set: { if !$0 { asking = nil } }),
                             presenting: asking) { p in
-            Button("Open \(domain(p))") { if let url = URL(string: p.url) { Platform.open(url) } }
+            Button("Open \(domain(p))") {
+                // A preview's URL comes from the other side: only web links may leave the app, exactly as in a chat.
+                if let url = LinkPreviews.openable(URL(string: p.url)) { Platform.open(url) }
+            }
             Button("Cancel", role: .cancel) {}
         } message: { p in
             Text("This goes to \(domain(p)). Pulshade can't protect you there.")

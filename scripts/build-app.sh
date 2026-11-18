@@ -16,16 +16,22 @@ if [[ "$config" != "debug" ]]; then
     *) echo "No usable relay: relay/pulshade-onion/hostname is missing. A release build would have no relay." >&2; exit 1 ;;
   esac
 fi
-[[ -n "${PULSHADE_RELAY_PIN:-$(cat relay/relay-pin 2>/dev/null)}" ]] \
-  || echo "Warning: no relay pin (relay/relay-pin or PULSHADE_RELAY_PIN): this build won't pin the relay's certificate." >&2
+pin="${PULSHADE_RELAY_PIN:-$(cat relay/relay-pin 2>/dev/null)}"
+if [[ -z "$pin" ]]; then
+  if [[ "$config" != "debug" ]]; then
+    echo "No relay pin (relay/relay-pin or PULSHADE_RELAY_PIN): a release build without one trusts any certificate." >&2
+    exit 1
+  fi
+  echo "Warning: no relay pin: this debug build won't pin the relay's certificate." >&2
+fi
 
-[[ -n ${PULSHADE_SKIP_TOR_BUILD:-} ]] || # PULSHADE_SKIP_TOR_BUILD=1 uses Tor as last built, when tor/ hasn't changed since.
 [[ -n ${PULSHADE_SKIP_TOR_BUILD:-} ]] || ./scripts/build-tor.sh
 swift build -c "$config"
 bin="$(swift build -c "$config" --show-bin-path)/Pulshade"
 
 # Every build gets a higher number than the last, so the updater knows which is newer.
 build_number=${PULSHADE_BUILD:-$(date -u +%Y%m%d%H%M)}
+[[ "$build_number" =~ ^[0-9]{1,18}$ ]] || { echo "PULSHADE_BUILD must be a number: $build_number" >&2; exit 1; }
 
 app=build/Pulshade.app
 rm -rf "$app"

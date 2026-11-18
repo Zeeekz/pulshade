@@ -896,11 +896,14 @@ struct RelayClient {
 
     /// Lets go of a handle held for this key before its three months are up.
     func unhold(_ handle: String, key: String, sig: String, ts: UInt64) async throws {
+        // The handle comes from the relay's own `v1/held` answer, so it must not be trusted as a path segment.
+        guard let handle = DirectoryProfile.validHandle(handle) else { throw URLError(.badURL) }
         struct Proof: Encodable { var key: String; var sig: String; var ts: UInt64 }
         _ = try await post("v1/dir/\(handle)/unhold", JSONEncoder().encode(Proof(key: key, sig: sig, ts: ts)))
     }
 
     func release(_ handle: String, sig: String, ts: UInt64) async throws {
+        guard let handle = DirectoryProfile.validHandle(handle) else { throw URLError(.badURL) }
         struct Removal: Encodable { var sig: String; var ts: UInt64 }
         _ = try await post("v1/dir/\(handle)/delete", JSONEncoder().encode(Removal(sig: sig, ts: ts)))
     }
@@ -1073,8 +1076,13 @@ extension RelayClient {
         let status = (response as? HTTPURLResponse)?.statusCode
         if status == 404 { return nil }
         guard status == 200, let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let size = object["size"] as? Int, let complete = object["complete"] as? Bool else { throw URLError(.badServerResponse) }
-        let bytes = Data(hexString: object["have"] as? String ?? "") ?? Data()
+              let size = object["size"] as? Int, size >= 0, size <= BlobCrypto.maxFile,
+              let complete = object["complete"] as? Bool else { throw URLError(.badServerResponse) }
+        // A 100 MB file is ~100 pieces, so the bitmap is a handful of bytes. Cap it before decoding: an
+        // oversized string would otherwise turn into millions of Set inserts.
+        let have = object["have"] as? String ?? ""
+        guard have.count <= 64, let decoded = Data(hexString: have) else { throw URLError(.badServerResponse) }
+        let bytes = decoded
         var present = Set<Int>()
         for (n, byte) in bytes.enumerated() { for bit in 0..<8 where byte & (1 << bit) != 0 { present.insert(n * 8 + bit) } }
         return BlobHead(size: size, complete: complete, expires: Date(timeIntervalSince1970: (object["expires"] as? Double) ?? 0),
