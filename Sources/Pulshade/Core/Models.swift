@@ -1411,7 +1411,9 @@ struct AppData: Codable {
     /// its sending chain can wait to be derived until the first message on it.
     /// 23: each device has keys of its own (`deviceKey`), and the keys of every device you know are pinned
     /// (`DeviceLink.keyPin`). A handshake without device keys isn't taken, so devices on builds before can't talk to this one.
-    static let currentFormat = 23
+    /// 24: group chains are handed to each member device over pairwise sessions (`GroupPeer`), with no announce keys;
+    /// groups saved before are set aside like those before 21.
+    static let currentFormat = 24
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []
@@ -1536,7 +1538,7 @@ struct AppData: Codable {
         contacts = try c.decodeIfPresent([Contact].self, forKey: .contacts) ?? []
         invites = try c.decodeIfPresent([OpenInvite].self, forKey: .invites) ?? []
         conversations = try c.decodeIfPresent([Conversation].self, forKey: .conversations) ?? []
-        if written < 21 {
+        if written < 24 {
             for k in conversations.indices where conversations[k].shared != nil {
                 conversations[k].shared?.gone = true
                 conversations[k].shared?.epochs = []
@@ -1548,6 +1550,8 @@ struct AppData: Codable {
                 conversations[k].shared?.heldMail = nil
                 conversations[k].shared?.pendingSettings = nil
                 conversations[k].shared?.linkSecrets = nil
+                conversations[k].shared?.chainStarts = nil
+                conversations[k].shared?.peers = nil
             }
         }
         stories = try c.decodeIfPresent([Story].self, forKey: .stories) ?? []

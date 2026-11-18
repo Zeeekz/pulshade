@@ -33,14 +33,14 @@ struct GroupKeysTests {
         let epoch = GroupEpoch.fresh(number: 1)
         let me = keys(.random(32)), mallory = keys(.random(32))
         var chain = SenderChain.fresh()
-        let blob = try GroupSeal.seal(Data("secret".utf8), group: group, epoch: epoch, keys: me, device: dev, chain: &chain).blob
+        let blob = try GroupSeal.seal(Data("secret".utf8), group: group, epoch: epoch, keys: me, device: dev, chain: &chain)
         #expect(blob.count >= 2_048, "Padded like any envelope")
         #expect(!blob.contains(me.publicKey) && blob.range(of: Data("secret".utf8)) == nil)
         #expect(throws: GroupSeal.Failure.self) { try GroupSeal.outer(blob, group: group, epoch: GroupEpoch.fresh(number: 2)) }
         #expect(throws: GroupSeal.Failure.self) { try GroupSeal.outer(blob, group: UUID(), epoch: epoch) }
         // Mallory, a member, re-signs nothing of mine: putting my key on her envelope fails the check.
         var hers = SenderChain.fresh()
-        let forged = try GroupSeal.seal(Data("from me".utf8), group: group, epoch: epoch, keys: mallory, device: dev, chain: &hers).blob
+        let forged = try GroupSeal.seal(Data("from me".utf8), group: group, epoch: epoch, keys: mallory, device: dev, chain: &hers)
         let outer = try GroupSeal.outer(forged, group: group, epoch: epoch)
         #expect(outer.sender == mallory.publicKey)
     }
@@ -150,7 +150,7 @@ struct GroupKeysTests {
         #expect(big.avatar == nil && big.avatarHash == nil && big.verified(group: group), "a picture too big is left off when the card is made")
         // Sealing with any epoch number never traps.
         var chain = SenderChain(key: .random(32), index: 0)
-        #expect((try? GroupSeal.seal(Data("x".utf8), group: group, epoch: GroupEpoch(number: -5, key: .random(32), started: Date(), announce: .random(32), hour: GroupEpoch.hourNow()),
+        #expect((try? GroupSeal.seal(Data("x".utf8), group: group, epoch: GroupEpoch(number: -5, key: .random(32), started: Date()),
                                      keys: owner, device: dev, chain: &chain)) != nil)
     }
 
@@ -236,7 +236,7 @@ struct GroupKeysTests {
         #expect(GroupSeal.fits(payload: bytes) && !GroupSeal.fits(payload: 2_100_000))
         // What the check passes really does seal under the relay's limit (2 MiB and a little).
         var chain = SenderChain(key: .random(32), index: 0)
-        let sealed = try! GroupSeal.seal(Data(count: bytes), group: group, epoch: .fresh(number: 1), keys: owner, device: dev, chain: &chain).blob
+        let sealed = try! GroupSeal.seal(Data(count: bytes), group: group, epoch: .fresh(number: 1), keys: owner, device: dev, chain: &chain)
         #expect(sealed.count <= 2 * 1024 * 1024 + 1024)
         var long = s
         long.title = String(repeating: "\u{0301}", count: 300)

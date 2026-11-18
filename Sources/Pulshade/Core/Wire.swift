@@ -165,6 +165,9 @@ enum Payload: Codable, Equatable {
     case membersAdded(names: [String])
     /// In a group's mailbox: a member's own card with their picture (the settings carry it without).
     case memberCard(MemberCard)
+    /// In a group's mailbox, as a direct post (`GroupSeal.sealDirect`): items for single member devices, each sealed by the
+    /// pairwise session with it (or asking for one), carrying where the sender device's chains start.
+    case groupDirect([GroupDirect])
     /// A story, or a new version of one already sent (same id, edited text or lifetime). `lasts` is in seconds;
     /// older apps leave it out, meaning a day. `loops` is a video that plays again from the start when it ends; older
     /// apps ignore it and play it once.
@@ -226,6 +229,13 @@ enum Payload: Codable, Equatable {
     /// I never got the new key; the newest epoch I hold is `epoch`". Answered with an ordinary invite, sealed by the chat,
     /// at most once every ten minutes per follower. Apps from before ignore it.
     case channelKeyWanted(group: UUID, epoch: Int)
+    /// Over a 1:1 chat, from a follower of a channel to the staff member who invited them: "I hold posts I can't open:
+    /// these staff devices' chains from these messages on". Answered with `groupChainKeys`, from the staff member's own
+    /// chain or by asking the staff device that posted over their pairwise session.
+    case groupChainWanted(group: UUID, wants: [GroupChainWant])
+    /// Over a 1:1 chat, from the staff member who invited a follower: where staff devices' chains are, so the follower
+    /// can read their posts in the channel. Followers never post, so this is how they get every chain.
+    case groupChainKeys(group: UUID, keys: [GroupChainKey])
     /// The sender logged out of the device this came from: stop sending to it.
     case deviceRemoved
     /// The sender erased their account: forget them completely, with everything they ever sent.

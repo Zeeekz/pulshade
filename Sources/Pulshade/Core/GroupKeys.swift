@@ -5,10 +5,11 @@ import os
 // Groups that share one mailbox on the relay (see docs/groups-design.md).
 //
 // A message is sealed once, with the sender's own chain key for the current *epoch*, and posted once into the group's
-// mailbox; every member reads it from there. Each sender device starts its chain from random bytes of its own, and every
-// post carries where that chain is, sealed under the epoch's *announce key* for the hour it was posted. The announce key
-// moves forward every hour and readers keep only the newest they still need, so whoever takes a member's phone gets the
-// chains as they stand and the last hour or two, never what was read before. A new epoch is started whenever someone
+// mailbox; every member reads it from there. Each sender device starts its chain from random bytes of its own, and hands
+// where it starts to each other member device over a pairwise session (`GroupPeer`: the same post-quantum Double Ratchet
+// 1:1 chats use, set up between the two members' group keys and carried in the group's mailbox). Readers keep only each
+// chain's next position and forget every key once used, so whoever takes a member's phone opens nothing it already read.
+// A new epoch is started whenever someone
 // leaves or is removed: they don't get the new key, and can't read what follows. Group keys are handed out sealed with
 // X25519 and ML-KEM-768 together, so a recording broken later by a quantum computer opens none of them.
 // Each member signs as a key made for this group alone, so two groups can't tell they share someone, and nobody in a
@@ -113,41 +114,9 @@ struct GroupEpoch: Codable, Equatable {
     var started: Date
     /// Whose new-epoch hand-out this came in (a candidate's), so one member can't crowd out another's.
     var from: Data? = nil
-    /// The announce key for hour `hour` (hours since 1970): it seals where each sender's chain is, in every post of that
-    /// hour. Random when the epoch is made and handed out with its key, not worked out from it; moved forward one HKDF step
-    /// an hour (`announceKey(at:)`) and, once this device has read everything from an hour on, kept only from there
-    /// (`advance(to:)`). So the epoch key opens the mailbox and the outer layer, and nothing said in it.
-    var announce: Data? = nil
-    var hour: Int? = nil
 
-    /// Well-formed as received: a number in range, a whole key and an announce key.
-    var isValid: Bool {
-        groupNumberRange.contains(number) && key.count == 32 && (1...7).contains(days) && announce?.count == 32
-            && (hour.map { $0 > 0 && $0 < Int(Int32.max) } ?? false)
-    }
-
-    /// The hour a post made now belongs to.
-    static func hourNow(_ date: Date = RelayClock.now) -> Int { Int(max(0, date.timeIntervalSince1970) / 3_600) }
-
-    /// How far ahead of the one held an announce key is worked out (a post that says it is from further on is not read).
-    static let maxHoursAhead = 24 * 40
-
-    /// The announce key for hour `h`, worked out forward from the one held. Nil for an hour before it (that key is gone,
-    /// on purpose) or too far ahead.
-    func announceKey(at h: Int) -> Data? {
-        // A channel's staff mailbox (number 0) has no epoch to hand out: its announce keys come from its key, hour by hour.
-        if number == 0 { return derive(key, "pulshade.group.staff-announce.v1", salt: be32(UInt32(truncatingIfNeeded: h))) }
-        guard var a = announce, let held = hour, h >= held, h - held <= Self.maxHoursAhead else { return nil }
-        for _ in held..<h { a = derive(a, "pulshade.group.announce.next.v1") }
-        return a
-    }
-
-    /// Moves the announce key on to hour `h`, forgetting the ones before.
-    mutating func advance(to h: Int) {
-        guard number != 0, let held = hour, h > held, let next = announceKey(at: min(h, held + Self.maxHoursAhead)) else { return }
-        announce = next
-        hour = min(h, held + Self.maxHoursAhead)
-    }
+    /// Well-formed as received: a number in range and a whole key.
+    var isValid: Bool { groupNumberRange.contains(number) && key.count == 32 && (1...7).contains(days) }
 
     /// How long the relay keeps a group's mail, in days: the most it takes (7), so a member whose phone was off over a
     /// long weekend still gets every post and photo (build 16; it was 3 from build 14). It holds mail even after
@@ -156,7 +125,7 @@ struct GroupEpoch: Codable, Equatable {
     static let defaultDays = 7
 
     static func fresh(number: Int, days: Int = defaultDays) -> GroupEpoch {
-        GroupEpoch(number: number, key: .random(32), days: min(max(days, 1), 7), started: Date(), announce: .random(32), hour: hourNow())
+        GroupEpoch(number: number, key: .random(32), days: min(max(days, 1), 7), started: Date())
     }
 
     /// The mailbox this epoch's mail goes to. A new epoch means a new mailbox, so the relay can't line the two up by it.
@@ -401,7 +370,7 @@ struct GroupSettings: Codable, Equatable {
     }
 }
 
-/// A new epoch's key and announce key, sealed to each remaining member's group keys (X25519 and ML-KEM-768 together), so
+/// A new epoch's key, sealed to each remaining member's group keys (X25519 and ML-KEM-768 together), so
 /// whoever was taken out (who can still read the old epoch's mail) can't open it, even with a quantum computer later.
 ///
 /// In a channel the copies are filed under a short tag worked out from each reader's own key instead of the key itself,
@@ -411,8 +380,6 @@ struct GroupRekey: Codable, Equatable {
     var group: UUID
     var epoch: Int
     var days: Int
-    /// The hour the announce key in the copies is for.
-    var hour: Int
     /// The one-off public key the copies were sealed with.
     var ephemeral: Data
     /// Each member's copy, by the member's signing key (hex), or by their tag (hex) when `tagged`.
@@ -423,14 +390,13 @@ struct GroupRekey: Codable, Equatable {
     /// Copies a tagged rekey holds at least, and the most it may hold.
     static let minTagged = 8
     static let maxTagged = 1_024
-    /// What a copy carries: the epoch key and the announce key.
-    static let copySize = 64 + GroupPQ.overhead
+    /// What a copy carries: the epoch key.
+    static let copySize = 32 + GroupPQ.overhead
 
     static func make(_ epoch: GroupEpoch, group: UUID, for members: [MemberCard], tagged: Bool = false) -> GroupRekey {
         let eph = Curve25519.KeyAgreement.PrivateKey()
-        let hour = epoch.hour ?? GroupEpoch.hourNow()
-        let secret = epoch.key + (epoch.announce ?? Data(count: 32))
-        let context = Self.context(group: group, epoch: epoch.number, hour: hour)
+        let secret = epoch.key
+        let context = Self.context(group: group, epoch: epoch.number)
         var sealed: [String: Data] = [:]
         for member in members {
             guard let (shared, box) = GroupPQ.seal(secret, ephemeral: eph, to: member, context: context) else { continue }
@@ -443,27 +409,26 @@ struct GroupRekey: Codable, Equatable {
             // Same length as a real copy, so none stands out.
             while sealed.count < size { sealed[Data.random(8).hex] = Data.random(copySize) }
         }
-        return GroupRekey(group: group, epoch: epoch.number, days: epoch.days, hour: hour, ephemeral: eph.publicKey.rawRepresentation,
+        return GroupRekey(group: group, epoch: epoch.number, days: epoch.days, ephemeral: eph.publicKey.rawRepresentation,
                           sealed: sealed, tagged: tagged ? true : nil)
     }
 
     /// This member's copy, opened.
     func open(with keys: GroupMemberKeys) -> GroupEpoch? {
-        guard hour > 0, hour < Int(Int32.max), let shared = GroupPQ.shared(ephemeral: ephemeral, keys: keys) else { return nil }
+        guard let shared = GroupPQ.shared(ephemeral: ephemeral, keys: keys) else { return nil }
         let name = tagged == true ? Self.tag(shared, group: group, epoch: epoch).hex : keys.publicKey.hex
         guard let box = sealed[name], box.count == Self.copySize,
               let raw = GroupPQ.open(box, ephemeral: ephemeral, shared: shared, keys: keys, kem: keys.kem,
-                                     context: Self.context(group: group, epoch: epoch, hour: hour)),
-              raw.count == 64 else { return nil }
-        return GroupEpoch(number: epoch, key: Data(raw.prefix(32)), days: min(max(days, 1), 7), started: Date(),
-                          announce: Data(raw.suffix(32)), hour: hour)
+                                     context: Self.context(group: group, epoch: epoch)),
+              raw.count == 32 else { return nil }
+        return GroupEpoch(number: epoch, key: raw, days: min(max(days, 1), 7), started: Date())
     }
 
     /// Whether the number of copies is one a rekey may have (so a huge one can't be used to fill someone's phone).
     var isReasonable: Bool { tagged == true ? sealed.count <= Self.maxTagged : sealed.count <= GroupSettings.maxMembers }
 
-    private static func context(group: UUID, epoch: Int, hour: Int) -> Data {
-        Data("pulshade.group.rekey.v2".utf8) + bytes(group) + be32(UInt32(truncatingIfNeeded: epoch)) + be32(UInt32(truncatingIfNeeded: hour))
+    private static func context(group: UUID, epoch: Int) -> Data {
+        Data("pulshade.group.rekey.v3".utf8) + bytes(group) + be32(UInt32(truncatingIfNeeded: epoch))
     }
 
     /// The eight bytes a reader's copy is filed under: only the reader (and whoever sealed it) can work them out.
@@ -603,11 +568,13 @@ struct GroupRoster: Codable, Equatable {
 
 /// A group envelope as posted to the mailbox, and opened from it.
 ///
-/// Inside the epoch's outer layer: the sender's member key, device tag, message number and signature, then the hour and
-/// the *announcement* (where the sender's chain is at this message, sealed under that hour's announce key), then the
-/// message sealed with its own key. A reader who already follows this sender's chain ignores the announcement; one who
-/// doesn't starts the chain from it. The announcement isn't signed: a wrong one gives a key that doesn't open the
-/// message, and nothing is kept from it.
+/// Inside the epoch's outer layer: the sender's member key, device tag, message number and signature, then the message
+/// sealed with that number's key from the sender device's chain. A reader learns where a chain starts only over its
+/// pairwise session with the sender device (`GroupPeer`), never from the post.
+///
+/// A *direct* post (number `directIndex`) carries no chain message: its body is a `Payload.groupDirect`, items each meant
+/// for one member device and sealed by the session with it, so anyone holding the epoch key can open the outer layer and
+/// find their own items, before they follow the sender's chain.
 enum GroupSeal {
     enum Failure: Error { case malformed, badSignature }
 
@@ -620,15 +587,15 @@ enum GroupSeal {
         var index: UInt32
         var inner: Data
         var signature: Data
-        /// The hour the announcement is sealed for, and the announcement.
-        var hour: Int
-        var announcement: Data
+
+        /// A direct post: its inner part is not sealed with a chain key (see `GroupSeal`).
+        var isDirect: Bool { index == GroupSeal.directIndex }
     }
 
     static let deviceLength = 8
-    /// A sealed chain key: nonce, 32 bytes, tag.
-    static let announcementLength = 12 + 32 + 16
-    private static let head = 32 + deviceLength + 4 + 64 + 4 + announcementLength
+    /// The message number direct posts carry; no chain gets that far.
+    static let directIndex = UInt32.max
+    private static let head = 32 + deviceLength + 4 + 64
 
     /// The largest padded body a group envelope may have: the relay takes up to 2 MiB plus a little for the seal.
     static let maxPadded = 2_097_152
@@ -646,76 +613,49 @@ enum GroupSeal {
     }
 
     private static func signed(group: UUID, epoch: Int, device: Data, index: UInt32, inner: Data) -> Data {
-        Data("pulshade.group.msg.v2".utf8) + bytes(group) + be32(UInt32(truncatingIfNeeded: epoch)) + device + be32(index) + Data(SHA256.hash(data: inner))
+        Data("pulshade.group.msg.v3".utf8) + bytes(group) + be32(UInt32(truncatingIfNeeded: epoch)) + device + be32(index) + Data(SHA256.hash(data: inner))
     }
 
-    private static func announceSeal(_ announceKey: Data, sender: Data, device: Data, index: UInt32) -> SymmetricKey {
-        SymmetricKey(data: derive(announceKey, "pulshade.group.announcement.v1", salt: sender + device + be32(index)))
+    private static func wrap(_ inner: Data, index: UInt32, group: UUID, epoch: GroupEpoch, keys: GroupMemberKeys, device: Data) throws -> Data {
+        let signature = try keys.signing.signature(for: signed(group: group, epoch: epoch.number, device: device, index: index, inner: inner))
+        let body = keys.publicKey + device + be32(index) + signature + inner
+        return try ChaChaPoly.seal(EnvelopeCore.padded(body), using: epoch.outerKey).combined
     }
 
-    /// The announcement for message `index` of a chain whose key there is `chainKey`, for hour `hour`.
-    private static func announcement(_ chainKey: Data, epoch: GroupEpoch, hour: Int, sender: Data, device: Data, index: UInt32) -> Data? {
-        guard let a = epoch.announceKey(at: hour) else { return nil }
-        return try? ChaChaPoly.seal(chainKey, using: announceSeal(a, sender: sender, device: device, index: index)).combined
-    }
-
-    /// Seals `payload` as message `chain.index` of `keys`' chain, and moves the chain on. Also gives back the chain key it
-    /// was sealed at, so the announcement can be made again for a later hour if the post waits (`reannounce`).
+    /// Seals `payload` as message `chain.index` of `keys`' chain, and moves the chain on.
     static func seal(_ payload: Data, group: UUID, epoch: GroupEpoch, keys: GroupMemberKeys, device: Data,
-                     chain: inout SenderChain) throws -> (blob: Data, chainKey: Data) {
+                     chain: inout SenderChain) throws -> Data {
+        guard chain.index < directIndex else { throw Failure.malformed }
         let device = deviceTag(device)
-        let used = chain
         let (messageKey, next) = chain.step()
         let inner = try ChaChaPoly.seal(payload, using: SymmetricKey(data: messageKey)).combined
-        let signature = try keys.signing.signature(for: signed(group: group, epoch: epoch.number, device: device, index: chain.index, inner: inner))
-        let hour = GroupEpoch.hourNow()
-        guard let note = announcement(used.key, epoch: epoch, hour: hour, sender: keys.publicKey, device: device, index: used.index)
-        else { throw Failure.malformed }
-        var body = keys.publicKey + device + be32(chain.index) + signature + be32(UInt32(truncatingIfNeeded: hour)) + note
-        body += inner
+        let blob = try wrap(inner, index: chain.index, group: group, epoch: epoch, keys: keys, device: device)
         chain = next
-        return (try ChaChaPoly.seal(EnvelopeCore.padded(body), using: epoch.outerKey).combined, used.key)
+        return blob
     }
 
-    /// The same post with its announcement made again for the hour it is now (it waited to be sent), so readers who have
-    /// already let go of the hour it was sealed in can still start the sender's chain from it.
-    static func reannounce(_ blob: Data, group: UUID, epoch: GroupEpoch, chainKey: Data) -> Data? {
-        guard let outer = try? outer(blob, group: group, epoch: epoch) else { return nil }
-        let hour = GroupEpoch.hourNow()
-        guard outer.hour != hour else { return blob }
-        guard let note = announcement(chainKey, epoch: epoch, hour: hour, sender: outer.sender, device: outer.device, index: outer.index)
-        else { return nil }
-        var body = outer.sender + outer.device + be32(outer.index) + outer.signature + be32(UInt32(truncatingIfNeeded: hour)) + note
-        body += outer.inner
-        return try? ChaChaPoly.seal(EnvelopeCore.padded(body), using: epoch.outerKey).combined
+    /// Seals a direct post (`Payload.groupDirect`, whose items are already sealed one by one): signed, under the outer
+    /// layer only.
+    static func sealDirect(_ payload: Data, group: UUID, epoch: GroupEpoch, keys: GroupMemberKeys, device: Data) throws -> Data {
+        try wrap(payload, index: directIndex, group: group, epoch: epoch, keys: keys, device: deviceTag(device))
     }
 
     /// Opens the outer layer and checks the sender's signature. Whether the sender is a member, and opening the inner
     /// layer, is up to the caller, who holds the chains.
     static func outer(_ blob: Data, group: UUID, epoch: GroupEpoch) throws -> Outer {
         guard let box = try? ChaChaPoly.SealedBox(combined: blob), let padded = try? ChaChaPoly.open(box, using: epoch.outerKey),
-              let body = EnvelopeCore.unpadded(padded), body.count > head + 28 else { throw Failure.malformed }
+              let body = EnvelopeCore.unpadded(padded), body.count > head else { throw Failure.malformed }
         let b = Data(body)
         let sender = Data(b.prefix(32))
         let device = Data(b.dropFirst(32).prefix(deviceLength))
         let index = b.dropFirst(32 + deviceLength).prefix(4).reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
         let signature = Data(b.dropFirst(36 + deviceLength).prefix(64))
-        let hour = b.dropFirst(100 + deviceLength).prefix(4).reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
-        let note = Data(b.dropFirst(104 + deviceLength).prefix(announcementLength))
         let inner = Data(b.dropFirst(head))
         guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: sender),
               key.isValidSignature(signature, for: signed(group: group, epoch: epoch.number, device: device, index: index, inner: inner)) else {
             throw Failure.badSignature
         }
-        return Outer(sender: sender, device: device, index: index, inner: inner, signature: signature, hour: Int(hour), announcement: note)
-    }
-
-    /// The chain key the announcement says, if this device still holds the announce key for its hour.
-    static func announced(_ outer: Outer, epoch: GroupEpoch) -> Data? {
-        guard let a = epoch.announceKey(at: outer.hour), let box = try? ChaChaPoly.SealedBox(combined: outer.announcement),
-              let key = try? ChaChaPoly.open(box, using: announceSeal(a, sender: outer.sender, device: outer.device, index: outer.index)),
-              key.count == 32 else { return nil }
-        return key
+        return Outer(sender: sender, device: device, index: index, inner: inner, signature: signature)
     }
 
     static func inner(_ outer: Outer, messageKey: Data) -> Data? {
@@ -724,14 +664,17 @@ enum GroupSeal {
     }
 }
 
-/// What a member keeps to read others in one group: each sender's chain where it has got to, and keys for messages
-/// skipped over (arrived out of order), so each one opens once and the key is then forgotten. A chain is only ever
-/// started from a post's announcement (never worked out from the epoch key), and only once that post has opened with it.
+/// What a member keeps to read others in one group: each sender device's chain where it has got to, and keys for
+/// messages skipped over (arrived out of order), so each one opens once and the key is then forgotten. A chain is only
+/// ever started from what its sender device handed over (`start`), never worked out from the epoch key.
 struct GroupReader: Codable, Equatable {
     /// "epoch|sender hex|device hex" → the chain's next position.
     var chains: [String: SenderChain] = [:]
     /// "epoch|sender hex|device hex|index" → that message's key.
     var skipped: [String: Data] = [:]
+    /// "epoch|sender hex|device hex" → the first position this device was given: a post from before it was never
+    /// readable here (ask for it), one from after it and before the chain's position has been read (or skipped).
+    var starts: [String: UInt32]? = [:]
 
     static let maxSkip: UInt32 = 2_000
     /// Most keys kept for one sender's skipped messages, and in all.
@@ -739,43 +682,73 @@ struct GroupReader: Codable, Equatable {
     static let maxSkipped = 20_000
     /// Most devices (chains) one member may post from in one epoch.
     static let maxDevicesPerSender = 16
-    /// Most posting devices followed in one epoch, all members together: past it, posts from further devices are not
-    /// read (a group this big has a few hundred people who talk, at most).
+    /// Most posting devices followed in one epoch, all members together.
     static let maxChainsPerEpoch = 2_000
 
-    /// Whether this sender device's chain is followed already.
-    func follows(epoch: Int, sender: Data, device: Data) -> Bool { chains["\(epoch)|\(sender.hex)|\(device.hex)"] != nil }
+    enum Lookup: Equatable {
+        case key(Data)
+        /// No key for it here: the sender device's chain isn't followed, or not from that far back. Hold it and ask.
+        case missing
+        /// Already opened (or skipped and let go): a copy, dropped.
+        case used
+    }
 
-    /// The key for `index` of `sender`'s chain in `epoch`, used up (it can't be had twice). Nil for a message already
-    /// opened, or one too far ahead. A chain not followed yet (or so far behind that catching up would cost too much)
-    /// starts from `announced`, the chain key the post's announcement gives, but only if `opens` says the key it gives
-    /// opens the post.
-    mutating func messageKey(epoch: Int, sender: Data, device: Data, index: UInt32, announced: Data?, opens: (Data) -> Bool) -> Data? {
-        let id = "\(epoch)|\(sender.hex)|\(device.hex)"
-        if let key = skipped.removeValue(forKey: "\(id)|\(index)") { return key }
-        let senderPrefix = "\(epoch)|\(sender.hex)|"
-        if var chain = chains[id] {
-            guard index >= chain.index else { return nil }
-            if index - chain.index <= Self.maxSkip {
-                while chain.index < index {
-                    let (key, next) = chain.step()
-                    skipped["\(id)|\(chain.index)"] = key
-                    chain = next
-                }
-                let (key, next) = chain.step()
-                chains[id] = next
-                trim(id: id, senderPrefix: senderPrefix, index: index)
-                return key
-            }
-        } else {
-            if chains.keys.count(where: { $0.hasPrefix(senderPrefix) }) >= Self.maxDevicesPerSender { return nil }
-            if chains.keys.count(where: { $0.hasPrefix("\(epoch)|") }) >= Self.maxChainsPerEpoch { return nil }
+    static func id(epoch: Int, sender: Data, device: Data) -> String { "\(epoch)|\(sender.hex)|\(device.hex)" }
+
+    /// Whether this sender device's chain is followed already.
+    func follows(epoch: Int, sender: Data, device: Data) -> Bool { chains[Self.id(epoch: epoch, sender: sender, device: device)] != nil }
+
+    /// The key for `index` of `sender`'s chain in `epoch`, used up (it can't be had twice).
+    mutating func messageKey(epoch: Int, sender: Data, device: Data, index: UInt32) -> Lookup {
+        let id = Self.id(epoch: epoch, sender: sender, device: device)
+        if let key = skipped.removeValue(forKey: "\(id)|\(index)") { return .key(key) }
+        guard var chain = chains[id] else { return .missing }
+        if index < chain.index { return index < (starts?[id] ?? 0) ? .missing : .used }
+        guard index - chain.index <= Self.maxSkip else { return .missing }
+        while chain.index < index {
+            let (key, next) = chain.step()
+            skipped["\(id)|\(chain.index)"] = key
+            chain = next
         }
-        guard let announced, announced.count == 32 else { return nil }
-        let (key, next) = SenderChain(key: announced, index: index).step()
-        guard opens(key) else { return nil }
+        let (key, next) = chain.step()
         chains[id] = next
-        return key
+        trim(id: id, senderPrefix: "\(epoch)|\(sender.hex)|", index: index)
+        return .key(key)
+    }
+
+    /// A chain position handed over by its sender device (or, in a channel, passed on by staff). A chain not followed yet
+    /// starts there. One followed already gains only keys for `wanted` (posts held here, unread) from before its position;
+    /// nothing else is kept, so no key of a post already read is ever made again. True if anything was taken.
+    @discardableResult
+    mutating func start(epoch: Int, sender: Data, device: Data, chain given: SenderChain, wanted: [UInt32] = []) -> Bool {
+        guard given.key.count == 32, given.index < GroupSeal.directIndex else { return false }
+        let id = Self.id(epoch: epoch, sender: sender, device: device)
+        if starts == nil { starts = [:] }
+        if let held = chains[id] {
+            // Far further on than this device could step to: the chain goes on from there (what lies between is lost).
+            if given.index > held.index, given.index - held.index > Self.maxSkip {
+                chains[id] = given
+                return true
+            }
+            guard given.index < held.index else { return false }
+            let floor = starts?[id] ?? 0
+            var chain = given
+            var took = false
+            for index in Set(wanted).sorted() where index >= given.index && index < held.index && index < floor
+                && index - given.index <= Self.maxSkip && skipped["\(id)|\(index)"] == nil {
+                while chain.index < index { chain = chain.step().next }
+                skipped["\(id)|\(index)"] = chain.step().messageKey
+                took = true
+            }
+            if took { starts?[id] = min(floor, given.index) }
+            return took
+        }
+        let senderPrefix = "\(epoch)|\(sender.hex)|"
+        if chains.keys.count(where: { $0.hasPrefix(senderPrefix) }) >= Self.maxDevicesPerSender { return false }
+        if chains.keys.count(where: { $0.hasPrefix("\(epoch)|") }) >= Self.maxChainsPerEpoch { return false }
+        chains[id] = given
+        starts?[id] = given.index
+        return true
     }
 
     /// A sender who skips a lot only pushes out their own oldest gaps, never anyone else's. Only looked at when this
@@ -794,6 +767,7 @@ struct GroupReader: Codable, Equatable {
     mutating func forget(epoch: Int) {
         chains = chains.filter { !$0.key.hasPrefix("\(epoch)|") }
         skipped = skipped.filter { !$0.key.hasPrefix("\(epoch)|") }
+        starts = starts?.filter { !$0.key.hasPrefix("\(epoch)|") }
     }
 
     /// Forgets everything about epochs before `epoch`. Only for epochs no longer read: while one is, what was opened in
@@ -802,7 +776,144 @@ struct GroupReader: Codable, Equatable {
         let keep = { (k: String) in (Int(k.split(separator: "|").first ?? "") ?? 0) >= epoch }
         chains = chains.filter { keep($0.key) }
         skipped = skipped.filter { keep($0.key) }
+        starts = starts?.filter { keep($0.key) }
     }
+}
+
+// MARK: - Pairwise sessions between member devices
+
+/// One sender device's chain at a position, handed to one reader device. Who it belongs to is said here, but a reader
+/// takes it in a group only over its session with that very device (and in a channel only from the staff member who
+/// invited it): a wrong key opens nothing, and every post is signed by its sender anyway.
+struct GroupChainKey: Codable, Equatable {
+    var epoch: Int
+    var sender: Data
+    var device: Data
+    var index: UInt32
+    var key: Data
+
+    var chain: SenderChain { SenderChain(key: key, index: index) }
+    var isValid: Bool { (0..<Int(Int32.max)).contains(epoch) && sender.count == 32 && device.count == GroupSeal.deviceLength && key.count == 32 && index < GroupSeal.directIndex }
+}
+
+/// "Hand me your chain in `epoch` from message `index` on": a reader holding a post it can't open.
+struct GroupChainWant: Codable, Equatable, Hashable {
+    var epoch: Int
+    var sender: Data
+    var device: Data
+    var index: UInt32
+
+    var chainID: String { GroupReader.id(epoch: epoch, sender: sender, device: device) }
+    var isValid: Bool { (0..<Int(Int32.max)).contains(epoch) && sender.count == 32 && device.count == GroupSeal.deviceLength && index < GroupSeal.directIndex }
+}
+
+/// What travels over a pairwise session: chain positions, and asks for them.
+struct GroupDirectBody: Codable, Equatable {
+    var keys: [GroupChainKey]?
+    var wants: [GroupChainWant]?
+
+    static let maxEach = 64
+}
+
+/// One item of a direct post, for one member device (`to`, `device`): a session being asked for (`hello`, with what is
+/// wanted, which is no secret, alongside), the answer to one (`accept` and the first message on it), or a message on a
+/// session that is open.
+struct GroupDirect: Codable, Equatable {
+    var to: Data
+    var device: Data
+    var hello: SessionInit?
+    var wants: [GroupChainWant]?
+    var accept: SessionAccept?
+    var message: RatchetMessage?
+
+    /// Most items one direct post may carry, and one post's items for this device that are looked at.
+    static let maxItems = 1_200
+}
+
+/// This device's pairwise session with one device of one member (another member's, or another of this account's own),
+/// in one group. It is the Double Ratchet 1:1 chats use, with its sparse post-quantum ratchet, opened by the same
+/// exchange (`GroupHandshake`) between the two members' group keys: fresh X25519 and ML-KEM-768 keys on both sides, thrown
+/// away once it opens. So what goes over it can't be opened again from either phone later.
+struct GroupPeer: Codable, Equatable {
+    var member: Data
+    var device: Data
+    var session: Ratchet?
+    /// This device asked for a session (`hello`) and waits for the answer.
+    var pending: PendingHandshake?
+    /// Their asks this device has answered (their one-off keys), so one posted again isn't answered twice.
+    var answered: [Data] = []
+    /// What waits for the session to open: chain positions to hand over.
+    var queued: [GroupChainKey]?
+    var used = Date()
+    /// When this device last had to start over (a message that didn't open), so it isn't done on every post.
+    var resetAt: Date?
+
+    static func id(member: Data, device: Data) -> String { "\(member.hex)|\(device.hex)" }
+
+    /// Told apart by who, the state of the ask, and when the session was last used (every message moves that on).
+    static func == (a: GroupPeer, b: GroupPeer) -> Bool {
+        a.member == b.member && a.device == b.device && a.used == b.used && a.answered == b.answered && a.queued == b.queued
+            && a.resetAt == b.resetAt && a.pending?.ephemeral == b.pending?.ephemeral && (a.session == nil) == (b.session == nil)
+    }
+
+    /// Most sessions one group keeps: past it, the ones unused longest go.
+    static let maxPerGroup = 3_000
+    /// An ask that got no answer is made again after this long.
+    static let helloRetry: TimeInterval = 600
+}
+
+/// The exchange that opens a `GroupPeer` session: `Handshake`'s, between two members' keys in one group and two devices,
+/// all of which go into the root and the session's bound data.
+enum GroupHandshake {
+    private static let info = Data("pulshade.group.handshake.v1".utf8)
+
+    static func start() throws -> (PendingHandshake, SessionInit) { try Handshake.start() }
+
+    /// The answering side: it can write at once.
+    static func accept(_ request: SessionInit, group: UUID, me: GroupMemberKeys, myDevice: Data, them: MemberCard,
+                       theirDevice: Data) throws -> (Ratchet, SessionAccept) {
+        let theirEphemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: request.ephemeral)
+        let theirIdentity = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: them.agreementKey)
+        let encapsulation = try MLKEM768.PublicKey(rawRepresentation: request.kem).encapsulate()
+        let ephemeral = Curve25519.KeyAgreement.PrivateKey()
+        let ikm = try raw(me.agreement.sharedSecretFromKeyAgreement(with: theirEphemeral))
+            + raw(ephemeral.sharedSecretFromKeyAgreement(with: theirIdentity))
+            + raw(ephemeral.sharedSecretFromKeyAgreement(with: theirEphemeral))
+            + encapsulation.sharedSecret.withUnsafeBytes { Data($0) }
+        let parties = binding(group: group, initiator: them.signingKey, initiatorDevice: theirDevice, responder: me.publicKey, responderDevice: myDevice)
+        let root = root(ikm, request.ephemeral + ephemeral.publicKey.rawRepresentation + request.kem + encapsulation.encapsulated, parties)
+        let ratchet = try Ratchet.sender(root: root, theirRatchet: request.ephemeral, ad: info + parties)
+        return (ratchet, SessionAccept(replyTo: request.ephemeral, ephemeral: ephemeral.publicKey.rawRepresentation,
+                                       kemCiphertext: encapsulation.encapsulated))
+    }
+
+    /// The asking side, once the answer comes.
+    static func complete(_ pending: PendingHandshake, _ answer: SessionAccept, group: UUID, me: GroupMemberKeys, myDevice: Data,
+                         them: MemberCard, theirDevice: Data) throws -> Ratchet {
+        let ephemeral = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: pending.ephemeral)
+        let kem = try MLKEM768.PrivateKey(seedRepresentation: pending.kemSeed, publicKey: nil)
+        let theirEphemeral = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: answer.ephemeral)
+        let theirIdentity = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: them.agreementKey)
+        let pq = try kem.decapsulate(answer.kemCiphertext)
+        let ikm = try raw(ephemeral.sharedSecretFromKeyAgreement(with: theirIdentity))
+            + raw(me.agreement.sharedSecretFromKeyAgreement(with: theirEphemeral))
+            + raw(ephemeral.sharedSecretFromKeyAgreement(with: theirEphemeral))
+            + pq.withUnsafeBytes { Data($0) }
+        let parties = binding(group: group, initiator: me.publicKey, initiatorDevice: myDevice, responder: them.signingKey, responderDevice: theirDevice)
+        let root = root(ikm, ephemeral.publicKey.rawRepresentation + answer.ephemeral + kem.publicKey.rawRepresentation + answer.kemCiphertext, parties)
+        return Ratchet.receiver(root: root, ourRatchet: ephemeral, ad: info + parties)
+    }
+
+    private static func binding(group: UUID, initiator: Data, initiatorDevice: Data, responder: Data, responderDevice: Data) -> Data {
+        bytes(group) + initiator + GroupSeal.deviceTag(initiatorDevice) + responder + GroupSeal.deviceTag(responderDevice)
+    }
+
+    private static func root(_ ikm: Data, _ transcript: Data, _ parties: Data) -> SymmetricKey {
+        HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: ikm), salt: Data(SHA256.hash(data: transcript + parties)),
+                               info: info, outputByteCount: 32)
+    }
+
+    private static func raw(_ secret: SharedSecret) -> Data { secret.withUnsafeBytes { Data($0) } }
 }
 
 /// Sent over a 1:1 chat to someone being added: everything they need to read and write in the group from now on.
@@ -841,9 +952,6 @@ struct GroupOutgoing: Codable, Equatable {
     var catchUp: Bool?
     /// Sent again for a member who was away: nothing to record, the original is already kept.
     var replay: Bool?
-    /// The chain key the post was sealed at, until it has gone: if it waits past the hour, its announcement is made again
-    /// for the hour it goes in (`GroupSeal.reannounce`). Opens only this post (the chain has moved on).
-    var chainKey: Data?
 }
 
 /// A post this device made, kept (sealed, as posted) until it has read it back from the mailbox, which shows the relay
@@ -898,6 +1006,16 @@ struct SharedGroup: Codable, Equatable {
     var epochs: [GroupEpoch]
     /// This device's sending chain in each epoch, by epoch number (as text, for the vault's JSON).
     var chains: [String: SenderChain] = [:]
+    /// Where this device's chain in each epoch began, kept while the epoch is read, to answer a member device that asks
+    /// for a post of this device's it can't open (`GroupChainWant`). Opens only what this device itself said.
+    var chainStarts: [String: SenderChain]?
+    /// This device's pairwise sessions with other member devices, by `GroupPeer.id`.
+    var peers: [String: GroupPeer]?
+    /// Chains this device asked for, by `GroupChainWant.chainID`, and when (asked again ten minutes on).
+    var chainAsked: [String: Date]?
+    /// As staff of a channel: followers who asked this device for another staff device's chain, by chain id, then by
+    /// account, with the position each wants. Passed on once the chain comes, then let go.
+    var followerWants: [String: [String: UInt32]]?
     var reader = GroupReader()
     /// The newest envelope read from each epoch's mailbox.
     var cursors: [String: UInt64] = [:]
@@ -983,8 +1101,9 @@ struct SharedGroup: Codable, Equatable {
     var keyAskedAt: Date?
     /// When this device last asked the admin who invited it for the current key over their 1:1 chat.
     var inviterAskedAt: Date?
-    /// Posts from someone the settings held here don't list yet (the settings that add them are still on the way):
-    /// read again once they arrive, instead of being lost.
+    /// Posts from someone the settings held here don't list yet (the settings that add them are still on the way), or
+    /// from a sender device whose chain hasn't been handed over yet (asked for meanwhile): read again once what they need
+    /// arrives, instead of being lost.
     var heldMail: [HeldGroupMail]?
     /// This device's own recent posts, kept until read back (see `KeptPost`).
     var kept: [KeptPost]?
