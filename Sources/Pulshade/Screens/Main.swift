@@ -149,7 +149,11 @@ private struct PhoneMainView: View {
         #if DEBUG
         .onAppear {
             // Screenshots: PULSHADE_DEMO_SCREEN=contacts|burn|settings|chat opens that screen (Invite is a page in Account: PULSHADE_DEMO_SETTINGS=invite).
-            guard AppModel.demoRequested, let name = ProcessInfo.processInfo.environment["PULSHADE_DEMO_SCREEN"] else { return }
+            guard AppModel.demoRequested else { return }
+            // PULSHADE_DEMO_CHAT=Kai opens the chat with that title.
+            if let title = ProcessInfo.processInfo.environment["PULSHADE_DEMO_CHAT"],
+               let chat = model.data.conversations.first(where: { $0.title == title }) { open(chat.id); return }
+            guard let name = ProcessInfo.processInfo.environment["PULSHADE_DEMO_SCREEN"] else { return }
             if name == "chat", let first = model.data.conversations.first { open(first.id) }
             else if let s = Section(rawValue: name) { section = s }
         }

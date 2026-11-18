@@ -949,7 +949,12 @@ struct Conversation: Codable, Identifiable, Equatable {
     /// A group or channel saved from before groups shared one mailbox: a copy used to go to each member. Its past messages
     /// stay readable, but nothing is sent in it or read for it any more. Announcements is not one: it is not a group on
     /// the wire, only a chat of its own kind with no members.
-    var isOldFormat: Bool { shared == nil && !isAnnouncements && (kind == .group || kind == .channel) }
+    var isOldFormat: Bool {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["PULSHADE_DEMO"] == "1" { return false } // the sample groups have no keys, but should look usable
+        #endif
+        return shared == nil && !isAnnouncements && (kind == .group || kind == .channel)
+    }
 
     var amOwner: Bool { owner == "me" }
     var amAdmin: Bool { amOwner || admins.contains("me") }
