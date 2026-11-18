@@ -9646,6 +9646,8 @@ extension AppModel {
     }
 
     static let keyAskCooldown: TimeInterval = 600
+    /// How many hours of announce keys before its last full read a device keeps (posts that were on their way then).
+    static let announceGraceHours = 1
 
     /// Asks the staff member who invited this follower for the key of the epoch it missed, over their chat.
     func askForKeyAgain(_ id: Conversation.ID) {
@@ -9706,12 +9708,34 @@ extension AppModel {
         save()
     }
 
+    /// Asks the admin who invited this account into a group for the current key, over the 1:1 chat (`channelKeyWanted`,
+    /// the same ask a channel's follower makes), at most once every ten minutes.
+    private func askInviterForKey(at i: Int) {
+        let convo = data.conversations[i]
+        guard let shared = convo.shared, !shared.gone, Date().timeIntervalSince(shared.inviterAskedAt ?? .distantPast) > Self.keyAskCooldown
+        else { return }
+        let held = shared.epochs.map(\.number).max() ?? 0
+        guard noticeToInviter(.channelKeyWanted(group: convo.wireID, epoch: held), of: convo) else { return }
+        data.conversations[i].shared?.inviterAskedAt = Date()
+    }
+
+    /// The member of a group this device invited under the account that is writing: only someone this phone itself added,
+    /// who is still a member. Whatever the message says plays no part.
+    private func memberEntry(of sender: Contact, group: UUID) -> (index: Int, card: MemberCard)? {
+        guard let i = groupIndex(group, persona: sender.persona), let shared = data.conversations[i].shared,
+              shared.settings.kind == .group, !shared.gone, let keys = memberKeys(sender.persona, group: group),
+              shared.settings.isAdmin(keys.publicKey), let known = shared.knownAs[sender.fingerprint],
+              let card = shared.settings.members.first(where: { $0.fingerprint == known }) else { return nil }
+        return (i, card)
+    }
+
     /// A follower asks for the current key, because the channel moved on while they were away. Answered with the same
     /// invite that admitted them (settings and the current epoch's key), over their own chat, so no other follower sees
     /// anything. Only if they are still in the roster and the epoch they hold is older than the current one, and once every
-    /// ten minutes however many requests come.
+    /// ten minutes however many requests come. A group's member asks the same way, and is answered by the admin's
+    /// phone that invited them, if they are still a member.
     private func answerKeyRequest(_ group: UUID, held: Int, from sender: Contact) {
-        guard let (i, card) = followerEntry(of: sender, group: group), let shared = data.conversations[i].shared,
+        guard let (i, card) = followerEntry(of: sender, group: group) ?? memberEntry(of: sender, group: group), let shared = data.conversations[i].shared,
               let current = shared.current, held >= 0, held < current.number, shared.settings.epoch == current.number else { return }
         let limit = group.uuidString + card.signingKey.hex
         guard Date().timeIntervalSince(channelKeyAnswered[limit] ?? .distantPast) > 600 else { return }
@@ -9953,7 +9977,11 @@ extension AppModel {
         // The key goes out in the old mailbox first, then the settings that move to it, in that order.
         let channel = settings.kind == .channel
         let readers = settings.members.filter { $0.signingKey != keys.publicKey } + (channel ? (shared.roster?.live ?? []) : [])
-        post(.groupRekey(GroupRekey.make(next, group: shared.settings.group, for: readers, tagged: channel)), at: i)
+        // Each copy carries an ML-KEM ciphertext (about 1.5 KB once posted); a hand-out that wouldn't fit one envelope
+        // isn't made.
+        let rekey = GroupRekey.make(next, group: shared.settings.group, for: readers, tagged: channel)
+        guard rekey.isReasonable, GroupSeal.fits(payload: (try? Payload.groupRekey(rekey).wire(framed: false).count) ?? Int.max) else { return }
+        post(.groupRekey(rekey), at: i)
         post(.groupSettings(settings), at: i)
         shared = data.conversations[i].shared ?? shared
         shared.previous = shared.settings
@@ -10021,9 +10049,10 @@ extension AppModel {
         if shared.settings.kind == .channel, !shared.settings.isMember(keys.publicKey) { return }
         let tag = shared.myTag ?? .random(GroupSeal.deviceLength)
         shared.myTag = tag
-        var chain = shared.chains[String(epoch.number)] ?? epoch.chainStart(for: keys.publicKey, device: tag)
+        // This device's chain in the epoch starts from random bytes of its own; readers learn where it is from each post.
+        var chain = shared.chains[String(epoch.number)] ?? .fresh()
         guard let plain = try? payload.wire(framed: false),
-              let blob = try? GroupSeal.seal(plain, group: data.conversations[i].wireID, epoch: epoch, keys: keys, device: tag, chain: &chain) else { return }
+              let (blob, chainKey) = try? GroupSeal.seal(plain, group: data.conversations[i].wireID, epoch: epoch, keys: keys, device: tag, chain: &chain) else { return }
         shared.chains[String(epoch.number)] = chain
         if payload.isChat {
             shared.chatInEpoch = true
@@ -10034,7 +10063,7 @@ extension AppModel {
         if about == nil, case let .clipBlob(id, _) = payload { about = id }
         shared.outbox.append(GroupOutgoing(sendID: epoch.sendID, days: epoch.days, blob: blob, message: message,
                                            wake: payload.wakes, ephemeral: payload.isEphemeral, epoch: epoch.number, about: about,
-                                           catchUp: payload.isChat && !payload.isEphemeral))
+                                           catchUp: payload.isChat && !payload.isEphemeral, chainKey: chainKey))
         data.conversations[i].shared = shared
         kick()
     }
@@ -10046,11 +10075,20 @@ extension AppModel {
             let id = convo.id
             groupFlushing.insert(id)
             defer { groupFlushing.remove(id) }
-            while let next = index(of: id).flatMap({ data.conversations[$0].shared?.outbox.first }) {
+            while var next = index(of: id).flatMap({ data.conversations[$0].shared?.outbox.first }) {
                 // Typing that waited too long means nothing now.
                 if next.ephemeral, Date().timeIntervalSince(next.queued) > 10 {
                     if let i = index(of: id) { data.conversations[i].shared?.outbox.removeAll { $0.id == next.id } }
                     continue
+                }
+                // A post that waited past the hour it was sealed in gets its announcement made again for this hour, so a
+                // reader who has let go of that hour's announce key can still start this device's chain from it.
+                if let chainKey = next.chainKey, let i = index(of: id), let shared = data.conversations[i].shared,
+                   let number = next.epoch, let epoch = shared.epoch(number),
+                   let fresh = GroupSeal.reannounce(next.blob, group: data.conversations[i].wireID, epoch: epoch, chainKey: chainKey),
+                   fresh != next.blob, let k = shared.outbox.firstIndex(where: { $0.id == next.id }) {
+                    next.blob = fresh
+                    data.conversations[i].shared?.outbox[k].blob = fresh
                 }
                 // The first post this device makes to a mailbox may be the one that starts it: that carries a proof of
                 // work over Tor, so nobody can start endless mailboxes for free.
@@ -10071,6 +10109,7 @@ extension AppModel {
                 }
                 guard let i = index(of: id) else { break }
                 data.conversations[i].shared?.outbox.removeAll { $0.id == next.id }
+                next.chainKey = nil
                 notePosted(next, at: i)
                 if let m = next.message { setStatus(.sent, for: [m]) }
                 save()
@@ -10171,6 +10210,9 @@ extension AppModel {
             if let last = shared.lastFetch {
                 if time.timeIntervalSince(last) > Double(life) * 86_400, shared.catchUpSince == nil {
                     data.conversations[i].shared?.catchUpSince = last
+                    // Away longer than the relay keeps mail: any new key handed out meanwhile has gone with it, so the
+                    // admin who invited this account is asked over the 1:1 chat (they answer only if there is a newer one).
+                    if shared.settings.kind == .group { askInviterForKey(at: i) }
                 }
                 if time.timeIntervalSince(last) > 600 { data.conversations[i].shared?.lastFetch = time }
             } else {
@@ -10281,6 +10323,16 @@ extension AppModel {
                 shared.chains = shared.chains.filter { stillRead.contains(Int($0.key) ?? -1) }
                 data.conversations[i].shared = shared
             }
+            // Announce keys: once this device has read its mailboxes to the end, it keeps them only from an hour before that
+            // read on. Whoever later takes this device can then start no sender's chain from where it was earlier, so what
+            // was read before stays closed.
+            if let fetched = shared.lastFetch {
+                let floor = GroupEpoch.hourNow(fetched) - Self.announceGraceHours
+                if shared.epochs.contains(where: { ($0.hour ?? Int.max) < floor }) {
+                    for k in shared.epochs.indices { shared.epochs[k].advance(to: floor) }
+                    data.conversations[i].shared?.epochs = shared.epochs
+                }
+            }
             let readableBoxes = Set(shared.readable.map { $0.sendID.hex })
             if !shared.postedTo.isSubset(of: readableBoxes) {
                 shared.postedTo.formIntersection(readableBoxes)
@@ -10354,6 +10406,11 @@ extension AppModel {
                 data.conversations[i].shared?.keyAskedAt = now
                 post(.groupKeyWanted(group: data.conversations[i].wireID, epoch: pending.epoch), at: i)
             }
+            // A new key never came: the admin who invited this account is asked too, over the 1:1 chat with them
+            // (post-quantum, and still there after the group's old mailbox has gone).
+            if shared.settings.kind == .group, shared.missedKey, !shared.joining {
+                askInviterForKey(at: i)
+            }
             for (fp, at) in shared.invited where now.timeIntervalSince(at) > Self.inviteLife {
                 cancelInvite(fp, in: data.conversations[i].id)
             }
@@ -10401,16 +10458,22 @@ extension AppModel {
         }
         if !shared.settings.isMember(outer.sender) && !ours {
             // Not listed yet: the settings that add them may still be on the way. Kept for a while, and read again then.
-            var held = (shared.heldMail ?? []).filter { Date().timeIntervalSince($0.at) < 8 * 86_400 && $0.seq != mail.seq }
-            held.append(HeldGroupMail(epoch: number, seq: mail.seq, blob: mail.blob, at: Date()))
-            held = Array(held.suffix(HeldGroupMail.max))
-            // And no more than a few megabytes of it, newest kept.
-            while held.count > 1, held.reduce(0, { $0 + $1.blob.count }) > HeldGroupMail.maxBytes { held.removeFirst() }
-            shared.heldMail = held
+            hold(mail, epoch: number, in: &shared)
             data.conversations[i].shared = shared
             return
         }
-        guard let messageKey = shared.reader.messageKey(epoch: epoch, sender: outer.sender, device: outer.device, index: outer.index),
+        let follows = shared.reader.follows(epoch: number, sender: outer.sender, device: outer.device)
+        let announced = GroupSeal.announced(outer, epoch: epoch)
+        // A sender device not followed yet whose announcement this device can't open because its hour is too far ahead of
+        // the announce key held (a sender's clock far off): kept for a while, and read again with the other held posts.
+        // (An announcement from an hour this device has let go of is never opened again: that is the point.)
+        if !follows, announced == nil, outer.hour > (epoch.hour ?? Int.max) {
+            hold(mail, epoch: number, in: &shared)
+            data.conversations[i].shared = shared
+            return
+        }
+        guard let messageKey = shared.reader.messageKey(epoch: number, sender: outer.sender, device: outer.device, index: outer.index,
+                                                        announced: announced, opens: { GroupSeal.inner(outer, messageKey: $0) != nil }),
               let plain = GroupSeal.inner(outer, messageKey: messageKey),
               let payload = try? Payload.fromWire(plain) else {
             data.conversations[i].shared = shared
@@ -10506,6 +10569,16 @@ extension AppModel {
             // Nothing else is said in a group's mailbox.
             break
         }
+    }
+
+    /// Keeps a post to read again later (its sender isn't listed yet, or its chain can't be started yet): for eight days at
+    /// most, a hundred posts and a few megabytes, newest kept.
+    private func hold(_ mail: RelayClient.GroupMail, epoch number: Int, in shared: inout SharedGroup) {
+        var held = (shared.heldMail ?? []).filter { Date().timeIntervalSince($0.at) < 8 * 86_400 && $0.seq != mail.seq }
+        held.append(HeldGroupMail(epoch: number, seq: mail.seq, blob: mail.blob, at: mail.deposited ?? Date()))
+        held = Array(held.suffix(HeldGroupMail.max))
+        while held.count > 1, held.reduce(0, { $0 + $1.blob.count }) > HeldGroupMail.maxBytes { held.removeFirst() }
+        shared.heldMail = held
     }
 
     /// Posts held back because their sender wasn't listed yet, read again now that the settings have moved on. Any
@@ -10698,9 +10771,9 @@ extension AppModel {
     }
 
     /// The owner and admins, as (member key, group agreement key), from their cards in the settings.
-    private func staffCards(at i: Int) -> [(key: Data, agreement: Data)] {
+    private func staffCards(at i: Int) -> [MemberCard] {
         guard let s = data.conversations[i].shared?.settings else { return [] }
-        return s.members.filter { s.isAdmin($0.signingKey) }.map { ($0.signingKey, $0.agreementKey) }
+        return s.members.filter { s.isAdmin($0.signingKey) }
     }
 
     private func heldSecrets(at i: Int) -> [UUID: LinkSecrets] {
@@ -10819,7 +10892,7 @@ extension AppModel {
         data.conversations[i].shared?.linkSecrets = Dictionary(uniqueKeysWithValues: secrets.map { ($0.key.uuidString, $0.value) })
         data.conversations[i].shared?.linksEpoch = shared.current?.number
         if owner {
-            let sealedTo = staff.map(\.key).sorted { $0.hex < $1.hex }
+            let sealedTo = staff.map(\.signingKey).sorted { $0.hex < $1.hex }
             data.conversations[i].shared?.linksSealedTo = sealedTo
             // A version made now with new secrets for every link starts the record afresh.
             let renewedAll = !next.links.isEmpty && next.links.allSatisfy { link in shared.links?.link(link.id)?.secret != link.secret }
@@ -10955,7 +11028,7 @@ extension AppModel {
         let now = Date()
         for i in data.conversations.indices {
             guard let keys = amGroupAdmin(at: i), let shared = data.conversations[i].shared, let links = shared.links else { continue }
-            let staff = Set(staffCards(at: i).map(\.key))
+            let staff = Set(staffCards(at: i).map(\.signingKey))
             if shared.settings.owner == keys.publicKey, !links.links.isEmpty {
                 let exposed = Set(shared.linksExposed ?? Array(links.sealedTo)).union(links.sealedTo)
                 if !exposed.subtracting(staff).isEmpty {
@@ -11235,7 +11308,7 @@ extension AppModel {
         let mark = request.card.signingKey.hex + "|" + kind
         guard Date().timeIntervalSince(joinAnswered[mark] ?? .distantPast) > gap,
               let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID),
-              let blob = JoinSeal.seal(mail, from: keys, to: request.card.agreementKey),
+              let blob = JoinSeal.seal(mail, from: keys, to: request.card),
               let client = client(nil, lane: "joins|\(data.conversations[i].id.uuidString)") else { return }
         if joinAnswered.count > 2_000 { joinAnswered = joinAnswered.filter { Date().timeIntervalSince($0.value) < 86_400 } }
         joinAnswered[mark] = Date()
@@ -11316,7 +11389,7 @@ extension AppModel {
         guard let n = data.joinAsks.firstIndex(where: { $0.id == id }) else { return }
         let ask = data.joinAsks[n]
         let staff = Set(ask.staff + [ask.owner])
-        guard let keys = memberKeys(ask.persona, group: ask.group), let opened = JoinSeal.open(envelope.blob, with: keys.agreement),
+        guard let keys = memberKeys(ask.persona, group: ask.group), let opened = JoinSeal.openAnswer(envelope.blob, with: keys),
               staff.contains(opened.signer) else { return }
         switch opened.mail {
         case let .declined(group) where group == ask.group:

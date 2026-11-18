@@ -296,8 +296,8 @@ struct JoinLinkTests {
         let member = GroupMemberKeys(seed: .random(32), group: group)
         let (link, secrets) = try #require(JoinLink.make(label: "", approval: false, expires: nil, limit: nil, creator: owner.publicKey))
         var links = GroupLinks(group: group, version: 1, links: [link])
-        links.seal([link.id: secrets], to: [(owner.publicKey, owner.agreement.publicKey.rawRepresentation),
-                                            (admin.publicKey, admin.agreement.publicKey.rawRepresentation)])
+        links.seal([link.id: secrets], to: [MemberCard.make(owner, group: group, name: "", avatar: nil, color: nil),
+                                            MemberCard.make(admin, group: group, name: "", avatar: nil, color: nil)])
         links.sign(with: owner)
         #expect(links.signatureIsValid && links.wellFormed)
         #expect(links.open(with: owner)?[link.id] == secrets && links.open(with: admin)?[link.id] == secrets)

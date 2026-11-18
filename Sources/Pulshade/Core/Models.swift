@@ -1404,6 +1404,9 @@ struct AppData: Codable {
     /// 20: a ratchet session carries the sparse post-quantum ratchet's state (its refresh fields from before are gone), a
     /// device can be marked as needing to update (`DeviceLink.needsUpdate`), and post-quantum keys are pinned per contact
     /// (`Contact.pq`, `pqCommit`, `pqCardSent`, `tooOld`).
+    /// 21: shared groups with per-sender chains and announce keys (`GroupEpoch.announce`), member cards with an ML-KEM key,
+    /// group keys handed out sealed with X25519 and ML-KEM-768. Groups saved before can't be used: they are kept read-only,
+    /// as left, with their keys erased.
     /// 22: a ratchet session's post-quantum state no longer waits for the other side's word before mixing a secret in, and
     /// its sending chain can wait to be derived until the first message on it.
     /// 23: each device has keys of its own (`deviceKey`), and the keys of every device you know are pinned
@@ -1533,6 +1536,20 @@ struct AppData: Codable {
         contacts = try c.decodeIfPresent([Contact].self, forKey: .contacts) ?? []
         invites = try c.decodeIfPresent([OpenInvite].self, forKey: .invites) ?? []
         conversations = try c.decodeIfPresent([Conversation].self, forKey: .conversations) ?? []
+        if written < 21 {
+            for k in conversations.indices where conversations[k].shared != nil {
+                conversations[k].shared?.gone = true
+                conversations[k].shared?.epochs = []
+                conversations[k].shared?.chains = [:]
+                conversations[k].shared?.candidates = []
+                conversations[k].shared?.reader = GroupReader()
+                conversations[k].shared?.outbox = []
+                conversations[k].shared?.kept = nil
+                conversations[k].shared?.heldMail = nil
+                conversations[k].shared?.pendingSettings = nil
+                conversations[k].shared?.linkSecrets = nil
+            }
+        }
         stories = try c.decodeIfPresent([Story].self, forKey: .stories) ?? []
         outbox = try c.decodeIfPresent([Outgoing].self, forKey: .outbox) ?? []
         theme = try c.decodeIfPresent(String.self, forKey: .theme) ?? Theme.dark.id

@@ -8,7 +8,8 @@ import CryptoKit
 // it: the group's preview, signed by that admin's group key, naming the group's owner and admins. The preview says where
 // to send a request to join (an ordinary mailbox) and the key to seal it to. The request carries the newcomer's card for
 // this group alone and a fresh mailbox for the answer. An admin's phone that reads it adds them (an open link) or shows it
-// to the admins (a link that needs approval), and answers with what the newcomer needs to read the group. The newcomer
+// to the admins (a link that needs approval), and answers with what the newcomer needs to read the group, in the same
+// post-quantum envelope 1:1 chats use (X25519 and ML-KEM-768, to the newcomer's group keys). The newcomer
 // takes an answer only from the owner or an admin the preview named. Nobody involved learns anyone's account.
 //
 // The links themselves (and the group's bans) are a document of their own, signed by an admin and posted into the
@@ -148,7 +149,8 @@ struct GroupLinks: Codable, Equatable {
     var bans: [Data] = []
     /// Keys unbanned lately, so a version made without knowing of the unban doesn't bring the ban back.
     var unbans: [Data] = []
-    /// Every link's `LinkSecrets`, sealed to each admin's group agreement key, by admin key (hex). Members can't open them.
+    /// Every link's `LinkSecrets`, sealed to each admin's group keys (X25519 and ML-KEM-768), by admin key (hex). Members
+    /// can't open them.
     var sealed: [String: Data] = [:]
     /// The one-off public key `sealed` was made with.
     var ephemeral = Data()
@@ -178,7 +180,7 @@ struct GroupLinks: Codable, Equatable {
     var wellFormed: Bool {
         groupNumberRange.contains(version) && version <= Self.maxVersion && links.count <= Self.maxLinks && bans.count <= Self.maxBans && unbans.count <= Self.maxUnbans
             && links.allSatisfy(\.wellFormed) && Set(links.map(\.id)).count == links.count && bans.allSatisfy { $0.count == 32 }
-            && sealed.count <= 256 && sealed.values.allSatisfy { $0.count <= 8 * 1024 } && (sealed.isEmpty || ephemeral.count == 32)
+            && sealed.count <= 256 && sealed.values.allSatisfy { $0.count <= 12 * 1024 } && (sealed.isEmpty || ephemeral.count == 32)
     }
 
     var tieBreak: Data { Data(SHA256.hash(data: signable())) }
@@ -199,23 +201,21 @@ struct GroupLinks: Codable, Equatable {
     /// The admins (by member key) the secrets are sealed to.
     var sealedTo: Set<Data> { Set(sealed.keys.compactMap { Data(hexString: $0) }) }
 
-    private static func wrapKey(_ shared: Data, group: UUID, admin: Data) -> SymmetricKey {
-        var salt = Data("pulshade.group.link-secrets.v1".utf8)
-        withUnsafeBytes(of: group.uuid) { salt.append(contentsOf: $0) }
-        return HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: shared), salt: salt + admin, info: Data(), outputByteCount: 32)
+    private var context: Data {
+        var d = Data("pulshade.group.link-secrets.v2".utf8)
+        withUnsafeBytes(of: group.uuid) { d.append(contentsOf: $0) }
+        return d
     }
 
-    /// Seals the secrets of every link to each admin (member key and group agreement key), replacing what was sealed before.
-    mutating func seal(_ secrets: [UUID: LinkSecrets], to admins: [(key: Data, agreement: Data)]) {
+    /// Seals the secrets of every link to each admin's card (group agreement key and ML-KEM key), replacing what was
+    /// sealed before.
+    mutating func seal(_ secrets: [UUID: LinkSecrets], to admins: [MemberCard]) {
         let plain = (try? JSONEncoder.pulshade.encode(Dictionary(uniqueKeysWithValues: secrets.map { ($0.key.uuidString, $0.value) }))) ?? Data()
         let eph = Curve25519.KeyAgreement.PrivateKey()
         var out: [String: Data] = [:]
         for admin in admins {
-            guard let theirs = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: admin.agreement),
-                  let shared = try? eph.sharedSecretFromKeyAgreement(with: theirs),
-                  let box = try? ChaChaPoly.seal(plain, using: Self.wrapKey(shared.withUnsafeBytes { Data($0) }, group: group, admin: admin.key))
-            else { continue }
-            out[admin.key.hex] = box.combined
+            guard let (_, box) = GroupPQ.seal(plain, ephemeral: eph, to: admin, context: context) else { continue }
+            out[admin.signingKey.hex] = box
         }
         sealed = out
         ephemeral = eph.publicKey.rawRepresentation
@@ -223,10 +223,8 @@ struct GroupLinks: Codable, Equatable {
 
     /// The secrets sealed to this admin, keyed by link id. Nil if there's no copy for them or it doesn't open.
     func open(with keys: GroupMemberKeys) -> [UUID: LinkSecrets]? {
-        guard let box = sealed[keys.publicKey.hex], let eph = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: ephemeral),
-              let shared = try? keys.agreement.sharedSecretFromKeyAgreement(with: eph),
-              let sealedBox = try? ChaChaPoly.SealedBox(combined: box),
-              let plain = try? ChaChaPoly.open(sealedBox, using: Self.wrapKey(shared.withUnsafeBytes { Data($0) }, group: group, admin: keys.publicKey)),
+        guard let box = sealed[keys.publicKey.hex], let shared = GroupPQ.shared(ephemeral: ephemeral, keys: keys),
+              let plain = GroupPQ.open(box, ephemeral: ephemeral, shared: shared, keys: keys, kem: keys.kem, context: context),
               let byID = try? JSONDecoder.pulshade.decode([String: LinkSecrets].self, from: plain) else { return nil }
         var out: [UUID: LinkSecrets] = [:]
         for (id, secrets) in byID {
@@ -306,7 +304,8 @@ struct JoinRequest: Codable, Equatable {
     }
 }
 
-/// What travels through join and answer mailboxes, sealed with `EnvelopeCore` from one group key to another.
+/// What travels through join and answer mailboxes: a request sealed with `EnvelopeCore` to the link's request key, an
+/// answer in the post-quantum envelope (`EnvelopeCore.sealPQ`) to the newcomer's group keys.
 enum JoinMail: Codable, Equatable {
     case request(JoinRequest)
     /// You're in: the settings that name you and the epoch they're in.
@@ -394,19 +393,39 @@ enum JoinSeal {
     /// a couple of megabytes.
     static let maxSize = 4 * 1024 * 1024
 
-    /// Seals a join mail from one group key to another (the receiver's group agreement key, or a link's request key).
-    /// Framed, so the settings in an answer aren't base64'd twice over.
+    /// Seals a request to a link's request key. Framed, like any join mail. (It carries the newcomer's card and no group key.)
     static func seal(_ mail: JoinMail, from keys: GroupMemberKeys, to agreementKey: Data) -> Data? {
         guard let body = try? JSONEncoder.pulshade.encode(mail) else { return nil }
         return try? EnvelopeCore.seal(body: body, framed: true, signing: keys.signing, agreement: keys.agreement, device: Data(),
                                       caps: 0, at: RelayClock.now, to: agreementKey)
     }
 
-    /// Opens one, saying which group key sealed it.
+    /// Seals an answer (which carries the group's keys) to the newcomer's card: the version 3 envelope, with the ML-KEM
+    /// secret mixed into both layers, so a recording broken later by a quantum computer doesn't open it.
+    static func seal(_ mail: JoinMail, from keys: GroupMemberKeys, to card: MemberCard) -> Data? {
+        guard let kem = card.kem, kem.count == PQPin.kemSize, let body = try? JSONEncoder.pulshade.encode(mail) else { return nil }
+        // Only the ML-KEM half of the recipient's pin is used for sealing; nothing is signed with ML-DSA here (the binding
+        // signature of the sender's group key says who it is from).
+        return try? EnvelopeCore.sealPQ(body: body, signing: keys.signing, agreement: keys.agreement, pq: keys.pq, sign: false,
+                                        introduce: false, device: Data(), caps: 0, at: RelayClock.now,
+                                        to: EnvelopeRecipient(agreement: card.agreementKey, pq: PQPin(kem: kem, dsa: Data())))
+    }
+
+    /// Opens a request, saying which group key sealed it.
     static func open(_ blob: Data, with agreement: Curve25519.KeyAgreement.PrivateKey) -> (mail: JoinMail, signer: Data, agreement: Data, at: Date)? {
         guard blob.count <= maxSize, let header = try? EnvelopeCore.open(blob, agreement: agreement),
               let mail = try? JSONDecoder.pulshade.decode(JoinMail.self, from: header.body) else { return nil }
         return (mail, header.signer, header.agreement, header.sentAt)
+    }
+
+    /// Opens an answer (post-quantum envelope only: an answer sealed with X25519 alone is not taken), saying which group
+    /// key sealed it.
+    static func openAnswer(_ blob: Data, with keys: GroupMemberKeys) -> (mail: JoinMail, signer: Data, agreement: Data, at: Date)? {
+        guard blob.count <= maxSize, blob.first == EnvelopeCore.versionPQ,
+              let opened = try? EnvelopeCore.openPQ(blob, agreement: keys.agreement, pq: keys.pq, known: { _ in nil }),
+              let mail = try? JSONDecoder.pulshade.decode(JoinMail.self, from: opened.header.body) else { return nil }
+        let h = opened.header
+        return (mail, h.signer, h.agreement, h.sentAt)
     }
 }
 

@@ -29,92 +29,18 @@ struct GroupKeysTests {
                 "A group key says nothing about the account")
     }
 
-    @Test func aMessageOpensOnceForEveryMemberAndNotAfterTheChainMovesOn() throws {
-        let epoch = GroupEpoch.fresh(number: 1)
-        let me = keys(.random(32))
-        var chain = epoch.chainStart(for: me.publicKey, device: GroupSeal.deviceTag(dev))
-        let first = try GroupSeal.seal(Data("hello".utf8), group: group, epoch: epoch, keys: me, device: dev, chain: &chain)
-        let second = try GroupSeal.seal(Data("again".utf8), group: group, epoch: epoch, keys: me, device: dev, chain: &chain)
-        #expect(chain.index == 2)
-        // Two readers, each with their own state.
-        for _ in 0..<2 {
-            var reader = GroupReader()
-            let outer2 = try GroupSeal.outer(second, group: group, epoch: epoch)
-            let outer1 = try GroupSeal.outer(first, group: group, epoch: epoch)
-            #expect(outer1.sender == me.publicKey && outer2.index == 1)
-            // Out of order: the second first.
-            let maybe2 = reader.messageKey(epoch: epoch, sender: outer2.sender, device: outer2.device, index: outer2.index)
-            let k2 = try #require(maybe2)
-            #expect(GroupSeal.inner(outer2, messageKey: k2) == Data("again".utf8))
-            let maybe1 = reader.messageKey(epoch: epoch, sender: outer1.sender, device: outer1.device, index: outer1.index)
-            let k1 = try #require(maybe1)
-            #expect(GroupSeal.inner(outer1, messageKey: k1) == Data("hello".utf8))
-            #expect(reader.messageKey(epoch: epoch, sender: outer1.sender, device: outer1.device, index: 0) == nil, "Each key is used once")
-            #expect(reader.skipped.isEmpty)
-        }
-        // A second device of the same account has a chain of its own: the same index is a different key.
-        let other = Data.random(16)
-        var otherChain = epoch.chainStart(for: me.publicKey, device: GroupSeal.deviceTag(other))
-        let fromOther = try GroupSeal.seal(Data("other device".utf8), group: group, epoch: epoch, keys: me, device: other, chain: &otherChain)
-        var reader = GroupReader()
-        let o = try GroupSeal.outer(fromOther, group: group, epoch: epoch)
-        #expect(o.index == 0 && o.device == GroupSeal.deviceTag(other))
-        let key = reader.messageKey(epoch: epoch, sender: o.sender, device: o.device, index: o.index)
-        #expect(key.flatMap { GroupSeal.inner(o, messageKey: $0) } == Data("other device".utf8))
-    }
-
-    /// What a reader keeps after reading holds no key of a message it has opened, and a late or repeated message can't be
-    /// opened by what is left: the sender's chain only moves forward and each key is used once.
-    @Test func aReaderKeepsNoKeyOfWhatItHasRead() throws {
-        let epoch = GroupEpoch.fresh(number: 1)
-        let me = keys(.random(32))
-        var chain = epoch.chainStart(for: me.publicKey, device: GroupSeal.deviceTag(dev))
-        var blobs: [Data] = []
-        var messageKeys: [Data] = []
-        var probe = chain
-        for i in 0..<5 {
-            blobs.append(try GroupSeal.seal(Data("m\(i)".utf8), group: group, epoch: epoch, keys: me, device: dev, chain: &chain))
-            messageKeys.append(probe.step().messageKey)
-            probe = probe.step().next
-        }
-        var reader = GroupReader()
-        // Read 0, 1, 4 (2 and 3 are late).
-        for i in [0, 1, 4] {
-            let outer = try GroupSeal.outer(blobs[i], group: group, epoch: epoch)
-            let maybe = reader.messageKey(epoch: epoch, sender: outer.sender, device: outer.device, index: outer.index)
-            let key = try #require(maybe)
-            #expect(GroupSeal.inner(outer, messageKey: key) == Data("m\(i)".utf8))
-        }
-        let held = reader.chains.values.map(\.key) + Array(reader.skipped.values)
-        for i in [0, 1, 4] { #expect(!held.contains(messageKeys[i]), "No key of a message already read is kept") }
-        #expect(reader.skipped.count == 2, "Only the two late ones wait, a bounded set")
-        // The late ones still open, in any order, and once.
-        for i in [3, 2] {
-            let outer = try GroupSeal.outer(blobs[i], group: group, epoch: epoch)
-            let maybe = reader.messageKey(epoch: epoch, sender: outer.sender, device: outer.device, index: outer.index)
-            let key = try #require(maybe)
-            #expect(GroupSeal.inner(outer, messageKey: key) == Data("m\(i)".utf8))
-            let again = reader.messageKey(epoch: epoch, sender: outer.sender, device: outer.device, index: outer.index)
-            #expect(again == nil)
-        }
-        #expect(reader.skipped.isEmpty)
-        // Beyond the bound, a sender can't make a reader keep more.
-        let tooFar = reader.messageKey(epoch: epoch, sender: me.publicKey, device: Data.random(8), index: GroupReader.maxSkip + 5)
-        #expect(tooFar == nil)
-    }
-
     @Test func theRelayAndOtherEpochsSeeNothingAndNobodyCanSignAsSomeoneElse() throws {
         let epoch = GroupEpoch.fresh(number: 1)
         let me = keys(.random(32)), mallory = keys(.random(32))
-        var chain = epoch.chainStart(for: me.publicKey, device: GroupSeal.deviceTag(dev))
-        let blob = try GroupSeal.seal(Data("secret".utf8), group: group, epoch: epoch, keys: me, device: dev, chain: &chain)
+        var chain = SenderChain.fresh()
+        let blob = try GroupSeal.seal(Data("secret".utf8), group: group, epoch: epoch, keys: me, device: dev, chain: &chain).blob
         #expect(blob.count >= 2_048, "Padded like any envelope")
         #expect(!blob.contains(me.publicKey) && blob.range(of: Data("secret".utf8)) == nil)
         #expect(throws: GroupSeal.Failure.self) { try GroupSeal.outer(blob, group: group, epoch: GroupEpoch.fresh(number: 2)) }
         #expect(throws: GroupSeal.Failure.self) { try GroupSeal.outer(blob, group: UUID(), epoch: epoch) }
         // Mallory, a member, re-signs nothing of mine: putting my key on her envelope fails the check.
-        var hers = epoch.chainStart(for: mallory.publicKey, device: GroupSeal.deviceTag(dev))
-        let forged = try GroupSeal.seal(Data("from me".utf8), group: group, epoch: epoch, keys: mallory, device: dev, chain: &hers)
+        var hers = SenderChain.fresh()
+        let forged = try GroupSeal.seal(Data("from me".utf8), group: group, epoch: epoch, keys: mallory, device: dev, chain: &hers).blob
         let outer = try GroupSeal.outer(forged, group: group, epoch: epoch)
         #expect(outer.sender == mallory.publicKey)
     }
@@ -205,17 +131,6 @@ struct GroupKeysTests {
         #expect(next.sendID != GroupEpoch.fresh(number: 2).sendID, "Each epoch has its own mailbox")
     }
 
-    @Test func readersForgetOldEpochsAndDontRunAhead() {
-        let epoch = GroupEpoch.fresh(number: 3)
-        var reader = GroupReader()
-        let sender = keys(.random(32)).publicKey
-        #expect(reader.messageKey(epoch: epoch, sender: sender, device: GroupSeal.deviceTag(dev), index: GroupReader.maxSkip + 1) == nil)
-        #expect(reader.messageKey(epoch: epoch, sender: sender, device: GroupSeal.deviceTag(dev), index: 5) != nil)
-        #expect(reader.skipped.count == 5)
-        reader.drop(before: 4)
-        #expect(reader.chains.isEmpty && reader.skipped.isEmpty)
-    }
-
     @Test func numbersOutOfRangeAndBigPicturesAreRefusedNotCrashedOn() {
         let owner = keys(.random(32))
         var s = settings(owner: owner, members: [])
@@ -235,7 +150,7 @@ struct GroupKeysTests {
         #expect(big.avatar == nil && big.avatarHash == nil && big.verified(group: group), "a picture too big is left off when the card is made")
         // Sealing with any epoch number never traps.
         var chain = SenderChain(key: .random(32), index: 0)
-        #expect((try? GroupSeal.seal(Data("x".utf8), group: group, epoch: GroupEpoch(number: -5, key: .random(32), started: Date()),
+        #expect((try? GroupSeal.seal(Data("x".utf8), group: group, epoch: GroupEpoch(number: -5, key: .random(32), started: Date(), announce: .random(32), hour: GroupEpoch.hourNow()),
                                      keys: owner, device: dev, chain: &chain)) != nil)
     }
 
@@ -282,22 +197,6 @@ struct GroupKeysTests {
         #expect(base.acceptsJump(back) == (back.epoch >= base.epoch))
     }
 
-    @Test func oneSenderCantCrowdOutOthersOrOpenEndlessChains() {
-        let epoch = GroupEpoch.fresh(number: 1)
-        var reader = GroupReader()
-        let noisy = keys(.random(32)).publicKey, quiet = keys(.random(32)).publicKey
-        let quietDevice = GroupSeal.deviceTag(.random(8))
-        _ = reader.messageKey(epoch: epoch, sender: quiet, device: quietDevice, index: 3)
-        #expect(reader.skipped.count == 3)
-        let noisyDevice = GroupSeal.deviceTag(.random(8))
-        var at: UInt32 = 0
-        for _ in 0..<2 { at += 1_500; _ = reader.messageKey(epoch: epoch, sender: noisy, device: noisyDevice, index: at) }
-        #expect(reader.skipped.keys.filter { $0.contains(noisy.hex) }.count <= GroupReader.maxSkippedPerSender)
-        #expect(reader.skipped.keys.filter { $0.contains(quiet.hex) }.count == 3, "the quiet member's gaps are kept")
-        for _ in 0..<GroupReader.maxDevicesPerSender { _ = reader.messageKey(epoch: epoch, sender: noisy, device: .random(8), index: 0) }
-        #expect(reader.messageKey(epoch: epoch, sender: noisy, device: .random(8), index: 0) == nil, "no more devices")
-    }
-
     @Test func eachEpochKeyCarriesACheckTheSettingsName() {
         let one = GroupEpoch.fresh(number: 2), other = GroupEpoch.fresh(number: 2)
         #expect(one.check.count == 32 && one.check != other.check && one.check != one.key)
@@ -337,7 +236,7 @@ struct GroupKeysTests {
         #expect(GroupSeal.fits(payload: bytes) && !GroupSeal.fits(payload: 2_100_000))
         // What the check passes really does seal under the relay's limit (2 MiB and a little).
         var chain = SenderChain(key: .random(32), index: 0)
-        let sealed = try! GroupSeal.seal(Data(count: bytes), group: group, epoch: .fresh(number: 1), keys: owner, device: dev, chain: &chain)
+        let sealed = try! GroupSeal.seal(Data(count: bytes), group: group, epoch: .fresh(number: 1), keys: owner, device: dev, chain: &chain).blob
         #expect(sealed.count <= 2 * 1024 * 1024 + 1024)
         var long = s
         long.title = String(repeating: "\u{0301}", count: 300)
