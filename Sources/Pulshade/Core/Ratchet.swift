@@ -4,9 +4,9 @@ import CryptoKit
 enum RatchetError: Error { case notReady, tooManySkipped, decryptFailed, malformed, peerTooOld }
 
 struct RatchetHeader: Codable, Equatable {
-    /// The one form of header this build speaks (`v`). A message in any other form comes from a build from before the
-    /// sparse post-quantum ratchet, which this build refuses (`RatchetError.peerTooOld`).
-    static let version: UInt8 = 3
+    /// The one form of header this build speaks (`v`). A message in any other form comes from an older build, which this
+    /// build refuses (`RatchetError.peerTooOld`).
+    static let version: UInt8 = 4
 
     /// The sender's current ratchet public key.
     var dh: Data
@@ -16,24 +16,22 @@ struct RatchetHeader: Codable, Equatable {
     var n: UInt32
     /// `RatchetHeader.version`. Nil on a message from a build before it (and on the filler that wakes a phone).
     var v: UInt8? = nil
-    /// One chunk of the sparse post-quantum ratchet, in every message and always the same size (see `Ratchet`).
+    /// Chunks of the sparse post-quantum ratchet, one after another (see `Ratchet`): always at least one, and more only
+    /// where the message had room for them inside the padding it would have had anyway.
     var pq: Data? = nil
-    /// "I hold the secret of my own offer of this epoch": the other side may mix it into its next new chain.
-    var pd: UInt32? = nil
-    /// "This chain's root has the secret of your offer of this epoch mixed in."
+    /// "This chain's root has the secret of my offer of this epoch mixed in": the receiver answered that offer, so it holds
+    /// the secret already.
     var pm: UInt32? = nil
 
     /// What goes into the message's AEAD: the position fields, the version and everything post-quantum, so a changed
     /// chunk or flag fails right here rather than being mixed into the session.
     var authenticated: Data {
-        var out = Data("pulshade.ratchet.bound.v3".utf8)
+        var out = Data("pulshade.ratchet.bound.v4".utf8)
         out.append(dh)
         out.append(n32(pn))
         out.append(n32(n))
         out.append(v ?? 0)
         out.append(contentsOf: SHA256.hash(data: pq ?? Data()))
-        out.append(pd == nil ? 0 : 1)
-        out.append(n32(pd ?? 0))
         out.append(pm == nil ? 0 : 1)
         out.append(n32(pm ?? 0))
         return out
@@ -53,26 +51,31 @@ struct RatchetMessage: Codable, Equatable {
 /// state doesn't open earlier messages, and the next fresh exchange locks a thief back out.
 ///
 /// Sparse post-quantum ratchet: each side keeps making fresh ML-KEM-768 keys and offering them, in pieces. An
-/// ML-KEM key (1,184 bytes) or ciphertext (1,088) is far too big for the 2 KiB envelope next to a short message,
-/// so it is cut into chunks of 96 bytes and erasure coded (`ChunkCode`): every message carries exactly one chunk,
-/// in a field that is always there and always the same size, and any 13 different chunks of a key (12 of a
-/// ciphertext) rebuild it, in any order, whichever messages were lost. Nothing about a message's size says
-/// whether a post-quantum exchange is going on.
+/// ML-KEM key (1,184 bytes) or ciphertext (1,088) is too big to add to every message, so it is cut into chunks of 96
+/// bytes and erasure coded (`ChunkCode`): any 13 different chunks of a key (12 of a ciphertext) rebuild it, in any
+/// order, whichever messages were lost, repeated or late. Every message carries at least one chunk, in a field that is
+/// always there. Envelopes are padded to fixed sizes anyway, so where a message leaves room in its padding it carries
+/// as many more chunks as fit there (a short text, about seven): the envelope is the same size it would have been
+/// without them, and nothing about its size says whether a post-quantum exchange is going on.
 ///
 /// Two exchanges run at once, one offered by each side. For one of them: the offerer's messages carry chunks of its
-/// key; the other side rebuilds it, encapsulates, and its messages carry chunks of the ciphertext; the offerer
-/// rebuilds that and decapsulates, and says so in `pd` on every message from then on. Only once the other side has
-/// seen that does it mix the secret into the root key of its next new chain, and say so in `pm` on every message of
-/// that chain; the offerer, seeing `pm`, mixes the same secret in on its side of the same step. Then both start the
-/// next epoch. A secret is never used before the other side holds it, so no message waits on a chunk, and nothing
-/// in this needs more than the existing chain keys: a lost or late message is handled exactly as before.
+/// key; the other side rebuilds it, encapsulates, keeps the secret, and its messages carry chunks of the ciphertext;
+/// the offerer rebuilds that and decapsulates. Now both sides hold the secret, so the offerer mixes it into the root
+/// key of its next new sending chain (right away, if it has not sent on its current one yet) and says so in `pm` on
+/// every message of that chain; the other side mixes in the same secret when it steps to that chain. No message ever
+/// waits on a chunk: the side that needs the secret to read is always the one that made it. A lost, late or repeated
+/// message at worst delays the next exchange.
 ///
-/// A thief who later breaks X25519 with a quantum computer is locked out again at the next completed epoch (about
-/// 25 messages each way), not once every fifty messages or a day, and not only before the handshake.
+/// Any message the other side sends moves the exchange on, delivery receipts and typing notes included, and the secret
+/// goes in on the first new chain after it, so a stream that is mostly one way still refreshes. A thief who later
+/// breaks X25519 with a quantum computer is locked out again at the next completed exchange: a handful of short
+/// messages each way.
 struct Ratchet: Codable {
     private var dhs: Data
     private var dhr: Data?
     private var rk: Data
+    /// The sending chain. Nil after a step until the first message on it: it is derived then, so a post-quantum secret
+    /// that arrived in between can still go into it.
     private var cks: Data?
     private var ckr: Data?
     private var ns: UInt32 = 0
@@ -84,8 +87,7 @@ struct Ratchet: Codable {
 
     /// The post-quantum ratchet's state. Nil in a session saved before it, which starts it on its next message.
     private var pq: PQState?
-    /// The epoch of the other side's offer that went into the root of our current sending chain, said in every
-    /// message of it.
+    /// The epoch of our offer that went into the root of our current sending chain, said in every message of it.
     private var sendMix: UInt32?
     /// When a post-quantum secret last went into the root.
     private var pqAt: Date?
@@ -107,7 +109,7 @@ struct Ratchet: Codable {
         var offerSeed: Data?
         var offerNext: UInt32 = 0
         var offerParts: [Part] = []
-        /// What we decapsulated, with what it came from, waiting for the other side to mix it in.
+        /// What we decapsulated, with what it came from, waiting for our next new sending chain.
         var offerSecret: Data?
         var offerTranscript: Data?
 
@@ -116,10 +118,9 @@ struct Ratchet: Codable {
         /// Our ciphertext, with its digest, while it is being sent.
         var takeBlob: Data?
         var takeNext: UInt32 = 0
+        /// What we encapsulated, kept until the other side's chain says it went in.
         var takeSecret: Data?
         var takeTranscript: Data?
-        /// The other side said it holds this epoch's secret, so it can go into our next new chain.
-        var takeAcked = false
         /// Which exchange's chunk goes next, when both have something to say.
         var turn = false
     }
@@ -151,7 +152,7 @@ struct Ratchet: Codable {
         Ratchet(dhs: ourRatchet.rawRepresentation, dhr: nil, rk: root.bytes, cks: nil, ad: ad)
     }
 
-    var canSend: Bool { cks != nil }
+    var canSend: Bool { cks != nil || dhr != nil }
 
     /// Completed post-quantum epochs, for tests: ours offered and mixed in, theirs answered and mixed in.
     var postQuantumEpochs: (offered: UInt32, answered: UInt32) {
@@ -159,18 +160,48 @@ struct Ratchet: Codable {
         return (q.offerEpoch - 1, q.takeEpoch - 1)
     }
 
-    mutating func encrypt(_ plaintext: Data) throws -> RatchetMessage {
+    /// Encrypts the next message. `fit`, when given, says for a message how big its envelope will be and how many bytes
+    /// of padding it has left: the message then carries as many more post-quantum chunks as fit in that padding, and its
+    /// envelope stays exactly the size it would have been with one.
+    mutating func encrypt(_ plaintext: Data, fit: ((RatchetMessage) -> (size: Int, room: Int))? = nil) throws -> RatchetMessage {
+        try startSendingChain()
         guard let ck = cks else { throw RatchetError.notReady }
-        var q = pq ?? PQState()
-        let chunk = try Self.nextChunk(&q)
+        var base = pq ?? PQState()
+        if base.offerSecret == nil && base.offerSeed == nil { base.offerSeed = try MLKEM768.PrivateKey().seedRepresentation }
+        let offer = try base.offerSecret == nil ? base.offerSeed.map { seed -> Data in
+            let key = try MLKEM768.PrivateKey(seedRepresentation: seed, publicKey: nil).publicKey.rawRepresentation
+            return key + Self.digest(key)
+        } : nil
         let (next, mk) = Self.kdfChain(ck)
-        let header = RatchetHeader(dh: try Self.publicKey(dhs), pn: pn, n: ns, v: RatchetHeader.version, pq: chunk,
-                                   pd: q.offerSecret == nil ? nil : q.offerEpoch, pm: sendMix)
-        let sealed = try Self.seal(plaintext, key: mk, ad: ad + header.authenticated)
+        let dhPublic = try Self.publicKey(dhs)
+
+        func build(_ slots: Int) throws -> (RatchetMessage, PQState) {
+            var q = base
+            let chunks = Self.chunks(&q, offer: offer, slots: slots)
+            let header = RatchetHeader(dh: dhPublic, pn: pn, n: ns, v: RatchetHeader.version, pq: chunks, pm: sendMix)
+            let sealed = try Self.seal(plaintext, key: mk, ad: ad + header.authenticated)
+            return (RatchetMessage(header: header, ciphertext: sealed), q)
+        }
+
+        var (message, q) = try build(1)
+        if let fit {
+            let first = fit(message)
+            // Each chunk more is 102 bytes, a little over 136 once written out.
+            var extra = min(Self.maxChunks - 1, max(0, first.room) / 140)
+            while extra > 0 {
+                let (bigger, state) = try build(1 + extra)
+                let now = fit(bigger)
+                if now.size == first.size && now.room >= 0 {
+                    (message, q) = (bigger, state)
+                    break
+                }
+                extra -= 1
+            }
+        }
         cks = next
         pq = q
         ns += 1
-        return RatchetMessage(header: header, ciphertext: sealed)
+        return message
     }
 
     /// Works on a copy, so a forged or garbled message never damages the real state.
@@ -179,13 +210,10 @@ struct Ratchet: Codable {
         guard message.header.v == RatchetHeader.version else { throw RatchetError.peerTooOld }
         var s = self
         if let plain = try s.openSkipped(message) {
-            s.absorbAck(message.header)
-            s.absorbChunk(message.header)
+            s.absorbChunks(message.header)
             self = s
             return plain
         }
-        // The other side's word that it holds a secret counts before the step below, which may mix ours in.
-        s.absorbAck(message.header)
         if message.header.dh != s.dhr {
             try s.skip(until: message.header.pn)
             try s.step(message.header)
@@ -196,8 +224,8 @@ struct Ratchet: Codable {
         s.ckr = next
         s.nr += 1
         let plain = try Self.open(message.ciphertext, key: mk, ad: ad + message.header.authenticated)
-        // Only a message that opened is believed about its chunk.
-        s.absorbChunk(message.header)
+        // Only a message that opened is believed about its chunks.
+        s.absorbChunks(message.header)
         self = s
         return plain
     }
@@ -225,11 +253,14 @@ struct Ratchet: Codable {
         if skipped.count > Self.maxStoredSkipped { skipped.removeFirst(skipped.count - Self.maxStoredSkipped) }
     }
 
-    /// A new ratchet key from the other side: derive a fresh receiving chain, then a fresh sending one.
-    /// Either can carry a post-quantum secret: theirs if they mixed in our offer, ours if we mix in theirs.
+    /// A new ratchet key from the other side: derive a fresh receiving chain, and make a fresh key for the sending chain,
+    /// which is derived when the first message goes on it (`startSendingChain`). The receiving chain carries a
+    /// post-quantum secret if the other side mixed in its offer that we answered.
     private mutating func step(_ header: RatchetHeader) throws {
         let theirs = header.dh
         var q = pq ?? PQState()
+        // A sending chain still waiting to be derived was never used, so the other side can't have stepped past it: it is
+        // simply dropped, and a secret that would have gone into it goes into the next one.
         pn = ns
         ns = 0
         nr = 0
@@ -237,35 +268,41 @@ struct Ratchet: Codable {
         let ours = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: dhs)
         var receiving = try Self.dh(ours, theirs)
         if let epoch = header.pm {
-            // They mixed in our offer. Without the secret it names, nothing in this chain can open.
-            guard epoch == q.offerEpoch, let secret = q.offerSecret, let transcript = q.offerTranscript else {
+            // They mixed in the secret of the ciphertext we sent them. We made it, so we always have it.
+            guard epoch == q.takeEpoch, let secret = q.takeSecret, let transcript = q.takeTranscript else {
                 throw RatchetError.decryptFailed
             }
             receiving += Self.pqInput(secret, transcript: transcript, epoch: epoch)
-            q.offerEpoch += 1
-            q.offerSeed = nil
-            q.offerNext = 0
-            q.offerParts = []
-            q.offerSecret = nil
-            q.offerTranscript = nil
-            pqAt = Self.now()
-        }
-        (rk, ckr) = Self.kdfRoot(rk, receiving)
-
-        let fresh = Curve25519.KeyAgreement.PrivateKey()
-        dhs = fresh.rawRepresentation
-        var sending = try Self.dh(fresh, theirs)
-        sendMix = nil
-        if q.takeAcked, let secret = q.takeSecret, let transcript = q.takeTranscript {
-            sending += Self.pqInput(secret, transcript: transcript, epoch: q.takeEpoch)
-            sendMix = q.takeEpoch
             q.takeEpoch += 1
             q.takeParts = []
             q.takeBlob = nil
             q.takeNext = 0
             q.takeSecret = nil
             q.takeTranscript = nil
-            q.takeAcked = false
+            pqAt = Self.now()
+        }
+        (rk, ckr) = Self.kdfRoot(rk, receiving)
+        pq = q
+        dhs = Curve25519.KeyAgreement.PrivateKey().rawRepresentation
+        cks = nil
+        sendMix = nil
+    }
+
+    /// Derives the sending chain after a step, with the secret of our offer in it if we hold one by now.
+    private mutating func startSendingChain() throws {
+        guard cks == nil, let theirs = dhr else { return }
+        var q = pq ?? PQState()
+        var sending = try Self.dh(try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: dhs), theirs)
+        sendMix = nil
+        if let secret = q.offerSecret, let transcript = q.offerTranscript {
+            sending += Self.pqInput(secret, transcript: transcript, epoch: q.offerEpoch)
+            sendMix = q.offerEpoch
+            q.offerEpoch += 1
+            q.offerSeed = nil
+            q.offerNext = 0
+            q.offerParts = []
+            q.offerSecret = nil
+            q.offerTranscript = nil
             pqAt = Self.now()
         }
         pq = q
@@ -276,46 +313,55 @@ struct Ratchet: Codable {
 
     /// Chunk on the wire: kind (0 a piece of an offered key, 1 a piece of an answer, 2 filler), epoch, chunk number, bytes.
     private static let chunkLength = 1 + 4 + 1 + ChunkCode.size
+    /// The most chunks one message carries: enough for a whole key and a whole answer.
+    private static var maxChunks: Int { ChunkCode.blocks(for: offerLength) + ChunkCode.blocks(for: answerLength) }
 
     private static func pack(kind: UInt8, epoch: UInt32, number: Int, bytes: Data) -> Data {
         Data([kind]) + n32(epoch) + Data([UInt8(number)]) + bytes
     }
 
-    /// The chunk this message carries. Always one, so the size never says anything.
-    private static func nextChunk(_ q: inout PQState) throws -> Data {
-        let offering = q.offerSecret == nil
-        let answering = q.takeBlob != nil
-        if offering && (!answering || q.turn) {
-            q.turn = false
-            if q.offerSeed == nil { q.offerSeed = try MLKEM768.PrivateKey().seedRepresentation }
-            let key = try MLKEM768.PrivateKey(seedRepresentation: q.offerSeed!, publicKey: nil).publicKey.rawRepresentation
-            let number = Int(q.offerNext % UInt32(ChunkCode.numbers))
-            q.offerNext += 1
-            return pack(kind: 0, epoch: q.offerEpoch, number: number, bytes: ChunkCode.chunk(key + digest(key), number: number))
+    /// The chunks this message carries, at most `slots` and at least one, so the field is always there. Each exchange
+    /// sends fresh chunk numbers, taking turns, and no more in one message than it takes to rebuild it.
+    private static func chunks(_ q: inout PQState, offer: Data?, slots: Int) -> Data {
+        var out = Data()
+        var offerLeft = offer == nil ? 0 : ChunkCode.blocks(for: offerLength)
+        var answerLeft = q.takeBlob == nil ? 0 : ChunkCode.blocks(for: answerLength)
+        var used = 0
+        while used < slots, offerLeft + answerLeft > 0 {
+            if let offer, offerLeft > 0, answerLeft == 0 || !q.turn {
+                q.turn = true
+                let number = Int(q.offerNext % UInt32(ChunkCode.numbers))
+                q.offerNext += 1
+                offerLeft -= 1
+                out += pack(kind: 0, epoch: q.offerEpoch, number: number, bytes: ChunkCode.chunk(offer, number: number))
+            } else if let blob = q.takeBlob {
+                q.turn = false
+                let number = Int(q.takeNext % UInt32(ChunkCode.numbers))
+                q.takeNext += 1
+                answerLeft -= 1
+                out += pack(kind: 1, epoch: q.takeEpoch, number: number, bytes: ChunkCode.chunk(blob, number: number))
+            } else {
+                break
+            }
+            used += 1
         }
-        if let blob = q.takeBlob {
-            q.turn = true
-            let number = Int(q.takeNext % UInt32(ChunkCode.numbers))
-            q.takeNext += 1
-            return pack(kind: 1, epoch: q.takeEpoch, number: number, bytes: ChunkCode.chunk(blob, number: number))
-        }
-        return pack(kind: 2, epoch: 0, number: 0, bytes: .random(ChunkCode.size))
+        if out.isEmpty { out = pack(kind: 2, epoch: 0, number: 0, bytes: .random(ChunkCode.size)) }
+        return out
     }
 
-    /// "They hold this epoch's secret" lets ours go into the next new chain.
-    private mutating func absorbAck(_ header: RatchetHeader) {
-        guard var q = pq, let epoch = header.pd, epoch == q.takeEpoch, q.takeSecret != nil, !q.takeAcked else { return }
-        q.takeAcked = true
-        pq = q
+    /// Collects the chunks a message carried. One that is for another epoch, or is not what it should be, is just ignored.
+    private mutating func absorbChunks(_ header: RatchetHeader) {
+        guard let raw = header.pq, !raw.isEmpty, raw.count % Self.chunkLength == 0 else { return }
+        let all = Data(raw)
+        for i in 0..<min(all.count / Self.chunkLength, Self.maxChunks) {
+            absorbChunk(Data(all[(i * Self.chunkLength)..<((i + 1) * Self.chunkLength)]))
+        }
     }
 
-    /// Collects the chunk a message carried. A chunk that is for another epoch, or is not what it should be, is just ignored.
-    private mutating func absorbChunk(_ header: RatchetHeader) {
-        guard let raw = header.pq, raw.count == Self.chunkLength else { return }
-        let bytes = Data(raw)
-        let kind = bytes[bytes.startIndex]
-        let epoch = bytes[(bytes.startIndex + 1)..<(bytes.startIndex + 5)].reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
-        let number = bytes[bytes.startIndex + 5]
+    private mutating func absorbChunk(_ bytes: Data) {
+        let kind = bytes[0]
+        let epoch = bytes[1..<5].reduce(UInt32(0)) { $0 << 8 | UInt32($1) }
+        let number = bytes[5]
         let body = Data(bytes.suffix(ChunkCode.size))
         guard Int(number) < ChunkCode.numbers else { return }
         var q = pq ?? PQState()

@@ -22,7 +22,7 @@ enum Envelope {
     /// Bit 6: it takes part in channels that share one mailbox, as a follower (hidden from the other followers) or as staff
     /// (`GroupRoster`, a tagged `GroupRekey`).
     /// Bit 7: this build's generation: envelopes are version 3 (identity keys with ML-KEM and ML-DSA halves, `PQKeys`) and its
-    /// chats use the sparse post-quantum ratchet (`RatchetHeader.version` 3). Nothing older is read from a peer without it:
+    /// chats use the sparse post-quantum ratchet (`RatchetHeader.version` 4). Nothing older is read from a peer without it:
     /// it is refused and told to update.
     static let reads: UInt8 = 255
 
@@ -111,4 +111,19 @@ enum Envelope {
     }
 
     static func paddedSize(of count: Int) -> Int { EnvelopeCore.paddedSize(of: count) }
+
+    /// For a ratchet message whose payload is `body` bytes as it travels: the size of the padded envelope it goes out in,
+    /// and how many bytes it could grow and still fit that size (`Ratchet.encrypt` fills them with post-quantum chunks).
+    /// Counts the sender's key, both seals and the inner header generously (an unsigned envelope with no card), so the
+    /// real envelope never comes out bigger.
+    static func ratchetFit(body: Int) -> (size: Int, room: Int) {
+        let used = body + ratchetOverhead
+        let size = EnvelopeCore.paddedSize(of: used)
+        guard size > 0 else { return (0, 0) }
+        return (size, size - 4 - used)
+    }
+
+    /// Sender key (32), the inner seal's nonce and tag (28), the frame (5), and the inner header's JSON: about 220 bytes
+    /// with a 16-byte device id, plus room for escaped slashes in its base64 and a longer device id.
+    private static let ratchetOverhead = 32 + 28 + 5 + 300
 }

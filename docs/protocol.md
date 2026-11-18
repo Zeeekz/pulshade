@@ -119,29 +119,34 @@ After the handshake, each pair of devices talks through a Double Ratchet, as Sig
     erasure coded: pieces are combinations of the data blocks over GF(2^8) with a Cauchy matrix, so **any 13 different
     pieces of a key (12 of a ciphertext) rebuild it**, in any order, whichever messages were lost. A rebuilt key or
     ciphertext that does not match its digest is thrown away and collected again.
-  - **Every message carries exactly one piece** in its header (`pq`, 102 bytes: kind, epoch, piece number, bytes), and
-    when there is nothing to send, random filler of the same length. So the field is always present and always the same
-    size, and message sizes say nothing about when an exchange runs. It adds about 150 bytes of JSON to a message; a
-    short message still fits the 2 KiB bucket (`RatchetPQTests.aMessageStillFitsTheSmallestBucket`), and one that was
-    within about 150 bytes of a bucket edge now falls into the next bucket, like any other message that grows.
-  - When the offerer has rebuilt the ciphertext and decapsulated, it says so in every message (`pd`, the epoch). Only
-    when the other side has seen that does it mix the secret into the **root key** at its next new chain (the same step
-    that mixes in X25519), and it says so in every message of that chain (`pm`). The offerer, seeing `pm`, mixes the same
-    secret in on its side of the same step, and both start the next epoch. A secret is never used before the other side
-    holds it, so no message ever waits on a piece, and it adds no message keys of its own: lost, late and repeated
-    messages are handled by the ordinary skipped-key logic.
+  - **Every message carries at least one piece** in its header (`pq`, 102 bytes each: kind, epoch, piece number,
+    bytes), and when there is nothing to send, one piece of random filler. Envelopes are padded to fixed buckets anyway,
+    so a message carries **as many more pieces as fit in the padding it already has** (`Ratchet.encrypt(_:fit:)`,
+    `Envelope.ratchetFit`): about seven more for a short text, more for a receipt or typing note, none for a message
+    already near the edge of its bucket. The sender works out the envelope's bucket with one piece, then adds pieces
+    only while the envelope stays in that same bucket, so no envelope is ever bigger because of them and sizes say
+    nothing about when an exchange runs. Each exchange sends fresh piece numbers, taking turns, at most as many in one
+    message as it takes to rebuild it. Not while the envelope still carries the sender's post-quantum card.
+  - When the offerer has rebuilt the ciphertext and decapsulated, both sides hold the secret (the answerer made it). The
+    offerer mixes it into the **root key** of its next new sending chain, next to that chain's X25519 output, and says so
+    in every message of that chain (`pm`, the epoch). A sending chain is derived when the first message goes on it, not at
+    the step, so a secret that arrived in between goes into the very next message. The answerer, stepping to that chain,
+    mixes in the secret it kept, and both start the next epoch. The side that needs the secret to read is always the
+    one that made it, so no message ever waits on a piece and no acknowledgement round is needed; lost, late and
+    repeated messages are handled by the ordinary skipped-key logic and at worst delay the next exchange.
   - The secret goes in as `HKDF-SHA256(secret, salt = SHA-256(key ‖ ciphertext), info = "pulshade.pqr.mix" ‖ epoch)`,
     next to the X25519 output, so it is bound to the exact key and ciphertext. Piece digests use the label
-    `pulshade.pqr.digest`. The piece, `pd` and `pm` are part of what each message's AEAD authenticates (label
-    `pulshade.ratchet.bound.v3`), so a changed piece or flag fails on the spot.
-  - **How often:** measured in the tests (`RatchetPQTests.secretsKeepGoingIn`), a back-and-forth chat completes a new
-    secret about every 35 to 40 messages in total, in both directions in turn, with no day timer. Healing therefore
-    no longer depends on X25519 alone between refreshes. A chat where one side only sends does not advance (it needs
-    the other side's ciphertext and a new chain), the same as the X25519 ratchet itself.
+    `pulshade.pqr.digest`. The pieces and `pm` are part of what each message's AEAD authenticates (label
+    `pulshade.ratchet.bound.v4`), so a changed piece or flag fails on the spot.
+  - **How often:** with short messages, a back-and-forth chat completes a new secret roughly every 6 to 10 messages in
+    total (before build 17: every 35 to 40). Messages with no spare padding carry one piece and go at about the old
+    pace. Any message from the other side moves the exchange on, delivery receipts and typing notes included, so a chat
+    that is mostly one way refreshes with every few of those. A peer that sends nothing at all cannot refresh the
+    sender's direction: the secret has to come from it, as the X25519 ratchet's does.
   - Limits kept: at most 1,000 skipped messages per jump and 2,000 spare keys; at most 240 piece numbers per epoch and one
     epoch of each exchange in memory (under about 3 KB). A message that fails to open, for any reason, changes nothing in
     the saved state (it is tried on a copy).
-  - **Old builds.** Every message has to be in this form (header version 3, bit 7 of the `caps` byte). A message from a
+  - **Old builds.** Every message has to be in this form (header version 4, bit 7 of the `caps` byte). A message from a
     build from before is refused (`RatchetError.peerTooOld`) and the friend is marked as needing to update
     (`DeviceLink.needsUpdate`): nothing is sent to that device, the chat's composer is closed with "<name> needs to update
     Pulshade first.", and no new keys are started over it. Their next envelope with bit 7 lifts the mark. Sessions
@@ -769,7 +774,7 @@ the apps.
 
 | Recorded traffic, broken later | Result |
 | --- | --- |
-| Message content | **Still safe.** The handshake mixes ML-KEM-768, and the sparse post-quantum ratchet adds a fresh ML-KEM-768 secret about every 35 to 40 messages of a back-and-forth chat. |
+| Message content | **Still safe.** The handshake mixes ML-KEM-768, and the sparse post-quantum ratchet adds a fresh ML-KEM-768 secret about every 6 to 10 short messages of a back-and-forth chat. |
 | The sealed-sender layer (version 3 envelopes) | **Still safe.** ML-KEM-768 is mixed into both layers. Exceptions: the first, introducing envelope each way (hello, request or introduction), and group-member envelopes, which are classical. |
 | Any TLS/Tor layers (X25519-based) | **Could be opened** (outside what Pulshade controls). That would reveal the mailbox read keys sent in requests and timing, not message content or, for version 3 envelopes, the sender. |
 | Identity authentication | **Hybrid.** Control messages need an Ed25519 and an ML-DSA-65 signature, and a pinned contact can't be downgraded. Pinning is trust on first use; the pulse code covers both signing keys and both agreement keys (Ed25519 and X25519), not the post-quantum keys, and public directory entries, collectibles and admin signatures are still Ed25519 only. |

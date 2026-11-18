@@ -1399,7 +1399,9 @@ struct AppData: Codable {
     /// 20: a ratchet session carries the sparse post-quantum ratchet's state (its refresh fields from before are gone), a
     /// device can be marked as needing to update (`DeviceLink.needsUpdate`), and post-quantum keys are pinned per contact
     /// (`Contact.pq`, `pqCommit`, `pqCardSent`, `tooOld`).
-    static let currentFormat = 20
+    /// 22: a ratchet session's post-quantum state no longer waits for the other side's word before mixing a secret in, and
+    /// its sending chain can wait to be derived until the first message on it.
+    static let currentFormat = 22
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []

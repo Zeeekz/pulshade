@@ -202,7 +202,7 @@ private func restart(_ r: Ratchet) throws -> Ratchet { try JSONDecoder().decode(
         var wrongChunk = good
         wrongChunk.header.pq![10] ^= 1
         var wrongAck = good
-        wrongAck.header.pd = 7
+        wrongAck.header.n += 1
         var wrongMix = good
         wrongMix.header.pm = 1
         var wrongBody = good

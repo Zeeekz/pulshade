@@ -4682,8 +4682,19 @@ final class AppModel {
                 // To an app that reads frames, big things go without the base64 that nearly doubles them at each
                 // layer. Short messages are sent exactly as before.
                 let frames = data.contacts[i].devices[d].readsFrames == true
-                guard let plain = try? item.payload.wire(framed: frames),
-                      let message = try? session.encrypt(plain) else {
+                guard let plain = try? item.payload.wire(framed: frames) else {
+                    data.contacts[i].devices[d].pending.append(item)
+                    continue
+                }
+                // Post-quantum chunks fill the padding the envelope has anyway. Not while our own keys still go along
+                // in the envelope (`pqCardSent`), which makes it bigger than this can tell.
+                let framed = frames && plain.count + 16 > Self.smallEnvelope
+                let carriesCard = data.contacts[i].pqCardSent != true && !data.contacts[i].isSelf
+                let fit: ((RatchetMessage) -> (size: Int, room: Int))? = carriesCard ? nil : { candidate in
+                    guard let body = try? Payload.ratchet(candidate).wire(framed: framed) else { return (0, -1) }
+                    return Envelope.ratchetFit(body: body.count)
+                }
+                guard let message = try? session.encrypt(plain, fit: fit) else {
                     // Couldn't be sealed: keep it to try again rather than dropping it silently.
                     data.contacts[i].devices[d].pending.append(item)
                     continue
@@ -4691,7 +4702,7 @@ final class AppModel {
                 seal(.ratchet(message), contact: i, device: d, message: item.message, ephemeral: item.payload.isEphemeral,
                      collapse: item.payload.collapseKind, resendOf: item.resendOf,
                      story: item.payload.storyID, viewReport: item.payload.storyViewID, rings: item.payload.rings,
-                     framed: frames && message.ciphertext.count > Self.smallEnvelope, wakes: item.payload.isInvite)
+                     framed: framed, wakes: item.payload.isInvite)
             }
             data.contacts[i].devices[d].session = session
         }
