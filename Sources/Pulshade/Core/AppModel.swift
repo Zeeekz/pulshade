@@ -184,8 +184,10 @@ final class AppModel {
         phase = vault.exists ? .locked : .welcome
         #if os(iOS)
         // iOS keeps Keychain items when an app is deleted. A fresh install with no vault must not inherit keys left
-        // by a deleted one (the notification helper's bundle and inbox, sealed files' keys).
-        if vault.claimFreshInstall() {
+        // by a deleted one (the notification helper's bundle and inbox, sealed files' keys). Only for the app's own
+        // vault: a throwaway one (the sample account) is always new, and wiping every key from it would lock the real
+        // account out for good.
+        if vault.directory.standardizedFileURL == Vault.standard.directory.standardizedFileURL, vault.claimFreshInstall() {
             HelperStore.clear()
             FileKeys.forgetAll()
         }
