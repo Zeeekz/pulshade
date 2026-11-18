@@ -121,6 +121,9 @@ struct Ratchet: Codable {
         /// What we encapsulated, kept until the other side's chain says it went in.
         var takeSecret: Data?
         var takeTranscript: Data?
+        /// The digest of the key we answered, so the same key arriving again isn't answered twice and a different one
+        /// (the offerer started over) is.
+        var takeKey: Data?
         /// Which exchange's chunk goes next, when both have something to say.
         var turn = false
     }
@@ -279,6 +282,7 @@ struct Ratchet: Codable {
             q.takeNext = 0
             q.takeSecret = nil
             q.takeTranscript = nil
+            q.takeKey = nil
             pqAt = Self.now()
         }
         (rk, ckr) = Self.kdfRoot(rk, receiving)
@@ -367,25 +371,34 @@ struct Ratchet: Codable {
         var q = pq ?? PQState()
         switch kind {
         case 0:
-            // A piece of their key, for us to answer.
-            guard epoch == q.takeEpoch, q.takeSecret == nil else { return }
+            // A piece of their key, for us to answer. Still taken after we answered: if the key they offer now is a different
+            // one (our answer didn't match theirs, so they started over with a fresh key), it is answered again. Until it
+            // has, they never mix in this epoch, so replacing our secret can't leave a message unreadable.
+            guard epoch == q.takeEpoch else { return }
             if !q.takeParts.contains(where: { $0.n == number }) { q.takeParts.append(Part(n: number, bytes: body)) }
             if q.takeParts.count >= ChunkCode.blocks(for: Self.offerLength) {
                 let parts = Dictionary(uniqueKeysWithValues: q.takeParts.map { (Int($0.n), $0.bytes) })
+                q.takeParts = []
                 guard let whole = ChunkCode.decode(parts, length: Self.offerLength),
-                      Self.digest(whole.prefix(Self.keyLength)) == whole.suffix(32),
+                      Self.digest(whole.prefix(Self.keyLength)) == whole.suffix(32) else {
+                    // Pieces that don't fit together: start collecting again.
+                    pq = q
+                    return
+                }
+                let keyDigest = Self.digest(whole.prefix(Self.keyLength))
+                guard keyDigest != q.takeKey,
                       let key = try? MLKEM768.PublicKey(rawRepresentation: whole.prefix(Self.keyLength)),
                       let sealed = try? key.encapsulate() else {
-                    // Pieces that don't fit together: start collecting again.
-                    q.takeParts = []
                     pq = q
                     return
                 }
                 let ciphertext = sealed.encapsulated
                 q.takeSecret = sealed.sharedSecret.withUnsafeBytes { Data($0) }
                 q.takeTranscript = Data(SHA256.hash(data: whole.prefix(Self.keyLength) + ciphertext))
-                q.takeBlob = ciphertext + Self.digest(ciphertext)
-                q.takeParts = []
+                q.takeKey = keyDigest
+                // The answer names the key it answers, so the offerer can tell it answers the key it holds.
+                let answer = ciphertext + keyDigest
+                q.takeBlob = answer + Self.digest(answer)
                 q.takeNext = 0
             }
         case 1:
@@ -395,8 +408,17 @@ struct Ratchet: Codable {
             if q.offerParts.count >= ChunkCode.blocks(for: Self.answerLength) {
                 let parts = Dictionary(uniqueKeysWithValues: q.offerParts.map { (Int($0.n), $0.bytes) })
                 guard let whole = ChunkCode.decode(parts, length: Self.answerLength),
-                      Self.digest(whole.prefix(Self.ciphertextLength)) == whole.suffix(32),
-                      let kem = try? MLKEM768.PrivateKey(seedRepresentation: seed, publicKey: nil),
+                      Self.digest(whole.prefix(Self.ciphertextLength + 32)) == whole.suffix(32),
+                      let kem = try? MLKEM768.PrivateKey(seedRepresentation: seed, publicKey: nil) else {
+                    q.offerParts = []
+                    pq = q
+                    return
+                }
+                // An answer to some other key than the one we offer: thrown away, and our key goes on being offered. The other
+                // side answers again once it rebuilds a key that isn't the one it answered (`takeKey`). A fresh key here
+                // would let stale chunks of the wrong answer, still on their way, throw each new key away in turn.
+                let answered = whole.dropFirst(Self.ciphertextLength).prefix(32)
+                guard Data(answered) == Self.digest(kem.publicKey.rawRepresentation),
                       let secret = try? kem.decapsulate(whole.prefix(Self.ciphertextLength)) else {
                     q.offerParts = []
                     pq = q
@@ -412,11 +434,11 @@ struct Ratchet: Codable {
         pq = q
     }
 
-    /// An ML-KEM-768 public key and its digest; a ciphertext and its digest.
+    /// An ML-KEM-768 public key and its digest; a ciphertext, the digest of the key it answers, and the digest of both.
     private static let keyLength = 1184
     private static let ciphertextLength = 1088
     private static let offerLength = keyLength + 32
-    private static let answerLength = ciphertextLength + 32
+    private static let answerLength = ciphertextLength + 32 + 32
 
     private static func digest(_ data: Data) -> Data {
         Data(SHA256.hash(data: Data("pulshade.pqr.digest".utf8) + data))
