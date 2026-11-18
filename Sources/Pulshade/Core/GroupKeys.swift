@@ -826,8 +826,11 @@ struct GroupDirect: Codable, Equatable {
     var accept: SessionAccept?
     var message: RatchetMessage?
 
-    /// Most items one direct post may carry, and one post's items for this device that are looked at.
+    /// Most items one direct post may carry.
     static let maxItems = 1_200
+    /// Most items of one post meant for this device that are looked at (all from the one device that posted it), and of
+    /// those, only the first ask for a session.
+    static let maxForOneDevice = 64
 }
 
 /// This device's pairwise session with one device of one member (another member's, or another of this account's own),
@@ -847,6 +850,20 @@ struct GroupPeer: Codable, Equatable {
     var used = Date()
     /// When this device last had to start over (a message that didn't open), so it isn't done on every post.
     var resetAt: Date?
+    /// The lowest position of this device's own chain in each epoch (by number, as text) this device hands that device:
+    /// where it was first given it, and, once that device has shown it got it, where this device's chain was then. So
+    /// whoever takes that device can't ask for what it has already read.
+    var floor: [String: UInt32]?
+    /// Epochs whose chain this device handed that device that it hasn't shown it got yet (by sending anything that opens
+    /// on the session since).
+    var unconfirmed: [String]?
+    /// When the session opened (the relay's time on the post that opened it): an ask for a new one from before is not
+    /// taken while it works.
+    var openedAt: Date?
+    /// When a message from that device last didn't open here: its ask for a new session is taken then.
+    var failedAt: Date?
+    /// The epoch this device first met that one in, so a member can't make up device after device.
+    var metIn: Int?
 
     static func id(member: Data, device: Data) -> String { "\(member.hex)|\(device.hex)" }
 
@@ -854,10 +871,15 @@ struct GroupPeer: Codable, Equatable {
     static func == (a: GroupPeer, b: GroupPeer) -> Bool {
         a.member == b.member && a.device == b.device && a.used == b.used && a.answered == b.answered && a.queued == b.queued
             && a.resetAt == b.resetAt && a.pending?.ephemeral == b.pending?.ephemeral && (a.session == nil) == (b.session == nil)
+            && a.floor == b.floor && a.unconfirmed == b.unconfirmed && a.openedAt == b.openedAt && a.failedAt == b.failedAt
     }
 
     /// Most sessions one group keeps: past it, the ones unused longest go.
     static let maxPerGroup = 3_000
+    /// Most devices of one member met for the first time in one epoch.
+    static let maxNewPerMember = 16
+    /// How long after a message from a device didn't open its ask for a new session is taken, though one is open.
+    static let failedWindow: TimeInterval = 86_400
     /// An ask that got no answer is made again after this long.
     static let helloRetry: TimeInterval = 600
 }
@@ -917,8 +939,8 @@ enum GroupHandshake {
 }
 
 /// Sent over a 1:1 chat to someone being added: everything they need to read and write in the group from now on.
-/// Whoever adds someone starts a new epoch first if anything has been said in the current one, so a newcomer reads
-/// from when they joined, not what the group said before.
+/// Whoever adds someone to a group starts a new epoch first, so a newcomer reads from when they joined, not what the
+/// group said before (in a channel, only once something was said; followers get staff chains from where they came in).
 struct GroupInvite: Codable, Equatable {
     var settings: GroupSettings
     var epoch: GroupEpoch
@@ -992,6 +1014,11 @@ struct HeldGroupMail: Codable, Equatable {
     var seq: UInt64
     var blob: Data
     var at: Date
+    /// Who posted it, and from which device, so no one member's posts crowd out the others'.
+    var from: Data?
+    var device: Data?
+    /// Held for want of a chain (not because its sender isn't listed yet).
+    var chain: Bool?
 
     static let max = 100
     /// All that is kept for one group, in bytes.
@@ -1052,11 +1079,14 @@ struct SharedGroup: Codable, Equatable {
     /// As an admin: who joined through this device, by account fingerprint, as which member. Only on this device:
     /// nobody else in the group learns who a member is outside it.
     var knownAs: [String: String] = [:]
+    /// As staff of a channel: where each staff device's chain was (by `GroupReader.id`) when this device let a follower
+    /// in, by the follower's account fingerprint. Nothing from before goes to them.
+    var admittedAt: [String: [String: UInt32]]?
     /// The tag this device signs its posts with: random, made the first time it posts, and never copied to another
     /// device (a backup or a newly linked device makes its own), so no two ever use the same chain.
     var myTag: Data?
-    /// Someone has said something in the current epoch (as far as this device has read). A newcomer is then given a
-    /// new epoch, so they can't read it; several joining in a quiet spell share one.
+    /// Someone has said something in the current epoch (as far as this device has read). A channel's newcomer is then
+    /// given a new epoch; a group's always gets one.
     var chatInEpoch = false
     /// How many chat posts this device has seen in the current epoch (its own and others'), for a new epoch by count.
     var chatsInEpoch: Int?

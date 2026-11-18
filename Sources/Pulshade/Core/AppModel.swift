@@ -1958,6 +1958,8 @@ final class AppModel {
     @ObservationIgnored var keyResent: [String: Date] = [:]
     /// When a follower of a channel was last sent the current key because they asked (by channel and key), so a flood of asks is answered once.
     @ObservationIgnored var channelKeyAnswered: [String: Date] = [:]
+    /// Groups with posts just held for want of a chain: asked for together, in one direct post, once a fetch is read.
+    @ObservationIgnored var chainAsksDue: Set<UUID> = []
     /// When the envelope being handled was sent (as its sender signed it), for the few payloads that mustn't act on a stale copy.
     @ObservationIgnored var handlingSentAt: Date?
     /// When each channel let someone in through its code lately, for its hourly limit.
@@ -5967,6 +5969,7 @@ final class AppModel {
                         guard let at = cursors.first(where: { $0.key == mail.receiveKey }) else { continue }
                         receiveGroupMail(mail, convo: at.convo, epoch: at.epoch)
                     }
+                    askDueChains()
                     lastMailReceived = Date()
                     save()
                 }
@@ -9398,8 +9401,8 @@ extension AppModel {
     }
 
     /// Sends each of `fingerprints` (contacts of the group's persona whose apps take part) what they need to join.
-    /// Whoever adds starts a new epoch first when anything has been said in the current one, so a newcomer reads from
-    /// when they joined and nothing before. Gives back the ones whose app is too old to take part: they are not invited, and
+    /// Whoever adds someone to a group starts a new epoch first, so a newcomer reads from when they joined and nothing
+    /// before (a channel, only when something was said in this one). Gives back the ones whose app is too old to take part: they are not invited, and
     /// nothing is kept to invite them later.
     @discardableResult
     private func invite(_ fingerprints: [String], at i: Int) -> [String] {
@@ -9415,10 +9418,16 @@ extension AppModel {
         let held = kind == .channel ? (shared.roster?.live.count ?? 0) : shared.settings.members.count
         let room = (kind == .channel ? GroupRoster.Body.maxEntries : GroupSettings.maxMembers) - held - shared.invited.count
         guard room > 0 else { return tooOld }
-        if shared.chatInEpoch {
+        // Someone joining a group always starts in a new epoch: whether anything was said in this one is only what this
+        // device has read, and other members' devices may have posted that it hasn't. If no new epoch could be made,
+        // nobody is invited. A channel's follower is handed staff chains only from where they are when they come in
+        // (`admittedAt`), so a channel moves on only once something was said.
+        if kind == .group || shared.chatInEpoch {
+            let before = shared.settings.epoch
             startEpoch(at: i, without: [])
             guard let updated = data.conversations[i].shared else { return tooOld }
             shared = updated
+            if kind == .group, shared.settings.epoch == before { return tooOld }
         }
         guard let epoch = shared.current else { return tooOld }
         let added = Array(people.prefix(room))
@@ -9428,6 +9437,7 @@ extension AppModel {
             enqueue(.groupInvite(GroupInvite(settings: shared.settings, epoch: epoch)), to: person)
         }
         data.conversations[i].shared = shared
+        if kind == .channel { for person in added { noteAdmitted(person.fingerprint, at: i) } }
         // Everyone sees who was added straight away, as in other apps, not only when each one's app answers. Not in a
         // channel: its followers are hidden from each other.
         let names = added.map { String($0.displayName.prefix(40)) }
@@ -10339,6 +10349,7 @@ extension AppModel {
                 data.conversations[i].shared?.chainStarts = starts.filter { stillRead.contains(Int($0.key) ?? -1) }
             }
             tendPeers(at: i)
+            expireHeldMail(at: i)
             askForHeldChains(at: i)
             let readableBoxes = Set(shared.readable.map { $0.sendID.hex })
             if !shared.postedTo.isSubset(of: readableBoxes) {
@@ -10434,11 +10445,13 @@ extension AppModel {
 
     // MARK: Reading
 
-    /// One envelope from a group's mailbox. Its number moves the cursor whatever is in it, so nothing is read twice.
-    func receiveGroupMail(_ mail: RelayClient.GroupMail, convo id: UUID, epoch number: Int) {
+    /// One envelope from a group's mailbox. Its number moves the cursor whatever is in it, so nothing is read twice: one
+    /// at or below the cursor (the relay handing an old one out again) is dropped, unless it is held mail read again.
+    func receiveGroupMail(_ mail: RelayClient.GroupMail, convo id: UUID, epoch number: Int, rereading: Bool = false) {
         guard let i = index(of: id), var shared = data.conversations[i].shared, !shared.gone,
               let epoch = shared.epoch(number) else { return }
         let key = String(number)
+        if !rereading, let cursor = shared.cursors[key], mail.seq <= cursor { return }
         if mail.seq > shared.cursors[key] ?? 0 { shared.cursors[key] = mail.seq }
         data.conversations[i].shared = shared
         let persona = data.conversations[i].persona
@@ -10465,7 +10478,7 @@ extension AppModel {
         }
         if !shared.settings.isMember(outer.sender) && !ours {
             // Not listed yet: the settings that add them may still be on the way. Kept for a while, and read again then.
-            hold(mail, epoch: number, in: &shared)
+            hold(mail, epoch: number, from: outer.sender, device: outer.device, chain: false, in: &shared)
             data.conversations[i].shared = shared
             return
         }
@@ -10474,7 +10487,7 @@ extension AppModel {
             data.conversations[i].shared = shared
             guard outer.inner.count <= GroupSeal.maxPadded, let payload = try? Payload.fromWire(outer.inner),
                   case let .groupDirect(items) = payload else { return }
-            receiveDirect(items, from: outer.sender, device: outer.device, at: i)
+            receiveDirect(items, from: outer.sender, device: outer.device, deposited: mail.deposited, at: i)
             return
         }
         let messageKey: Data
@@ -10484,10 +10497,16 @@ extension AppModel {
             return
         case .missing:
             // Where this sender device's chain is hasn't come yet (or not from this far back): kept, and the device that
-            // posted it is asked over the pairwise session with it (a channel's follower asks the staff member who invited it).
-            hold(mail, epoch: number, in: &shared)
+            // posted it is asked over the pairwise session with it (a channel's follower asks the staff member who invited it),
+            // all the asks from one fetch in one direct post. Only for a device this one could still follow: a member who
+            // makes up device tags gets nothing held, and nothing asked.
+            guard mayHold(epoch: number, sender: outer.sender, device: outer.device, in: shared) else {
+                data.conversations[i].shared = shared
+                return
+            }
+            hold(mail, epoch: number, from: outer.sender, device: outer.device, chain: true, in: &shared)
             data.conversations[i].shared = shared
-            askForChain(GroupChainWant(epoch: number, sender: outer.sender, device: outer.device, index: outer.index), at: i)
+            chainAsksDue.insert(id)
             return
         case let .key(key):
             messageKey = key
@@ -10589,13 +10608,35 @@ extension AppModel {
     }
 
     /// Keeps a post to read again later (its sender isn't listed yet, or its chain can't be started yet): for eight days at
-    /// most, a hundred posts and a few megabytes, newest kept.
-    private func hold(_ mail: RelayClient.GroupMail, epoch number: Int, in shared: inout SharedGroup) {
-        var held = (shared.heldMail ?? []).filter { Date().timeIntervalSince($0.at) < 8 * 86_400 && $0.seq != mail.seq }
-        held.append(HeldGroupMail(epoch: number, seq: mail.seq, blob: mail.blob, at: mail.deposited ?? Date()))
-        held = Array(held.suffix(HeldGroupMail.max))
-        while held.count > 1, held.reduce(0, { $0 + $1.blob.count }) > HeldGroupMail.maxBytes { held.removeFirst() }
+    /// most, a hundred posts and a few megabytes. Past that, the oldest of whoever has the most held goes, so one member
+    /// can't push out everyone else's.
+    private func hold(_ mail: RelayClient.GroupMail, epoch number: Int, from sender: Data, device: Data, chain: Bool,
+                      in shared: inout SharedGroup) {
+        // What is past its eight days goes in `expireHeldMail`, which says so.
+        var held = (shared.heldMail ?? []).filter { $0.seq != mail.seq || $0.epoch != number }
+        held.append(HeldGroupMail(epoch: number, seq: mail.seq, blob: mail.blob, at: mail.deposited ?? Date(), from: sender,
+                                  device: device, chain: chain ? true : nil))
+        func size() -> Int { held.reduce(0) { $0 + $1.blob.count } }
+        while held.count > HeldGroupMail.max || (held.count > 1 && size() > HeldGroupMail.maxBytes) {
+            let counts = Dictionary(grouping: held.indices, by: { held[$0].from ?? Data() })
+            guard let most = counts.max(by: { ($0.value.count, $1.key.hex) < ($1.value.count, $0.key.hex) }),
+                  let oldest = most.value.min(by: { held[$0].at < held[$1].at }) else { break }
+            held.remove(at: oldest)
+        }
         shared.heldMail = held
+    }
+
+    /// Whether a post from this sender device may be held for want of its chain: its chain is followed already, or this
+    /// device could still start following it (at most `GroupReader.maxDevicesPerSender` devices of one member in an epoch,
+    /// counting those whose posts are held, and `maxChainsPerEpoch` in all).
+    private func mayHold(epoch number: Int, sender: Data, device: Data, in shared: SharedGroup) -> Bool {
+        if shared.reader.follows(epoch: number, sender: sender, device: device) { return true }
+        let prefix = "\(number)|\(sender.hex)|"
+        let followed = Set(shared.reader.chains.keys.filter { $0.hasPrefix(prefix) }.map { String($0.dropFirst(prefix.count)) })
+        let waiting = Set((shared.heldMail ?? []).filter { $0.epoch == number && $0.from == sender && $0.chain == true }
+            .compactMap { $0.device?.hex }).subtracting(followed)
+        guard followed.count + waiting.union([device.hex]).count <= GroupReader.maxDevicesPerSender else { return false }
+        return shared.reader.chains.keys.count(where: { $0.hasPrefix("\(number)|") }) < GroupReader.maxChainsPerEpoch
     }
 
     /// Posts held back because their sender wasn't listed yet, read again now that the settings have moved on. Any
@@ -10606,7 +10647,23 @@ extension AppModel {
         data.conversations[i].shared?.heldMail = []
         for item in held {
             receiveGroupMail(RelayClient.GroupMail(receiveKey: Data(), seq: item.seq, blob: item.blob, deposited: item.at),
-                             convo: id, epoch: item.epoch)
+                             convo: id, epoch: item.epoch, rereading: true)
+        }
+    }
+
+    /// Held mail past its eight days goes; if any of it was waiting for a chain, the chat says some posts couldn't be
+    /// opened (their sender's device never answered), once each time.
+    private func expireHeldMail(at i: Int) {
+        guard let held = data.conversations[i].shared?.heldMail, !held.isEmpty else { return }
+        let cutoff = Date().addingTimeInterval(-8 * 86_400)
+        let expired = held.filter { $0.at <= cutoff }
+        guard !expired.isEmpty else { return }
+        data.conversations[i].shared?.heldMail = held.filter { $0.at > cutoff }
+        if expired.contains(where: { $0.chain == true }) {
+            withAnimation(.snappy) {
+                data.conversations[i].messages.append(Message(sender: "system", text: "Some posts couldn't be opened: the phone that sent them never handed over their keys",
+                                                              date: Date()))
+            }
         }
     }
 
@@ -10735,7 +10792,7 @@ extension AppModel {
     static let maxChainSteps: UInt32 = 20_000
 
     /// This device's chain in `epoch` at message `index` (no earlier than where it began, no later than where it is), to
-    /// hand to a device that asked.
+    /// hand to a device. Where it may be handed from is up to the caller (`handOverFrom`, `followerFloor`).
     private func myChain(epoch: Int, from index: UInt32, at i: Int) -> GroupChainKey? {
         guard let shared = data.conversations[i].shared, let tag = shared.myTag,
               let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID),
@@ -10761,6 +10818,63 @@ extension AppModel {
         shared.settings.kind == .channel ? shared.settings.isAdmin(member) : shared.settings.isMember(member)
     }
 
+    /// Where this device's chain in `epoch` may be handed to `peer` from, when it asks for `index`: never before the
+    /// peer's floor. A device met for the first time starts where the chain is now if another device of the same member
+    /// has been handed it already (a newly linked device, or one made up by whoever took a member's phone, reads nothing
+    /// said before); if none has, no device of that member could read any of it, and the ask is answered as made.
+    private func handOverFrom(_ index: UInt32, epoch: Int, to peer: GroupPeer, at i: Int) -> UInt32? {
+        guard let shared = data.conversations[i].shared, let now = shared.chains[String(epoch)] else { return nil }
+        let n = String(epoch)
+        if let floor = peer.floor?[n] { return max(index, floor) }
+        let id = GroupPeer.id(member: peer.member, device: peer.device)
+        let another = (shared.peers ?? [:]).contains { $0.key != id && $0.value.member == peer.member && $0.value.floor?[n] != nil }
+        return another ? max(index, now.index) : index
+    }
+
+    /// Chain positions handed to a peer: the lowest is its floor in that epoch (if it has none yet), and each waits for the
+    /// peer to show it got it.
+    private static func noteHanded(_ keys: [GroupChainKey], to peer: inout GroupPeer) {
+        guard !keys.isEmpty else { return }
+        var floor = peer.floor ?? [:]
+        var waiting = peer.unconfirmed ?? []
+        for k in keys {
+            let n = String(k.epoch)
+            floor[n] = min(floor[n] ?? k.index, k.index)
+            if !waiting.contains(n) { waiting.append(n) }
+        }
+        peer.floor = floor
+        peer.unconfirmed = waiting
+    }
+
+    /// The peer sent something that opened on the session after this device handed it chains: it holds them, and steps
+    /// them on itself, so from now on it is handed nothing from before where this device's chains are now.
+    private static func confirmHanded(_ peer: inout GroupPeer, chains: [String: SenderChain]) {
+        guard let waiting = peer.unconfirmed, !waiting.isEmpty else { return }
+        var floor = peer.floor ?? [:]
+        for n in waiting { if let now = chains[n] { floor[n] = max(floor[n] ?? 0, now.index) } }
+        peer.floor = floor
+        peer.unconfirmed = nil
+    }
+
+    /// This device's chains for a peer: as its asks want them (no earlier than `handOverFrom` allows; asks for other
+    /// devices' chains are not for this one), and with `current` every other epoch's where it is now. Noted on the peer.
+    private func handOver(_ wants: [GroupChainWant], current: Bool, to peer: inout GroupPeer, at i: Int) -> [GroupChainKey] {
+        guard let shared = data.conversations[i].shared, let tag = shared.myTag,
+              let me = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID) else { return [] }
+        var lowest: [Int: UInt32] = [:]
+        for want in wants.prefix(GroupDirectBody.maxEach) where want.isValid && want.sender == me.publicKey && want.device == tag {
+            lowest[want.epoch] = min(lowest[want.epoch] ?? want.index, want.index)
+        }
+        var out: [GroupChainKey] = []
+        for (epoch, index) in lowest.sorted(by: { $0.key < $1.key }) {
+            guard let from = handOverFrom(index, epoch: epoch, to: peer, at: i), let k = myChain(epoch: epoch, from: from, at: i) else { continue }
+            out.append(k)
+        }
+        if current { out += currentPositions(except: Set(out.map(\.epoch)), at: i) }
+        Self.noteHanded(out, to: &peer)
+        return out
+    }
+
     /// Hands where this device's chain in `epoch` starts to every member device it has a session with (queued for any
     /// whose session is still being opened). Devices it has none with ask when they see the post. In a channel, staff also
     /// pass it to the followers they invited.
@@ -10770,6 +10884,11 @@ extension AppModel {
         let key = GroupChainKey(epoch: epoch, sender: keys.publicKey, device: tag, index: start.index, key: start.key)
         var items: [GroupDirect] = []
         for peer in (shared.peers ?? [:]).values where mayPair(peer.member, in: shared) && !(peer.member == keys.publicKey && peer.device == tag) {
+            let id = GroupPeer.id(member: peer.member, device: peer.device)
+            if var p = data.conversations[i].shared?.peers?[id] {
+                Self.noteHanded([key], to: &p)
+                data.conversations[i].shared?.peers?[id] = p
+            }
             if let item = directItem(GroupDirectBody(keys: [key]), to: peer.member, device: peer.device, at: i) { items.append(item) }
         }
         postDirect(items, at: i, chainEpoch: epoch)
@@ -10782,7 +10901,7 @@ extension AppModel {
         guard var shared = data.conversations[i].shared, !shared.gone, member.count == 32, device.count == GroupSeal.deviceLength else { return nil }
         let id = GroupPeer.id(member: member, device: device)
         var peers = shared.peers ?? [:]
-        var peer = peers[id] ?? GroupPeer(member: member, device: device)
+        var peer = peers[id] ?? GroupPeer(member: member, device: device, metIn: shared.current?.number)
         if shared.myTag == nil { shared.myTag = .random(GroupSeal.deviceLength) }
         var item: GroupDirect?
         if var session = peer.session, session.canSend, let plain = try? JSONEncoder.pulshade.encode(body),
@@ -10830,24 +10949,40 @@ extension AppModel {
         kick()
     }
 
-    /// Asks the device that posted for its chain from `want.index` on, ten minutes apart for each chain. A channel's
-    /// follower asks the staff member who invited it, over their 1:1 chat.
-    private func askForChain(_ want: GroupChainWant, at i: Int) {
-        guard want.isValid, let shared = data.conversations[i].shared, !shared.gone, !shared.joining || isFollower(data.conversations[i]),
+    /// Asks the devices that posted for their chains from each want's index on, ten minutes apart for each chain, all in
+    /// one direct post (one item per device). A channel's follower asks the staff member who invited it, over their 1:1 chat.
+    private func askForChains(_ wants: [GroupChainWant], at i: Int) {
+        guard !wants.isEmpty, let shared = data.conversations[i].shared, !shared.gone,
+              !shared.joining || isFollower(data.conversations[i]),
               let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID) else { return }
-        guard !(want.sender == keys.publicKey && want.device == shared.myTag) else { return }
-        let id = want.chainID
-        guard Date().timeIntervalSince(shared.chainAsked?[id] ?? .distantPast) > Self.keyAskCooldown else { return }
-        var asked = (shared.chainAsked ?? [:]).filter { Date().timeIntervalSince($0.value) < 86_400 }
-        asked[id] = Date()
+        let now = Date()
+        var asked = (shared.chainAsked ?? [:]).filter { now.timeIntervalSince($0.value) < 86_400 }
+        var due: [GroupChainWant] = []
+        for want in wants where want.isValid && !(want.sender == keys.publicKey && want.device == shared.myTag) {
+            guard now.timeIntervalSince(asked[want.chainID] ?? .distantPast) > Self.keyAskCooldown else { continue }
+            asked[want.chainID] = now
+            due.append(want)
+        }
+        guard !due.isEmpty else { return }
         data.conversations[i].shared?.chainAsked = asked
         if isFollower(data.conversations[i]) {
-            guard want.epoch != 0, shared.settings.isMember(want.sender) else { return }
-            noticeToInviter(.groupChainWanted(group: data.conversations[i].wireID, wants: [want]), of: data.conversations[i])
+            let staff = due.filter { $0.epoch != 0 && shared.settings.isMember($0.sender) }
+            for start in stride(from: 0, to: staff.count, by: 16) {
+                noticeToInviter(.groupChainWanted(group: data.conversations[i].wireID, wants: Array(staff[start..<min(start + 16, staff.count)])),
+                                of: data.conversations[i])
+            }
             return
         }
-        guard mayPair(want.sender, in: shared), mayPair(keys.publicKey, in: shared) else { return }
-        if let item = directItem(GroupDirectBody(wants: [want]), to: want.sender, device: want.device, at: i) { postDirect([item], at: i) }
+        guard mayPair(keys.publicKey, in: shared) else { return }
+        let byDevice = Dictionary(grouping: due.filter { mayPair($0.sender, in: shared) }) { GroupPeer.id(member: $0.sender, device: $0.device) }
+        var items: [GroupDirect] = []
+        for (_, theirs) in byDevice.sorted(by: { $0.key < $1.key }) {
+            guard let first = theirs.first else { continue }
+            if let item = directItem(GroupDirectBody(wants: Array(theirs.prefix(GroupDirectBody.maxEach))), to: first.sender, device: first.device, at: i) {
+                items.append(item)
+            }
+        }
+        postDirect(items, at: i)
     }
 
     /// For each sender device with posts held here that this device can't open: the earliest such post.
@@ -10865,9 +11000,16 @@ extension AppModel {
         return out
     }
 
-    /// Held posts whose chain hasn't come: asked for again (each chain ten minutes apart).
+    /// Held posts whose chain hasn't come: asked for again (each chain ten minutes apart), in one direct post.
     private func askForHeldChains(at i: Int) {
-        for want in heldWants(at: i).values { askForChain(want, at: i) }
+        askForChains(heldWants(at: i).values.sorted { $0.chainID < $1.chainID }, at: i)
+    }
+
+    /// The groups that held posts for want of a chain while a fetch was read: asked for now, one direct post each.
+    func askDueChains() {
+        let due = chainAsksDue
+        chainAsksDue = []
+        for id in due { if let i = index(of: id) { askForHeldChains(at: i) } }
     }
 
     /// The indexes of held posts for each chain, so a chain handed over from further back fills in just those.
@@ -10899,21 +11041,45 @@ extension AppModel {
         return took
     }
 
-    /// Direct items in a post from `member`'s `device`: the ones for this device are taken in, and answered.
-    private func receiveDirect(_ items: [GroupDirect], from member: Data, device: Data, at i: Int) {
+    /// Direct items in a post from `member`'s `device`: the ones for this device are taken in, and answered. At most
+    /// `GroupDirect.maxForOneDevice` are looked at, and one ask for a session.
+    private func receiveDirect(_ items: [GroupDirect], from member: Data, device: Data, deposited: Date?, at i: Int) {
         guard let shared = data.conversations[i].shared, !shared.gone, let tag = shared.myTag,
               let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID),
               mayPair(member, in: shared), mayPair(keys.publicKey, in: shared),
               let card = shared.settings.card(member), !(member == keys.publicKey && device == tag) else { return }
         let gid = data.conversations[i].wireID
         let id = GroupPeer.id(member: member, device: device)
+        let mine = items.prefix(GroupDirect.maxItems).filter { $0.to == keys.publicKey && $0.device == tag }.prefix(GroupDirect.maxForOneDevice)
         var replies: [GroupDirect] = []
         var took = false
-        for item in items.prefix(GroupDirect.maxItems) where item.to == keys.publicKey && item.device == tag {
-            var peer = data.conversations[i].shared?.peers?[id] ?? GroupPeer(member: member, device: device)
+        var helloSeen = false
+        for item in mine {
+            let known = data.conversations[i].shared?.peers?[id]
+            var peer = known ?? GroupPeer(member: member, device: device, metIn: shared.current?.number)
             var body: GroupDirectBody?
+            // The session has just opened at this end: the other end hears back, even with nothing to say, so it knows
+            // what it handed over arrived.
+            var ack = false
             if let hello = item.hello {
+                guard !helloSeen else { continue }
+                helloSeen = true
                 guard hello.ephemeral.count == 32, hello.kem.count == PQPin.kemSize, !peer.answered.contains(hello.ephemeral) else { continue }
+                // A device met for the first time: at most a few of one member's in an epoch, so nobody can make up tags
+                // to fill this phone with sessions.
+                if known == nil {
+                    let epochNow = shared.current?.number
+                    let fresh = (data.conversations[i].shared?.peers ?? [:]).values.count { $0.member == member && $0.metIn == epochNow }
+                    guard fresh < GroupPeer.maxNewPerMember else { continue }
+                }
+                // With a session open, an ask for a new one replaces it only if it was posted after the session opened, or
+                // a message from that device lately didn't open here (its end lost the session). An old ask posted again
+                // changes nothing.
+                if peer.session != nil {
+                    let newer = (deposited ?? Date()) > (peer.openedAt ?? .distantPast)
+                    let failed = Date().timeIntervalSince(peer.failedAt ?? .distantPast) < GroupPeer.failedWindow
+                    guard newer || failed else { continue }
+                }
                 // Both asked at once: the one whose key and device sort first is answered, the other let go.
                 if peer.pending != nil, (keys.publicKey + tag).hex < (member + device).hex { continue }
                 guard let (session, accept) = try? GroupHandshake.accept(hello, group: gid, me: keys, myDevice: tag, them: card, theirDevice: device)
@@ -10922,10 +11088,11 @@ extension AppModel {
                 peer.pending = nil
                 peer.answered = Array((peer.answered + [hello.ephemeral]).suffix(8))
                 peer.used = Date()
-                // A device met for the first time gets this device's chains where they are now (not what was said
-                // before), and anything it asked for.
-                var give = answers(item.wants ?? [], at: i)
-                give += currentPositions(except: Set(give.map(\.epoch)), at: i)
+                peer.openedAt = deposited ?? Date()
+                peer.failedAt = nil
+                // A device gets this device's chains where they are now (not what was said before), and what it asked
+                // for, no earlier than its floor allows.
+                var give = handOver(item.wants ?? [], current: true, to: &peer, at: i)
                 give += peer.queued ?? []
                 peer.queued = nil
                 var s = session
@@ -10940,38 +11107,51 @@ extension AppModel {
                 peer.session = session
                 peer.pending = nil
                 peer.used = Date()
+                peer.openedAt = deposited ?? Date()
+                peer.failedAt = nil
                 body = try? JSONDecoder.pulshade.decode(GroupDirectBody.self, from: plain)
                 // The session is open both ways now: the other device gets this one's chains where they are now.
-                let give = currentPositions(except: [], at: i)
+                let give = handOver([], current: true, to: &peer, at: i)
                 if !give.isEmpty { peer.queued = Array(((peer.queued ?? []) + give).suffix(GroupDirectBody.maxEach)) }
+                ack = true
             } else if let message = item.message {
                 if var session = peer.session, let plain = try? session.decrypt(message) {
                     peer.session = session
                     peer.used = Date()
+                    // Anything that opens shows that device got what this one handed it before.
+                    Self.confirmHanded(&peer, chains: data.conversations[i].shared?.chains ?? [:])
                     body = try? JSONDecoder.pulshade.decode(GroupDirectBody.self, from: plain)
-                } else if peer.pending == nil, Date().timeIntervalSince(peer.resetAt ?? .distantPast) > GroupPeer.helloRetry {
-                    // A message that doesn't open: their side holds a session this device doesn't. A new one is asked for.
-                    peer.resetAt = Date()
-                    data.conversations[i].shared?.peers?[id] = peer
-                    if let hello = directItem(GroupDirectBody(), to: member, device: device, at: i) { replies.append(hello) }
-                    continue
+                } else {
+                    peer.failedAt = Date()
+                    if peer.pending == nil, Date().timeIntervalSince(peer.resetAt ?? .distantPast) > GroupPeer.helloRetry {
+                        // A message that doesn't open: their side holds a session this device doesn't. A new one is asked for.
+                        peer.resetAt = Date()
+                        data.conversations[i].shared?.peers = (data.conversations[i].shared?.peers ?? [:]).merging([id: peer]) { _, new in new }
+                        if let hello = directItem(GroupDirectBody(), to: member, device: device, at: i) { replies.append(hello) }
+                        continue
+                    }
                 }
             }
             data.conversations[i].shared?.peers = (data.conversations[i].shared?.peers ?? [:]).merging([id: peer]) { _, new in new }
-            guard let body else { continue }
-            if let given = body.keys, !given.isEmpty {
-                if takeChainKeys(given, from: (member, device), at: i) { took = true }
-                if data.conversations[i].shared?.settings.kind == .channel { passOn(given, from: member, device: device, at: i) }
+            if let body {
+                if let given = body.keys, !given.isEmpty {
+                    if takeChainKeys(given, from: (member, device), at: i) { took = true }
+                    if data.conversations[i].shared?.settings.kind == .channel { passOn(given, from: member, device: device, at: i) }
+                }
+                if let wants = body.wants, !wants.isEmpty, var p = data.conversations[i].shared?.peers?[id] {
+                    let give = handOver(wants, current: false, to: &p, at: i)
+                    data.conversations[i].shared?.peers?[id] = p
+                    if !give.isEmpty, let reply = directItem(GroupDirectBody(keys: give), to: member, device: device, at: i) { replies.append(reply) }
+                }
             }
-            if let wants = body.wants, !wants.isEmpty {
-                let give = answers(wants, at: i)
-                if !give.isEmpty, let reply = directItem(GroupDirectBody(keys: give), to: member, device: device, at: i) { replies.append(reply) }
-            }
-            // Positions that waited for the session to open.
-            if let queued = data.conversations[i].shared?.peers?[id]?.queued, !queued.isEmpty,
-               data.conversations[i].shared?.peers?[id]?.session?.canSend == true {
-                data.conversations[i].shared?.peers?[id]?.queued = nil
-                if let reply = directItem(GroupDirectBody(keys: queued), to: member, device: device, at: i) { replies.append(reply) }
+            // Positions that waited for the session to open (or, just opened, a word back with nothing in it).
+            if data.conversations[i].shared?.peers?[id]?.session?.canSend == true {
+                let queued = data.conversations[i].shared?.peers?[id]?.queued ?? []
+                if !queued.isEmpty || ack {
+                    data.conversations[i].shared?.peers?[id]?.queued = nil
+                    let reply = directItem(GroupDirectBody(keys: queued.isEmpty ? nil : queued), to: member, device: device, at: i)
+                    if let reply { replies.append(reply) }
+                }
             }
         }
         postDirect(replies, at: i)
@@ -10986,17 +11166,6 @@ extension AppModel {
         }.compactMap { n in myChain(epoch: n, from: shared.chains[String(n)]?.index ?? 0, at: i) }
     }
 
-    /// This device's chains as the asks want them (asks for other devices' chains are not for it).
-    private func answers(_ wants: [GroupChainWant], at i: Int) -> [GroupChainKey] {
-        guard let shared = data.conversations[i].shared, let tag = shared.myTag,
-              let me = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID) else { return [] }
-        var out: [GroupChainKey] = []
-        for want in Set(wants.prefix(GroupDirectBody.maxEach)) where want.isValid && want.sender == me.publicKey && want.device == tag {
-            if let k = myChain(epoch: want.epoch, from: want.index, at: i) { out.append(k) }
-        }
-        return out
-    }
-
     // MARK: A channel's followers
 
     /// The followers this staff device's account invited, by account, still following.
@@ -11006,22 +11175,60 @@ extension AppModel {
         return shared.knownAs.filter { keys.contains($0.value) }.keys.sorted().compactMap { contact($0, in: data.conversations[i].persona) }
     }
 
+    /// Where a staff device's chain (by `GroupReader.id`) is as this device knows it: its own where it is, another's where
+    /// this device reads it from.
+    private func knownPosition(_ chain: String, at i: Int) -> UInt32? {
+        guard let shared = data.conversations[i].shared,
+              let me = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID) else { return nil }
+        let parts = chain.split(separator: "|")
+        if parts.count == 3, let tag = shared.myTag, parts[1] == Substring(me.publicKey.hex), parts[2] == Substring(tag.hex) {
+            return shared.chains[String(parts[0])]?.index
+        }
+        return shared.reader.chains[chain]?.index
+    }
+
+    /// Notes, as this device lets a follower in, where every staff device's chain it knows is, so the follower is handed
+    /// nothing said before they came in.
+    private func noteAdmitted(_ account: String, at i: Int) {
+        guard let shared = data.conversations[i].shared, shared.settings.kind == .channel,
+              let me = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID) else { return }
+        var at: [String: UInt32] = [:]
+        if let tag = shared.myTag {
+            for (n, chain) in shared.chains where n != "0" {
+                if let e = Int(n) { at[GroupReader.id(epoch: e, sender: me.publicKey, device: tag)] = chain.index }
+            }
+        }
+        for (id, chain) in shared.reader.chains where !id.hasPrefix("0|") { at[id] = chain.index }
+        data.conversations[i].shared?.admittedAt = (shared.admittedAt ?? [:]).merging([account: at]) { _, new in new }
+    }
+
+    /// The earliest position of a staff device's chain a follower this device let in may be given: where it was when they
+    /// came in (a chain this device didn't know of then from its start). With no note of when, where it is now.
+    private func followerFloor(_ account: String, chain: String, at i: Int) -> UInt32 {
+        if let admitted = data.conversations[i].shared?.admittedAt?[account] { return admitted[chain] ?? 0 }
+        return knownPosition(chain, at: i) ?? 0
+    }
+
     /// Passes a chain position on to followers this account invited, over their 1:1 chats: those who asked for it (at the
-    /// place each asked), or with `accounts` nil, all of them.
+    /// place each asked), or with `accounts` nil, all of them; never from before each came in.
     private func passToFollowers(_ k: GroupChainKey, accounts: [String: UInt32]?, at i: Int) {
         let gid = data.conversations[i].wireID
+        let id = GroupReader.id(epoch: k.epoch, sender: k.sender, device: k.device)
         for follower in myFollowers(at: i) {
-            var give = k
+            var index = k.index
             if let accounts {
-                guard let index = accounts[follower.fingerprint] else { continue }
-                if index > k.index, let later = Self.stepped(k, to: index) { give = later }
+                guard let asked = accounts[follower.fingerprint] else { continue }
+                index = max(index, asked)
             }
+            index = max(index, followerFloor(follower.fingerprint, chain: id, at: i))
+            guard let give = Self.stepped(k, to: index) else { continue }
             enqueue(.groupChainKeys(group: gid, keys: [give]), to: follower)
         }
     }
 
     /// As staff of a channel, chain positions another staff device handed over: passed on to the followers who asked for
-    /// them, and a chain's start to every follower this account invited (by one device of the account only).
+    /// them, and a chain's start to every follower this device let in. Each device passes chains to the followers it let in
+    /// itself (`knownAs` is kept on that device alone), so a follower let in on any of an account's devices gets them.
     private func passOn(_ keys: [GroupChainKey], from member: Data, device: Data, at i: Int) {
         guard let me = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID),
               data.conversations[i].shared?.settings.isAdmin(me.publicKey) == true else { return }
@@ -11030,32 +11237,45 @@ extension AppModel {
             if let wanted = data.conversations[i].shared?.followerWants?[id] {
                 data.conversations[i].shared?.followerWants?[id] = nil
                 passToFollowers(k, accounts: wanted, at: i)
-            } else if k.index == 0, isLeadDevice(data.conversations[i].persona) {
+            } else if k.index == 0 || data.conversations[i].shared?.reader.starts?[id] == k.index {
+                // A chain's start, or the first place this device was given it: every follower this device let in gets it.
                 passToFollowers(k, accounts: nil, at: i)
             }
         }
     }
 
-    /// A follower this account invited holds posts it can't open: this device's own chain is handed straight back; for
-    /// another staff device's, that device is asked over the pairwise session, and the answer passed on.
+    /// A follower this device let in holds posts it can't open: this device's own chain is handed straight back; for
+    /// another staff device's, that device is asked over the pairwise session, and the answer passed on. Never from before
+    /// the follower came in.
     private func answerFollowerChainWants(_ group: UUID, wants: [GroupChainWant], from sender: Contact) {
         guard let (i, _) = followerEntry(of: sender, group: group), let shared = data.conversations[i].shared,
               let me = memberKeys(sender.persona, group: group) else { return }
         var mine: [GroupChainKey] = []
+        var asks: [GroupChainWant] = []
         for want in Set(wants.prefix(16)) where want.isValid && want.epoch != 0 && shared.epoch(want.epoch) != nil
             && shared.settings.isAdmin(want.sender) {
             let limit = group.uuidString + sender.fingerprint + want.chainID
             guard Date().timeIntervalSince(channelKeyAnswered[limit] ?? .distantPast) > 60 else { continue }
             channelKeyAnswered[limit] = Date()
+            let from = max(want.index, followerFloor(sender.fingerprint, chain: want.chainID, at: i))
             if want.sender == me.publicKey && want.device == shared.myTag {
-                if let k = myChain(epoch: want.epoch, from: want.index, at: i) { mine.append(k) }
-            } else if isLeadDevice(sender.persona) {
+                if let k = myChain(epoch: want.epoch, from: from, at: i) { mine.append(k) }
+            } else {
                 var wanted = data.conversations[i].shared?.followerWants ?? [:]
                 if wanted.count >= 200, wanted[want.chainID] == nil { continue }
-                wanted[want.chainID, default: [:]][sender.fingerprint] = min(want.index, wanted[want.chainID]?[sender.fingerprint] ?? .max)
+                wanted[want.chainID, default: [:]][sender.fingerprint] = min(from, wanted[want.chainID]?[sender.fingerprint] ?? .max)
                 data.conversations[i].shared?.followerWants = wanted
-                if let item = directItem(GroupDirectBody(wants: [want]), to: want.sender, device: want.device, at: i) { postDirect([item], at: i) }
+                asks.append(GroupChainWant(epoch: want.epoch, sender: want.sender, device: want.device, index: from))
             }
+        }
+        if !asks.isEmpty {
+            let byDevice = Dictionary(grouping: asks) { GroupPeer.id(member: $0.sender, device: $0.device) }
+            var items: [GroupDirect] = []
+            for (_, theirs) in byDevice.sorted(by: { $0.key < $1.key }) {
+                guard let first = theirs.first else { continue }
+                if let item = directItem(GroupDirectBody(wants: theirs), to: first.sender, device: first.device, at: i) { items.append(item) }
+            }
+            postDirect(items, at: i)
         }
         if !mine.isEmpty { enqueue(.groupChainKeys(group: group, keys: mine), to: sender) }
         save()
@@ -11082,7 +11302,18 @@ extension AppModel {
         if peers.count > GroupPeer.maxPerGroup {
             for (id, _) in peers.sorted(by: { $0.value.used < $1.value.used }).prefix(peers.count - GroupPeer.maxPerGroup) { peers[id] = nil }
         }
+        // Floors go with the epochs no longer read (this device's chains in them are gone).
+        let stillRead = Set(shared.readable.map { String($0.number) }).union(["0"])
+        for (id, peer) in peers where peer.floor?.keys.contains(where: { !stillRead.contains($0) }) == true
+            || peer.unconfirmed?.contains(where: { !stillRead.contains($0) }) == true {
+            peers[id]?.floor = peer.floor?.filter { stillRead.contains($0.key) }
+            peers[id]?.unconfirmed = peer.unconfirmed?.filter { stillRead.contains($0) }
+        }
         if peers != before { data.conversations[i].shared?.peers = peers }
+        // Notes of where followers came in go with followers this device no longer has, or is no longer inviting.
+        if let admitted = shared.admittedAt, admitted.keys.contains(where: { shared.knownAs[$0] == nil && shared.invited[$0] == nil }) {
+            data.conversations[i].shared?.admittedAt = admitted.filter { shared.knownAs[$0.key] != nil || shared.invited[$0.key] != nil }
+        }
     }
 }
 
@@ -11619,7 +11850,7 @@ extension AppModel {
     }
 
     /// Puts everyone who asked (and may come in) into the group in one change to the settings, and tells each of them. A
-    /// new epoch comes first if anything has been said in this one, so they read from when they joined. False if they
+    /// new epoch comes first, so they read from when they joined. False if they
     /// couldn't be added (the change wasn't one this account may make, or the settings would be too big).
     private func admitAll(_ requests: [(JoinRequest, UUID)], at i: Int) -> Bool {
         guard amGroupAdmin(at: i) != nil, var shared = data.conversations[i].shared else { return false }
@@ -11628,10 +11859,13 @@ extension AppModel {
             !shared.settings.isMember(request.card.signingKey) && seenKeys.insert(request.card.signingKey).inserted
         }
         guard !fresh.isEmpty else { return true }
-        if shared.chatInEpoch {
+        // A group's newcomers always start in a new epoch (see `invite`); none is let in if it couldn't be made.
+        if shared.settings.kind == .group || shared.chatInEpoch {
+            let before = shared.settings.epoch
             startEpoch(at: i, without: [])
             guard let updated = data.conversations[i].shared else { return false }
             shared = updated
+            if shared.settings.kind == .group, shared.settings.epoch == before { return false }
         }
         var next = shared.settings
         let room = GroupSettings.maxMembers - next.members.count
