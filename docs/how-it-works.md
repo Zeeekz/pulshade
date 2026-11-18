@@ -234,9 +234,9 @@ groups, and members never get each other's mailboxes. The group's name, roles an
 that only someone allowed can change, and nobody can change someone else's card. Taking someone out gives everyone
 else a new key that person never gets; someone added doesn't get what was said before. The server keeps group mail
 sealed for up to 7 days and can't tell who reads it over Tor. Each member's device keeps its own key chain in
-each group, started from fresh random bytes and moved on with every post, and the keys that let new members and
-devices follow it change every hour; group keys are handed out sealed with post-quantum keys as well as classical
-ones. So someone who takes a member's phone can't open posts it had already read, beyond about the last hour. The
+each group, started from fresh random bytes and moved on with every post, and hands its starting point to the other
+members' devices over private, post-quantum sessions; group keys are handed out sealed with post-quantum keys as well
+as classical ones. So someone who takes a member's phone can't open the group posts it had already read. The
 trade-off: group messages show "sent" rather than ticking per member.
 
 **Groups, channels and broadcasts.** Groups and channels share one mailbox (a channel's followers can't see who else
