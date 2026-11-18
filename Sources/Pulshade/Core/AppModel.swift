@@ -11491,13 +11491,17 @@ extension AppModel {
                     if peer.pending == nil, Date().timeIntervalSince(peer.resetAt ?? .distantPast) > GroupPeer.helloRetry {
                         // A message that doesn't open: their side holds a session this device doesn't. A new one is asked for.
                         peer.resetAt = Date()
-                        data.conversations[i].shared?.peers = (data.conversations[i].shared?.peers ?? [:]).merging([id: peer]) { _, new in new }
+                        // Read first, then write: reading `data` inside an optional-chained write to it is an exclusivity conflict,
+                        // which stops the app.
+                        let peers = (data.conversations[i].shared?.peers ?? [:]).merging([id: peer]) { _, new in new }
+                        data.conversations[i].shared?.peers = peers
                         if let hello = directItem(GroupDirectBody(), to: member, device: device, at: i) { replies.append(hello) }
                         continue
                     }
                 }
             }
-            data.conversations[i].shared?.peers = (data.conversations[i].shared?.peers ?? [:]).merging([id: peer]) { _, new in new }
+            let peers = (data.conversations[i].shared?.peers ?? [:]).merging([id: peer]) { _, new in new }
+            data.conversations[i].shared?.peers = peers
             if let body {
                 if let given = body.keys, !given.isEmpty {
                     if takeChainKeys(given, from: (member, device), at: i) { took = true }
