@@ -23,7 +23,8 @@ enum Envelope {
     /// (`GroupRoster`, a tagged `GroupRekey`).
     /// Bit 7: this build's generation: envelopes are version 3 (identity keys with ML-KEM and ML-DSA halves, `PQKeys`) and its
     /// chats use the sparse post-quantum ratchet (`RatchetHeader.version` 4). Nothing older is read from a peer without it:
-    /// it is refused and told to update.
+    /// it is refused and told to update. Bit 7 alone can't tell build 16 (ratchet version 3) from build 17 (version 4), so every
+    /// envelope also says its ratchet version (`EnvelopeCore.Inner.rv`), and that is what decides (`Opened.readsPostQuantumRatchet`).
     static let reads: UInt8 = 255
 
     /// Opened envelope: the payload, who sent it, from which of their devices, and when.
@@ -37,6 +38,8 @@ enum Envelope {
         var sentAt: Date
         /// What the sender's app says it can read (0 from apps before this).
         var caps: UInt8 = 0
+        /// The sender's ratchet header version (0 from builds before it was said).
+        var ratchet: UInt8 = 0
         /// The sender's post-quantum keys, when this envelope introduced them (they weren't pinned yet) and both signatures on
         /// their card verified. The app pins them.
         var introduced: PQPin?
@@ -49,7 +52,8 @@ enum Envelope {
         var readsSharedGroups: Bool { caps & 16 == 16 }
         var readsMediaBlobs: Bool { caps & 32 == 32 }
         var readsChannels: Bool { caps & 64 == 64 }
-        var readsPostQuantumRatchet: Bool { caps & 128 == 128 }
+        /// Its chats speak this build's ratchet. A build that leaves the version out, or says an older one, has to update.
+        var readsPostQuantumRatchet: Bool { caps & 128 == 128 && ratchet >= RatchetHeader.version }
         /// Seals to and opens post-quantum envelopes (identity keys with an ML-KEM key and an ML-DSA key).
         var readsPostQuantum: Bool { caps & 128 == 128 }
     }
@@ -61,7 +65,8 @@ enum Envelope {
     static func seal(_ payload: Payload, from me: Identity, device: Data = Data(), to recipient: EnvelopeRecipient, framed: Bool = false,
                      introduce: Bool = false) throws -> Data {
         try EnvelopeCore.sealPQ(body: try payload.wire(framed: framed), signing: me.signingKey, agreement: me.agreementKey, pq: me.pq,
-                                sign: !payload.isRatchet, introduce: introduce, device: device, caps: reads, at: RelayClock.now,
+                                sign: !payload.isRatchet, introduce: introduce, device: device, caps: reads,
+                                ratchet: RatchetHeader.version, at: RelayClock.now,
                                 to: recipient)
     }
 
@@ -71,7 +76,8 @@ enum Envelope {
     static func sealIntroduction(_ payload: Payload, from me: Identity, device: Data = Data(), to agreementKey: Data) throws -> Data {
         precondition(payload.carriesPQCard)
         return try EnvelopeCore.seal(body: try payload.wire(framed: false), framed: false, signing: me.signingKey,
-                                     agreement: me.agreementKey, device: device, caps: reads, at: RelayClock.now, to: agreementKey)
+                                     agreement: me.agreementKey, device: device, caps: reads, ratchet: RatchetHeader.version,
+                                     at: RelayClock.now, to: agreementKey)
     }
 
     /// Returns the payload and the sender's signing key.
@@ -91,7 +97,7 @@ enum Envelope {
             guard payload.isRatchet || opened.signed else { throw EnvelopeError.badSignature }
             let h = opened.header
             return Opened(payload: payload, signer: h.signer, agreement: h.agreement, device: h.device, sentAt: h.sentAt, caps: h.caps,
-                          introduced: opened.introduced, postQuantum: true)
+                          ratchet: h.ratchet, introduced: opened.introduced, postQuantum: true)
         }
         let header = try EnvelopeCore.open(blob, agreement: me.agreementKey)
         let payload = try Payload.fromWire(header.body)
@@ -104,10 +110,10 @@ enum Envelope {
         if let pinned = known(header.signer) {
             guard pinned == pin, payload.isRequest || payload.isIntroduction else { throw EnvelopeRefusal.classical(signer: header.signer, sentAt: header.sentAt) }
             return Opened(payload: payload, signer: header.signer, agreement: header.agreement, device: header.device,
-                          sentAt: header.sentAt, caps: header.caps)
+                          sentAt: header.sentAt, caps: header.caps, ratchet: header.ratchet)
         }
         return Opened(payload: payload, signer: header.signer, agreement: header.agreement, device: header.device,
-                      sentAt: header.sentAt, caps: header.caps, introduced: pin)
+                      sentAt: header.sentAt, caps: header.caps, ratchet: header.ratchet, introduced: pin)
     }
 
     static func paddedSize(of count: Int) -> Int { EnvelopeCore.paddedSize(of: count) }

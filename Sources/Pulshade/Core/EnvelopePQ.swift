@@ -116,6 +116,8 @@ extension EnvelopeCore {
         var signed: Bool?
         /// The sender's post-quantum keys, for a recipient that hasn't got them yet.
         var card: PQCard?
+        /// The sender's ratchet header version (see `EnvelopeCore.Inner.rv`).
+        var rv: UInt8?
     }
 
     struct HeaderPQ {
@@ -127,8 +129,8 @@ extension EnvelopeCore {
     }
 
     static func sealPQ(body: Data, signing: Curve25519.Signing.PrivateKey, agreement: Curve25519.KeyAgreement.PrivateKey,
-                       pq: PQKeys, sign: Bool, introduce: Bool, device: Data, caps: UInt8, at: Date,
-                       to recipient: EnvelopeRecipient) throws -> Data {
+                       pq: PQKeys, sign: Bool, introduce: Bool, device: Data, caps: UInt8, ratchet: UInt8? = nil,
+                       at: Date, to recipient: EnvelopeRecipient) throws -> Data {
         let theirs = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: recipient.agreement)
         let encapsulation = try MLKEM768.PublicKey(rawRepresentation: recipient.pq.kem).encapsulate()
         let kemSecret = encapsulation.sharedSecret.withUnsafeBytes { Data($0) }
@@ -146,7 +148,7 @@ extension EnvelopeCore {
         }
         let inner = InnerPQ(from: signing.publicKey.rawRepresentation, bind: try signing.signature(for: bindLabel + sender),
                             device: device.isEmpty ? nil : device, at: stamp, caps: caps, signed: sign ? true : nil,
-                            card: introduce ? try PQCard.make(signing: signing, agreement: sender, keys: pq) : nil)
+                            card: introduce ? try PQCard.make(signing: signing, agreement: sender, keys: pq) : nil, rv: ratchet)
         let innerPlain = Frame.join(try JSONEncoder().encode(inner), tail + body)
 
         let outerSecret = try ephemeral.sharedSecretFromKeyAgreement(with: theirs)
@@ -216,7 +218,8 @@ extension EnvelopeCore {
             if known(inner.from) == nil, let verified = card.verified(signer: inner.from, agreement: sender) { introduced = verified }
         }
         return HeaderPQ(header: Header(signer: inner.from, agreement: sender, device: inner.device ?? Data(),
-                                       sentAt: Date(timeIntervalSince1970: TimeInterval(inner.at)), caps: inner.caps ?? 0, body: body),
+                                       sentAt: Date(timeIntervalSince1970: TimeInterval(inner.at)), caps: inner.caps ?? 0, body: body,
+                                       ratchet: inner.rv ?? 0),
                         signed: signed, introduced: introduced)
     }
 

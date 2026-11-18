@@ -6979,10 +6979,10 @@ final class AppModel {
             }
             // A build from before the sparse post-quantum ratchet: its messages aren't read, and the chat tells whose app
             // has to update. Not a broken session, so no new keys are started over it.
-            if message.header.v != RatchetHeader.version || data.contacts[i].devices[d].needsUpdate == true {
-                if data.contacts[i].devices[d].needsUpdate != true { data.contacts[i].devices[d].needsUpdate = true }
-                return .handled
-            }
+            // One from a newer build (a version past this one's) can't be read either, but it is this app that is behind,
+            // so the friend isn't blamed for it.
+            if (message.header.v ?? 0) < RatchetHeader.version { markNeedsUpdate(contact: i, device: d) }
+            if message.header.v != RatchetHeader.version || data.contacts[i].devices[d].needsUpdate == true { return .handled }
             let keptKey = sessionKey(contact: i, device: d)
             // The very same ciphertext again (the relay sent it twice, or its sender sent it again after a dropped
             // connection): already read, so nothing to do. Without this it can't be opened a second time, which looked
@@ -7053,10 +7053,29 @@ final class AppModel {
         if (data.contacts[i].devices[d].readsChannels == true) != opened.readsChannels {
             data.contacts[i].devices[d].readsChannels = opened.readsChannels ? true : nil
         }
-        // Said on everything it sends, so a device that updates is let in again by its next envelope.
-        if (data.contacts[i].devices[d].needsUpdate == true) != !opened.readsPostQuantumRatchet {
-            data.contacts[i].devices[d].needsUpdate = opened.readsPostQuantumRatchet ? nil : true
+        // Said on everything it sends, so a device that updates is let in again by its next envelope. A ratchet message in an
+        // older header form is behind whatever its envelope says, so it never lets the device back in.
+        var behind = !opened.readsPostQuantumRatchet
+        if case let .ratchet(message) = opened.payload, (message.header.v ?? 0) < RatchetHeader.version { behind = true }
+        if behind {
+            markNeedsUpdate(contact: i, device: d)
+        } else if data.contacts[i].devices[d].needsUpdate == true {
+            data.contacts[i].devices[d].needsUpdate = nil
         }
+    }
+
+    /// A friend's device is on a build from before this one's ratchet: nothing goes either way until it updates, and the chat
+    /// says by name whose app has to update, once each time it falls behind.
+    private func markNeedsUpdate(contact i: Int, device d: Int) {
+        guard data.contacts[i].devices[d].needsUpdate != true else { return }
+        data.contacts[i].devices[d].needsUpdate = true
+        guard !data.contacts[i].isSelf, !data.contacts[i].hidden else { return }
+        let fp = data.contacts[i].fingerprint, persona = data.contacts[i].persona
+        if let c = data.conversations.firstIndex(where: { $0.kind == .direct && $0.members == [fp] && $0.persona == persona }) {
+            data.conversations[c].messages.append(Message(sender: "system", text: "\(data.contacts[i].displayName) needs to update Pulshade before you can message each other.",
+                                                          date: Date()))
+        }
+        save()
     }
 
     static let maxAvatarBytes = 512 * 1024

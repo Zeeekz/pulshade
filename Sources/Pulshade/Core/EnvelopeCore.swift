@@ -25,6 +25,9 @@ enum EnvelopeCore {
         var at: UInt64
         /// What the sender's app can read, as bits (see `Envelope.reads`). Older apps leave it out and ignore it.
         var caps: UInt8?
+        /// The ratchet header version the sender's chats use (`RatchetHeader.version`). Builds before 17 leave it out, which
+        /// is how a build is told apart from the one before it when the capability bits stay the same.
+        var rv: UInt8?
     }
 
     /// An opened envelope before its payload is read: who sent it, from which device, when, and the payload's bytes.
@@ -35,6 +38,8 @@ enum EnvelopeCore {
         var sentAt: Date
         var caps: UInt8
         var body: Data
+        /// The sender's ratchet header version (0 from builds before it was said).
+        var ratchet: UInt8 = 0
     }
 
     /// The signing key's signature over an agreement key: "these two keys are the same person". Envelopes carry it,
@@ -49,13 +54,13 @@ enum EnvelopeCore {
     }
 
     static func seal(body: Data, framed: Bool, signing: Curve25519.Signing.PrivateKey,
-                     agreement: Curve25519.KeyAgreement.PrivateKey, device: Data, caps: UInt8, at: Date,
+                     agreement: Curve25519.KeyAgreement.PrivateKey, device: Data, caps: UInt8, ratchet: UInt8? = nil, at: Date,
                      to agreementKey: Data) throws -> Data {
         let recipient = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: agreementKey)
         let sender = agreement.publicKey.rawRepresentation
         let bind = try signing.signature(for: bindLabel + sender)
         let inner = Inner(from: signing.publicKey.rawRepresentation, bind: bind, body: framed ? Data() : body,
-                          device: device.isEmpty ? nil : device, at: UInt64(max(0, at.timeIntervalSince1970)), caps: caps)
+                          device: device.isEmpty ? nil : device, at: UInt64(max(0, at.timeIntervalSince1970)), caps: caps, rv: ratchet)
         let innerPlain = framed ? Frame.join(try JSONEncoder().encode(inner), body) : try JSONEncoder().encode(inner)
 
         let ephemeral = Curve25519.KeyAgreement.PrivateKey()
@@ -96,7 +101,8 @@ enum EnvelopeCore {
         let signer = try Curve25519.Signing.PublicKey(rawRepresentation: inner.from)
         guard signer.isValidSignature(inner.bind, for: bindLabel + sender) else { throw EnvelopeError.badSignature }
         return Header(signer: inner.from, agreement: sender, device: inner.device ?? Data(),
-                      sentAt: Date(timeIntervalSince1970: TimeInterval(inner.at)), caps: inner.caps ?? 0, body: inner.body)
+                      sentAt: Date(timeIntervalSince1970: TimeInterval(inner.at)), caps: inner.caps ?? 0, body: inner.body,
+                      ratchet: inner.rv ?? 0)
     }
 
     private static func deriveOuter(_ secret: SharedSecret, ephemeral: Data, recipient: Data) -> SymmetricKey {
