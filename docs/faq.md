@@ -81,11 +81,6 @@ No. Nothing you say is signed, so a message can't be shown to a third party as c
 Separate identities with their own keys, mailboxes, contacts and chats. They can't be tied to each other, and each
 connects separately. Burners are personas that destroy themselves on a timer.
 
-**What can Pulshade not protect me from?**
-Honest limits: someone watching both ends of the network can still line up timing; a friend can screenshot or copy a
-message; a modified app on the other side can keep what you thought had disappeared; and the app hasn't been audited.
-[How Pulshade works](how-it-works.md) lists them all under "Known limits".
-
 **Do you read my address book?**
 Never. You add friends by scanning a code or sharing a link, so there is nothing to match or upload.
 
