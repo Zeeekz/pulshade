@@ -28,7 +28,7 @@ struct CanaryTests {
         var crashes = 0
 
         init(port: Int) throws {
-            self.port = port
+            self.port = port + (Int(ProcessInfo.processInfo.environment["PULSHADE_PORT_OFFSET"] ?? "") ?? 0)
             directory = FileManager.default.temporaryDirectory.appending(path: "pulshade-canary-relay-\(UUID().uuidString)")
             try start()
         }

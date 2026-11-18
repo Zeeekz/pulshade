@@ -112,7 +112,7 @@ struct GroupDeliveryTests {
         private var process: Process?
 
         init(port: Int) throws {
-            self.port = port
+            self.port = port + (Int(ProcessInfo.processInfo.environment["PULSHADE_PORT_OFFSET"] ?? "") ?? 0)
             directory = FileManager.default.temporaryDirectory.appending(path: "pulshade-relayloss-\(UUID().uuidString)")
             try start()
         }
