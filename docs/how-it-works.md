@@ -228,14 +228,16 @@ can't be switched off, except that one-time chats never send them. The author's 
 that gets no answer is sent again a few times over the next hours, so one lost on the way still arrives. A story whose time has run out, or that you delete, stops being sent: copies still waiting to go are dropped.
 
 **Groups that share one mailbox.** New groups, once everyone in them runs an app that can, post each message once into
-one mailbox on the server that every member reads, instead of a copy to each person: up to 5,000 people. Each member
+one mailbox on the server that every member reads, instead of a copy to each person: up to 1,000 people. Each member
 is known in the group by a key made for that group alone, so the group can't be tied to your profile or to your other
 groups, and members never get each other's mailboxes. The group's name, roles and member list are one signed document
 that only someone allowed can change, and nobody can change someone else's card. Taking someone out gives everyone
 else a new key that person never gets; someone added doesn't get what was said before. The server keeps group mail
-sealed for up to 7 days and can't tell who reads it over Tor. The owner of an older group can move it over in its
-details. The trade-off: a stolen group key reads that group until its key next changes, and group messages show
-"sent" rather than ticking per member.
+sealed for up to 7 days and can't tell who reads it over Tor. Each member's device keeps its own key chain in
+each group, started from fresh random bytes and moved on with every post, and the keys that let new members and
+devices follow it change every hour; group keys are handed out sealed with post-quantum keys as well as classical
+ones. So someone who takes a member's phone can't open posts it had already read, beyond about the last hour. The
+trade-off: group messages show "sent" rather than ticking per member.
 
 **Groups, channels and broadcasts.** Groups and channels share one mailbox (a channel's followers can't see who else
 follows: only its staff keep that list, in a mailbox of their own). A group saved from the older format, where every
@@ -345,8 +347,8 @@ the relay, and Burn erases them. (A few display settings and Tor's own state are
 lists them.)
 
 No messenger is without limits, and we would rather you read ours here than find them yourself. They are in two
-groups: the ones every end-to-end encrypted messenger shares, and the ones where Pulshade is still catching up, with
-what we are doing about each.
+groups: the ones every end-to-end encrypted messenger shares, and the ones that come from how Pulshade itself is
+built.
 
 ### Limits every end-to-end messenger shares
 
@@ -356,8 +358,9 @@ what we are doing about each.
   **Pulse check** proves nobody stood in the middle; for two weeks after you add someone, their chat reminds you to.
 - **A friend's new device is announced, not approved.** When their account adds a phone or computer, or a device of
   theirs starts reading another mailbox, your chat says so. A device can only be added with the account's own
-  signature, so the server can't slip one in; but each of their devices holds that key, so someone who took one of
-  them could. If you want more, turn on **Ask before a friend's new device gets my messages** (Settings → Privacy →
+  signature, so the server can't slip one in, and every device also has a key of its own that never leaves it, which
+  your app remembers: a device that turns up with a different key is announced as new, even under the same name.
+  Someone who took one of their devices could still add a device, and you would see it. If you want more, turn on **Ask before a friend's new device gets my messages** (Settings → Privacy →
   What others see) on each of your devices: nothing goes to a new device, and none of its messages are shown,
   until you allow it. The Pulse check can't tell devices apart, so ask them another way before you do.
 - **Disappearing messages and deleted stories trust the other device.** A modified app could ignore the timer, and
@@ -383,34 +386,27 @@ what we are doing about each.
   by default, see [wake-up pushes](push-notifications.md)); the push says nothing about the message. Blank screenshots
   rely on iOS behaviour Apple doesn't document.
 
-### Where Pulshade is still catching up, and what's next
+### Limits that come from how Pulshade is built
 
-- **Group keys are shared per period, not per message.** A group's key changes whenever someone leaves, and, once
-  something has been said, every **3 days or 300 posts** when an admin's device is on (from build 16; it was 7 days or
-  1,000). Someone who stole a member's key could read that period, and is locked out again at the next change. Old keys
-  are kept a week after the next begins, so members who were away can still read what they missed, and then erased
-  (from build 16; before, they stayed on the device). Signal and WhatsApp groups go further here: within a period, a
-  stolen key there doesn't open earlier messages. **Next:** each sender gets their own key chain, sealed to every
-  member (designed in `docs/groups-design.md`).
-- **New post-quantum secrets arrive about every 35 to 40 messages** in a back-and-forth chat, not on every reply;
-  between them, healing after a theft relies on X25519. A one-sided stream of messages does not advance it. Every
-  chat still starts with a hybrid X25519 + ML-KEM-768 handshake, so traffic recorded today can't be opened later by
-  breaking X25519 alone. **Next:** messages are padded to fixed sizes; that space will carry extra pieces of the next
-  key, roughly halving the wait without making messages bigger.
-- **Group keys aren't yet protected against a future quantum computer the way 1:1 chats are.** Each member's copy of
-  a new group key is sealed with X25519, inside the previous key's encryption. Someone removed from a group, or someone
-  who recorded the answer to a join link (sealed with X25519 alone), could with a future quantum computer recover a
-  group key and follow the later ones from there. **Next:** post-quantum sealing for group keys and join answers, part
-  of the group key work above.
+- **Group keys move on every post, but the keys to follow a sender change hourly.** Each sender's chain moves forward
+  with every message, so a stolen phone can't open what it had already read, except roughly the last hour, during
+  which the hourly key that lets members follow a sender is still on the device. Group keys, and the answer to a join
+  link, are sealed with post-quantum keys as well as classical ones.
+- **Post-quantum keys are refreshed every few messages, not every one.** Every chat starts with a hybrid X25519 +
+  ML-KEM-768 handshake, so traffic recorded today can't be opened later by breaking X25519 alone. After that, pieces
+  of the next post-quantum key ride in space every message already has, so a fresh secret arrives every several
+  messages, in either direction, including delivery and typing notes. Between them, healing after a theft relies on
+  X25519, as it does in Signal.
 - **One operator.** The official app talks only to Pulshade's servers, which can see when and how much traffic flows
   (never what it says, or who you are behind Tor). Apple's push service, sites behind link previews you turn on and a
   Snowflake bridge's front are contacted separately, and links you tap open in the browser.
 - **Our own implementation.** The ratchet, the handshake and the envelopes are our implementation of published
   designs (Signal's Double Ratchet and X3DH ideas, ML-KEM-768, ML-DSA-65), with a large test suite; it hasn't had an
   independent review yet. Reports are welcome ([SECURITY.md](../SECURITY.md)).
-- **Collecting messages while locked is switched off for now.** It isn't offered from build 16 until it has been tested
-  as thoroughly as ordinary delivery; push wake-ups still work. When it returns it stays off by default, because the
+- **Collecting messages while locked is switched off for now.** It isn't offered until it has been tested as
+  thoroughly as ordinary delivery; push wake-ups still work. When it returns it stays off by default, because the
   notification helper has to keep this account's keys in the Keychain, readable once the phone has been unlocked since
   it started.
-- **A group or channel can only hold people whose app is recent enough.** Groups take 5,000 members, and so do channels.
-  Someone on an app from before shared mailboxes is told to update first.
+- **Groups take up to 1,000 members, and channels up to 500 followers.** Every member's card carries a post-quantum
+  key, which makes a group's records larger; the limits will rise as those records move to the file store. Everyone in
+  a group needs an app recent enough to read it.
