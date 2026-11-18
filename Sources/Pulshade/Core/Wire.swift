@@ -238,6 +238,9 @@ enum Payload: Codable, Equatable {
     case groupChainKeys(group: UUID, keys: [GroupChainKey])
     /// The sender logged out of the device this came from: stop sending to it.
     case deviceRemoved
+    /// The sender unlinked these devices of theirs (ids as this account knows them), said by one of their devices still
+    /// linked, over its own session: drop them and never take them back (`Contact.revoked`).
+    case devicesUnlinked([Data])
     /// The sender erased their account: forget them completely, with everything they ever sent.
     case erased
     /// An abuse report, sent only to the operator's report mailbox.
@@ -424,6 +427,10 @@ struct ContactCard: Codable, Equatable {
     var pq: PQPin? = nil
     /// What the invite that added them committed their post-quantum keys to, for a device that hasn't got the keys yet.
     var pqCommit: Data? = nil
+    /// Devices their account unlinked (`Contact.revoked`): `id`, and the pinned keys as `key`.
+    var revoked: [DeviceCard]? = nil
+    /// Two of their devices unlinked each other (`Contact.contested`).
+    var contested: Bool? = nil
 }
 
 /// A group, channel or list as your other devices should know it (without its messages).

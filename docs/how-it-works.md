@@ -238,7 +238,9 @@ each group, started from fresh random bytes and moved on with every post, and ha
 members' devices over private, post-quantum sessions; group keys are handed out sealed with post-quantum keys as well
 as classical ones. So someone who takes a member's phone can't open the group posts it had already read, and once you
 unlink that phone from another of your devices, every group you're in moves to new keys it can't work out, so it reads
-nothing said there from then on. The
+nothing said there from then on. Your contacts are told too, by the device that unlinked it over its own session:
+they drop that phone, never write to it again and never take it back (a device with new keys shows as a new device). If
+two of your devices unlink each other, contacts drop both and hold your next device until they allow it. The
 trade-off: group messages show "sent" rather than ticking per member.
 
 **Groups, channels and broadcasts.** Groups and channels share one mailbox (a channel's followers can't see who else

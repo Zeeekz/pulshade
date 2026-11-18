@@ -143,6 +143,20 @@ struct DeviceLink: Codable {
     }
 }
 
+/// A device a contact's account took off its list (`Payload.devicesUnlinked`): never written to or read from again, and
+/// never taken back under this id or these keys. Coming back needs new device keys, which makes it a new device.
+struct RevokedDevice: Codable {
+    var id: Data
+    /// The keys it had, when known, so the same device under another id isn't taken either.
+    var pin: Data?
+    /// Which of their devices said so. Nil when another of your devices passed it on.
+    var by: Data?
+    var at: Date
+    /// Its session, kept a while only to read one thing from it: the same removal the other way round (`by` taken off
+    /// by this device), which makes it a contest (`Contact.contested`). Nothing is ever sent on it.
+    var session: Ratchet?
+}
+
 /// Someone whose keys you hold: one account, with one or more devices. `hidden` peers came from a group
 /// or channel roster and aren't in your contacts list. Your own other devices live in a hidden contact
 /// with `isSelf` set.
@@ -212,6 +226,11 @@ struct Contact: Codable, Identifiable {
     /// An envelope from them arrived in the old classical form, so their app is too old: nothing from it is read. When it
     /// last did, so you're told once, not each time.
     var tooOld: Date?
+    /// Devices their account unlinked (`RevokedDevice`), the newest `AppModel.maxRevoked` at most.
+    var revoked: [RevokedDevice]?
+    /// Two of their devices unlinked each other (a phone that was taken, say, against the one it was taken from): both
+    /// were dropped, the safety code counts as unchecked, and any new device of theirs is held until you allow it.
+    var contested: Date?
 
     /// Where a new contact starts: their first device's mailbox.
     var sendID: Data {
@@ -236,7 +255,7 @@ struct Contact: Codable, Identifiable {
 
     private enum CodingKeys: String, CodingKey {
         case fingerprint, name, nickname, avatar, banner, color, bio, links, walletChangedAt, notes, handle, verified, badge, collectibles, signingKey, agreementKey, devices, receiveKey, relay
-        case hidden, isSelf, awaitingAcceptance, addedAt, persona, wantsMyPresence, toldPresence, spare, oldSpares, departing, pq, pqCommit, pqCardSent, tooOld
+        case hidden, isSelf, awaitingAcceptance, addedAt, persona, wantsMyPresence, toldPresence, spare, oldSpares, departing, pq, pqCommit, pqCardSent, tooOld, revoked, contested
         // Single-device fields from before linked devices.
         case sendID, session, handshake, pending
     }
@@ -275,6 +294,8 @@ struct Contact: Codable, Identifiable {
         pqCommit = try? c.decodeIfPresent(Data.self, forKey: .pqCommit)
         pqCardSent = try? c.decodeIfPresent(Bool.self, forKey: .pqCardSent)
         tooOld = try? c.decodeIfPresent(Date.self, forKey: .tooOld)
+        revoked = try? c.decodeIfPresent([RevokedDevice].self, forKey: .revoked)
+        contested = try? c.decodeIfPresent(Date.self, forKey: .contested)
         addedAt = try c.decodeIfPresent(Date.self, forKey: .addedAt) ?? Date()
         // A saved list of devices is taken as it is, even an empty one: your own entry once the last linked device leaves,
         // and the members of a group that shares one mailbox, who are never written to directly. (An empty list used to
@@ -327,6 +348,8 @@ struct Contact: Codable, Identifiable {
         try c.encodeIfPresent(pqCommit, forKey: .pqCommit)
         try c.encodeIfPresent(pqCardSent, forKey: .pqCardSent)
         try c.encodeIfPresent(tooOld, forKey: .tooOld)
+        try c.encodeIfPresent(revoked, forKey: .revoked)
+        try c.encodeIfPresent(contested, forKey: .contested)
     }
 
     var displayName: String {
@@ -1415,7 +1438,8 @@ struct AppData: Codable {
     /// groups saved before are set aside like those before 21.
     /// 25: the account's group secret (`groupSecret`), which group keys are made from and which is replaced when a
     /// device is unlinked; a group can still be on the one before (`SharedGroup.memberSecret`).
-    static let currentFormat = 25
+    /// 26: devices a contact's account unlinked are remembered and refused (`Contact.revoked`, `contested`).
+    static let currentFormat = 26
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []

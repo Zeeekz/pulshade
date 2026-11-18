@@ -3517,7 +3517,7 @@ final class AppModel {
             if isSelf {
                 data.contacts[i].devices[d].unconfirmed = true
             } else {
-                if data.security.holdNewDevices { data.contacts[i].devices[d].unconfirmed = true }
+                if holdsNewDevices(contact: i) { data.contacts[i].devices[d].unconfirmed = true }
                 noteNewDevice(of: data.contacts[i])
             }
         }
@@ -4255,6 +4255,8 @@ final class AppModel {
             peer.addedAt = old.addedAt
             peer.verified = old.verified && old.agreementKey == request.card.agreementKey
             peer.pqCommit = old.pqCommit
+            peer.revoked = old.revoked
+            peer.contested = old.contested
             // Every device of theirs already known stays, with the keys pinned for it and whether it's held: a request is
             // no way round them. The asking device joins them; one not among them is a new device like any other. Links
             // still waiting for a device's id (an invite not answered yet) are what this request answers, so they go.
@@ -4265,7 +4267,7 @@ final class AppModel {
                 var link = link
                 if !devices.isEmpty {
                     newDevice = true
-                    if data.security.holdNewDevices { link.unconfirmed = true }
+                    if data.security.holdNewDevices || old.contested != nil { link.unconfirmed = true }
                 }
                 devices.append(link)
             }
@@ -4979,6 +4981,7 @@ final class AppModel {
         let persona = data.contacts[i].persona
         guard let me = me(persona), let mine = deviceKey(for: persona),
               let theirPin = askerPin(request, contact: i, device: data.contacts[i].devices[d].id, context: context),
+              !isRevoked(contact: i, id: data.contacts[i].devices[d].id, pin: theirPin),
               let (session, answer) = try? Handshake.accept(request, me: me, initiatorAgreement: data.contacts[i].agreementKey,
                                                              initiatorPin: theirPin, responderPin: mine.card.pin),
               let signed = try? Handshake.signed(answer, by: mine.key, card: mine.card,
@@ -5619,7 +5622,7 @@ final class AppModel {
             // A device of a friend's that now reads another mailbox is as good as a new device (anyone with their account's
             // keys could claim its id): said in the chat, and held again if you ask before new devices.
             if !isSelf, knownByID, data.contacts[i].devices[d].sendID != sendID, !data.contacts[i].devices[d].sendID.isEmpty {
-                if data.security.holdNewDevices { data.contacts[i].devices[d].unconfirmed = true }
+                if holdsNewDevices(contact: i) { data.contacts[i].devices[d].unconfirmed = true }
                 noteNewDevice(of: data.contacts[i])
                 syncContact(data.contacts[i].fingerprint, data.contacts[i].persona)
             }
@@ -5638,7 +5641,7 @@ final class AppModel {
         // so say so where the person would see it (their chat, or the list of your own devices).
         let announce = !data.contacts[i].devices.isEmpty && !id.isEmpty
         var link = DeviceLink(id: id, sendID: sendID)
-        let hold = announce && !isSelf && data.security.holdNewDevices
+        let hold = announce && !isSelf && holdsNewDevices(contact: i)
         if announce && (isSelf || hold) { link.unconfirmed = true }
         data.contacts[i].devices.append(link)
         if announce && !isSelf { noteNewDevice(of: data.contacts[i]) }
@@ -5648,6 +5651,103 @@ final class AppModel {
     }
 
 
+    // MARK: Unlinked devices
+
+    /// The most unlinked devices remembered for one contact.
+    static let maxRevoked = 32
+    /// How long an unlinked device's session is kept, only to read a removal the other way round from it.
+    static let revokedSessionLife: TimeInterval = 30 * 24 * 3600
+
+    /// New devices of contact `i` wait until you allow them: you ask that for everyone, or two of theirs unlinked each other.
+    private func holdsNewDevices(contact i: Int) -> Bool {
+        data.security.holdNewDevices || data.contacts[i].contested != nil
+    }
+
+    /// A device contact `i`'s account unlinked, by its id or by its keys.
+    private func isRevoked(contact i: Int, id: Data, pin: Data?) -> Bool {
+        guard let gone = data.contacts[i].revoked else { return false }
+        return gone.contains { (!id.isEmpty && $0.id == id) || (pin != nil && $0.pin == pin) }
+    }
+
+    /// Takes a device off contact `i` for good: its session, what waits for it, and its place in the list go, and it is
+    /// remembered so it is never taken back (`RevokedDevice`). Its session is kept a while, read-only, when one of their
+    /// devices said so (`by`), for the removal the other way round.
+    private func revoke(_ id: Data, pin: Data?, by: Data?, contact i: Int) {
+        guard !id.isEmpty else { return }
+        let link = data.contacts[i].devices.first { $0.id == id }
+        let key = "\(data.contacts[i].persona?.uuidString ?? "main")|\(data.contacts[i].fingerprint)|\(id.hex)"
+        data.contacts[i].devices.removeAll { $0.id == id }
+        unreadable[key] = nil
+        keysAnsweredAt[key] = nil
+        deadSpareFrom[key] = nil
+        var gone = data.contacts[i].revoked ?? []
+        if let k = gone.firstIndex(where: { $0.id == id }) {
+            if gone[k].pin == nil { gone[k].pin = pin ?? link?.keyPin }
+        } else {
+            let keep = by != nil && !data.contacts[i].isSelf
+            gone.append(RevokedDevice(id: id, pin: pin ?? link?.keyPin, by: by, at: Date(), session: keep ? link?.session : nil))
+        }
+        // Sessions past their time are let go; the oldest entries make way.
+        for k in gone.indices where Date().timeIntervalSince(gone[k].at) > Self.revokedSessionLife { gone[k].session = nil }
+        if gone.count > Self.maxRevoked { gone.removeFirst(gone.count - Self.maxRevoked) }
+        data.contacts[i].revoked = gone
+    }
+
+    /// Contact `i`'s device `by` says their account unlinked these devices. It speaks over its own session, which only
+    /// that device's keys (signed for by their account) could have opened, so this is their account and a device of
+    /// theirs still on it. The devices are dropped and never taken back; they can only return with new device keys, as a
+    /// new device. A device can't unlink itself this way (that's `deviceRemoved`).
+    private func devicesUnlinked(_ ids: [Data], by: Data, contact i: Int) {
+        guard !by.isEmpty, data.contacts[i].devices.contains(where: { $0.id == by }) else { return }
+        var dropped = 0
+        for id in ids.prefix(Self.maxDevicesPerContact) where !id.isEmpty && id != by && !isRevoked(contact: i, id: id, pin: nil) {
+            if data.contacts[i].devices.contains(where: { $0.id == id }) { dropped += 1 }
+            revoke(id, pin: nil, by: by, contact: i)
+        }
+        if dropped > 0 { noteUnlinked(of: data.contacts[i]) }
+        syncContact(data.contacts[i].fingerprint, data.contacts[i].persona)
+        save()
+    }
+
+    /// Something arrived over the kept session of a device contact `i`'s account unlinked. Only one thing is read from
+    /// it: that device unlinking the one that unlinked it. Then two of their devices each say the other is gone, and this
+    /// device can't tell which is theirs and which was taken: both are dropped, the safety code counts as unchecked, and
+    /// their next device is held until you allow it (`Contact.contested`). Nothing else from it is read.
+    private func readRevoked(_ message: RatchetMessage, contact i: Int, entry r: Int) {
+        guard var session = data.contacts[i].revoked?[r].session, let gone = data.contacts[i].revoked?[r],
+              Date().timeIntervalSince(gone.at) < Self.revokedSessionLife,
+              let plain = try? session.decrypt(message) else { return }
+        data.contacts[i].revoked?[r].session = session
+        guard let inner = try? Payload.fromWire(plain), case let .devicesUnlinked(ids) = inner,
+              let by = gone.by, ids.contains(by) else { return }
+        revoke(by, pin: nil, by: gone.id, contact: i)
+        for k in (data.contacts[i].revoked ?? []).indices { data.contacts[i].revoked?[k].session = nil }
+        data.contacts[i].contested = Date()
+        data.contacts[i].verified = false
+        let contact = data.contacts[i]
+        if !contact.hidden, !contact.awaitingAcceptance {
+            let convo = startConversation(kind: .direct, title: "", members: [contact.fingerprint], persona: .some(contact.persona))
+            if let c = index(of: convo.id) {
+                data.conversations[c].messages.append(Message(
+                    sender: "system",
+                    text: "Two of \(contact.displayName)'s devices removed each other, so neither gets your messages now. "
+                        + "Check their safety code with them; a new device of theirs waits until you allow it.",
+                    date: Date()))
+            }
+        }
+        syncContact(contact.fingerprint, contact.persona)
+        save()
+    }
+
+    /// A line in the chat with a contact whose account unlinked a device: it gets nothing from you from now on.
+    private func noteUnlinked(of contact: Contact) {
+        guard !contact.hidden, !contact.awaitingAcceptance else { return }
+        let convo = startConversation(kind: .direct, title: "", members: [contact.fingerprint], persona: .some(contact.persona))
+        guard let c = index(of: convo.id) else { return }
+        data.conversations[c].messages.append(Message(sender: "system", text: "\(contact.displayName) removed a device from their account. "
+                                                      + "It no longer gets your messages.", date: Date()))
+    }
+
     /// A line in the chat with a contact whose account just added a device we hadn't seen. Their messages and ours
     /// reach it from now on, as with any device of theirs, which matters most when it isn't theirs.
     private func noteNewDevice(of contact: Contact) {
@@ -5656,7 +5756,7 @@ final class AppModel {
         guard !contact.hidden, !contact.awaitingAcceptance else { return }
         let convo = startConversation(kind: .direct, title: "", members: [contact.fingerprint], persona: .some(contact.persona))
         guard let c = index(of: convo.id) else { return }
-        let held = data.security.holdNewDevices
+        let held = data.security.holdNewDevices || contact.contested != nil
         data.conversations[c].messages.append(Message(sender: "system", text: "\(contact.displayName)'s account added a new device"
                                                       + (held ? ". Your messages wait until you allow it." : ""), date: Date()))
     }
@@ -5798,10 +5898,13 @@ final class AppModel {
 
     /// This device's id as one persona's contacts see it. Each persona gets its own, so someone who knows
     /// two of your personas can't match them up by the device they write from.
-    func deviceID(for persona: UUID?) -> Data {
-        guard let persona else { return data.deviceID }
+    func deviceID(for persona: UUID?) -> Data { Self.deviceID(data.deviceID, for: persona) }
+
+    /// The id a device with main id `main` writes to one persona's contacts with.
+    static func deviceID(_ main: Data, for persona: UUID?) -> Data {
+        guard let persona else { return main }
         let code = HMAC<SHA256>.authenticationCode(for: Data("pulshade.device.\(persona.uuidString)".utf8),
-                                                   using: SymmetricKey(data: data.deviceID))
+                                                   using: SymmetricKey(data: main))
         return Data(code.prefix(16))
     }
 
@@ -6844,6 +6947,8 @@ final class AppModel {
             var incoming = FriendRequest(fingerprint: fp, card: kept, handshake: request, note: String(note.prefix(280)),
                                          persona: invite.persona)
             incoming.device = device
+            // From a device their account unlinked: not taken, whatever it says.
+            if let known = contactIndex(fp, invite.persona), isRevoked(contact: known, id: device, pin: nil) { return .junk }
             // Someone known only from a group isn't a friend yet: theirs is an ordinary request.
             if let known = contactIndex(fp, invite.persona), !data.contacts[known].hidden {
                 // Already a friend: they've lost the chat on their side (a reinstall, a detach), and their identity
@@ -6871,6 +6976,12 @@ final class AppModel {
         // A message from someone this persona doesn't know yet. Kept rather than acknowledged: the contact
         // may arrive a moment later (a group's roster, a hello in the same fetch).
         guard let i = contactIndex(fp, persona) else { return .retry }
+        // A device their account unlinked: nothing it says is taken, bar one thing read from its kept session (`readRevoked`).
+        if !device.isEmpty, let r = data.contacts[i].revoked?.firstIndex(where: { $0.id == device }) {
+            markSeen()
+            if case let .ratchet(message) = payload, !data.contacts[i].isSelf { readRevoked(message, contact: i, entry: r) }
+            return .handled
+        }
         markSeen()
         // The notification helper's note (`.collected`) says caps 0 because it knows nothing of what the app reads: taking that
         // as the truth would mark the friend's device as needing an update (bit 7 absent) until its next real envelope.
@@ -6884,7 +6995,8 @@ final class AppModel {
             // so it really is theirs. Every current app names its device: one that doesn't could take over another
             // device's place unannounced.
             // Its own keys must sign it, under a card its account signed for this id: anything else isn't taken.
-            guard card.id == device, !device.isEmpty, askerPin(request, contact: i, device: device, context: .device) != nil else { return .junk }
+            guard card.id == device, !device.isEmpty, let pin = askerPin(request, contact: i, device: device, context: .device),
+                  !isRevoked(contact: i, id: device, pin: pin) else { return .junk }
             let d = upsertDevice(i, id: card.id, sendID: card.sendID)
             // The same hello again (a relay redelivery) must not replace the session it already opened.
             if data.contacts[i].devices[d].session != nil && data.contacts[i].devices[d].acceptedHello == request.ephemeral {
@@ -6932,6 +7044,7 @@ final class AppModel {
             let asks = [link.handshake].compactMap { $0 } + (link.earlierAsks ?? [])
             guard let pending = asks.first(where: { $0.publicEphemeral == answer.replyTo }),
                   let theirPin = answererPin(answer, to: pending, contact: i, device: link.id),
+                  !isRevoked(contact: i, id: link.id, pin: theirPin),
                   let session = try? Handshake.complete(pending, answer, me: me, responderAgreement: data.contacts[i].agreementKey,
                                                         responderPin: theirPin) else { return .junk }
             pinDeviceKey(theirPin, contact: i, device: d)
@@ -6982,6 +7095,7 @@ final class AppModel {
             // Signed by the answering device's own keys, under a card its account signed: anything else isn't taken.
             let theirPin = used.flatMap { answererPin(answer, to: $0.handshake, contact: i, device: device) }
             if used != nil, theirPin == nil { return .junk }
+            if let theirPin, isRevoked(contact: i, id: device, pin: theirPin) { return .junk }
             let d = upsertDevice(i, id: card.id, sendID: card.sendID)
             guard let used, let theirPin,
                   let session = try? Handshake.complete(used.handshake, answer, me: me, responderAgreement: data.contacts[i].agreementKey,
@@ -7241,6 +7355,10 @@ final class AppModel {
         case .deviceRemoved:
             guard let i = contactIndex(fp, persona), data.contacts[i].devices.count > 1 else { break }
             data.contacts[i].devices.removeAll { $0.id == device }
+        case let .devicesUnlinked(ids):
+            // Your own devices hear of it by sync (`deviceLoggedOut`).
+            guard let i = contactIndex(fp, persona), !data.contacts[i].isSelf else { break }
+            devicesUnlinked(ids, by: device, contact: i)
         case .erased:
             eraseTraces(of: fp)
         case .hello, .request, .pqIntro, .sessionInit, .deviceHello, .sessionAccept, .spareAccept, .ratchet, .collected:
@@ -7902,9 +8020,13 @@ extension AppModel {
     /// and every group moves to keys it can't work out (`renewGroupSecret`), so it reads nothing said there from then on.
     func unlinkDevice(_ id: Data) {
         guard let i = selfIndex, data.contacts[i].devices.contains(where: { $0.id == id }) else { return }
-        data.contacts[i].devices.removeAll { $0.id == id }
+        revoke(id, pin: data.contacts[i].devices.first { $0.id == id }?.keyPin, by: data.deviceID, contact: i)
         // Sent to the devices left, not the one taken out.
         sync(.deviceLoggedOut(id))
+        // Every contact drops it, told by this device over its own session (under the id each persona's contacts know).
+        for c in data.contacts where !c.isSelf && !c.awaitingAcceptance && !c.devices.isEmpty {
+            enqueue(.devicesUnlinked([Self.deviceID(id, for: c.persona)]), to: c)
+        }
         renewGroupSecret()
         save()
     }
@@ -7912,7 +8034,7 @@ extension AppModel {
     /// Another of your devices logged out, or unlinked one: it's dropped here too. That device moves the groups on.
     private func forgetLinkedDevice(_ id: Data) {
         guard id != data.deviceID, let i = selfIndex else { return }
-        data.contacts[i].devices.removeAll { $0.id == id }
+        revoke(id, pin: data.contacts[i].devices.first { $0.id == id }?.keyPin, by: nil, contact: i)
         save()
     }
 
@@ -7947,7 +8069,9 @@ extension AppModel {
                     verified: c.verified, signingKey: c.signingKey, agreementKey: c.agreementKey,
                     devices: c.devices.map { DeviceCard(id: $0.id, sendID: $0.sendID, held: c.isSelf ? nil : $0.unconfirmed, key: $0.keyPin) },
                     relay: c.relay, hidden: c.hidden,
-                    awaitingAcceptance: c.awaitingAcceptance, persona: c.persona, pq: c.pq, pqCommit: c.pqCommit)
+                    awaitingAcceptance: c.awaitingAcceptance, persona: c.persona, pq: c.pq, pqCommit: c.pqCommit,
+                    revoked: c.revoked.map { $0.map { DeviceCard(id: $0.id, sendID: Data(), key: $0.pin) } },
+                    contested: c.contested != nil ? true : nil)
     }
 
     private func card(of c: Conversation) -> ConversationCard {
@@ -7993,6 +8117,9 @@ extension AppModel {
                 for d in data.contacts[i].devices.indices where data.contacts[i].devices[d].session == nil && data.contacts[i].devices[d].handshake == nil
                     && !card.awaitingAcceptance { startHandshake(contact: i, device: d) }
             }
+            // Devices their account unlinked, as another of yours heard: dropped here too, before the list below.
+            for gone in card.revoked ?? [] { revoke(gone.id, pin: gone.key, by: nil, contact: i) }
+            if card.contested == true, data.contacts[i].contested == nil { data.contacts[i].contested = Date() }
             for device in card.devices {
                 if let d = data.contacts[i].devices.firstIndex(where: { (!device.id.isEmpty && $0.id == device.id) || $0.sendID == device.sendID }) {
                     // The same device on another mailbox: another of yours saw it change, and holds it again if it says so.
@@ -8016,7 +8143,9 @@ extension AppModel {
                     var link = DeviceLink(id: device.id, sendID: device.sendID)
                     if let key = device.key, key.count == 32 { link.keyPin = key }
                     // A device new to this one: held if another of yours holds it, or if this one asks before new devices.
-                    if device.held == true || (device.held == nil && data.security.holdNewDevices && !data.contacts[i].devices.isEmpty) {
+                    // One their account unlinked, as this device already knows, isn't taken back.
+                    if isRevoked(contact: i, id: device.id, pin: device.key) { continue }
+                    if device.held == true || (device.held == nil && holdsNewDevices(contact: i) && !data.contacts[i].devices.isEmpty) {
                         link.unconfirmed = true
                     } else if device.held == false {
                         link.unconfirmed = false
@@ -8031,7 +8160,10 @@ extension AppModel {
         var c = Contact(fingerprint: card.fingerprint, name: card.name, nickname: card.nickname, avatar: card.avatar,
                         signingKey: card.signingKey, agreementKey: card.agreementKey, sendID: Data(),
                         receiveKey: Mailbox.make().receiveKey, hidden: card.hidden)
-        c.devices = card.devices.map {
+        c.revoked = card.revoked?.prefix(Self.maxRevoked).map { RevokedDevice(id: $0.id, pin: $0.key, by: nil, at: Date()) }
+        c.contested = card.contested == true ? Date() : nil
+        let gone = Set((card.revoked ?? []).map(\.id))
+        c.devices = card.devices.filter { !gone.contains($0.id) }.map {
             var link = DeviceLink(id: $0.id, sendID: $0.sendID)
             link.unconfirmed = $0.held
             if let key = $0.key, key.count == 32 { link.keyPin = key }
