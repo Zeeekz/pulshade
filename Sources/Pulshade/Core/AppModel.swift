@@ -693,7 +693,7 @@ final class AppModel {
             }
             if let card = found[index], Date().timeIntervalSince(card.madeAt) < Self.spareMaxAge,
                !answeredSpares.contains(card.request.ephemeral),
-               acceptSession(card.request, contact: i, device: d, spare: true) {
+               acceptSession(card.request, contact: i, device: d, spare: true, context: .spare) {
                 answeredSpares.insert(card.request.ephemeral)
                 // A hello of theirs sent before now crossed this answer: it isn't taken (see `.deviceHello`).
                 data.contacts[i].devices[d].spareTakenAt = RelayClock.now
@@ -749,7 +749,7 @@ final class AppModel {
         // Signed by this device's own keys, like any ask for keys.
         let parties = HandshakeParties(from: me.card.signing, to: data.contacts[i].signingKey, device: deviceID(for: persona))
         guard let spare = data.contacts[i].spare, var card = spare.card,
-              let signed = try? Handshake.signed(card.request, by: mine.key, card: mine.card, parties) else { return }
+              let signed = try? Handshake.signed(card.request, by: mine.key, card: mine.card, parties, context: .spare) else { return }
         card.request = signed
         guard let keys = mySpareKeys(contact: i), let sealed = SpareSlot.seal(card, with: keys),
               let client = client(data.contacts[i].relay, lane: Self.spareLane(keys)) else { return }
@@ -1576,7 +1576,7 @@ final class AppModel {
         contact.receiveKey = mailbox.receiveKey
         // Following a channel doesn't make its owner one of your contacts.
         contact.hidden = invite.kind == .channel ? (known?.hidden ?? true) : false
-        guard let (handshake, request) = signedHandshake(persona: owner, to: invite.signingKey) else { return nil }
+        guard let (handshake, request) = signedHandshake(persona: owner, to: invite.signingKey, context: .hello) else { return nil }
         // The invite names one of their devices' mailboxes; its id arrives with their answer.
         var link = DeviceLink(sendID: invite.sendID)
         link.handshake = handshake
@@ -3409,12 +3409,19 @@ final class AppModel {
     }
 
     /// A new ask for keys from `persona` to the account with signing key `to`, signed by this device's own keys.
-    private func signedHandshake(persona: UUID?, to: Data) -> (PendingHandshake, SessionInit)? {
-        guard let me = me(persona), let mine = deviceKey(for: persona), var (pending, request) = try? Handshake.start() else { return nil }
+    private func signedHandshake(persona: UUID?, to: Data, context: HandshakeContext) -> (PendingHandshake, SessionInit)? {
+        guard let me = me(persona), var (pending, request) = try? Handshake.start(),
+              let mine = deviceKey(for: persona), let signed = signedAsk(request, persona: persona, to: to, context: context)
+        else { return nil }
         pending.pin = mine.card.pin
-        let parties = HandshakeParties(from: me.card.signing, to: to, device: deviceID(for: persona))
-        guard let signed = try? Handshake.signed(request, by: mine.key, card: mine.card, parties) else { return nil }
         return (pending, signed)
+    }
+
+    /// An ask for keys signed by this device's own keys, for the way in it's sent by.
+    private func signedAsk(_ request: SessionInit, persona: UUID?, to: Data, context: HandshakeContext) -> SessionInit? {
+        guard let me = me(persona), let mine = deviceKey(for: persona) else { return nil }
+        let parties = HandshakeParties(from: me.card.signing, to: to, device: deviceID(for: persona))
+        return try? Handshake.signed(request, by: mine.key, card: mine.card, parties, context: context)
     }
 
     /// Who a handshake signed by contact `i`'s device `device` is between.
@@ -3429,9 +3436,9 @@ final class AppModel {
     }
 
     /// The pin of the keys contact `i`'s device `device` signed an ask with, if they check out. Nil: not taken.
-    private func askerPin(_ request: SessionInit, contact i: Int, device: Data) -> Data? {
+    private func askerPin(_ request: SessionInit, contact i: Int, device: Data, context: HandshakeContext) -> Data? {
         guard let pq = accountPQ(contact: i), let parties = theirParties(contact: i, device: device) else { return nil }
-        return Handshake.devicePin(of: request, parties, accountPQ: pq)
+        return Handshake.devicePin(of: request, parties, accountPQ: pq, context: context)
     }
 
     /// The pin of the keys contact `i`'s device `device` signed its answer to `pending` with, if they check out.
@@ -4152,7 +4159,7 @@ final class AppModel {
         guard identity != nil, !myFingerprints.contains(profile.fingerprint),
               profile.relay == nil || Invite.allowedRelay(profile.relay) != nil else { return nil }
         if let known = contact(profile.fingerprint, in: persona), !known.awaitingAcceptance, !known.hidden { return known }
-        guard let (handshake, request) = signedHandshake(persona: persona, to: profile.signingKey) else { return nil }
+        guard let (handshake, request) = signedHandshake(persona: persona, to: profile.signingKey, context: .request) else { return nil }
         let mailbox = Mailbox.make()
         var contact = Contact(fingerprint: profile.fingerprint, name: String(profile.name.prefix(64)), avatar: profile.avatar,
                               signingKey: profile.signingKey, agreementKey: profile.agreementKey, sendID: profile.sendID,
@@ -4180,7 +4187,9 @@ final class AppModel {
         var peer = Contact(fingerprint: request.fingerprint, name: String(request.card.name.prefix(64)),
                            avatar: request.card.avatar, signingKey: request.card.signingKey,
                            agreementKey: request.card.agreementKey, sendID: request.card.sendID, receiveKey: mailbox.receiveKey,
-                           device: request.device ?? request.card.device ?? Data())
+                           device: request.device ?? Data())
+        // Only the device id the envelope was signed under: the card's own `device` is just what the request says.
+        let asking = request.device ?? Data()
         peer.color = request.card.color
         peer.persona = request.persona
         var newDevice = false
@@ -4189,15 +4198,21 @@ final class AppModel {
             peer.addedAt = old.addedAt
             peer.verified = old.verified && old.agreementKey == request.card.agreementKey
             peer.pqCommit = old.pqCommit
-            // Keys pinned for their devices stay pinned: a request is no way round them. A device of theirs with other
-            // keys than before, or one never seen, is a new device like any other.
-            if let same = old.devices.first(where: { !$0.id.isEmpty && $0.id == peer.devices.first?.id }) {
-                peer.devices[0].keyPin = same.keyPin
-                peer.devices[0].unconfirmed = same.unconfirmed
-            } else if !peer.devices.isEmpty, old.devices.contains(where: { $0.keyPin != nil }) {
-                newDevice = true
-                if data.security.holdNewDevices { peer.devices[0].unconfirmed = true }
+            // Every device of theirs already known stays, with the keys pinned for it and whether it's held: a request is
+            // no way round them. The asking device joins them; one not among them is a new device like any other. Links
+            // still waiting for a device's id (an invite not answered yet) are what this request answers, so they go.
+            var devices = old.devices.filter { !$0.id.isEmpty || $0.keyPin != nil }
+            if let k = devices.firstIndex(where: { !$0.id.isEmpty && $0.id == asking }) {
+                devices[k].sendID = request.card.sendID
+            } else if let link = peer.devices.first {
+                var link = link
+                if !devices.isEmpty {
+                    newDevice = true
+                    if data.security.holdNewDevices { link.unconfirmed = true }
+                }
+                devices.append(link)
             }
+            peer.devices = devices
         }
         peer.pq = request.card.pq?.verified(signer: request.card.signingKey, agreement: request.card.agreementKey)
         if let pin = peer.pq, !pinMatchesInvite(pin, contact: peer) { peer.pq = nil }
@@ -4207,7 +4222,9 @@ final class AppModel {
         sync(.requestResolved(fingerprint: request.fingerprint, persona: request.persona))
         if let i = contactIndex(peer.fingerprint, peer.persona) {
             if newDevice { noteNewDevice(of: data.contacts[i]) }
-            acceptSession(request.handshake, contact: i, device: 0)
+            if let d = data.contacts[i].devices.firstIndex(where: { $0.id == asking }) {
+                acceptSession(request.handshake, contact: i, device: d, context: .request)
+            }
         }
         enqueue(.accepted(sendID: mailbox.sendID), to: peer)
         shareStories(with: peer)
@@ -4863,7 +4880,7 @@ final class AppModel {
 
     /// Opens a session with one device, introducing this device at the same time.
     private func startHandshake(contact i: Int, device d: Int) {
-        guard let (handshake, request) = signedHandshake(persona: data.contacts[i].persona, to: data.contacts[i].signingKey) else { return }
+        guard let (handshake, request) = signedHandshake(persona: data.contacts[i].persona, to: data.contacts[i].signingKey, context: .device) else { return }
         if let earlier = data.contacts[i].devices[d].handshake { keepEarlierAsk(earlier, contact: i, device: d) }
         data.contacts[i].devices[d].handshake = handshake
         data.contacts[i].devices[d].needsKeys = nil
@@ -4900,10 +4917,11 @@ final class AppModel {
     /// The ask must carry the asking device's keys, signed by its account, and its own signature over the ask; the keys
     /// are pinned (`pinDeviceKey`), and the answer is signed by this device's keys in turn. Whether it was answered.
     @discardableResult
-    private func acceptSession(_ request: SessionInit, contact i: Int, device d: Int, spare: Bool = false, sentAt: Date? = nil) -> Bool {
+    private func acceptSession(_ request: SessionInit, contact i: Int, device d: Int, spare: Bool = false, sentAt: Date? = nil,
+                               context: HandshakeContext) -> Bool {
         let persona = data.contacts[i].persona
         guard let me = me(persona), let mine = deviceKey(for: persona),
-              let theirPin = askerPin(request, contact: i, device: data.contacts[i].devices[d].id),
+              let theirPin = askerPin(request, contact: i, device: data.contacts[i].devices[d].id, context: context),
               let (session, answer) = try? Handshake.accept(request, me: me, initiatorAgreement: data.contacts[i].agreementKey,
                                                              initiatorPin: theirPin, responderPin: mine.card.pin),
               let signed = try? Handshake.signed(answer, by: mine.key, card: mine.card,
@@ -5210,7 +5228,9 @@ final class AppModel {
         for c in data.contacts where c.awaitingAcceptance && !c.isSelf && c.addedAt > Date().addingTimeInterval(-7 * 24 * 3600) {
             guard let handshake = c.devices.first?.handshake, let public_ = handshake.publicEphemeral, let key = c.receiveKey,
                   let kem = try? MLKEM768.PrivateKey(seedRepresentation: handshake.kemSeed, publicKey: nil), me(c.persona) != nil else { continue }
-            let request = SessionInit(ephemeral: public_, kem: kem.publicKey.rawRepresentation)
+            // Signed again by this device's keys: an unsigned ask isn't taken.
+            guard let request = signedAsk(SessionInit(ephemeral: public_, kem: kem.publicKey.rawRepresentation), persona: c.persona,
+                                          to: c.signingKey, context: .request) else { continue }
             let note = requestNotes["\(c.persona?.uuidString ?? "main")|\(c.fingerprint)"] ?? ""
             guard let meCard = card(sendID: Mailbox.sendID(for: key), persona: c.persona) else { continue }
             seal(.request(meCard, request, note: note),
@@ -6734,7 +6754,8 @@ final class AppModel {
                   contact(fp, in: invite.persona)?.pq == nil || contact(fp, in: invite.persona)?.pq == pin,
                   pinMatchesInvite(pin, contact: contact(fp, in: invite.persona)),
                   let mine = self.me(invite.persona),
-                  Handshake.devicePin(of: request, HandshakeParties(from: signer, to: mine.card.signing, device: device), accountPQ: pin) != nil
+                  Handshake.devicePin(of: request, HandshakeParties(from: signer, to: mine.card.signing, device: device), accountPQ: pin,
+                                      context: .hello) != nil
             else { return .junk }
             markSeen()
             acceptHello(card, request, fingerprint: fp, device: device, via: invite, pq: pin, sentAt: opened.sentAt)
@@ -6754,7 +6775,8 @@ final class AppModel {
                   contact(fp, in: persona)?.pq == nil || contact(fp, in: persona)?.pq == pin,
                   pinMatchesInvite(pin, contact: contact(fp, in: persona)),
                   let invite = data.invites.first(where: { $0.receiveKey == envelope.receiveKey && $0.isPublic }),
-                  Handshake.devicePin(of: request, HandshakeParties(from: signer, to: me.card.signing, device: device), accountPQ: pin) != nil
+                  Handshake.devicePin(of: request, HandshakeParties(from: signer, to: me.card.signing, device: device), accountPQ: pin,
+                                      context: .request) != nil
             else { return .junk }
             markSeen()
             // A stranger's card is kept in the vault until answered, so it is held to the sizes a profile may have.
@@ -6804,7 +6826,7 @@ final class AppModel {
             // so it really is theirs. Every current app names its device: one that doesn't could take over another
             // device's place unannounced.
             // Its own keys must sign it, under a card its account signed for this id: anything else isn't taken.
-            guard card.id == device, !device.isEmpty, askerPin(request, contact: i, device: device) != nil else { return .junk }
+            guard card.id == device, !device.isEmpty, askerPin(request, contact: i, device: device, context: .device) != nil else { return .junk }
             let d = upsertDevice(i, id: card.id, sendID: card.sendID)
             // The same hello again (a relay redelivery) must not replace the session it already opened.
             if data.contacts[i].devices[d].session != nil && data.contacts[i].devices[d].acceptedHello == request.ephemeral {
@@ -6823,7 +6845,7 @@ final class AppModel {
             // Sent before this device answered their spare: they drop that ask when the answer reaches them.
             if !broken, hello(opened.sentAt, crossedSpareOf: data.contacts[i].devices[d]) { return .handled }
             if !broken, hello(opened.sentAt, overtakenIn: data.contacts[i].devices[d]) { return .handled }
-            acceptSession(request, contact: i, device: d, sentAt: opened.sentAt)
+            acceptSession(request, contact: i, device: d, sentAt: opened.sentAt, context: .device)
             return .handled
         case let .sessionInit(request):
             // Every current app names its device: one that doesn't could take a device's place unannounced.
@@ -6842,7 +6864,7 @@ final class AppModel {
                 return .handled
             }
             if !broken, hello(opened.sentAt, overtakenIn: data.contacts[i].devices[d]) { return .handled }
-            acceptSession(request, contact: i, device: d, sentAt: opened.sentAt)
+            acceptSession(request, contact: i, device: d, sentAt: opened.sentAt, context: .initial)
             return .handled
         case let .sessionAccept(answer):
             guard let d = deviceIndex(i, device) else { return .junk }
@@ -7414,7 +7436,7 @@ final class AppModel {
             // A hello that names no device could take over another device's place unannounced.
             guard let i = contactIndex(fp, persona), !device.isEmpty || data.contacts[i].devices.isEmpty else { return }
             let d = upsertDevice(i, id: device, sendID: card.sendID)
-            acceptSession(request, contact: i, device: d)
+            acceptSession(request, contact: i, device: d, context: .hello)
         }
 
         if let channelID = invite.channel {

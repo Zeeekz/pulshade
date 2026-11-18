@@ -101,6 +101,21 @@ struct HandshakeParties {
     var device: Data
 }
 
+/// Where an ask for keys is meant to be used, signed into it, so an ask made for one way in (a spare left on the relay, say)
+/// can't be replayed through another (a device's hello, a friend request).
+enum HandshakeContext: UInt8 {
+    /// A spare left on the relay for a friend (`SpareSlot`).
+    case spare = 1
+    /// The hello that answers an invite (`Payload.hello`).
+    case hello = 2
+    /// A device introducing itself or restarting its session (`Payload.deviceHello`).
+    case device = 3
+    /// A bare ask on a known device (`Payload.sessionInit`).
+    case initial = 4
+    /// A friend request (`Payload.request`).
+    case request = 5
+}
+
 extension Handshake {
     private static func header(_ label: String, _ parties: HandshakeParties) -> Data {
         var out = Data(label.utf8) + parties.from + parties.to
@@ -108,8 +123,9 @@ extension Handshake {
         return out + parties.device
     }
 
-    static func initMessage(_ request: SessionInit, _ parties: HandshakeParties, card: DeviceKeyCard) -> Data {
-        header("pulshade.handshake.init.v2", parties) + card.pin + request.ephemeral + Data(SHA256.hash(data: request.kem))
+    static func initMessage(_ request: SessionInit, _ parties: HandshakeParties, card: DeviceKeyCard, context: HandshakeContext) -> Data {
+        header("pulshade.handshake.init.v3", parties) + Data([context.rawValue]) + card.pin + request.ephemeral
+            + Data(SHA256.hash(data: request.kem))
     }
 
     /// Covers the ask it answers, and the asking device's keys, so the answer is tied to both devices.
@@ -120,10 +136,11 @@ extension Handshake {
     }
 
     /// Puts this device's card on an ask and signs it.
-    static func signed(_ request: SessionInit, by key: DeviceKey, card: DeviceKeyCard, _ parties: HandshakeParties) throws -> SessionInit {
+    static func signed(_ request: SessionInit, by key: DeviceKey, card: DeviceKeyCard, _ parties: HandshakeParties,
+                       context: HandshakeContext) throws -> SessionInit {
         var out = request
         out.device = card
-        out.sig = try key.sign(initMessage(request, parties, card: card))
+        out.sig = try key.sign(initMessage(request, parties, card: card, context: context))
         return out
     }
 
@@ -136,11 +153,11 @@ extension Handshake {
     }
 
     /// The asking device's pin, if its ask carries a card the account signed for that device and the device's own
-    /// signature over the ask. Nil means the ask isn't taken.
-    static func devicePin(of request: SessionInit, _ parties: HandshakeParties, accountPQ: PQPin) -> Data? {
+    /// signature over the ask, made for the way in it arrived by (`context`). Nil means the ask isn't taken.
+    static func devicePin(of request: SessionInit, _ parties: HandshakeParties, accountPQ: PQPin, context: HandshakeContext) -> Data? {
         guard let card = request.device, let sig = request.sig,
               card.isSigned(by: parties.from, accountPQ: accountPQ, device: parties.device),
-              card.checks(sig, for: initMessage(request, parties, card: card)) else { return nil }
+              card.checks(sig, for: initMessage(request, parties, card: card, context: context)) else { return nil }
         return card.pin
     }
 
