@@ -29,12 +29,20 @@ struct PushTests {
         }
     }
 
+    /// Other suites run beside this one and drop every connection in the process when their accounts lock or
+    /// reconnect, which cuts a request here off as "cancelled". That says nothing about the relay, so it is tried again.
+    private func notCutOff(_ work: () async throws -> Void) async throws {
+        for attempt in 0..<4 {
+            do { return try await work() } catch let error as URLError where error.code == .cancelled && attempt < 3 { continue }
+        }
+    }
+
     @Test func takingARegistrationBackIsHarmlessWhenThereIsNone() async throws {
-        try await client.unregisterPush(keys: [Data(repeating: 2, count: 32)])
+        try await notCutOff { try await client.unregisterPush(keys: [Data(repeating: 2, count: 32)]) }
     }
 
     @Test func aDeviceTokenCanBeTakenOffTheRelayWithoutAnyMailboxKeys() async throws {
-        try await client.forgetPush(token: String(repeating: "cd", count: 32))
+        try await notCutOff { try await client.forgetPush(token: String(repeating: "cd", count: 32)) }
         await #expect(throws: (any Error).self) { try await client.forgetPush(token: "not a token") }
     }
 
@@ -109,7 +117,7 @@ struct PushTests {
         defer { model.lock() }
         try await model.create(identity: .generate(), profile: Profile(name: "N"), passcode: "test-passcode")
         let s = model.data.security
-        #expect(!s.deliveryReceipts && !s.readReceipts && !s.typingIndicators && !s.onlineStatus && !s.linkPreviews)
+        #expect(!s.readReceipts && !s.typingIndicators && !s.onlineStatus && !s.linkPreviews)
         #expect(s.autoLockMinutes == 1 && s.notificationContent == .hidden)
         #expect(s.tor == Tor.enabled, "the connection choice is its own screen and is left alone")
     }

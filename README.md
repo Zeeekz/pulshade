@@ -39,10 +39,10 @@ possible:
   don't carry their sender.
 - **Not where you are.** Over Tor the server sees a made-up address for each connection, never your IP address.
   Each persona and inbox uses its own Tor circuit, so they can't be linked by address.
-- **Nothing for long.** Envelopes are deleted once collected, or after 7 days. While they wait they are written, sealed, to the server's disk (every record sealed with a key the server keeps only in memory), and the server keeps no second copy of them in memory, so a restart, crash or reboot doesn't lose them. Collected mail is overwritten and removed within minutes.
+- **Nothing for long.** Envelopes are deleted once collected, or after 30 days (so a phone that was off for a holiday still gets everything). While they wait they are written, sealed, to the server's disk (every record sealed with a key the server keeps only in memory), and the server keeps no second copy of them in memory, so a restart, crash or reboot doesn't lose them. Collected mail is overwritten and removed within minutes.
   Files you send (up to 100 MB) are the one other thing the server keeps on disk besides that journal, profiles and backups: sealed on your
   phone with a key that only travels inside the end-to-end encrypted message, sealed again by the server, erased the
-  moment the message is deleted (the server's key for it is destroyed) or after 7 days. A phone only ever holds a
+  moment the message is deleted (the server's key for it is destroyed) or after 30 days (7 in groups). A phone only ever holds a
   received file in memory.
   The relay and the web server in front of it keep no request log. Your sealed backup (profile, contacts, groups and settings; never messages or chat keys) is saved again as things change and erased 180
   days after its last save, so a detached account's waits at most that long for its recovery code. Turn it off in

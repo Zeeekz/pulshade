@@ -190,7 +190,7 @@ enum BlobTransfer {
         var next = 0
         var running = 0
         let first = BlobStart(size: a.sealedSize, secretHash: Data(SHA256.hash(data: a.secret)).hex,
-                              days: max(1, min(7, Int((a.expires.timeIntervalSince(RelayClock.now) / 86_400).rounded(.up)))))
+                              days: max(1, min(30, Int((a.expires.timeIntervalSince(RelayClock.now) / 86_400).rounded(.up)))))
 
         try await withThrowingTaskGroup(of: Int.self) { group in
             func launchNext() throws -> Bool {

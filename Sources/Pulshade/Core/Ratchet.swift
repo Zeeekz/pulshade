@@ -153,9 +153,6 @@ struct Ratchet: Codable {
 
     var canSend: Bool { cks != nil }
 
-    /// When a post-quantum secret last went into this session's root.
-    var postQuantumAt: Date? { pqAt }
-
     /// Completed post-quantum epochs, for tests: ours offered and mixed in, theirs answered and mixed in.
     var postQuantumEpochs: (offered: UInt32, answered: UInt32) {
         let q = pq ?? PQState()

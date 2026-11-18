@@ -313,4 +313,44 @@ import CryptoKit
         }
         #expect(model.seenEnvelopeCount > 0 && model.seenEnvelopeCount <= 10)
     }
+
+    /// Strangers (friend requests to a username) fill a pool of their own: however many they send, and whatever send time
+    /// they claim, a contact's envelopes still count, and chats read once already don't move the contacts' floor either.
+    @Test func aStrangerFloodCantBlockContacts() async throws {
+        let model = try await makeModel()
+        defer { model.lock() }
+        let me = try #require(model.identity)
+        let mailbox = Mailbox.make()
+        let (them, _) = seed(model, mailbox: mailbox)
+        model.maxSeenEnvelopes = 10
+        for n in 0..<40 { model.noteSeenForTests("stranger\(n)", in: .stranger, sentAt: Date().addingTimeInterval(23 * 3600)) }
+        for n in 0..<40 { model.noteSeenForTests("chat\(n)", in: .ratchet, sentAt: Date()) }
+        #expect(model.strangerFloorForTests != nil, "the strangers' own pool got full")
+        #expect(model.seenFloorForTests == nil, "the contacts' pool is untouched")
+        let blob = try Envelope.seal(.collected(digests: [Data("x".utf8)]), from: them, to: me.recipient, introduce: true)
+        #expect(model.receive(RelayEnvelope(receiveKey: mailbox.receiveKey, id: 1, blob: blob)) == .handled)
+    }
+
+    /// Flooding the table must not let an early envelope count again once its digest has been let go.
+    @Test func aLetGoEnvelopeCantBeReplayed() async throws {
+        let model = try await makeModel()
+        defer { model.lock() }
+        let me = try #require(model.identity)
+        let mailbox = Mailbox.make()
+        let (them, _) = seed(model, mailbox: mailbox)
+        model.maxSeenEnvelopes = 10
+        // A note that the friend's phone collected some mail: accepted outside a session, so it goes through the replay table.
+        func envelope() throws -> Data {
+            try Envelope.seal(.collected(digests: [Data(UUID().uuidString.utf8)]), from: them, to: me.recipient, introduce: true)
+        }
+        let first = try envelope()
+        #expect(model.receive(RelayEnvelope(receiveKey: mailbox.receiveKey, id: 0, blob: first)) == .handled)
+        for n in 1..<40 { _ = model.receive(RelayEnvelope(receiveKey: mailbox.receiveKey, id: UInt64(n), blob: try envelope())) }
+        #expect(model.seenFloorForTests != nil)
+        #expect(model.receive(RelayEnvelope(receiveKey: mailbox.receiveKey, id: 100, blob: first)) == .junk,
+                "the first envelope's digest was let go, and the floor still refuses it")
+        // Something sent after the floor still gets through.
+        try await Task.sleep(for: .seconds(1.1))
+        #expect(model.receive(RelayEnvelope(receiveKey: mailbox.receiveKey, id: 101, blob: try envelope())) == .handled)
+    }
 }

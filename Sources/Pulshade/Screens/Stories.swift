@@ -405,7 +405,7 @@ struct StoryComposer: View {
     private var legacyContent: some View {
         SheetBody(width: 440) {
             VStack(spacing: 18) {
-                SheetHeader(symbol: "circle.dashed.inset.filled", title: editing == nil ? "Story" : "Edit story")
+                SheetHeader(symbol: "circle.dashed.inset.filled", title: "Edit story")
                 face
                     .frame(width: 260, height: 400)
                     .clipShape(.rect(cornerRadius: 26))
@@ -1132,7 +1132,7 @@ struct StoryViewers: View {
                         .frame(minHeight: 52)
                     }
                 }
-                SettingsGroup(footer: model.storyReceipt(of: story) == nil ? nil : "Counts only people with delivery receipts on.") {
+                SettingsGroup {
                     SettingRow("Shared with", symbol: "person.2") {
                         Text(model.summary(of: story.shownTo)).font(.system(size: 14)).foregroundStyle(Ink.faint)
                     }

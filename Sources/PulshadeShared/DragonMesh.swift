@@ -5,11 +5,9 @@ import simd
 #if os(macOS)
 import AppKit
 typealias DragonColor = NSColor
-typealias DragonImage = NSImage
 #else
 import UIKit
 typealias DragonColor = UIColor
-typealias DragonImage = UIImage
 #endif
 
 /// A colour of the dragon, or of the rare golden one: the blues turned round, so what was blue becomes red and green

@@ -148,7 +148,7 @@ struct PersonaBurnSheet: View {
                 VStack(alignment: .leading, spacing: 10) {
                     BurnPoint(symbol: "bubble.left.and.bubble.right", text: "Its chats are deleted for both sides. Groups it owns are deleted for everyone; it leaves the rest.")
                     BurnPoint(symbol: "person.crop.circle.badge.xmark", text: "Its contacts forget it, along with its messages, stories and requests.")
-                    BurnPoint(symbol: "at", text: "Its @handles can't be claimed for 3 months, and the relay forgets they were its.")
+                    BurnPoint(symbol: "at", text: "Its usernames can't be claimed for 3 months, and the relay forgets they were its.")
                     BurnPoint(symbol: "laptopcomputer.and.iphone", text: "It's removed from every device on your account.")
                     if hasCollectibles {
                         BurnPoint(symbol: "key.horizontal", text: "Its collectibles come back with its backup code. Write it down first.")
@@ -292,7 +292,7 @@ private struct BurnPoints: View {
         VStack(alignment: .leading, spacing: 10) {
             BurnPoint(symbol: "bubble.left.and.bubble.right", text: "Every chat is deleted for both sides. Groups you own are deleted for everyone; you leave the rest.")
             BurnPoint(symbol: "person.crop.circle.badge.xmark", text: "Your contacts forget you, along with your messages, stories and requests.")
-            BurnPoint(symbol: "at", text: "Your @handles can't be claimed for 3 months, and the relay forgets they were yours.")
+            BurnPoint(symbol: "at", text: "Your usernames can't be claimed for 3 months, and the relay forgets they were yours.")
             BurnPoint(symbol: "server.rack", text: "The relay keeps nothing: no backup, no waiting messages.")
             BurnPoint(symbol: "laptopcomputer.and.iphone", text: "Every device on the account is wiped, and this one keeps no trace of it.")
         }

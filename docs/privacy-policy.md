@@ -25,8 +25,8 @@ is never written to its disk. Here is every kind of thing, in plain words:
 
 | What | Where it is kept | How long | Can we read it? |
 | --- | --- | --- | --- |
-| **Messages** (text, receipts, calls' set-up) | The server's disk, sealed in segments that each have a key of their own (the server keeps no second copy of messages in its memory; typing and presence signals are the only things it holds in memory alone) | Until the other person's phone collects it, or 7 days. When it is collected, the key of any segment with nothing else waiting in it is forgotten and its file is overwritten and deleted at once; a segment that still holds someone else's waiting mail is rewritten without the collected mail within a minute or so | No. Sealed on your phone with keys only you and they have. |
-| **Files and chat videos you send** (files up to 100 MB; videos a few MB) | The server's disk, in pieces | Erased the moment the other person's phone has downloaded it, or when you delete the message, or after 7 days at most | No. Sealed on your phone with a key that travels only inside the encrypted message, and sealed a second time by the server with a key of its own. Its name and type are inside the encrypted message, so we don't even know those. |
+| **Messages** (text, receipts, calls' set-up) | The server's disk, sealed in segments that each have a key of their own (the server keeps no second copy of messages in its memory; typing and presence signals are the only things it holds in memory alone) | Until the other person's phone collects it, or 30 days (if the server runs short of room, messages that have waited more than a week go first). When it is collected, the key of any segment with nothing else waiting in it is forgotten and its file is overwritten and deleted at once; a segment that still holds someone else's waiting mail is rewritten without the collected mail within a minute or so | No. Sealed on your phone with keys only you and they have. |
+| **Files and chat videos you send** (files up to 100 MB; videos a few MB) | The server's disk, in pieces | Erased the moment the other person's phone has downloaded it, or when you delete the message, or after 30 days at most (7 days in groups) | No. Sealed on your phone with a key that travels only inside the encrypted message, and sealed a second time by the server with a key of its own. Its name and type are inside the encrypted message, so we don't even know those. |
 | **Video stories** (a few MB) | The server's disk, one copy for everyone | Until the story's timer runs out (then overwritten and erased), or sooner if you delete the story | No. The same two layers of encryption. |
 | **Sealed backup** (profile, contacts, groups and settings; never chats themselves or the keys for any chat, so mail sent while you were logged out can't be opened afterwards) | The server's disk | Until you switch it off, Burn, or 180 days without an update | No. Sealed with a key only your recovery code makes. |
 | **Spare keys** (one per friend, so a friend who logs back in can write to you straight away) | The server's disk, in the sealed-backup store | Erased by your friend when they use it, or by you when you remove them; otherwise replaced every 5 to 10 days, and 180 days without an update at most | No. Only you and that friend can work out where it is or open it, and it holds no message. |
@@ -48,10 +48,10 @@ your phone's memory when you open it and is never written to the phone's disk by
 When you delete something you sent (by deleting the message), it disappears from your phone straight away, your app
 tells the server in the same moment, and the server erases it on the spot: the piece files are overwritten with random bytes and removed, and the key the server sealed them with is
 destroyed, so even a stray copy left on a solid-state disk can't be opened. If your phone can't reach the server at
-that moment, it tries again until it does. A file nobody deletes is erased after at most 7 days. Detach, the panic
+that moment, it tries again until it does. A file nobody deletes is erased after at most 30 days (7 days in groups). Detach, the panic
 passcode and Burn also erase your files from the server. All three wipe your phone at once and send the erase
 requests in the same moment without waiting (on an account's only device; if your phone is offline then, the server
-forgets the files within 7 days at most). Burn goes further: see below.
+forgets the files within 30 days at most). Burn goes further: see below.
 
 What the server can still see about a file, as with any message: that something of about that size was uploaded,
 when it was uploaded and collected, and, if you connect without Tor, your IP address while you do. It can't see what
@@ -63,11 +63,11 @@ it is, what it's called or who it is for.
 see your recovery code, your passcode, your keys or your contacts.
 
 **Messages and calls.** These are encrypted on your device before they leave it. Our server only passes on sealed
-envelopes, padded to a few fixed sizes. We can't read them. Envelopes wait on the server's disk, sealed in segment files that each have a key of their own (the keys are kept in a file sealed with a key that is never written to the disk), and recent ones also in its memory. They are deleted once collected (the file that held them is overwritten and removed at once, or, if it still holds someone else's waiting mail, rewritten without the collected mail within a minute or so) or after 7 days, and are not logged.
+envelopes, padded to a few fixed sizes. We can't read them. Envelopes wait on the server's disk, sealed in segment files that each have a key of their own (the keys are kept in a file sealed with a key that is never written to the disk), and recent ones also in its memory. They are deleted once collected (the file that held them is overwritten and removed at once, or, if it still holds someone else's waiting mail, rewritten without the collected mail within a minute or so) or after 30 days, and are not logged.
 
 **Files.** A file you send is encrypted on your device in pieces, with a fresh key that is sent only inside the
 end-to-end encrypted message, and uploaded once to our server, which seals it again and keeps it on its disk until
-you delete the message or 7 days pass. We can't open it. See "What is stored on our servers" above.
+you delete the message or 30 days pass (7 days in groups). We can't open it. See "What is stored on our servers" above.
 
 **Public handles and profiles (only if you choose them).** If you claim a public @handle, its name, your picture and
 banner and the key it belongs to are stored on our server so anyone can look it up. This is public by your choice.
@@ -195,7 +195,7 @@ word it for each region.]
   the app: you can see and edit your own profile, turn the backup off, and Burn erases everything we hold for you. For a
   public handle or collectible, ask us as above. [Lawyer: confirm controller details and any representative needed
   in the EU or UK.]
-- **How long things are kept**, in one place: messages up to 7 days in memory; files up to 7 days; the sealed backup
+- **How long things are kept**, in one place: messages up to 30 days, sealed on the server's disk; files up to 30 days (7 in groups); the sealed backup
   until you switch it off or Burn, or 180 days after its last update; handles and collectibles until you let them go;
   the wake-up token while the setting is on; and request counts for an hour. Nothing is kept "just in case".
 

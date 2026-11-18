@@ -92,7 +92,18 @@ Never. You add friends by scanning a code or sharing a link, so there is nothing
 ## Friends and chats
 
 **How do I add a friend?**
-Scan their QR code or open their link. A one-time chat can also be started with a 20-digit code you read out loud.
+Open **Add a friend** (on the empty chat list, in Contacts, or under New). There are three ways, and none needs the
+other person to have a username:
+
+- **In person:** one of you shows the QR code, the other scans it.
+- **From a distance:** send your invite link in any other app, or paste theirs. Each code works for one person.
+- **By username:** if they chose one, type it and send a request, which they accept or decline.
+
+A one-time chat can also be started with a 20-digit code you read out loud.
+
+**Do I need a username?**
+No. Without one, only people you give your code or link to can reach you, and everything else works the same:
+chats, groups, calls and stories. A username only adds a way to be found by people who know it.
 
 **How do I know I'm talking to the right person?**
 Use Pulse check. Both of you see the same ten emoji, 30 digits, colours and QR code, derived from both your keys.
@@ -110,9 +121,10 @@ Yes. Voice notes are recorded and played from memory, never a file, and calls ar
 channel.
 
 **Why are some messages "waiting"?**
-Unread messages wait in the server's memory until your friend's phone collects them, or for 7 days at most. If the
-server restarts, it hands them on in memory, so nothing is lost. If the whole machine reboots, a message not yet
-collected is lost and your phone sends it again.
+Unread messages wait, sealed on the server's disk, until your friend's phone collects them, or for 30 days at most (mail to a phone in use waits
+at least a week even if the server is full). A
+restart, crash or reboot of the server doesn't lose them. Until your friend's phone confirms it has a message, yours
+quietly sends it again now and then, for as long as the server would keep it.
 
 **What are link previews?**
 Off by default. When on, the sender's device builds the preview and sends it inside the encrypted message.
@@ -210,7 +222,7 @@ Turn on bridges in Settings → Network → Bridges. Without bridges, your netwo
 is Pulshade.
 
 **How can I see what the server sees?**
-Settings → Anonymity Report shows the address the server sees for you.
+Settings → Network → Anonymity Report shows the address the server sees for you.
 
 ## Notifications
 
@@ -225,9 +237,9 @@ encryption.
 
 ## Handles, collectibles and extras
 
-**What is a @handle?**
-An optional public name you can claim per persona, so people can look you up. Its name, picture and banner are public by
-your choice. A handle you let go of is held for a while so nobody takes it straight away.
+**What is a username (@handle)?**
+An optional public name you can claim per persona, so people can look you up. Its name and picture are public by
+your choice. A username you let go of is held for a while so nobody takes it straight away.
 
 **What are collectibles and pets?**
 Numbered items, drawn in code, that the operator gives to an account. You can gift them or let them go; pets have their

@@ -28,11 +28,11 @@ struct SettingsView: View {
                     header
                     SettingsGroup {
                         MenuRow(page: .profile, symbol: "person.crop.circle.fill", color: .hex(0x3D8BFF), title: "Profile",
-                                value: model.activeProfile.handle.map { "@\($0)" } ?? "Private")
+                                value: model.activeProfile.handle.map { "@\($0)" } ?? "No username")
                         if Platform.isPhone {
                             RowDivider(inset: 54)
-                            MenuRow(page: .invite, symbol: "qrcode", color: .hex(0x30D158), title: "Invite",
-                                    value: "QR code or link")
+                            MenuRow(page: .invite, symbol: "person.badge.plus", color: .hex(0x30D158), title: "Add a friend",
+                                    value: "Code, link or @username")
                             RowDivider(inset: 54)
                             MenuRow(page: .collectibles, symbol: "crown.fill", color: .hex(0xE5383B), title: "Collectibles",
                                     value: model.activeProfile.badge?.kind?.name)
@@ -123,10 +123,10 @@ struct SettingsView: View {
             // Screenshots: PULSHADE_DEMO_SETTINGS=privacy opens that page.
             if AppModel.demoRequested, let raw = ProcessInfo.processInfo.environment["PULSHADE_DEMO_SETTINGS"],
                let page = SettingsPage(rawValue: raw) { path = [page] }
-            // PULSHADE_DEMO_CROP=avatar|banner|story opens the framing editor on a sample picture.
+            // PULSHADE_DEMO_CROP=avatar|story opens the framing editor on a sample picture.
             if AppModel.demoRequested, let kind = ProcessInfo.processInfo.environment["PULSHADE_DEMO_CROP"],
                let art = ImageRenderer(content: GenerativeArt(seed: "crop").frame(width: 1200, height: 900)).cgImage {
-                demoFrame = kind == "banner" ? .banner : kind == "story" ? .story : .avatar
+                demoFrame = kind == "story" ? .story : .avatar
                 demoCrop = PendingCrop(image: .from(cgImage: art))
             }
         }
@@ -164,14 +164,14 @@ struct SettingsView: View {
                     withAnimation(.snappy) { copiedHandle = false }
                 }
             } label: {
-                Text(copiedHandle ? "Copied" : (model.activeProfile.handle.map { "@\($0)" } ?? "Private profile"))
+                Text(copiedHandle ? "Copied" : (model.activeProfile.handle.map { "@\($0)" } ?? "No username"))
                     .font(.system(size: 14))
                     .foregroundStyle(model.activeProfile.handle == nil ? Ink.dim : theme.accent)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(model.activeProfile.handle == nil)
-            .accessibilityLabel(model.activeProfile.handle.map { "@\($0)" } ?? "Private profile")
+            .accessibilityLabel(model.activeProfile.handle.map { "@\($0)" } ?? "No username")
             .accessibilityHint(model.activeProfile.handle == nil ? "" : "Copies your username")
         }
         .frame(maxWidth: .infinity)
@@ -633,8 +633,8 @@ private struct ProfileSettings: View {
                 }
             }
             SettingsGroup {
-                MenuRow(page: .handles, symbol: "at", color: .hex(0x3D8BFF), title: "Handles",
-                        value: model.activeProfile.handle.map { "@\($0)" } ?? "Private")
+                MenuRow(page: .handles, symbol: "at", color: .hex(0x3D8BFF), title: "Username",
+                        value: model.activeProfile.handle.map { "@\($0)" } ?? "No username")
                 RowDivider(inset: 54)
                 MenuRow(page: .pinned, symbol: "pin.fill", color: .hex(0xFF9F0A), title: "Pinned",
                         value: pinnedCount == 0 ? nil : "\(pinnedCount)")
@@ -661,7 +661,7 @@ private struct HandleSettings: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        SettingsScreen(title: "Handles", back: "Profile") {
+        SettingsScreen(title: "Username", back: "Profile") {
             HandlesEditor()
             if model.activeProfile.handle != nil {
                 SettingsGroup {
@@ -698,9 +698,9 @@ struct HandlesEditor: View {
     private var used: Int { active.count + off.count }
 
     var body: some View {
-        SettingsGroup("Handles", footer: "Handles that are on take chat requests. Up to \(AppModel.maxHandles) per persona; one you turn off stays yours for 3 months.") {
+        SettingsGroup("Username", footer: "Optional. A username that is on can be found by anyone who knows it, and takes chat requests. Up to \(AppModel.maxHandles) per persona; one you turn off stays yours for 3 months.") {
             if active.isEmpty && off.isEmpty && !loading {
-                SettingRow("No public handle", symbol: "at") { Text("Private").font(.system(size: 13)).foregroundStyle(Ink.faint) }
+                SettingRow("No username", symbol: "at") { Text("Code or link only").font(.system(size: 13)).foregroundStyle(Ink.faint) }
                 RowDivider()
             }
             ForEach(active, id: \.self) { handle in
@@ -735,7 +735,7 @@ struct HandlesEditor: View {
                 .padding(.horizontal, 16)
                 .frame(minHeight: 50)
             } else {
-                SettingRow("All \(AppModel.maxHandles) handles used") { EmptyView() }
+                SettingRow("All \(AppModel.maxHandles) usernames used") { EmptyView() }
             }
             if let problem {
                 Text(problem)
@@ -825,7 +825,7 @@ struct HandlesEditor: View {
 
     private func load() async {
         loading = true
-        do { held = try await model.heldHandles(); problem = nil } catch { problem = "Can't reach the relay to check which handles are kept for you" }
+        do { held = try await model.heldHandles(); problem = nil } catch { problem = "Can't reach the relay to check which usernames are kept for you" }
         loading = false
     }
 
@@ -846,7 +846,7 @@ struct HandlesEditor: View {
             } catch AppModel.DirectoryError.held {
                 problem = "@\(handle) was let go of recently, so nobody can claim it yet. It frees up within 3 months"
             } catch AppModel.DirectoryError.full {
-                problem = "You've used your \(AppModel.maxHandles) handles. One you let go of frees up 3 months later"
+                problem = "You've used your \(AppModel.maxHandles) usernames. One you let go of frees up 3 months later"
             } catch AppModel.DirectoryError.invalidHandle {
                 problem = "Use 3–24 letters, numbers or _"
             } catch AppModel.DirectoryError.unreachable {
@@ -925,21 +925,20 @@ private struct LockSettings: View {
 
     var body: some View {
         SettingsScreen(title: "Lock & screen", back: "Privacy") {
-            if model.isPrimary {
-                SettingsGroup("Passcode", footer: model.hasShortPIN
-                              ? "Your PIN is only 4 digits, which can be guessed. New ones need at least 6 digits; a passcode with letters is stronger still. Change it now."
-                              : "A longer passcode is the strongest protection you control.") {
-                    ActionRow(title: model.hasShortPIN ? "Change your 4-digit PIN" : "Change passcode") { changing = true }
-                    RowDivider()
-                    MenuChoiceRow(title: "Wipe after wrong guesses", values: WipeAfterFailures.choices,
-                                  selected: model.wipeAfterAttempts, label: { $0 == 0 ? "Off" : "\($0) in a row" }) { n in
-                        if n == 0 || n >= 10 { model.setWipeAfterAttempts(n) } else { confirmWipe = n }
-                    }
-                    Text(wipeFooter)
-                        .font(.system(size: 12)).foregroundStyle(Ink.faint)
-                        .padding(.horizontal, 14).padding(.vertical, 8)
-                        .fixedSize(horizontal: false, vertical: true)
+            // Shown in a decoy too: a page with no passcode row would give the decoy away.
+            SettingsGroup("Passcode", footer: model.hasShortPIN
+                          ? "Your PIN is only 4 digits, which can be guessed. New ones need at least 6 digits; a passcode with letters is stronger still. Change it now."
+                          : "A longer passcode is the strongest protection you control.") {
+                ActionRow(title: model.hasShortPIN ? "Change your 4-digit PIN" : "Change passcode") { changing = true }
+                RowDivider()
+                MenuChoiceRow(title: "Wipe after wrong guesses", values: WipeAfterFailures.choices,
+                              selected: model.wipeAfterAttempts, label: { $0 == 0 ? "Off" : "\($0) in a row" }) { n in
+                    if n == 0 || n >= 10 { model.setWipeAfterAttempts(n) } else { confirmWipe = n }
                 }
+                Text(wipeFooter)
+                    .font(.system(size: 12)).foregroundStyle(Ink.faint)
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             SettingsGroup("Lock", footer: model.biometricsBlocked
                           ? "\(Vault.biometryName) is off while a decoy or panic passcode is set."
@@ -1053,8 +1052,6 @@ private struct MessagePrivacySettings: View {
             SettingsGroup("Messages", footer: "Turn one off and you stop seeing theirs too.") {
                 SecurityToggle(title: "Link previews", key: \.linkPreviews)
                 RowDivider()
-                SecurityToggle(title: "Delivery receipts", key: \.deliveryReceipts)
-                RowDivider()
                 SecurityToggle(title: "Read receipts", key: \.readReceipts)
                 RowDivider()
                 SecurityToggle(title: "Typing indicators", key: \.typingIndicators)
@@ -1064,6 +1061,9 @@ private struct MessagePrivacySettings: View {
             }
             SettingsGroup("Forwarding", footer: "Off, people can't forward or copy what you send from now on. Forwarded messages never say who wrote them. Nothing can stop a screenshot.") {
                 SecurityToggle(title: "Let people forward my messages", key: \.allowForwarding)
+            }
+            SettingsGroup("New devices", footer: "On, when a friend's account adds a phone or computer, nothing goes to it and none of its messages are shown until you allow it in your chat with them. Turn it on on each of your devices. Off, new devices get your messages at once and the chat says so; ones already waiting still need allowing.") {
+                SecurityToggle(title: "Ask before a friend's new device gets my messages", key: \.holdNewDevices)
             }
             LearnMore(title: "Link previews",
                       text: "Fetched over Tor, so the site never sees your IP (with Tor off, it does).")
@@ -1190,8 +1190,10 @@ private struct NotificationSettings: View {
                     if security.pushWake {
                         RowDivider()
                         SecurityToggle(title: "Friend request alerts when locked", key: \.pushRequests)
-                        RowDivider()
-                        LockedDeliveryRow()
+                        if AppModel.lockedDeliveryAvailable {
+                            RowDivider()
+                            LockedDeliveryRow()
+                        }
                     }
                     #endif
                 }
@@ -1205,7 +1207,8 @@ private struct NotificationSettings: View {
                     .padding(.horizontal, 14)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if on, security.pushWake, security.tor {
+            // Collecting while locked is parked (`AppModel.lockedDeliveryAvailable`), so nothing here speaks of it.
+            if on, AppModel.lockedDeliveryAvailable, security.pushWake, security.tor {
                 Text("Collecting while locked is off while Tor is on: the helper can't use Tor, so it would connect directly and the server would see this phone's address.")
                     .font(.system(size: 12)).foregroundStyle(Ink.faint)
                     .padding(.horizontal, 14)
@@ -1213,7 +1216,8 @@ private struct NotificationSettings: View {
             }
             if on {
                 LearnMore(title: "Waking a locked iPhone",
-                          text: "Apple wakes your iPhone with a note that only says \"New message\". Apple learns when, and the relay keeps your push token. Off, you only hear about messages while PULSHADE is open. Collect messages when locked lets a small helper take short messages off the server into a sealed inbox on this iPhone, without opening them, so they don't wait on the server until you open PULSHADE. Photos and videos still wait there. With delivery receipts on, friends also get their second tick. It uses keys kept on this iPhone after you first unlock it.")
+                          text: "Apple wakes your iPhone with a note that only says \"New message\". Apple learns when, and the relay keeps your push token. Off, you only hear about messages while PULSHADE is open."
+                              + (AppModel.lockedDeliveryAvailable ? " Collect messages when locked lets a small helper take short messages off the server into a sealed inbox on this iPhone, without opening them, so they don't wait on the server until you open PULSHADE. Photos and videos still wait there, and friends also get their second tick. It uses keys kept on this iPhone after you first unlock it." : ""))
             }
             #endif
             #if os(macOS)

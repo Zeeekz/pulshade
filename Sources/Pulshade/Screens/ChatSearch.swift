@@ -115,7 +115,7 @@ struct ChatSearchResults: View {
             }
             .buttonStyle(.plain)
         } else if lookedUp == handle {
-            note(problem ?? "No one has @\(handle). Handles are exact, so check the spelling.")
+            note(problem ?? "No one has @\(handle). Usernames are exact, so check the spelling.")
         } else {
             Button { lookUp(handle) } label: {
                 HStack(spacing: 12) {
@@ -126,7 +126,7 @@ struct ChatSearchResults: View {
                         .background(theme.accent.opacity(0.85), in: .circle)
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Find @\(handle)").font(.system(size: rowTitle, weight: .semibold)).foregroundStyle(Ink.text)
-                        Text("Everyone on PULSHADE, by exact handle").font(.system(size: rowLine)).foregroundStyle(Ink.faint)
+                        Text("Everyone on PULSHADE, by exact username").font(.system(size: rowLine)).foregroundStyle(Ink.faint)
                     }
                     Spacer()
                     if looking { ProgressView().controlSize(.small) }

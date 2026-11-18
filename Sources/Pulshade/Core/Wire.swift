@@ -9,6 +9,9 @@ struct DeviceCard: Codable, Equatable {
     var sendID: Data
     /// What the device calls itself, for your own linked devices.
     var name: String?
+    /// A friend's device, between your own devices only: true while it is held ("ask before new devices"), false once
+    /// you allowed it on one of them, nil when it was never held (or from an app before this).
+    var held: Bool? = nil
 }
 
 /// How to reach someone: their public keys and the send id of a mailbox they read.
@@ -29,11 +32,6 @@ struct PeerCard: Codable, Equatable {
     /// before leave it out, and nothing is read from them any more.
     var pq: PQCard? = nil
 
-    /// Every device this card describes.
-    var allDevices: [DeviceCard] {
-        if let devices, !devices.isEmpty { return devices }
-        return [DeviceCard(id: device ?? Data(), sendID: sendID)]
-    }
 }
 
 struct WireMessage: Codable, Equatable {
@@ -264,6 +262,19 @@ enum Payload: Codable, Equatable {
         }
     }
 
+    /// A message that says nothing: the first one to a friend's device you haven't allowed, so its session can start
+    /// (the device that answered a handshake can't write until it has heard once). Read as a note that nothing was
+    /// collected.
+    static let opener = Payload.collected(digests: [])
+
+    /// Only of use the moment it's sent: signals and call set-up. Not kept for a device that can't have them yet.
+    var isPassing: Bool {
+        switch self {
+        case .typing, .presence, .callOffer, .callAnswer, .callEnd: true
+        default: false
+        }
+    }
+
     var isEphemeral: Bool {
         switch self {
         case .typing, .presence: true
@@ -338,7 +349,6 @@ struct DirectoryProfile: Codable, Equatable {
     /// Handles that mean "I want to report someone": searching one opens the report form.
     static let reportHandles: Set<String> = ["abuse", "report", "safety", "moderation"]
     static func isReserved(_ handle: String) -> Bool { handle.count < 3 || reservedNames.contains(handle) }
-    var isCreator: Bool { Self.isReserved(handle) }
 
     var card: PeerCard {
         PeerCard(name: name, avatar: avatar, color: color, signingKey: signingKey, agreementKey: agreementKey,

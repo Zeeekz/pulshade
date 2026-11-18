@@ -23,6 +23,7 @@ struct ContactsView: View {
     @State private var lookUpWhenFilled = false
     /// From a profile link: the handle and the key check its profile has to match.
     @State private var linkCheck: (handle: String, keyCheck: String)?
+    @State private var addingFriend = false
 
     /// What's typed, as a handle: "@Nova" and "nova" both look up "nova".
     private var handle: String? { DirectoryProfile.validHandle(query) }
@@ -45,6 +46,10 @@ struct ContactsView: View {
                             .padding(.horizontal, 8).frame(height: 20).background(theme.accent, in: .capsule)
                     }
                     Spacer()
+                    Button { addingFriend = true } label: { Image(systemName: "person.badge.plus") }
+                        .buttonStyle(BarButtonStyle(prominent: true))
+                        .help("Add a friend")
+                        .accessibilityLabel("Add a friend")
                 }
                 searchField
                 if safety { safetyCard }
@@ -63,6 +68,7 @@ struct ContactsView: View {
         .scrollIndicators(.never)
         .sheet(item: $reporting) { ReportSheet(subject: $0) }
         .sheet(isPresented: $reportingSomeone) { ReportSheet(subject: nil) }
+        .sheet(isPresented: $addingFriend) { PeopleView(openChat: openChat, inSheet: true) }
         .animation(.snappy, value: found)
         .animation(.snappy, value: notFound)
         .animation(.snappy, value: model.requests.count)
@@ -81,7 +87,7 @@ struct ContactsView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
                 Image(systemName: "magnifyingglass").font(.system(size: 14)).foregroundStyle(Ink.faint)
-                TextField("", text: $query, prompt: Text("Search contacts or find @handle").foregroundStyle(Ink.faint))
+                TextField("", text: $query, prompt: Text("Search contacts or find @username").foregroundStyle(Ink.faint))
                     .textFieldStyle(.plain)
                     .font(.system(size: 15))
                     .foregroundStyle(Ink.text)
@@ -134,7 +140,7 @@ struct ContactsView: View {
                 .padding(.horizontal, -16)
                 .transition(.opacity.combined(with: .scale(scale: 0.97)))
         } else if notFound {
-            Text("No one has @\(handle ?? query). Handles are exact, so check the spelling.")
+            Text("No one has @\(handle ?? query). Usernames are exact, so check the spelling.")
                 .font(.system(size: 13)).foregroundStyle(Ink.dim)
         } else if let problem {
             ProblemText(problem)
@@ -185,7 +191,7 @@ struct ContactsView: View {
                     problem = "This link was for a different account than the one using @\(handle) now"
                 }
             } catch AppModel.DirectoryError.invalidHandle {
-                problem = "Handles are letters, numbers or _"
+                problem = "Usernames are letters, numbers or _"
             } catch AppModel.DirectoryError.unreachable {
                 problem = "Can't reach the relay"
             } catch {
@@ -235,10 +241,13 @@ struct ContactsView: View {
             VStack(spacing: 10) {
                 Constellation(symbol: "person.2", text: query.isEmpty ? "No contacts yet" : "No contacts match")
                 if query.isEmpty {
-                    Text(Platform.isPhone ? "Find people by their @handle above, or share your invite from Account > Invite."
-                         : "Find people by their @handle above, or share your invite code from Invite.")
+                    Text("Find someone by their @username above, or swap codes with them: no username needed.")
                         .font(.system(size: 12)).foregroundStyle(Ink.faint)
                         .multilineTextAlignment(.center)
+                    Button { addingFriend = true } label: { Label("Add a friend", systemImage: "person.badge.plus") }
+                        .buttonStyle(SecondaryButtonStyle())
+                        .frame(maxWidth: 240)
+                        .padding(.top, 6)
                 }
             }
             .frame(maxWidth: .infinity)

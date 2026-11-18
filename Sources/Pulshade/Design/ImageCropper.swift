@@ -12,7 +12,6 @@ struct CropFrame: Equatable {
     var allowsFit = false
 
     static let avatar = CropFrame(aspect: 1, circle: true, maxSide: 512)
-    static let banner = CropFrame(aspect: 3, maxSide: 1200)
     static let story = CropFrame(aspect: 9.0 / 16.0, maxSide: 1600, allowsFit: true)
 }
 

@@ -64,6 +64,12 @@ struct Persona: Codable, Identifiable, Equatable {
 }
 
 /// One of a person's devices, from your side: where to reach it and your encrypted session with it.
+/// An envelope from a device you haven't allowed, kept as it came.
+struct HeldMail: Codable, Equatable {
+    var receiveKey: Data
+    var blob: Data
+}
+
 struct DeviceLink: Codable {
     /// Their device's id. Empty until we've heard from it (older apps don't send one).
     var id: Data
@@ -85,8 +91,13 @@ struct DeviceLink: Codable {
     var name: String?
     /// Your own account's device that introduced itself here without this device having approved it (another of
     /// your devices may have). Shown as a warning in the device list until you confirm or remove it. Nil otherwise,
-    /// and for anything saved before this existed.
+    /// and for anything saved before this existed. On a contact's device: added while "ask before new devices"
+    /// (`SecuritySettings.holdNewDevices`) was on and not allowed yet, so nothing is sent to it; what's for it waits in
+    /// `pending` until you allow it.
     var unconfirmed: Bool?
+    /// What a held friend's device (`unconfirmed`) sent, still sealed, opened only once you allow it. The newest
+    /// `AppModel.maxHeldMail` at most.
+    var heldMail: [HeldMail]?
     /// The device that approved this one opens the session; until it does, don't open a competing one.
     var awaitingHello: Bool?
     /// The handshake behind the current session, so a redelivered copy is recognised and ignored.
@@ -102,9 +113,6 @@ struct DeviceLink: Codable {
     var readsFrames: Bool?
     /// Their app reads files kept on the relay. Nil for an app from before.
     var readsAttachments: Bool?
-    /// Their app answers group messages with a receipt, so a group's tick can wait for this device. Nil for an app
-    /// from before, which neither sends nor expects one.
-    var readsGroupReceipts: Bool?
     /// Their app takes spare keys (`SpareSlot`): this device leaves them one, and takes theirs. Nil for an app from before.
     var takesSpares: Bool?
     /// Their app takes part in groups that share one mailbox. Nil for an app from before.
@@ -536,6 +544,17 @@ struct VoiceNote: Codable, Equatable {
     var duration: TimeInterval
     /// 0...255 loudness samples for drawing the waveform.
     var levels: [UInt8]
+
+    /// The longest a voice note is taken to be, and the most loudness samples kept: what a sender claims is not
+    /// trusted, since a length that isn't a real number (or is absurdly large) can't be shown and stops the app.
+    static let longest: TimeInterval = 6 * 3600
+    static let mostLevels = 512
+
+    /// What someone sent, with its claimed length and samples brought within bounds.
+    var checked: VoiceNote {
+        VoiceNote(audio: audio, duration: duration.isFinite ? min(max(duration, 0), Self.longest) : 0,
+                  levels: Array(levels.prefix(Self.mostLevels)))
+    }
 }
 
 /// The message a reply quotes: enough to show it even if the original has gone.
@@ -686,7 +705,8 @@ struct Mention: Codable, Equatable {
         var end = 0
         for m in (mentions ?? []).sorted(by: { $0.start < $1.start }) {
             guard out.count < maxPerMessage, !m.fingerprint.isEmpty, m.fingerprint.count <= 128,
-                  m.start >= end, m.length >= 2, m.length <= 200, m.start + m.length <= ns.length,
+                  // Compared without adding: a start near the largest number would overflow, and that stops the app.
+                  m.start >= end, m.length >= 2, m.length <= 200, m.length <= ns.length, m.start <= ns.length - m.length,
                   ns.substring(with: NSRange(location: m.start, length: 1)) == "@" else { continue }
             out.append(m)
             end = m.start + m.length
@@ -1111,6 +1131,9 @@ struct ClipParts: Codable {
 struct PendingPayload: Codable {
     var payload: Payload
     var message: UUID?
+    /// The message this is a copy of, sent again because no receipt came: it replaces the previous copy still waiting on
+    /// the relay (`AppModel.resendTag`).
+    var resendOf: UUID?
 }
 
 /// One of your messages as it was handed to the relay for one device: which message, and when.
@@ -1196,7 +1219,6 @@ enum PendingPrivacy {
 extension SecuritySettings {
     /// The settings the sign-up screen offers, copied from what was chosen there.
     mutating func adopt(_ c: SecuritySettings) {
-        deliveryReceipts = c.deliveryReceipts
         readReceipts = c.readReceipts
         typingIndicators = c.typingIndicators
         onlineStatus = c.onlineStatus
@@ -1211,13 +1233,13 @@ extension SecuritySettings {
         blurWhenInactive = c.blurWhenInactive
         keepBackup = c.keepBackup
         allowForwarding = c.allowForwarding
+        holdNewDevices = c.holdNewDevices
         lockedDelivery = c.lockedDelivery
     }
 
     /// The strictest choice for each, short of turning off the backup that makes Detach and recovery work.
     static var strictest: SecuritySettings {
         var s = SecuritySettings()
-        s.deliveryReceipts = false
         s.readReceipts = false
         s.typingIndicators = false
         s.onlineStatus = false
@@ -1231,6 +1253,7 @@ extension SecuritySettings {
         s.blockCapture = true
         s.blurWhenInactive = true
         s.allowForwarding = false
+        s.holdNewDevices = true
         s.lockedDelivery = false
         return s
     }
@@ -1266,14 +1289,18 @@ struct SecuritySettings: Codable, Equatable {
     /// Build a preview when you send a link. Off by default: building one visits the website from your own
     /// connection. Received previews never contact the website.
     var linkPreviews = false
-    /// Tell people when their messages reach you.
-    var deliveryReceipts = true
+    // Delivery receipts can't be turned off (from build 16): a sender that never hears back keeps sending again, and
+    // the tick is how people trust that a message got there. A saved "off" from an older build is ignored. Read
+    // receipts stay a choice.
     /// Tell people when you've seen their messages, and see when they've seen yours. Never in one-time chats.
     var readReceipts = true
     /// Show people when you're typing, and see when they are.
     var typingIndicators = true
     /// Let people forward your messages to other chats. Off, your messages ask their apps not to offer Forward or Copy.
     var allowForwarding = true
+    /// When a contact's account adds a device, nothing of yours goes to it until you allow it in their chat (it waits in
+    /// the vault meanwhile). Off by default, as in other messengers: the new device is announced and gets messages at once.
+    var holdNewDevices = false
     /// Show people when you have Pulshade open, and see when they do. Off by default: the relay can tell when
     /// the signals go out, even though it can't read them.
     var onlineStatus = false
@@ -1329,10 +1356,10 @@ struct SecuritySettings: Codable, Equatable {
         pushWake = pushWakeChosen ? (try c.decodeIfPresent(Bool.self, forKey: .pushWake) ?? d.pushWake) : d.pushWake
         linkPreviews = try c.decodeIfPresent(Bool.self, forKey: .linkPreviews) ?? d.linkPreviews
         menuBarIcon = try c.decodeIfPresent(Bool.self, forKey: .menuBarIcon) ?? d.menuBarIcon
-        deliveryReceipts = try c.decodeIfPresent(Bool.self, forKey: .deliveryReceipts) ?? d.deliveryReceipts
         readReceipts = try c.decodeIfPresent(Bool.self, forKey: .readReceipts) ?? d.readReceipts
         typingIndicators = try c.decodeIfPresent(Bool.self, forKey: .typingIndicators) ?? d.typingIndicators
         allowForwarding = try c.decodeIfPresent(Bool.self, forKey: .allowForwarding) ?? d.allowForwarding
+        holdNewDevices = try c.decodeIfPresent(Bool.self, forKey: .holdNewDevices) ?? d.holdNewDevices
         onlineStatus = try c.decodeIfPresent(Bool.self, forKey: .onlineStatus) ?? d.onlineStatus
         tor = try c.decodeIfPresent(Bool.self, forKey: .tor) ?? d.tor
         torSince = try c.decodeIfPresent(Date.self, forKey: .torSince)
@@ -1411,6 +1438,11 @@ struct AppData: Codable {
     var facade = Facade()
     /// Hashes of envelopes that came outside a ratchet session, so a replayed one is ignored.
     var seenEnvelopes: [String: Date] = [:]
+    /// Where `seenEnvelopes` keeps the newest time among the digests a pool had to let go of when it was full
+    /// (`SeenPool`): an envelope of that pool sent no later than it may have been one of them, so it is refused. Kept in
+    /// `seenEnvelopes` under names no digest can have, so the saved format is unchanged: an older build just keeps
+    /// them as more entries, and they age out with the rest.
+    static let seenFloorKeys: Set<String> = [SeenPool.contact.floorKey!, SeenPool.stranger.floorKey!]
     /// Your messages' envelopes the relay took, by `LockedDelivery.digest(of:)`, so a friend's phone can confirm one
     /// while locked (`Payload.collected`). Kept as long as `seenEnvelopes`.
     var sentDigests: [String: SentDigest] = [:]
@@ -1550,5 +1582,28 @@ extension Collectible {
     /// Signed by the Pulshade Admin key this build carries, for the account with `owner`'s key.
     @MainActor func isGenuine(for owner: Data) -> Bool {
         isGenuine(for: owner, adminKey: AppModel.adminKey, petKey: AppModel.petKey)
+    }
+}
+
+/// The replay table (`AppData.seenEnvelopes`) in three parts, each full on its own, so whoever can write to one can't
+/// push the others' digests out: what strangers can send (friend requests to a public username, hellos to a channel's
+/// code), what only contacts can (everything else outside a session), and ratchet messages read once already (which
+/// need no floor: a replayed one just can't be opened).
+enum SeenPool {
+    case contact, stranger, ratchet
+
+    var prefix: String {
+        switch self { case .contact: "" case .stranger: "s:" case .ratchet: "r:" }
+    }
+    var floorKey: String? {
+        switch self { case .contact: "floor" case .stranger: "floor.s" case .ratchet: nil }
+    }
+    /// Whether a key of the table belongs to this pool (floors belong to none).
+    func holds(_ key: String) -> Bool {
+        if AppData.seenFloorKeys.contains(key) { return false }
+        switch self {
+        case .contact: return !key.contains(":")
+        case .stranger, .ratchet: return key.hasPrefix(prefix)
+        }
     }
 }

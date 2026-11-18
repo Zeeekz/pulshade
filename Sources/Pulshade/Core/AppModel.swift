@@ -77,6 +77,9 @@ final class AppModel {
     var personaFlash: PersonaFlash?
     /// The chat on screen, so incoming messages there don't count as unread.
     var openConversation: Conversation.ID?
+    /// Contacts whose "compare your Pulse check" prompt was put away this time the app is open. Only in memory: which
+    /// contacts you verified is in the vault, and a list of names on disk outside it would say who you talk to.
+    var verifyPromptDismissed: Set<String> = []
     /// A chat something outside the window (a notification, the menu bar) asked to show.
     var requestedConversation: Conversation.ID?
     /// A code that arrived as a pulshade:// link, waiting for the scan screen to use it.
@@ -189,6 +192,11 @@ final class AppModel {
         #endif
         Ink.source = { [weak self] in self?.theme ?? .dark }
         guard watchSystem else { return }
+        #if os(iOS)
+        // Collecting while locked is switched off: the helper's keys (left by an earlier build) go at launch, before the
+        // vault is opened, so the helper can't keep fetching with them. Mail it already collected stays for the app.
+        if !Self.lockedDeliveryAvailable { HelperStore.clearDelivery() }
+        #endif
         resumeBurnCleanup()
         #if os(iOS)
         CallRinger.shared.model = self
@@ -814,16 +822,20 @@ final class AppModel {
         return try await Task.detached { try vault.unlock(passcode: passcode) }.value
     }
 
-    /// Wrong guesses since the last right one, for the "wipe after" setting's screen.
-    var wrongGuesses: Int { failedAttempts }
-
     /// "Wipe after wrong attempts": 0 is off. Only from the real account, so a decoy can't turn it off.
-    var wipeAfterAttempts: Int { WipeAfterFailures.limit }
+    var wipeAfterAttempts: Int { isPrimary ? WipeAfterFailures.limit : facadeWipeAfter ?? WipeAfterFailures.limit }
 
     func setWipeAfterAttempts(_ n: Int) {
-        guard isPrimary, WipeAfterFailures.choices.contains(n) else { return }
+        guard WipeAfterFailures.choices.contains(n) else { return }
+        // In a decoy the row looks and behaves the same, but the real setting is left alone.
+        guard isPrimary else { facadeWipeAfter = n; return }
         WipeAfterFailures.limit = n
     }
+
+    /// What a decoy shows for "wipe after wrong guesses" once it has been changed there. Memory only.
+    private var facadeWipeAfter: Int?
+    /// When a decoy says its backup was last saved (it keeps none). Memory only.
+    @ObservationIgnored private var facadeBackupAt: Date?
 
     /// Whether the real account is still behind a 4-digit PIN, which is shorter than a new one may be.
     var hasShortPIN: Bool { isPrimary && LockStyle.remembered == .pin4 }
@@ -831,7 +843,8 @@ final class AppModel {
     /// Puts the real account behind a new passcode. The current one is checked first, and opens the same account in the
     /// same slot; nothing else about the lock file changes, so a decoy or panic passcode keeps working.
     func changePasscode(current: String, to new: String) async throws {
-        guard isPrimary, phase == .unlocked, let identity else { return }
+        // A decoy changes its own passcode the same way, so its settings look no different from a real account's.
+        guard phase == .unlocked, let identity else { return }
         guard new.count >= LockStyle.minimumLength else { throw PasscodeSetupError.tooShort }
         let vault = vault, slot = slot
         let opened: Vault.Opened
@@ -895,6 +908,8 @@ final class AppModel {
                     return false
                 }
                 Notifier.shared.clearAll()
+                // Whatever the real account left in temporary files and caches goes too, as with Burn and Detach.
+                Vault.scrubLeftovers()
                 // The real account's mail and keys must not outlive it in the shared Keychain either.
                 HelperStore.clear()
                 helperWritten = nil
@@ -952,6 +967,9 @@ final class AppModel {
 
     private func didUnlock() {
         unlockedAt = Date()
+        // A decoy keeps no backup on the relay, but says it has one like any account with backups on.
+        facadeWipeAfter = nil
+        facadeBackupAt = isPrimary ? nil : Date().addingTimeInterval(-Double.random(in: 300...3000))
         // A device that was linked, or an account recovered, polled the relay before there was an account. From
         // here on nothing may share a circuit or connection with that pre-account traffic.
         Tor.newRoutes()
@@ -1890,7 +1908,12 @@ final class AppModel {
     /// Gets a clip to one contact: as a pointer to the one sealed copy on the relay if their app reads those, otherwise in
     /// pieces as before. The clip is uploaded once, however many people are waiting for it. `known` is the copy already
     /// there, if any.
-    private func deliverClip(_ clip: Data, id: UUID, to contact: Contact, known: Attachment?, lifetime: TimeInterval = 7 * 86_400,
+    /// How long a photo, video or file in a one-to-one chat stays on the relay for a phone that hasn't fetched it: as long
+    /// as the message naming it can wait (30 days), so the message doesn't arrive to a file that is already gone. Group
+    /// files keep the group's own week.
+    static let chatFileLife: TimeInterval = 30 * 86_400
+
+    private func deliverClip(_ clip: Data, id: UUID, to contact: Contact, known: Attachment?, lifetime: TimeInterval = AppModel.chatFileLife,
                              only wanted: [Int]? = nil, kind: Attachment.Kind = .video) {
         guard kind == .video ? readsAttachments(contact) : readsMediaBlobs(contact) else {
             sendClip(clip, id: id, to: contact, only: wanted)
@@ -1900,7 +1923,7 @@ final class AppModel {
         clipWaiting[id, default: []].append(contact)
         guard clipUploads[id] == nil else { return }
         guard let relay = client(nil, lane: "blob"),
-              let prepared = try? BlobTransfer.prepare(data: clip, kind: kind, lifetime: min(max(lifetime, 3600) + 3600, 7 * 86_400)) else {
+              let prepared = try? BlobTransfer.prepare(data: clip, kind: kind, lifetime: min(max(lifetime, 3600) + 3600, Self.chatFileLife)) else {
             clipUploaded(id, clip: clip, nil)
             return
         }
@@ -2053,9 +2076,10 @@ final class AppModel {
     /// docs/blob-store.md.
     func sendFile(_ url: URL, replyTo: Message? = nil, in id: Conversation.ID) {
         guard let i = index(of: id), canPost(in: data.conversations[i]) else { return }
+        let lifetime = data.conversations[i].kind == .direct ? Self.chatFileLife : 7 * 86_400
         Task { [weak self] in
             do {
-                let prepared = try await Task.detached { try BlobTransfer.prepare(url) }.value
+                let prepared = try await Task.detached { try BlobTransfer.prepare(url, lifetime: lifetime) }.value
                 self?.beginSending(prepared, replyTo: replyTo, in: id)
             } catch let error as BlobError {
                 self?.fileProblem = error.words
@@ -2519,7 +2543,8 @@ final class AppModel {
     private func sendIfReady(_ payload: Payload, contact i: Int) -> Bool {
         var sent = false
         for d in data.contacts[i].devices.indices where data.contacts[i].devices[d].session?.canSend == true
-            && !isDormant(contact: i, device: d) {
+            && !isDormant(contact: i, device: d)
+            && !(payload.isPassing && !data.contacts[i].isSelf && data.contacts[i].devices[d].unconfirmed == true) {
             data.contacts[i].devices[d].pending.append(PendingPayload(payload: payload, message: nil))
             sent = true
         }
@@ -2933,11 +2958,9 @@ final class AppModel {
     }
 
     /// Tells the author a story reached this device whole (a video: with its clip), so their app stops sending it
-    /// again. Only with delivery receipts on: it says when this device was online, which is what turning those off
-    /// keeps back.
+    /// again.
     private func acknowledgeStory(_ id: UUID, author: String, persona: UUID?) {
-        guard data.security.deliveryReceipts,
-              let story = data.stories.first(where: { $0.id == id && $0.author == author && $0.persona == persona }) else { return }
+        guard let story = data.stories.first(where: { $0.id == id && $0.author == author && $0.persona == persona }) else { return }
         guard story.isReady, let c = contact(author, in: persona), !c.hidden, !c.isSelf else { return }
         enqueue(.storyReceived(id: id), to: c)
     }
@@ -4609,15 +4632,18 @@ final class AppModel {
 
     /// Sends something to a contact through their ratchet sessions, opening them first if needed.
     /// Every one of their devices gets its own copy.
-    private func enqueue(_ payload: Payload, to contact: Contact, message: UUID? = nil) {
+    private func enqueue(_ payload: Payload, to contact: Contact, message: UUID? = nil, resendOf: UUID? = nil) {
         guard let i = contactIndex(contact.fingerprint, contact.persona) else { return }
         for d in data.contacts[i].devices.indices where !isDormant(contact: i, device: d) {
+            // A friend's device you haven't allowed only keeps what's worth having later: no signals, no calls (an old
+            // one would ring when you allow it).
+            if !data.contacts[i].isSelf, data.contacts[i].devices[d].unconfirmed == true, payload.isPassing { continue }
             // A signal waiting for keys is only worth its newest copy: a device that never answers would otherwise
             // collect every "typing" sent to it, here and then on the relay.
             if payload.isEphemeral, data.contacts[i].devices[d].session?.canSend != true {
                 data.contacts[i].devices[d].pending.removeAll { $0.payload.isEphemeral }
             }
-            data.contacts[i].devices[d].pending.append(PendingPayload(payload: payload, message: message))
+            data.contacts[i].devices[d].pending.append(PendingPayload(payload: payload, message: message, resendOf: resendOf))
             // A device whose spare key is being fetched gets its keys from that, and what waits goes then.
             if data.contacts[i].devices[d].session == nil && data.contacts[i].devices[d].handshake == nil
                 && data.contacts[i].devices[d].awaitingHello != true && !sparesFetching.contains(sessionKey(contact: i, device: d)) {
@@ -4630,13 +4656,28 @@ final class AppModel {
     /// Encrypts whatever is waiting for each of a contact's devices, where the session can send yet.
     private func sendPending(contact i: Int) {
         for d in data.contacts[i].devices.indices {
+            // A friend's new device you haven't allowed: what's for it waits here, at most the newest few hundred. Only
+            // the empty opener goes (`Payload.opener`): it says nothing, but without a first message from this side
+            // their new device can't write, and what it sends is what you'd want to see once you allow it.
+            let held = !data.contacts[i].isSelf && data.contacts[i].devices[d].unconfirmed == true
+            if held, data.contacts[i].devices[d].pending.count > Self.maxHeldPending {
+                // The opener is never what makes way.
+                let all = data.contacts[i].devices[d].pending
+                let openers = all.filter { $0.payload == Payload.opener }
+                data.contacts[i].devices[d].pending = openers + all.filter { $0.payload != Payload.opener }.suffix(Self.maxHeldPending)
+            }
             guard var session = data.contacts[i].devices[d].session, session.canSend,
                   data.contacts[i].devices[d].needsUpdate != true,
                   !data.contacts[i].devices[d].pending.isEmpty else { continue }
             // Nothing is sent to someone whose post-quantum keys aren't known (they are asked for), or whose app has none.
             guard data.contacts[i].pq != nil || data.contacts[i].isSelf else { sendPQIntro(contact: i); continue }
-            let pending = data.contacts[i].devices[d].pending
+            var pending = data.contacts[i].devices[d].pending
             data.contacts[i].devices[d].pending = []
+            if held {
+                data.contacts[i].devices[d].pending = pending.filter { $0.payload != Payload.opener }
+                pending = pending.filter { $0.payload == Payload.opener }
+                if pending.isEmpty { continue }
+            }
             for item in pending {
                 // To an app that reads frames, big things go without the base64 that nearly doubles them at each
                 // layer. Short messages are sent exactly as before.
@@ -4648,7 +4689,7 @@ final class AppModel {
                     continue
                 }
                 seal(.ratchet(message), contact: i, device: d, message: item.message, ephemeral: item.payload.isEphemeral,
-                     collapse: item.payload.collapseKind,
+                     collapse: item.payload.collapseKind, resendOf: item.resendOf,
                      story: item.payload.storyID, viewReport: item.payload.storyViewID, rings: item.payload.rings,
                      framed: frames && message.ciphertext.count > Self.smallEnvelope, wakes: item.payload.isInvite)
             }
@@ -4767,12 +4808,50 @@ final class AppModel {
         seal(spare ? .spareAccept(myDevice(for: i), answer) : .sessionAccept(answer), contact: i, device: d)
         let first: Payload = data.contacts[i].isSelf ? .sync(.hello) : profilePayload(data.contacts[i].persona, for: data.contacts[i].fingerprint)
         data.contacts[i].devices[d].pending.insert(PendingPayload(payload: first, message: nil), at: 0)
+        // A held friend's device gets the empty opener now; the profile waits with the rest until you allow it.
+        if !data.contacts[i].isSelf, data.contacts[i].devices[d].unconfirmed == true {
+            data.contacts[i].devices[d].pending.insert(PendingPayload(payload: .opener, message: nil), at: 0)
+        }
+        sendPending(contact: i)
+        resendUnconfirmed(contact: i, device: d)
+    }
+
+    /// When each device last had what wasn't confirmed sent again because of new keys. Memory only.
+    @ObservationIgnored private var keyResendAt: [String: Date] = [:]
+    /// The most messages sent again at once because of new keys, newest first; the timed resend covers older ones.
+    static let keyResendBatch = 50
+
+    /// New keys with one of someone's devices: what of yours they haven't confirmed goes again now, to that device, on the
+    /// new keys, rather than at the next timed try (which can be a day away). New keys usually mean the old ones had gone
+    /// out of step, and what was written on them couldn't be opened on their side; they drop a copy they already have.
+    /// At most once every ten minutes per device, the newest `keyResendBatch` messages, none sent again in the last ten
+    /// minutes: a contact asking for new keys over and over can't make this phone upload its history each time. Groups
+    /// keep their own mail.
+    private func resendUnconfirmed(contact i: Int, device d: Int) {
+        let c = data.contacts[i]
+        guard !c.isSelf, !c.hidden, c.devices.indices.contains(d),
+              let convo = directConversation(with: c.fingerprint, persona: c.persona) else { return }
+        let key = sessionKey(contact: i, device: d)
+        let now = Date(), cutoff = now.addingTimeInterval(-Self.resendWindow)
+        guard now.timeIntervalSince(keyResendAt[key] ?? .distantPast) > 600 else { return }
+        let due = convo.messages.filter { message in
+            message.isMine && !message.isVideo && message.status == .sent && message.date > cutoff
+                && (message.expiresAt.map { $0 > now } ?? true)
+                && (resentAt[message.id].map { now.timeIntervalSince($0.at) > 600 } ?? true)
+        }.suffix(Self.keyResendBatch)
+        guard !due.isEmpty else { return }
+        keyResendAt[key] = now
+        for message in due {
+            resentAt[message.id] = (now, (resentAt[message.id]?.count ?? 0) + 1)
+            data.contacts[i].devices[d].pending.append(PendingPayload(payload: .message(wireForResend(message, in: convo)),
+                                                                     message: nil, resendOf: message.id))
+        }
         sendPending(contact: i)
     }
 
     /// Seals a payload to one of a contact's devices, as the persona that knows them, and queues it.
     private func seal(_ payload: Payload, contact i: Int, device d: Int, message: UUID? = nil, ephemeral: Bool = false,
-                      collapse: String? = nil, story: UUID? = nil, viewReport: UUID? = nil, rings: Bool = false, framed: Bool = false,
+                      collapse: String? = nil, resendOf: UUID? = nil, story: UUID? = nil, viewReport: UUID? = nil, rings: Bool = false, framed: Bool = false,
                       wakes: Bool = false) {
         let c = data.contacts[i]
         guard c.devices.indices.contains(d), let me = me(c.persona) else { return }
@@ -4819,6 +4898,9 @@ final class AppModel {
         if let collapse {
             outgoing.collapse = Self.collapseTag(collapse, sendID: sendID, from: deviceID(for: c.persona))
             outgoing.collapseKind = collapse
+        } else if let resendOf {
+            outgoing.collapse = Self.resendTag(resendOf, sendID: sendID, from: deviceID(for: c.persona))
+            outgoing.collapseKind = "resend"
         }
         // Stamped so a Burn can take it back from the relay while it waits. Not signals, and not the Burn's own farewells.
         if !ephemeral && !burning {
@@ -4848,6 +4930,23 @@ final class AppModel {
         hasher.update(data: sendID)
         hasher.update(data: device)
         var window = Int64((time.timeIntervalSince1970 / collapseWindow).rounded(.down)).bigEndian
+        withUnsafeBytes(of: &window) { hasher.update(bufferPointer: $0) }
+        return Data(hasher.finalize().prefix(16))
+    }
+
+    /// The relay's tag for copies of one message sent again: the same for every try within a three-day window, so each
+    /// replaces the one before while it waits. It changes every three days (`resendTagWindow`), so the relay can tie copies
+    /// of one message together, and deposits made over different connections to one sender device, for three days at
+    /// most rather than for the whole month a message is tried; a new window leaves at most one more copy waiting.
+    nonisolated static let resendTagWindow: TimeInterval = 3 * 86_400
+
+    nonisolated static func resendTag(_ message: UUID, sendID: Data, from device: Data, at time: Date = Date()) -> Data {
+        var hasher = SHA256()
+        hasher.update(data: Data("pulshade.resend".utf8))
+        hasher.update(data: sendID)
+        hasher.update(data: device)
+        withUnsafeBytes(of: message.uuid) { hasher.update(bufferPointer: $0) }
+        var window = Int64((time.timeIntervalSince1970 / resendTagWindow).rounded(.down)).bigEndian
         withUnsafeBytes(of: &window) { hasher.update(bufferPointer: $0) }
         return Data(hasher.finalize().prefix(16))
     }
@@ -4887,12 +4986,14 @@ final class AppModel {
     private var restartsHandled = 0
     /// A request's note, so sending it again carries the words too. Kept while the app is open.
     private var requestNotes: [String: String] = [:]
-    /// The longest a message is sent again for after being sent: well inside what the relay keeps mail.
-    private static let resendWindow: TimeInterval = 24 * 3600
+    /// The longest a message is sent again for after being sent: as long as the relay keeps mail (30 days), so a friend
+    /// whose phone was off, or whose keys had to be mended, still gets it. Each copy sent again replaces the one before it
+    /// on the relay (`resendTag`), so a friend who is gone for good has one spare copy waiting, not one per try.
+    private static let resendWindow: TimeInterval = 30 * 24 * 3600
     /// How long mail this device can't use yet (a contact or device it hasn't met) is left on the relay.
     static let deferredMailLimit: TimeInterval = 10 * 60
     /// How long a message waits for its receipt before it is sent again, then again after the next wait, and so on.
-    static var resendGaps: [TimeInterval] = [90, 300, 900, 2700, 7200]
+    static var resendGaps: [TimeInterval] = [90, 300, 900, 2700, 7200, 21_600, 86_400]
     /// When each of your messages was last sent again, and how many times, while the app is open.
     @ObservationIgnored private var resentAt: [UUID: (at: Date, count: Int)] = [:]
     @ObservationIgnored private var lastDueCheck = Date.distantPast
@@ -5024,18 +5125,23 @@ final class AppModel {
                 resentAt[message.id] = (Date(), (resentAt[message.id]?.count ?? 0) + 1)
                 let wire = wireForResend(message, in: convo)
                 // Not marked queued: it stays "sent" until the receipt comes, which is what makes it worth sending again.
-                for member in missing { enqueue(.message(wire), to: member) }
+                for member in missing { enqueue(.message(wire), to: member, resendOf: message.id) }
             }
         }
     }
 
     // MARK: Two ticks while locked
 
+    /// Switched off in build 16 (the reliability build): collecting mail while locked is a second way for mail to arrive,
+    /// and the delivery counter doesn't cover it yet. The setting is hidden and the helper isn't given keys; mail it
+    /// collected before is still taken in (`drainHelperInbox`). Someone's saved choice is kept for when it comes back.
+    static var lockedDeliveryAvailable = false
+
     /// Whether the notification helper runs while this iPhone is locked: it collects short mail, and confirms
     /// delivery only when delivery receipts are on (see `LockedDelivery`).
     var lockedDeliveryOn: Bool {
         let s = data.security
-        guard pushWanted, s.lockedDeliveryChosen, !s.tor, !hasDecoy, !hasPanic, AppData.directRelay != nil
+        guard Self.lockedDeliveryAvailable, pushWanted, s.lockedDeliveryChosen, !s.tor, !hasDecoy, !hasPanic, AppData.directRelay != nil
         else { return false }
         return true
     }
@@ -5056,7 +5162,7 @@ final class AppModel {
         return HelperBundle(signing: me.signingKey.rawRepresentation, agreement: me.agreementKey.rawRepresentation,
                             pqKem: pq.kemSeed, pqSig: pq.sigSeed,
                             device: deviceID(for: nil), relay: relay, friends: friends,
-                            confirms: data.security.deliveryReceipts)
+                            confirms: true)
     }
 
     /// The helper's bundle for this account as it stands, pointed at `relay` (tests use their own relay).
@@ -5195,6 +5301,9 @@ final class AppModel {
         for c in data.conversations.indices {
             guard data.conversations[c].messages.contains(where: { $0.id == id && $0.isMine }) else { continue }
             guard data.conversations[c].kind == .direct || data.conversations[c].kind == .broadcast else { continue }
+            // Only from someone the message went to: another contact who learned its id can't tick it, or stop it being
+            // sent again to the person who hasn't got it.
+            guard data.conversations[c].members.contains(fingerprint) else { return }
             setStatus(read ? .read : .delivered, for: [id])
             return
         }
@@ -5298,27 +5407,48 @@ final class AppModel {
             data.contacts[i].devices[d].id = id
             return d
         }
-        if id.isEmpty, data.contacts[i].devices.count == 1 { return 0 }
+        // An app from before device ids, whose only device has none either.
+        if id.isEmpty, data.contacts[i].devices.count == 1, data.contacts[i].devices[0].id.isEmpty { return 0 }
         return nil
     }
 
     @discardableResult
     private func upsertDevice(_ i: Int, id: Data, sendID: Data) -> Int {
+        let isSelf = data.contacts[i].isSelf
+        // Known by this very id before now (not an old slot without one that `deviceIndex` names now).
+        let knownByID = !id.isEmpty && data.contacts[i].devices.contains { $0.id == id }
         if let d = deviceIndex(i, id) {
+            // A device of a friend's that now reads another mailbox is as good as a new device (anyone with their account's
+            // keys could claim its id): said in the chat, and held again if you ask before new devices.
+            if !isSelf, knownByID, data.contacts[i].devices[d].sendID != sendID, !data.contacts[i].devices[d].sendID.isEmpty {
+                if data.security.holdNewDevices { data.contacts[i].devices[d].unconfirmed = true }
+                noteNewDevice(of: data.contacts[i])
+                syncContact(data.contacts[i].fingerprint, data.contacts[i].persona)
+            }
             data.contacts[i].devices[d].sendID = sendID
             return d
         }
-        // More than anyone owns: the oldest makes way, so a contact can't grow the list without end.
-        if data.contacts[i].devices.count >= Self.maxDevicesPerContact { data.contacts[i].devices.removeFirst() }
+        // More than anyone owns: one makes way, so a contact can't grow the list without end. A held device goes first,
+        // then the one heard from longest ago, so nobody can push a friend's real devices out by adding new ones.
+        if data.contacts[i].devices.count >= Self.maxDevicesPerContact {
+            let devices = data.contacts[i].devices
+            let out = devices.firstIndex { $0.unconfirmed == true && !isSelf }
+                ?? devices.indices.min { (devices[$0].lastHeard ?? .distantPast) < (devices[$1].lastHeard ?? .distantPast) } ?? 0
+            data.contacts[i].devices.remove(at: out)
+        }
         // A device we haven't met, from an account we already had one for: its messages from now on go to it as well,
         // so say so where the person would see it (their chat, or the list of your own devices).
         let announce = !data.contacts[i].devices.isEmpty && !id.isEmpty
         var link = DeviceLink(id: id, sendID: sendID)
-        if announce && data.contacts[i].isSelf { link.unconfirmed = true }
+        let hold = announce && !isSelf && data.security.holdNewDevices
+        if announce && (isSelf || hold) { link.unconfirmed = true }
         data.contacts[i].devices.append(link)
-        if announce && !data.contacts[i].isSelf { noteNewDevice(of: data.contacts[i]) }
+        if announce && !isSelf { noteNewDevice(of: data.contacts[i]) }
+        // Your other devices hold it too.
+        if hold { syncContact(data.contacts[i].fingerprint, data.contacts[i].persona) }
         return data.contacts[i].devices.count - 1
     }
+
 
     /// A line in the chat with a contact whose account just added a device we hadn't seen. Their messages and ours
     /// reach it from now on, as with any device of theirs, which matters most when it isn't theirs.
@@ -5328,8 +5458,44 @@ final class AppModel {
         guard !contact.hidden, !contact.awaitingAcceptance else { return }
         let convo = startConversation(kind: .direct, title: "", members: [contact.fingerprint], persona: .some(contact.persona))
         guard let c = index(of: convo.id) else { return }
-        data.conversations[c].messages.append(Message(sender: "system", text: "\(contact.displayName)'s account added a new device",
-                                                      date: Date()))
+        let held = data.security.holdNewDevices
+        data.conversations[c].messages.append(Message(sender: "system", text: "\(contact.displayName)'s account added a new device"
+                                                      + (held ? ". Your messages wait until you allow it." : ""), date: Date()))
+    }
+
+    /// The most kept waiting for a friend's device you haven't allowed, and the most kept from it.
+    static let maxHeldPending = 500
+    static let maxHeldMail = 200
+
+    /// A friend's devices that their account added while "ask before new devices" was on, not allowed yet.
+    func heldDevices(of fingerprint: String, persona: UUID?) -> Int {
+        guard let i = contactIndex(fingerprint, persona), !data.contacts[i].isSelf else { return 0 }
+        return data.contacts[i].devices.filter { $0.unconfirmed == true }.count
+    }
+
+    /// Lets a friend's new devices have your messages: what waited for them goes now.
+    func allowHeldDevices(of fingerprint: String, persona: UUID?) {
+        guard let i = contactIndex(fingerprint, persona), !data.contacts[i].isSelf else { return }
+        for d in data.contacts[i].devices.indices where data.contacts[i].devices[d].unconfirmed == true { release(contact: i, device: d) }
+        // Your other devices let it through too.
+        syncContact(fingerprint, persona)
+        save()
+    }
+
+    /// A held friend's device allowed (here or on another of your devices): what waited for it goes, and what it sent
+    /// meanwhile is read now, in order.
+    private func release(contact i: Int, device d: Int) {
+        data.contacts[i].devices[d].unconfirmed = false
+        let waiting = data.contacts[i].devices[d].heldMail ?? []
+        data.contacts[i].devices[d].heldMail = nil
+        sendPending(contact: i)
+        let fp = data.contacts[i].fingerprint, persona = data.contacts[i].persona, id = data.contacts[i].devices[d].id
+        var again: [HeldMail] = []
+        for mail in waiting where receive(RelayEnvelope(receiveKey: mail.receiveKey, id: 0, blob: mail.blob)) == .retry { again.append(mail) }
+        // Anything that couldn't be read yet stays, sealed, and is tried with the next one allowed.
+        if !again.isEmpty, let c = contactIndex(fp, persona), let k = data.contacts[c].devices.firstIndex(where: { $0.id == id }) {
+            data.contacts[c].devices[k].heldMail = again
+        }
     }
 
     /// Says the device that introduced itself as yours is yours, so the warning goes.
@@ -5365,19 +5531,14 @@ final class AppModel {
     /// minutes ahead of the relay's clock (a clock set wrong, or an older build) would make everything after it look
     /// older, so new keys would be turned away for good. Such a time is ignored.
     func believable(_ date: Date?) -> Date? {
-        if legacyKeyRules { return date }
         return date.flatMap { $0 <= RelayClock.now.addingTimeInterval(120) ? $0 : nil }
     }
 
     /// Whether this device has lately failed to open what a device of theirs sent: the keys in use don't work, so
     /// there's nothing for the rules that keep them from being replaced to protect.
     private func keysBroken(contact i: Int, device d: Int) -> Bool {
-        !legacyKeyRules && unreadable[sessionKey(contact: i, device: d)] != nil
+        unreadable[sessionKey(contact: i, device: d)] != nil
     }
-
-    /// Tests only: follow the rules for asking for keys as build 12 did (no checks on stamps, no stepping aside, no
-    /// nudging), to check that a phone on build 13 still gets through to one that hasn't updated.
-    @ObservationIgnored var legacyKeyRules = false
 
     /// How long this device's own ask for keys may go unanswered before it gives way to an ask of theirs, and before it
     /// nudges them (see `nudgeStuckDevices`).
@@ -5389,7 +5550,7 @@ final class AppModel {
     private func yields(to sentAt: Date, contact i: Int, device d: Int) -> Bool {
         // Only with proof the keys are broken (something of theirs couldn't be opened): two asks that merely crossed are
         // settled by the usual rule, or both sides would give way and cross again.
-        guard !legacyKeyRules, keysBroken(contact: i, device: d), let started = data.contacts[i].devices[d].handshake?.startedAt,
+        guard keysBroken(contact: i, device: d), let started = data.contacts[i].devices[d].handshake?.startedAt,
               Date().timeIntervalSince(started) > Self.askPatience else { return false }
         // Ours is taken back if it hasn't gone, so the two don't cross again.
         withdrawHello(contact: i, device: d)
@@ -5404,7 +5565,6 @@ final class AppModel {
     /// takes that ask (`yields`). So two phones whose keys went out of step find their way back on their own, even when
     /// the other phone's app turns this one's asks down. A few times per ask, and only the newest waits on the relay.
     private func nudgeStuckDevices() {
-        guard !legacyKeyRules else { return }
         let now = Date()
         for i in data.contacts.indices where !data.contacts[i].isSelf && !data.contacts[i].awaitingAcceptance {
             for d in data.contacts[i].devices.indices {
@@ -5626,7 +5786,11 @@ final class AppModel {
                 var done: [RelayEnvelope] = []
                 var deferred = false
                 for envelope in envelopes {
-                    switch receive(envelope) {
+                    let result = receive(envelope)
+                    #if DEBUG
+                    receiveResultTap?(result)
+                    #endif
+                    switch result {
                     case .retry:
                         // Held only briefly. Past that it isn't waiting on a hello or a roster, it's from someone
                         // we don't know, and keeping it would have it fetched again on every check (and crowd out
@@ -6337,6 +6501,10 @@ final class AppModel {
     @ObservationIgnored var envelopeTap: ((RelayEnvelope) -> Void)?
     /// Tests only: mail this says yes to is left on the relay for now, as if it hadn't arrived yet.
     @ObservationIgnored var holdMail: ((RelayEnvelope) -> Bool)?
+    /// Tests only: what became of each envelope fetched from the relay (the delivery counter tallies these).
+    #if DEBUG
+    @ObservationIgnored var receiveResultTap: ((ReceiveResult) -> Void)?
+    #endif
 
     /// What became of an envelope taken from the relay.
     enum ReceiveResult: Equatable {
@@ -6368,6 +6536,11 @@ final class AppModel {
             let age = RelayClock.now.timeIntervalSince(sentAt)
             if age < Self.replayWindow, age > -24 * 3600 { noteTooOld(signer, persona: persona) }
             return .junk
+        } catch let EnvelopeRefusal.unpinned(signer) {
+            // From a contact whose keys are on their way (their hello is in another mailbox, fetched after this one): left on
+            // the relay for the next check, as with mail from a device not met yet, rather than lost.
+            if let known = contactIndex(Identity.fingerprint(of: signer), persona), data.contacts[known].pq == nil { return .retry }
+            return .junk
         } catch { return .junk }
         let payload = opened.payload, signer = opened.signer, device = opened.device
         let fp = Identity.fingerprint(of: signer)
@@ -6391,11 +6564,27 @@ final class AppModel {
         // before that would grow the table, and make a real envelope for a contact not yet added look like a repeat.
         let replayDigest = Data(SHA256.hash(data: envelope.blob).prefix(16)).hex
         let isRatchet: Bool = { if case .ratchet = payload { return true } else { return false } }()
+        // Friend requests to a public username and hellos to a channel's code can come from anyone: they count in a pool
+        // of their own, so a flood of them can't push out (or raise the floor over) what only contacts can send.
+        let fromAnyone: Bool = {
+            switch payload {
+            case .request: return true
+            case .hello: return data.invites.contains { $0.receiveKey == envelope.receiveKey && ($0.isPublic || $0.channel != nil) }
+            default: return false
+            }
+        }()
+        let pool: SeenPool = fromAnyone ? .stranger : .contact
         if !isRatchet {
             let age = RelayClock.now.timeIntervalSince(opened.sentAt)
-            guard age < Self.replayWindow, age > -24 * 3600, data.seenEnvelopes[replayDigest] == nil else { return .junk }
+            // No more than a day ahead of either clock, so a relay moving its clock can't let a send time sit far ahead
+            // (and with it a floor).
+            let horizon = min(RelayClock.now, Date()).addingTimeInterval(24 * 3600)
+            guard age < Self.replayWindow, opened.sentAt <= horizon, !wasSeen(replayDigest, in: pool) else { return .junk }
+            // The pool was full once and let go of digests up to its floor: anything sent by then may be one of them.
+            if let key = pool.floorKey, let floor = data.seenEnvelopes[key], opened.sentAt <= floor { return .junk }
         }
-        func markSeen() { if !isRatchet { noteSeen(replayDigest) } }
+        // Kept under the later of now and its signed send time, so a let-go digest always lies at or under the floor.
+        func markSeen() { if !isRatchet { noteSeen(replayDigest, in: pool, sentAt: opened.sentAt) } }
 
         if case let .pqIntro(card) = payload {
             guard let known = contactIndex(fp, persona), let pin = card.verified(signer: signer, agreement: opened.agreement),
@@ -6424,7 +6613,7 @@ final class AppModel {
                   contact(fp, in: invite.persona)?.pq == nil || contact(fp, in: invite.persona)?.pq == pin,
                   pinMatchesInvite(pin, contact: contact(fp, in: invite.persona)) else { return .junk }
             markSeen()
-            acceptHello(card, request, fingerprint: fp, device: device, via: invite, pq: pin)
+            acceptHello(card, request, fingerprint: fp, device: device, via: invite, pq: pin, sentAt: opened.sentAt)
             noteReads(opened, from: fp, persona: invite.persona)
             // Following through a channel's code: invited into its mailbox now that their app's abilities are known (when
             // their app can take part), up to the hourly limit.
@@ -6442,7 +6631,11 @@ final class AppModel {
                   pinMatchesInvite(pin, contact: contact(fp, in: persona)),
                   let invite = data.invites.first(where: { $0.receiveKey == envelope.receiveKey && $0.isPublic }) else { return .junk }
             markSeen()
-            var incoming = FriendRequest(fingerprint: fp, card: card, handshake: request, note: String(note.prefix(280)),
+            // A stranger's card is kept in the vault until answered, so it is held to the sizes a profile may have.
+            var kept = card
+            kept.name = String(card.name.prefix(64))
+            if let avatar = card.avatar, avatar.count > Self.maxAvatarBytes { kept.avatar = nil }
+            var incoming = FriendRequest(fingerprint: fp, card: kept, handshake: request, note: String(note.prefix(280)),
                                          persona: invite.persona)
             incoming.device = device
             // Someone known only from a group isn't a friend yet: theirs is an ordinary request.
@@ -6460,6 +6653,8 @@ final class AppModel {
             withAnimation(.snappy) {
                 data.requests.removeAll { $0.fingerprint == fp && $0.persona == invite.persona }
                 data.requests.insert(incoming, at: 0)
+                // Anyone who knows a username can send requests from throwaway keys: the oldest make way.
+                if data.requests.count > Self.maxRequests { data.requests.removeLast(data.requests.count - Self.maxRequests) }
             }
             sync(.requestReceived(incoming))
             if data.security.notifications {
@@ -6480,8 +6675,9 @@ final class AppModel {
         switch payload {
         case let .deviceHello(card, request):
             // A device introducing itself (a new one, or one restarting its session). Signed by the account,
-            // so it really is theirs.
-            guard card.id == device else { return .junk }
+            // so it really is theirs. Every current app names its device: one that doesn't could take over another
+            // device's place unannounced.
+            guard card.id == device, !device.isEmpty else { return .junk }
             let d = upsertDevice(i, id: card.id, sendID: card.sendID)
             // The same hello again (a relay redelivery) must not replace the session it already opened.
             if data.contacts[i].devices[d].session != nil && data.contacts[i].devices[d].acceptedHello == request.ephemeral {
@@ -6503,7 +6699,8 @@ final class AppModel {
             acceptSession(request, contact: i, device: d, sentAt: opened.sentAt)
             return .handled
         case let .sessionInit(request):
-            guard let d = deviceIndex(i, device) else { return .junk }
+            // Every current app names its device: one that doesn't could take a device's place unannounced.
+            guard !device.isEmpty, let d = deviceIndex(i, device) else { return .junk }
             if hello(opened.sentAt, crossedSpareOf: data.contacts[i].devices[d]) { return .handled }
             if data.contacts[i].devices[d].session != nil && data.contacts[i].devices[d].acceptedHello == request.ephemeral {
                 return .handled
@@ -6565,6 +6762,7 @@ final class AppModel {
             unreadable[sessionKey(contact: i, device: d)] = nil
             // We can write on these keys once their first message arrives; they send it straight after answering.
             keysAnsweredAt[sessionKey(contact: i, device: d)] = Date()
+            resendUnconfirmed(contact: i, device: d)
             return .handled
         case let .spareAccept(card, answer):
             // A device of theirs took the spare key this device left for them (see `SpareSlot`) and is already
@@ -6633,6 +6831,18 @@ final class AppModel {
             // A message from a device this account hasn't met yet (its hello may be right behind in the same
             // fetch). Kept rather than acknowledged, so it can be read once the device is known.
             guard let d = deviceIndex(i, device) else { return .retry }
+            // From a friend's device you haven't allowed: kept sealed and unread until you do, so it can't put words in
+            // their mouth next to the Allow button. Opened in order then, as if it had just come.
+            if !data.contacts[i].isSelf, data.contacts[i].devices[d].unconfirmed == true {
+                var held = data.contacts[i].devices[d].heldMail ?? []
+                // The relay may hand the same one over twice.
+                if !held.contains(where: { $0.blob == envelope.blob }) {
+                    held.append(HeldMail(receiveKey: envelope.receiveKey, blob: envelope.blob))
+                }
+                if held.count > Self.maxHeldMail { held.removeFirst(held.count - Self.maxHeldMail) }
+                data.contacts[i].devices[d].heldMail = held
+                return .handled
+            }
             // A build from before the sparse post-quantum ratchet: its messages aren't read, and the chat tells whose app
             // has to update. Not a broken session, so no new keys are started over it.
             if message.header.v != RatchetHeader.version || data.contacts[i].devices[d].needsUpdate == true {
@@ -6644,7 +6854,7 @@ final class AppModel {
             // connection): already read, so nothing to do. Without this it can't be opened a second time, which looked
             // like the two phones being out of step and started new keys over a healthy chat.
             let readBefore = replayDigest
-            if data.seenEnvelopes[readBefore] != nil { return .handled }
+            if wasSeen(readBefore, in: .ratchet) { return .handled }
             var plain: Data?
             if var session = data.contacts[i].devices[d].session, let opened = try? session.decrypt(message) {
                 data.contacts[i].devices[d].session = session
@@ -6673,7 +6883,7 @@ final class AppModel {
             // newer app) still counts and doesn't leave the session behind.
             unreadable[keptKey] = nil
             deadSpareFrom[keptKey] = nil
-            noteSeen(readBefore)
+            noteSeen(readBefore, in: .ratchet)
             guard let inner = try? Payload.fromWire(plain), !inner.isSetup else { return .handled }
             handlingSentAt = opened.sentAt
             handle(inner, from: fp, persona: persona, device: device)
@@ -6697,9 +6907,6 @@ final class AppModel {
         if (data.contacts[i].devices[d].readsAttachments == true) != opened.readsAttachments {
             data.contacts[i].devices[d].readsAttachments = opened.readsAttachments ? true : nil
         }
-        if (data.contacts[i].devices[d].readsGroupReceipts == true) != opened.readsGroupReceipts {
-            data.contacts[i].devices[d].readsGroupReceipts = opened.readsGroupReceipts ? true : nil
-        }
         if (data.contacts[i].devices[d].takesSpares == true) != opened.takesSpares {
             data.contacts[i].devices[d].takesSpares = opened.takesSpares ? true : nil
         }
@@ -6719,11 +6926,15 @@ final class AppModel {
     }
 
     static let maxAvatarBytes = 512 * 1024
+    /// The most friend requests kept waiting for an answer.
+    static let maxRequests = 200
+    /// The most clips one sender may have part-way here at once, out of the 32 there is room for.
+    static let maxClipsPerSender = 6
     static let maxBannerBytes = 2 * 1024 * 1024
     static let maxDevicesPerContact = 16
 
-    /// Longer than the relay keeps anything (seven days).
-    static let replayWindow: TimeInterval = 8 * 24 * 3600
+    /// Longer than the relay keeps anything (30 days).
+    static let replayWindow: TimeInterval = 32 * 24 * 3600
     /// How long a seen envelope's digest is kept. The age check uses the relay's clock, which a hostile relay can
     /// move by up to `RelayClock`'s 7-day limit to make an old envelope look young, so digests outlive that too.
     static let seenRetention: TimeInterval = replayWindow + 7 * 24 * 3600
@@ -6732,16 +6943,40 @@ final class AppModel {
     /// first, so what an outsider can make this table hold is bounded whatever they send.
     @ObservationIgnored var maxSeenEnvelopes = 50_000
 
-    private func noteSeen(_ digest: String) {
-        data.seenEnvelopes[digest] = Date()
-        guard data.seenEnvelopes.count > maxSeenEnvelopes else { return }
-        let keep = maxSeenEnvelopes * 9 / 10
-        let newest = data.seenEnvelopes.sorted { $0.value > $1.value }.prefix(keep)
-        data.seenEnvelopes = Dictionary(uniqueKeysWithValues: newest.map { ($0.key, $0.value) })
+    /// Whether a digest is in a pool. Digests saved before the pools existed have no prefix, so those count for all of them.
+    private func wasSeen(_ digest: String, in pool: SeenPool) -> Bool {
+        data.seenEnvelopes[pool.prefix + digest] != nil || data.seenEnvelopes[digest] != nil
     }
 
+    /// Writes a digest down in its pool. Past `maxSeenEnvelopes` in that pool the oldest of it go, and the newest time
+    /// among them becomes the pool's floor, below which its envelopes are refused, so flooding it can't make an old one
+    /// count again. Other pools are untouched.
+    private func noteSeen(_ digest: String, in pool: SeenPool, sentAt: Date? = nil) {
+        data.seenEnvelopes[pool.prefix + digest] = max(Date(), sentAt ?? .distantPast)
+        // Cheap test first: only when the whole table is past one pool's cap can this pool be.
+        guard data.seenEnvelopes.count > maxSeenEnvelopes else { return }
+        let mine = data.seenEnvelopes.filter { pool.holds($0.key) }
+        guard mine.count > maxSeenEnvelopes else { return }
+        let keep = maxSeenEnvelopes * 9 / 10
+        let sorted = mine.sorted { $0.value > $1.value }
+        for (key, _) in sorted.dropFirst(keep) { data.seenEnvelopes[key] = nil }
+        // Send times are whole seconds, so the floor is too: a let-go envelope's send time is still at or under it, and one
+        // sent later in that second isn't refused for nothing.
+        if let floorKey = pool.floorKey, let dropped = sorted.dropFirst(keep).first?.value {
+            let floor = Date(timeIntervalSince1970: dropped.timeIntervalSince1970.rounded(.down))
+            data.seenEnvelopes[floorKey] = max(data.seenEnvelopes[floorKey] ?? .distantPast, floor)
+        }
+    }
+
+    /// Tests: the floor of the pool contacts' envelopes count in, and of the one anyone's can, if they were ever full.
+    var seenFloorForTests: Date? { data.seenEnvelopes[SeenPool.contact.floorKey!] }
+    var strangerFloorForTests: Date? { data.seenEnvelopes[SeenPool.stranger.floorKey!] }
+
+    /// Tests: writes a digest down as if an envelope of that pool had been read.
+    func noteSeenForTests(_ digest: String, in pool: SeenPool, sentAt: Date) { noteSeen(digest, in: pool, sentAt: sentAt) }
+
     /// Tests: how many envelope digests are kept.
-    var seenEnvelopeCount: Int { data.seenEnvelopes.count }
+    var seenEnvelopeCount: Int { data.seenEnvelopes.keys.filter { !AppData.seenFloorKeys.contains($0) }.count }
 
     private func handle(_ payload: Payload, from fp: String, persona: UUID?, device: Data) {
         guard var sender = contact(fp, in: persona) else { return }
@@ -6858,7 +7093,9 @@ final class AppModel {
             if let at = mediaMessage(id, persona: .some(persona)), data.conversations[at.convo].persona == persona,
                !Self.isPending(data.conversations[at.convo].messages[at.message]) { break }
             guard (1...StoryClipPieces.maxPieces).contains(of), (0..<of).contains(index), bytes.count <= StoryClipPieces.framedSize,
-                  data.clipParts[key.stored] != nil || data.clipParts.count < 32 else { break }
+                  data.clipParts[key.stored] != nil
+                    || (data.clipParts.count < 32 && data.clipParts.values.filter { $0.author == fp }.count < Self.maxClipsPerSender)
+            else { break }
             var pending = data.clipParts[key.stored] ?? ClipParts(id: id, author: fp, persona: persona, of: of)
             guard pending.author == fp, pending.persona == persona else { break }
             // Cut differently from the pieces already here (their app or mine updated part-way): start over with these.
@@ -6985,20 +7222,44 @@ final class AppModel {
     }
 
     private func acceptHello(_ card: PeerCard, _ request: SessionInit, fingerprint fp: String, device: Data,
-                             via invite: OpenInvite, pq: PQPin) {
+                             via invite: OpenInvite, pq: PQPin, sentAt: Date? = nil) {
         let persona = invite.persona
         let known = contact(fp, in: persona)
-        var peer = known ?? Contact(fingerprint: fp, signingKey: card.signingKey,
-                                    agreementKey: card.agreementKey, sendID: card.sendID, device: device)
+        // Both added each other at about the same time (each scanned the other's code): this hello crossed the one this
+        // device sent them. Taking both would leave each side on the keys it answered and reading the mailbox from its
+        // own invite, so neither could read or even fetch what the other writes. One side's ask wins on both ends, as
+        // with other crossed hellos: the winner keeps its ask, its mailbox and the mailbox it writes to, and leaves this
+        // hello unanswered; the other side takes the winner's hello as if it had been added the ordinary way.
+        if invite.channel == nil, let known, !known.hidden, let i = contactIndex(fp, persona),
+           let d = data.contacts[i].devices.firstIndex(where: { $0.id == device || $0.id.isEmpty }) {
+            let link = data.contacts[i].devices[d]
+            let crossed = link.handshake != nil || sentAt.map { hello($0, crossedOurs: link) } == true
+            // Our side gives way: our hello carried our post-quantum card, but they may read this answer before that hello
+            // (another mailbox), so the answer carries the card again.
+            if crossed { data.contacts[i].pqCardSent = nil }
+            if crossed, let me = me(persona), myHandshakeWins(me: me.fingerprint, persona: persona, them: fp, theirDevice: device) {
+                data.contacts[i].pq = pq
+                data.contacts[i].name = String(card.name.prefix(64))
+                data.contacts[i].avatar = card.avatar
+                data.contacts[i].color = card.color
+                data.invites.removeAll { $0.receiveKey == invite.receiveKey }
+                syncContact(fp, persona)
+                save()
+                return
+            }
+        }
+        var peer = contact(fp, in: persona) ?? Contact(fingerprint: fp, signingKey: card.signingKey,
+                                                     agreementKey: card.agreementKey, sendID: card.sendID, device: device)
         peer.persona = persona
         peer.pq = pq
         peer.relay = invite.relay
         peer.name = String(card.name.prefix(64))
-        peer.avatar = card.avatar
+        peer.avatar = card.avatar.flatMap { $0.count <= Self.maxAvatarBytes ? $0 : nil }
         peer.color = card.color
 
         func answer() {
-            guard let i = contactIndex(fp, persona) else { return }
+            // A hello that names no device could take over another device's place unannounced.
+            guard let i = contactIndex(fp, persona), !device.isEmpty || data.contacts[i].devices.isEmpty else { return }
             let d = upsertDevice(i, id: device, sendID: card.sendID)
             acceptSession(request, contact: i, device: d)
         }
@@ -7108,7 +7369,7 @@ final class AppModel {
         // A picture too big to decode is left off; the words stay.
         let picture = wire.image.flatMap { ImageLimits.isReasonable($0) || $0.isEmpty ? $0 : nil }
         var message = Message(id: wire.id, sender: sender.fingerprint, text: String(wire.text.prefix(20_000)),
-                              image: picture, voice: wire.voice, date: date, status: .delivered, expiresAt: expires,
+                              image: picture, voice: wire.voice?.checked, date: date, status: .delivered, expiresAt: expires,
                               reply: reply, preview: preview)
         // Shown only if it's really theirs: a collectible is checked against their key, a note card is just a title.
         message.collectible = wire.collectible.flatMap { $0.isGenuine(for: sender.signingKey) ? $0 : nil }
@@ -7124,7 +7385,9 @@ final class AppModel {
         // A file on the relay: kept only if well-formed and not already gone. The words that stood in for it are dropped.
         if let a = wire.attachment, a.isValid, a.expires > RelayClock.now {
             var a = a
-            a.expires = min(a.expires, RelayClock.now.addingTimeInterval(8 * 86_400))
+            // As long as the relay keeps it (`chatFileLife` one to one, a week in groups), and a day more for clocks.
+            let life = data.conversations[i].kind == .direct ? Self.chatFileLife : 7 * 86_400
+            a.expires = min(a.expires, RelayClock.now.addingTimeInterval(life + 86_400))
             message.attachment = a
             message.text = ""
         }
@@ -7185,8 +7448,7 @@ final class AppModel {
     /// Read receipts are batched the same way.
     private func queueReceipt(_ id: UUID, to sender: Contact, read: Bool = false) {
         lastIncomingAt = Date()
-        // A read receipt stands in for the delivery one, so it goes even with delivery receipts off.
-        guard read || data.security.deliveryReceipts else { return }
+        // Delivery receipts always go (the sender would otherwise keep sending again); read receipts only with the setting on.
         if let i = pendingReceipts.firstIndex(where: { $0.fingerprint == sender.fingerprint && $0.persona == sender.persona
                                                        && $0.read == read }) {
             pendingReceipts[i].ids.append(id)
@@ -7431,7 +7693,8 @@ extension AppModel {
     private func card(of c: Contact) -> ContactCard {
         ContactCard(fingerprint: c.fingerprint, name: c.name, nickname: c.nickname, avatar: c.avatar, banner: c.banner, color: c.color,
                     verified: c.verified, signingKey: c.signingKey, agreementKey: c.agreementKey,
-                    devices: c.devices.map { DeviceCard(id: $0.id, sendID: $0.sendID) }, relay: c.relay, hidden: c.hidden,
+                    devices: c.devices.map { DeviceCard(id: $0.id, sendID: $0.sendID, held: c.isSelf ? nil : $0.unconfirmed) },
+                    relay: c.relay, hidden: c.hidden,
                     awaitingAcceptance: c.awaitingAcceptance, persona: c.persona, pq: c.pq, pqCommit: c.pqCommit)
     }
 
@@ -7479,9 +7742,25 @@ extension AppModel {
                     && !card.awaitingAcceptance { startHandshake(contact: i, device: d) }
             }
             for device in card.devices {
-                let known = data.contacts[i].devices.contains { (!device.id.isEmpty && $0.id == device.id) || $0.sendID == device.sendID }
-                if !known {
-                    data.contacts[i].devices.append(DeviceLink(id: device.id, sendID: device.sendID))
+                if let d = data.contacts[i].devices.firstIndex(where: { (!device.id.isEmpty && $0.id == device.id) || $0.sendID == device.sendID }) {
+                    // The same device on another mailbox: another of yours saw it change, and holds it again if it says so.
+                    let moved = !device.id.isEmpty && data.contacts[i].devices[d].sendID != device.sendID
+                    if moved { data.contacts[i].devices[d].sendID = device.sendID }
+                    // Held on another of your devices: held here too, unless you allowed it here (a move holds it anyway).
+                    // Allowed there: allowed here, and what it sent is read.
+                    if device.held == true, moved || data.contacts[i].devices[d].unconfirmed != false {
+                        data.contacts[i].devices[d].unconfirmed = true
+                    }
+                    if device.held == false, data.contacts[i].devices[d].unconfirmed == true { release(contact: i, device: d) }
+                } else {
+                    var link = DeviceLink(id: device.id, sendID: device.sendID)
+                    // A device new to this one: held if another of yours holds it, or if this one asks before new devices.
+                    if device.held == true || (device.held == nil && data.security.holdNewDevices && !data.contacts[i].devices.isEmpty) {
+                        link.unconfirmed = true
+                    } else if device.held == false {
+                        link.unconfirmed = false
+                    }
+                    data.contacts[i].devices.append(link)
                     startHandshake(contact: i, device: data.contacts[i].devices.count - 1)
                 }
             }
@@ -7491,7 +7770,7 @@ extension AppModel {
         var c = Contact(fingerprint: card.fingerprint, name: card.name, nickname: card.nickname, avatar: card.avatar,
                         signingKey: card.signingKey, agreementKey: card.agreementKey, sendID: Data(),
                         receiveKey: Mailbox.make().receiveKey, hidden: card.hidden)
-        c.devices = card.devices.map { DeviceLink(id: $0.id, sendID: $0.sendID) }
+        c.devices = card.devices.map { var link = DeviceLink(id: $0.id, sendID: $0.sendID); link.unconfirmed = $0.held; return link }
         c.banner = card.banner
         c.color = card.color
         c.verified = card.verified
@@ -7560,7 +7839,7 @@ extension AppModel {
             let mine = me(ref.persona)?.fingerprint
             let reply = wire.reply.map { ReplyRef(id: $0.id, author: $0.author == mine ? "me" : $0.author, snippet: $0.snippet,
                                                   picture: $0.picture.flatMap { $0.count <= ReplyRef.maxPicture ? $0 : nil }) }
-            var message = Message(id: wire.id, sender: "me", text: wire.text, image: wire.image, voice: wire.voice,
+            var message = Message(id: wire.id, sender: "me", text: wire.text, image: wire.image, voice: wire.voice?.checked,
                                   date: dated(wire.date), status: .sent,
                                   expiresAt: wire.expiresIn.map { dated(wire.date).addingTimeInterval($0) }, reply: reply,
                                   preview: wire.preview)
@@ -8373,7 +8652,7 @@ extension AppModel {
     /// One line for Settings and the Detach screen: how fresh the relay's copy is.
     var backupStatus: String {
         guard data.security.keepBackup else { return "Backups are off" }
-        guard let saved = data.backupSavedAt else { return "Not saved yet" }
+        guard let saved = isPrimary ? data.backupSavedAt : facadeBackupAt else { return "Not saved yet" }
         let seconds = Int(Date().timeIntervalSince(saved))
         if seconds < 60 { return "Saved just now" }
         if seconds < 3600 { return "Saved \(seconds / 60) min ago" }
@@ -8928,6 +9207,15 @@ extension AppModel {
                 // settings held, the next version and one its signer may make, or a later one the owner signed.
                 // Anything else could be someone rewriting the group.
                 guard s == shared.settings || shared.settings.accepts(s) || shared.settings.acceptsJump(s) else { return }
+                // A group this account left (or was taken out of) comes back only when it has been added again: newer
+                // settings that list it as a member, which only an admin can make. The settings from before, sent again
+                // by anyone who still holds them, bring nothing back. A channel's follower comes back only through the
+                // staff member who invited them.
+                if shared.gone {
+                    let addedBack = s.version > shared.settings.version && s.isMember(keys.publicKey)
+                    let sameStaff = s.kind == .channel && shared.ownerAccount == sender.fingerprint
+                    guard addedBack || sameStaff else { return }
+                }
                 // A channel this account follows takes (and answers) an invite only from the staff member who invited them:
                 // anyone else holding the settings and key (another follower, say) must not get this follower's card, nor
                 // be able to change anything here.
@@ -8949,6 +9237,9 @@ extension AppModel {
             }
             applySharedSettings(at: i)
         } else {
+            // A new group comes from a friend. Someone known only through another group or a channel can't put this
+            // account in one (and so get its name and picture card back); a channel's own invite is how it is followed.
+            if s.kind == .group, sender.hidden { return }
             let place = newGroupPlace(s.group, persona: sender.persona)
             var convo = Conversation(id: place.id, kind: s.kind, title: String(s.title.prefix(80)), avatar: s.avatar, members: [])
             convo.groupID = place.groupID
@@ -9120,9 +9411,13 @@ extension AppModel {
     /// How long after a follower leaves the channel's next epoch is made, so followers who leave close together share one
     /// (every new epoch costs the staff a copy of the key for each follower left, and each follower who was away a question).
     static var leaveRekeyWindow: TimeInterval = 600
-    /// A new epoch with everyone still in is started once the current one is this old, or this many chat posts long.
-    static var epochMaxAge: TimeInterval = 7 * 86_400
-    static var epochMaxChats = 1_000
+    /// A new epoch with everyone still in is started once the current one is this old, or this many chat posts long (once
+    /// something was said in it, and an admin's device is on), so someone who got hold of a group key is locked out again
+    /// within days. Three days, not less: a new epoch's key is posted in the one before, and a member away for longer than
+    /// the relay keeps that (7 days) has to be added again. Old keys go a week after the next epoch begins
+    /// (`SharedGroup.readable`, erased in `tendSharedGroups`).
+    static var epochMaxAge: TimeInterval = 3 * 86_400
+    static var epochMaxChats = 300
     /// An admin device whose attempt didn't take waits this long before another.
     static var rotationRetry: TimeInterval = 3_600
     /// How soon a new epoch for someone taken out that couldn't be made is tried again.
@@ -9717,6 +10012,16 @@ extension AppModel {
                 shared.reader.drop(before: oldest)
                 data.conversations[i].shared = shared
             }
+            // Keys of epochs no longer read are erased, with this device's sending chains in them: kept, they would let
+            // whoever later took this device open that group's old mail from a copy of the relay's traffic.
+            // (Number 0 is a channel's staff mailbox, which is never among the epochs: its chain stays.)
+            let stillRead = Set(shared.readable.map(\.number)).union([0])
+            if shared.epochs.contains(where: { !stillRead.contains($0.number) })
+                || shared.chains.keys.contains(where: { !stillRead.contains(Int($0) ?? -1) }) {
+                shared.epochs.removeAll { !stillRead.contains($0.number) }
+                shared.chains = shared.chains.filter { stillRead.contains(Int($0.key) ?? -1) }
+                data.conversations[i].shared = shared
+            }
             let readableBoxes = Set(shared.readable.map { $0.sendID.hex })
             if !shared.postedTo.isSubset(of: readableBoxes) {
                 shared.postedTo.formIntersection(readableBoxes)
@@ -10053,6 +10358,12 @@ extension AppModel {
         data.conversations[i].shared?.outbox = []
         data.conversations[i].shared?.kept = nil
         data.conversations[i].shared?.catchUpSince = nil
+        // Nothing more is read: the group's keys and this device's chains go, so a later look at this device can't open
+        // the group's old mail from a copy of the relay's traffic.
+        data.conversations[i].shared?.epochs = []
+        data.conversations[i].shared?.chains = [:]
+        data.conversations[i].shared?.candidates = []
+        data.conversations[i].shared?.reader = GroupReader()
         data.conversations[i].members = []
         withAnimation(.snappy) { data.conversations[i].messages.append(Message(sender: "system", text: note, date: Date())) }
     }
@@ -10174,9 +10485,6 @@ extension AppModel {
         data.conversations[i].shared?.held?.removeAll { $0.request.link == link }
         save()
     }
-
-    /// Whether another ban can be added (the list holds at most `GroupLinks.maxBans`).
-    func canBan(in id: Conversation.ID) -> Bool { (joinLinks(id)?.bans.count ?? 0) < GroupLinks.maxBans }
 
     /// Takes someone out and turns down any request of theirs from now on. False if the ban list is full.
     @discardableResult
@@ -10587,7 +10895,9 @@ extension AppModel {
         guard !data.conversations[i].muted, data.security.notifications,
               Date().timeIntervalSince(joinNotified[id] ?? .distantPast) > 600 else { return }
         joinNotified[id] = Date()
-        Notifier.shared.post((data.conversations[i].title, "Someone asked to join"), conversation: id, sound: data.security.notificationSound)
+        // The group's name only when notifications may show names: the system keeps this text outside the vault.
+        let title = data.security.notificationContent == .hidden ? "PULSHADE" : data.conversations[i].title
+        Notifier.shared.post((title, "Someone asked to join"), conversation: id, sound: data.security.notificationSound)
     }
 
     /// Puts everyone who asked (and may come in) into the group in one change to the settings, and tells each of them. A
@@ -10861,8 +11171,10 @@ extension AppModel {
         if data.friendInvites.count > GroupFriendInvite.max { data.friendInvites.removeLast(data.friendInvites.count - GroupFriendInvite.max) }
         save()
         if data.security.notifications {
-            Notifier.shared.post(("PULSHADE", "\(sender?.displayName ?? "Someone") from \(title) wants to be friends"),
-                                 conversation: group ?? UUID(), sound: data.security.notificationSound)
+            // Names only when notifications may show them: the system keeps this text outside the vault.
+            let words = data.security.notificationContent == .hidden ? "New friend request"
+                : "\(sender?.displayName ?? "Someone") from \(title) wants to be friends"
+            Notifier.shared.post(("PULSHADE", words), conversation: group ?? UUID(), sound: data.security.notificationSound)
         }
     }
 

@@ -50,11 +50,11 @@ struct GroupDeliveryTests {
         return (alice, bob, cara, made.id)
     }
 
-    @Test func newEpochsKeepMailForThreeDays() async throws {
+    @Test func newEpochsKeepMailForAWeek() async throws {
         let (alice, bob, cara, id) = try await group()
         defer { for m in [alice, bob, cara] { m.lock() } }
-        #expect(alice.conversation(id)?.shared?.current?.days == 3)
-        #expect(bob.conversation(id)?.shared?.current?.days == 3)
+        #expect(alice.conversation(id)?.shared?.current?.days == 7)
+        #expect(bob.conversation(id)?.shared?.current?.days == 7)
     }
 
     @Test func aPostTheMailboxNeverGaveBackIsPostedAgainAndNobodySeesItTwice() async throws {
@@ -89,14 +89,14 @@ struct GroupDeliveryTests {
         let (alice, bob, cara, id) = try await group()
         defer { for m in [alice, bob, cara] { m.lock() } }
         // Cara is away. Bob says something, and by the time Cara is back the relay would have let it go: her place in the
-        // mailbox is after it, and she last read it five days ago.
+        // mailbox is after it, and she last read it eight days ago (group mail lasts seven).
         bob.send("while you were gone", in: id)
         await until([bob]) { bob.conversation(id)?.shared?.kept?.contains { $0.chat && $0.seen } == true }
         let epoch = try #require(bob.conversation(id)?.shared?.current?.number)
         let at = try #require(bob.conversation(id)?.shared?.cursors[String(epoch)])
         let c = try #require(cara.data.conversations.firstIndex { $0.id == id })
         cara.data.conversations[c].shared?.cursors[String(epoch)] = at
-        cara.data.conversations[c].shared?.lastFetch = Date().addingTimeInterval(-5 * 86_400)
+        cara.data.conversations[c].shared?.lastFetch = Date().addingTimeInterval(-8 * 86_400)
         #expect(cara.conversation(id)?.messages.contains { $0.text == "while you were gone" } != true)
 
         await until([alice, bob, cara]) { cara.conversation(id)?.messages.contains { $0.text == "while you were gone" } == true }

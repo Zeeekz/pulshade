@@ -350,7 +350,8 @@ stale comment at the old `main.rs:53` is replaced. Counters: `stats` gains `disk
 disk, cache bytes, peaks, distinct mailboxes, segments, group disk bytes (see `relay/LOAD-TEST.md` for numbers).
 **After the security review of the disk store (2026-11-11):** mail for a mailbox nobody has collected from is held to a quarter
 of the share and slots, 4 MiB and 100 envelopes a mailbox, and 2 days; the rest is kept for mailboxes a phone has collected
-from (details in `relay/OPERATIONS.md`). Records are sealed for their segment and place and padded to size buckets, a failed
+from (details in `relay/OPERATIONS.md`). Since the third review one caller address may hold a quarter of that quarter at a
+time, and when it is nearly full, mail that has waited on it over twelve hours makes way, oldest first. Records are sealed for their segment and place and padded to size buckets, a failed
 erasure or dead-log write is retried or forces a rewrite, and the old journal is kept until all its mail is on the disk.
 **Left in stage 0:** the independent review of the erase and rewrite path (listed in `docs/audit-pack.md`); tuning the
 shares with real counters (2 GiB mail, 8 GiB blobs, 1 GiB groups on a 15 GB disk: the group cap is still 1 GiB, raise

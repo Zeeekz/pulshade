@@ -337,7 +337,7 @@ when every follower's app takes part (bit 6, see 7a-i below).
 
 - **One mailbox per epoch.** A member seals each message **once** and posts it into the group's mailbox on the relay;
   every member reads it from there with a cursor ("everything after the last one I saw"). The relay keeps group mail
-  sealed on disk for the epoch's life (3 days since build 14, 1 to 7 allowed) and does not let it go when it is read, because it must not learn
+  sealed on disk for the epoch's life (7 days from build 16, 3 in builds 14 and 15; 1 to 7 allowed) and does not let it go when it is read, because it must not learn
   how many members there are or who has read what.
 - **Member keys made for each group.** Each account's key in a group comes from its seed and the group's id, so it is
   the same on every device of the account and is linked to nothing outside the group. Members never hold each other's
@@ -362,7 +362,7 @@ when every follower's app takes part (bit 6, see 7a-i below).
   new epoch, or another of your devices) is used only if the settings name it. Two versions with the same number
   (two admins at once) are settled by the lower hash, everywhere alike. The owner's device signs every change made by
   someone else over again, and an owner-signed version may skip numbers, so a member who missed some catches up.
-- **Posts that must not get lost.** The relay keeps group mail for 3 days (new epochs; 1 to 7 is allowed). A device
+- **Posts that must not get lost.** The relay keeps group mail for 7 days (new epochs from build 16; 1 to 7 is allowed). A device
   keeps each post it makes, sealed as posted, until it reads that post back from the mailbox, which shows the relay holds
   it for every member. If it doesn't come back (the relay lost mail), after 2 minutes and then at growing gaps the same
   bytes are posted again, up to six times; readers already remember what they read, so a copy someone has is ignored.
@@ -387,7 +387,7 @@ What it changes, honestly:
 
 - **Healing.** A 1:1 chat heals at the next reply after a key is stolen. In a group, a stolen epoch key reads everything
   in that epoch (every member's chain starts from it), so epochs are short: a removal, a newcomer after the group has
-  talked, or 7 days / 1,000 posts. Within an epoch each sender's chain still only moves forward, so a member's
+  talked, or 3 days / 300 posts. Within an epoch each sender's chain still only moves forward, so a member's
   device holds no key of a message it has already read from a sender it has heard; but it can work out the chain of any
   sender it has not, from the epoch key, so **there is no per-message forward secrecy against someone who steals an
   epoch key** (see `docs/groups-design.md`, "Forward secrecy inside an epoch").
@@ -538,7 +538,7 @@ and waveform, and the rest follows as a pointer. Older apps still get them insid
    destroys the file's key (so a stray copy on a flash disk cannot be opened). Video and photo stories stay until their
    timer ends.
 5. Deleting the message sends the erase secret, and the relay erases the file at once. A file nobody deletes is erased
-   after **7 days at most**. Burn sends the same erase for everything the account uploaded.
+   after **30 days at most** (7 in groups). Burn sends the same erase for everything the account uploaded.
 
 The phone never writes a received file to disk unless you tap **Save a copy**. The relay can see that a file of about
 that size was uploaded, when, and when it was collected (and your IP in Fast mode). It cannot see what the file is, its
@@ -547,6 +547,15 @@ name, its type or who it is for.
 ## 10. Delivery receipts, and receipts from a locked phone
 
 *Code: `Sources/Pulshade/Core/LockedDelivery.swift`, `HelperStore.swift`.*
+
+From build 16, delivery receipts are always sent (there is no switch; a saved "off" from an older build is ignored);
+read receipts remain a choice. A message without a receipt is sent again: soon at first, then less often, up to once a
+day, for as long as the relay keeps mail (30 days). Each copy carries a relay replace tag (`x-pulshade-collapse`, from
+`AppModel.resendTag`: a hash of the mailbox, the sending device, the message id and a three-day window), so the newest
+copy replaces the one before while it waits. Within a three-day window the relay can see that deposits are copies of one
+thing and come from one sender device; across windows the tag changes. When new keys are set up with a device, what it
+hasn't confirmed goes to it again at once, at most once every ten minutes and at most the newest 50 messages.
+Collecting mail while locked (below) is switched off in build 16.
 
 Ordinary receipts are ratchet messages like any other. A receipt waits a random few seconds and goes out batched with
 others, so it does not pair "a message arrived" with "a message was sent" in time.
@@ -635,15 +644,15 @@ key that is never written to its disk, or public because someone chose to publis
 
 | What | Where | How long |
 | --- | --- | --- |
-| Waiting envelopes (messages, receipts, call set-up) | Disk, in segment files with every record sealed under a key of the segment's own (keys only in an index sealed by the storage key); recent ones also cached in memory. Written before the 202 | Until the recipient collects them, or **7 days**. Collected envelopes are dead at once: a segment with none alive has its key forgotten, its file overwritten and deleted; one kept alive by a slow reader is rewritten without them once at least half of it is dead. A full share of the disk answers **507** and drops nothing |
-| Group mail (groups and channels that share one mailbox) | Disk, sealed on the phones and again by the relay | The life the epoch was made with, **3 days** for every epoch made since build 14 (up to 7 for older ones). **Not erased when read**, so the relay can't learn who reads or how many do |
+| Waiting envelopes (messages, receipts, call set-up) | Disk, in segment files with every record sealed under a key of the segment's own (keys only in an index sealed by the storage key); recent ones also cached in memory. Written before the 202 | Until the recipient collects them, or **30 days** (when the mail share is over 90% full, mail that has waited over a week makes way, oldest first, down to 80%). Collected envelopes are dead at once: a segment with none alive has its key forgotten, its file overwritten and deleted; one kept alive by a slow reader is rewritten without them once at least half of it is dead. A full share of the disk answers **507** and drops nothing |
+| Group mail (groups and channels that share one mailbox) | Disk, sealed on the phones and again by the relay | The life the epoch was made with, **7 days** for every epoch made from build 16 (3 in builds 14 and 15). **Not erased when read**, so the relay can't learn who reads or how many do |
 | Short-lived signals (typing, "online") | Memory only | A few seconds to minutes; never written to the disk |
-| Big files, chat videos, story videos | Disk, sealed twice, in pieces | Erased when collected or deleted, **7 days at most** (an unfinished upload: 1 hour) |
+| Big files, chat videos, story videos | Disk, sealed twice, in pieces | Erased when collected or deleted, **30 days at most**, 7 in groups (an unfinished upload: 1 hour; one announced that sends no piece: 2 minutes, and unsent uploads together may hold at most a quarter of the store). When the store is full, finished files older than a week make way, oldest first, only for room really taken (not for uploads announced and not sent), no more than a quarter of the store an hour. Someone who keeps the store full of fresh files can still crowd out new ones; nothing younger than a week ever goes |
 | Sealed backups and spare keys | Disk, in the backup store | Until switched off or Burn; **180 days** after the last save. Spares: also erased when used |
 | Wake-up registrations (Apple push tokens) | Memory, and a sealed file | While the setting is on; dropped after 7 days without renewal |
 | Public @handles and profiles, collectibles, announcements | Disk | Public by choice. A let-go handle is held for its owner 90 days, then free (a 30-day cool-off if the owner gives up the hold early) |
 | Rate-limit counters | Memory | An hour. Only a salted hash of an address, never the address |
-| Mailboxes closed by a Burn | Memory | 7 days |
+| Mailboxes closed by a Burn | Memory | 30 days (as long as mail can wait) |
 
 The relay's disk files (mail segments, directory, backups, blobs, keys) are sealed with a **storage key that is kept only in
 the server's memory**, never written to the server's disk. A crash writes no memory to disk. What this does

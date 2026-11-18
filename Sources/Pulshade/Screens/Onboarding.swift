@@ -392,7 +392,7 @@ struct RestoreFlow: View {
                     ProblemText(problem)
                         .multilineTextAlignment(.center)
                 }
-                Text("Your profile, @handles, contacts and groups come back. Chats don't.")
+                Text("Your profile, usernames, contacts and groups come back. Chats don't.")
                     .font(.system(size: 12))
                     .foregroundStyle(Ink.faint)
                     .multilineTextAlignment(.center)
@@ -413,7 +413,7 @@ struct RestoreFlow: View {
 
     private var chooser: some View {
         OnboardingPage(title: "Choose your profile",
-                       subtitle: "This account has more than one @handle. Keep one; the others are released.",
+                       subtitle: "This account has more than one username. Keep one; the others are released.",
                        back: { choices = []; working = false }) {
             VStack(spacing: 10) {
                 ForEach(choices, id: \.handle) { profile in
@@ -987,71 +987,109 @@ struct Shake: GeometryEffect {
 }
 
 
-/// Asked after how to connect and before anything else: every privacy setting, explained, so they're set up before
-/// the account exists. Applies to the account made next; logging in to an existing one keeps that account's own.
+/// Asked after how to connect and before anything else: one tap picks a starting point, and every setting behind it
+/// can still be chosen one by one. Applies to the account made next; logging in to an existing one keeps that
+/// account's own.
 struct PrivacyChoice: View {
     var back: (() -> Void)?
     var done: () -> Void
     @State private var s = PendingPrivacy.chosen ?? SecuritySettings()
+    @State private var customising = false
 
     var body: some View {
         OnboardingPage(title: "Your privacy",
-                       subtitle: "Choose your privacy settings. You can change any later in Settings.",
+                       subtitle: "Pick a starting point. You can change every setting later in Settings.",
                        back: back) {
-            VStack(alignment: .leading, spacing: 22) {
-                HStack(spacing: 10) {
-                    Button("Recommended") { withAnimation(.snappy) { s = SecuritySettings() } }
-                        .buttonStyle(SecondaryButtonStyle())
-                    Button("Maximum privacy") { withAnimation(.snappy) { s = .strictest } }
-                        .buttonStyle(SecondaryButtonStyle())
+            VStack(alignment: .leading, spacing: 14) {
+                preset(symbol: "checkmark.shield.fill", title: "Recommended",
+                       detail: "Like other messengers: notifications that show no message text, read receipts and typing shown to the people you chat with, locks after 5 minutes.",
+                       settings: SecuritySettings())
+                preset(symbol: "eye.slash.fill", title: "Maximum privacy",
+                       detail: "Shares nothing extra: no read receipts, typing or notifications, locks after 1 minute. You only see new messages when you open PULSHADE.",
+                       settings: .strictest)
+                Button(customising ? "Hide the settings" : "Choose each setting myself") {
+                    withAnimation(.snappy) { customising.toggle() }
                 }
-                group("What others see", footer: "Turn one off and you stop seeing theirs too.") {
-                    toggle("Delivery receipts", $s.deliveryReceipts, "Tells people when a message reaches your phone.")
-                    toggle("Read receipts", $s.readReceipts, "Tells people when you've seen their message.")
-                    toggle("Typing indicators", $s.typingIndicators, "Shows people when you're writing to them.")
-                    toggle("Online status", $s.onlineStatus, "Shows accepted contacts when PULSHADE is open.")
-                }
-                group("Links & backup") {
-                    toggle("Link previews", $s.linkPreviews, "Builds a preview when you send a link, which visits the website from your connection.")
-                    toggle("Sealed backup", $s.keepBackup, "A sealed copy of your profile, contacts, groups and chat keys (never messages) that only your recovery code opens.")
-                }
-                group("Notifications") {
-                    toggle("Notifications", $s.notifications, "Banners for new messages.")
-                    #if os(iOS)
-                    toggle("Wake a locked iPhone", $s.pushWake, "Apple wakes your phone for new mail. Apple learns when, never what for.")
-                    if s.pushWake {
-                        toggle("Collect messages when locked", $s.lockedDeliveryChosen, Self.lockedCollectionWarning)
-                    }
-                    #endif
-                    choice("On the lock screen", $s.notificationContent, NotificationContent.allCases.map { ($0, $0.label) },
-                           "How much a notification shows: nothing, who it's from, or the message.")
-                }
-                group("Lock & screen") {
-                    choice("Auto-lock", $s.autoLockMinutes, [(1, "1 min"), (5, "5 min"), (15, "15 min"), (0, "Never")],
-                           "Locks PULSHADE after this long, so a borrowed or stolen phone shows nothing.")
-                    toggle("Keep receiving while locked", $s.keepReceivingLocked,
-                           "Auto-lock keeps PULSHADE running so messages still arrive. Off closes everything until you unlock.")
-                    toggle("Block screenshots & recording", $s.blockCapture, "Keeps chats out of screenshots and screen recordings.")
-                    toggle(Platform.isPhone ? "Hide in app switcher" : "Blur when in background", $s.blurWhenInactive,
-                           "Blurs your chats whenever PULSHADE isn't in front.")
-                }
+                .buttonStyle(.plain)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(Ink.dim)
+                .frame(maxWidth: .infinity)
+                .padding(.top, 4)
+                if customising { settings.transition(.opacity) }
             }
         } actions: {
-            Button("Continue") {
-                PendingPrivacy.chosen = s
-                PendingPrivacy.asked = true
-                done()
+            if customising {
+                Button("Continue") { finish(s) }.buttonStyle(PrimaryButtonStyle())
             }
-            .buttonStyle(PrimaryButtonStyle())
+        }
+    }
+
+    private func finish(_ chosen: SecuritySettings) {
+        PendingPrivacy.chosen = chosen
+        PendingPrivacy.asked = true
+        done()
+    }
+
+    /// A starting point. One tap takes it and moves on; with the settings open, it fills them in instead.
+    private func preset(symbol: String, title: String, detail: String, settings: SecuritySettings) -> some View {
+        Button {
+            if customising { withAnimation(.snappy) { s = settings } } else { finish(settings) }
+        } label: {
+            VStack(alignment: .leading, spacing: 8) {
+                Label(title, systemImage: symbol)
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(Ink.text)
+                Text(branded: detail)
+                    .font(.system(size: 14))
+                    .foregroundStyle(Ink.dim)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Ink.raised, in: .rect(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Ink.line))
+            .contentShape(.rect(cornerRadius: 14))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(title)
+        .accessibilityHint(detail)
+    }
+
+    private var settings: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            group("What others see", footer: "Turn one off and you stop seeing theirs too.") {
+                toggle("Read receipts", $s.readReceipts, "Tells people when you've seen their message.")
+                toggle("Typing indicators", $s.typingIndicators, "Shows people when you're writing to them.")
+                toggle("Online status", $s.onlineStatus, "Shows accepted contacts when PULSHADE is open.")
+            }
+            group("Links & backup") {
+                toggle("Link previews", $s.linkPreviews, "Builds a preview when you send a link, which visits the website from your connection.")
+                toggle("Sealed backup", $s.keepBackup, "A sealed copy of your profile, contacts, groups and chat keys (never messages) that only your recovery code opens.")
+            }
+            group("Notifications") {
+                toggle("Notifications", $s.notifications, "Banners for new messages.")
+                #if os(iOS)
+                toggle("Wake a locked iPhone", $s.pushWake, "Apple wakes your phone for new mail. Apple learns when, never what for.")
+                #endif
+                choice("On the lock screen", $s.notificationContent, NotificationContent.allCases.map { ($0, $0.label) },
+                       "How much a notification shows: nothing, who it's from, or the message.")
+            }
+            group("Lock & screen") {
+                choice("Auto-lock", $s.autoLockMinutes, [(1, "1 min"), (5, "5 min"), (15, "15 min"), (0, "Never")],
+                       "Locks PULSHADE after this long, so a borrowed or stolen phone shows nothing.")
+                toggle("Keep receiving while locked", $s.keepReceivingLocked,
+                       "Auto-lock keeps PULSHADE running so messages still arrive. Off closes everything until you unlock.")
+                toggle("Block screenshots & recording", $s.blockCapture, "Keeps chats out of screenshots and screen recordings.")
+                toggle(Platform.isPhone ? "Hide in app switcher" : "Blur when in background", $s.blurWhenInactive,
+                       "Blurs your chats whenever PULSHADE isn't in front.")
+            }
         }
     }
 
     private func group<C: View>(_ title: String, footer: String? = nil, @ViewBuilder _ content: () -> C) -> some View {
         SettingsGroup(title, footer: footer) { content() }
     }
-
-    /// Shared with Settings (`LockedDeliveryWarning`), so both say the same thing.
-    private static var lockedCollectionWarning: String { LockedDeliveryWarning.short }
 
     private func toggle(_ title: String, _ value: Binding<Bool>, _ detail: String) -> some View {
         VStack(alignment: .leading, spacing: 0) {

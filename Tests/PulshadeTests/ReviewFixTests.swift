@@ -214,14 +214,14 @@ import PulshadeShared
         let request = URLRequest(url: URL(string: "https://relay.test/x")!)
         // Within the cap.
         Stub.announced = -1; Stub.chunks = 3
-        let (data, _) = try await RelayPinning.shared.collect(request, body: nil, in: stubSession(), limit: 1_000_000)
+        let (data, _) = try await RelayPinning.shared.collect(stubSession().dataTask(with: request), limit: 1_000_000)
         #expect(data.count == 300_000)
         // Announced too big: refused before any of it is read.
         Stub.announced = 50_000_000; Stub.chunks = 3; Stub.sent = 0
-        await #expect(throws: URLError.self) { _ = try await RelayPinning.shared.collect(request, body: nil, in: stubSession(), limit: 1_000_000) }
+        await #expect(throws: URLError.self) { _ = try await RelayPinning.shared.collect(stubSession().dataTask(with: request), limit: 1_000_000) }
         // Not announced, but more arrives than the cap: stops, with an error.
         Stub.announced = -1; Stub.chunks = 40
-        await #expect(throws: URLError.self) { _ = try await RelayPinning.shared.collect(request, body: Data([1]), in: stubSession(), limit: 1_000_000) }
+        await #expect(throws: URLError.self) { _ = try await RelayPinning.shared.collect(stubSession().uploadTask(with: request, from: Data([1])), limit: 1_000_000) }
     }
 
     // MARK: SEC-210

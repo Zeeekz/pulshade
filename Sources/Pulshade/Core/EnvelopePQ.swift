@@ -80,7 +80,12 @@ struct EnvelopeRecipient {
 
 /// What was refused, so the app can tell the person: a classical-only envelope from someone who is known to have
 /// post-quantum keys (a downgrade), or from an app that has none (too old).
-enum EnvelopeRefusal: Error { case classical(signer: Data, sentAt: Date) }
+enum EnvelopeRefusal: Error {
+    case classical(signer: Data, sentAt: Date)
+    /// Signed, but by someone whose post-quantum keys aren't known here yet and who sent no card with it: it can't be
+    /// checked now, and may be once their card arrives (it travels in their hello, which can come after).
+    case unpinned(signer: Data)
+}
 
 /// Envelope version 3. Same shape as `EnvelopeCore`'s, with the post-quantum secret mixed in at both layers:
 ///
@@ -199,7 +204,8 @@ extension EnvelopeCore {
                 else { throw EnvelopeError.badSignature }
                 if pinned == nil { pin = verified; introduced = verified }
             }
-            guard let pin, let key = try? MLDSA65.PublicKey(rawRepresentation: pin.dsa),
+            guard let pin else { throw EnvelopeRefusal.unpinned(signer: inner.from) }
+            guard let key = try? MLDSA65.PublicKey(rawRepresentation: pin.dsa),
                   key.isValidSignature(signature, for: signedTranscript(ephemeral: Data(ephemeralRaw), kemCiphertext: kemCiphertext,
                                                                        recipient: mine, sender: sender, at: inner.at,
                                                                        device: inner.device ?? Data(), body: body))

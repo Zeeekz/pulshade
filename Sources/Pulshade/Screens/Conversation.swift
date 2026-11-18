@@ -24,6 +24,8 @@ struct ConversationView: View {
     @State private var choosingFile = false
     @State private var quickSending = false
     @State private var showInfo = false
+    @State private var verifying = false
+    @State private var confirmingAllow = false
     /// Their picture at full size, opened from the header on the phone.
     @State private var headerPicture: Data?
     @State private var recorder = VoiceRecorder()
@@ -58,6 +60,7 @@ struct ConversationView: View {
         if let c = model.conversation(id), model.belongsHere(c) {
             VStack(spacing: 0) {
                 header(c)
+                verifyPrompt(c)
                 messages(c)
                 if model.canPost(in: c) { composer(c) } else { ReadOnlyBar(kind: c.kind, announcements: c.isAnnouncements, oldFormat: c.isOldFormat, needsUpdate: model.peerNeedingUpdate(in: c)) }
             }
@@ -186,6 +189,62 @@ struct ConversationView: View {
         .overlay(alignment: .bottom) { Rectangle().fill(Ink.line).frame(height: 1) }
         .modifier(ImageViewerCover(isPresented: Binding(get: { headerPicture != nil }, set: { if !$0 { headerPicture = nil } }),
                                    data: headerPicture ?? Data()))
+    }
+
+    /// For a friend added in the last two weeks and not verified yet: a short line asking to compare the Pulse check, the
+    /// one thing that proves nobody stood in the middle when you connected. Put away until the app is next opened, and gone
+    /// for good once verified.
+    @ViewBuilder private func verifyPrompt(_ c: Conversation) -> some View {
+        if c.kind == .direct, let fp = c.members.first, model.heldDevices(of: fp, persona: c.persona) > 0 {
+            // A device their account added while "ask before new devices" is on: your messages wait for it until you say.
+            HStack(spacing: 10) {
+                Image(systemName: "laptopcomputer.and.iphone").foregroundStyle(Color.orange)
+                Text("\(model.displayName(fp))'s account added a new device. Nothing goes to it, and none of its messages are shown, until you allow it. Not sure? Ask them another way first, in person or by call.")
+                    .font(.system(size: 13))
+                    .foregroundStyle(Ink.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+                Button("Allow") { confirmingAllow = true }
+                    .font(.system(size: 13, weight: .semibold))
+                    .buttonStyle(.plain)
+                    .foregroundStyle(theme.accent)
+            }
+            .padding(.horizontal, 14).padding(.vertical, 9)
+            .background(Ink.raised)
+            .overlay(alignment: .bottom) { Rectangle().fill(Ink.line).frame(height: 1) }
+            .transition(.move(edge: .top).combined(with: .opacity))
+            .confirmationDialog("Let \(model.displayName(fp))'s new device have your messages?", isPresented: $confirmingAllow, titleVisibility: .visible) {
+                Button("Allow") { withAnimation(.snappy) { model.allowHeldDevices(of: fp, persona: c.persona) } }
+                Button("Not yet", role: .cancel) {}
+            } message: {
+                Text("What waited for it goes now, and what it sent is shown. Only allow it if they told you it's theirs.")
+            }
+        } else if c.kind == .direct, let fp = c.members.first, let peer = model.contact(fp, in: c.persona),
+           !peer.verified, !peer.isSelf, !peer.hidden, Date().timeIntervalSince(peer.addedAt) < 14 * 86_400,
+           !model.verifyPromptDismissed.contains(fp) {
+            HStack(spacing: 10) {
+                Image(systemName: "checkmark.shield").foregroundStyle(theme.accent)
+                Text("Compare your Pulse check with \(model.displayName(fp)) to be sure it's really them.")
+                    .font(.system(size: 13))
+                    .foregroundStyle(Ink.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+                Button("Compare") { verifying = true }
+                    .font(.system(size: 13, weight: .semibold))
+                    .buttonStyle(.plain)
+                    .foregroundStyle(theme.accent)
+                Button { withAnimation(.snappy) { _ = model.verifyPromptDismissed.insert(fp) } } label: { Image(systemName: "xmark") }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Ink.faint)
+                    .accessibilityLabel("Not now")
+            }
+            .padding(.horizontal, 14).padding(.vertical, 9)
+            .background(Ink.raised)
+            .overlay(alignment: .bottom) { Rectangle().fill(Ink.line).frame(height: 1) }
+            .sheet(isPresented: $verifying) { PulseCheckView(fingerprint: fp, persona: c.persona) }
+            .transition(.move(edge: .top).combined(with: .opacity))
+        }
     }
 
     private func subtitle(_ c: Conversation) -> String {
@@ -540,6 +599,10 @@ struct ConversationView: View {
                         }
                         .animation(.easeOut(duration: 0.15), value: focused)
                         .onSubmit(send)
+                        #if os(iOS)
+                        // Pasted text keeps its paragraphs and lists (PastedText).
+                        .onChange(of: focused, initial: true) { _, now in if now { ShapedPaste.attachToFocusedField() } }
+                        #endif
                         .onChange(of: draft) { _, new in
                             if !new.isEmpty { model.noteTyping(in: id) }
                             refreshPreview(for: new)
@@ -1069,12 +1132,65 @@ fileprivate struct Bubble: View, Equatable {
 
     @ViewBuilder private var words: some View {
         let mine = message.isMine
-        Text(mentioned(LinkPreviews.linked(message.text)))
+        let full = mentioned(LinkPreviews.linked(message.text))
+        Group {
+            if ListLine.hasList(message.text), let rows = Self.rows(message.text, in: full) {
+                // A list keeps its shape: each item's lines wrap under its words, not under its bullet.
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(rows.indices, id: \.self) { n in
+                        let row = rows[n]
+                        if let marker = row.marker {
+                            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                Text(marker).monospacedDigit()
+                                    .frame(minWidth: marker.count > 1 ? 18 : 10, alignment: .trailing)
+                                Text(row.words)
+                            }
+                            .padding(.leading, CGFloat(row.level) * 16)
+                        } else {
+                            // An empty line keeps its height, as a gap between paragraphs.
+                            Text(row.words.characters.isEmpty ? AttributedString(" ") : row.words)
+                        }
+                    }
+                }
+            } else {
+                Text(full)
+            }
+        }
             .font(.system(size: Self.textSize))
             .foregroundStyle(mine ? Ink.onAccent.opacity(0.88) : Ink.text)
             .tint(mine ? Ink.onAccent.opacity(0.85) : theme.accent)
             .modifier(SelectableText(enabled: canCopy))
             .confirmsLinkTaps()
+    }
+
+    private struct Row { var level: Int; var marker: String?; var words: AttributedString }
+
+    /// The message cut into lines, list items split into marker and words, each keeping its links and @mentions. Nil if
+    /// the styled text doesn't line up with the plain one, and the bubble shows it whole instead.
+    private static func rows(_ text: String, in full: AttributedString) -> [Row]? {
+        // A very long message is shown whole: thousands of rows would make the chat slow to draw.
+        guard text.count <= 5_000 else { return nil }
+        var rows: [Row] = []
+        var start = text.startIndex
+        while start <= text.endIndex {
+            let end = text[start...].firstIndex(of: "\n") ?? text.endIndex
+            let line = text[start..<end]
+            var from = start
+            var row = Row(level: 0, marker: nil, words: AttributedString())
+            if let item = ListLine.parse(line), let r = line.range(of: item.rest, options: [.backwards, .anchored]) {
+                row.level = item.level
+                row.marker = item.marker
+                from = r.lowerBound
+            }
+            guard let lower = AttributedString.Index(from, within: full),
+                  let upper = AttributedString.Index(end, within: full) else { return nil }
+            row.words = AttributedString(full[lower..<upper])
+            rows.append(row)
+            if rows.count > 200 { return nil }
+            if end == text.endIndex { break }
+            start = text.index(after: end)
+        }
+        return rows
     }
 
     private var timeLine: some View {

@@ -1,6 +1,7 @@
 import SwiftUI
 
-/// Swap invites: share yours as a QR code or link, or add someone from theirs (a contact or a channel).
+/// Add a friend: share your invite as a QR code or link, add someone from theirs (a contact or a channel), or
+/// find them by @username. The one place for all three, so nobody needs a username to be reached.
 struct PeopleView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
@@ -9,6 +10,9 @@ struct PeopleView: View {
     var scrolls = true
     /// Opened from the Account tab on iPhone: a page with a back button, not a tab of its own.
     var inSettings = false
+    /// Opened as a sheet from the chat list, Contacts or the New menu.
+    var inSheet = false
+    @Environment(\.dismiss) private var dismiss
 
     @State private var invite = ""
     @State private var theirCode = ""
@@ -17,21 +21,31 @@ struct PeopleView: View {
     @State private var added: Contact?
     @State private var copied = false
     @State private var scanning = false
+    @State private var username = ""
 
     private var parsed: Invite? { Invite(code: theirCode) }
 
     var body: some View {
         Group {
-            if inSettings { SettingsScreen(title: "Invite") { VStack(spacing: 20) { mine; theirs } } }
+            if inSettings { SettingsScreen(title: "Add a friend") { VStack(spacing: 20) { mine; theirs } } }
+            else if inSheet {
+                SheetBody(width: 440) {
+                    VStack(spacing: 20) {
+                        SheetHeader(symbol: "person.badge.plus", title: "Add a friend")
+                        mine
+                        theirs
+                    }
+                }
+            }
             else if scrolls { ScrollView { content }.scrollIndicators(.never) } else { content }
         }
             .onAppear { if invite.isEmpty { invite = model.makeInviteCode() } }
-            .sheet(isPresented: $scanning) { ScanSheet() }
+            .sheet(isPresented: $scanning) { ScanSheet(allowsDevices: false) }
     }
 
     private var content: some View {
             VStack(alignment: .leading, spacing: 20) {
-                Heading(title: "Invite")
+                Heading(title: "Add a friend")
                     .padding(.top, Platform.isPhone ? 12 : 38)
                 ViewThatFits(in: .horizontal) {
                     HStack(alignment: .top, spacing: 20) {
@@ -65,7 +79,7 @@ struct PeopleView: View {
                 VStack(spacing: 4) {
                     Text(model.activeProfile.displayName)
                         .font(.system(size: 17, weight: .semibold)).foregroundStyle(Ink.text)
-                    Text(model.activeProfile.handle.map { "@\($0)" } ?? "No public handle")
+                    Text(model.activeProfile.handle.map { "@\($0)" } ?? "No username: this code is how people add you")
                         .font(.system(size: 13)).foregroundStyle(model.activeProfile.handle == nil ? Ink.faint : theme.accent)
                 }
                 HStack(spacing: 10) {
@@ -90,7 +104,9 @@ struct PeopleView: View {
             }
             .frame(maxWidth: .infinity)
         } footer: {
-            "Each code works for one person."
+            model.activeProfile.handle == nil
+                ? "Show this code to a friend, or send them the link in any app. Each code works for one person; tap the arrows for a new one."
+                : "Show this code, send the link, or just tell them your @username. Each code works for one person."
         }
     }
 
@@ -153,11 +169,38 @@ struct PeopleView: View {
                 }
 
                 if let added { addedRow(added).transition(.opacity) }
+
+                HStack(spacing: 10) {
+                    Rectangle().fill(Ink.line).frame(height: 1)
+                    Text("or find their username").font(.system(size: 12)).foregroundStyle(Ink.faint).fixedSize()
+                    Rectangle().fill(Ink.line).frame(height: 1)
+                }
+                HStack(spacing: 6) {
+                    Text("@").font(.system(size: 14)).foregroundStyle(Ink.faint)
+                    TextField("", text: $username, prompt: Text("username").foregroundStyle(Ink.faint))
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 14))
+                        .foregroundStyle(Ink.text)
+                        #if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        #endif
+                        .onSubmit(find)
+                    Button("Find", action: find)
+                        .font(.system(size: 14, weight: .semibold))
+                        .buttonStyle(.plain)
+                        .foregroundStyle(DirectoryProfile.validHandle(username) == nil ? Ink.faint : theme.accent)
+                        .disabled(DirectoryProfile.validHandle(username) == nil)
+                }
+                .padding(.horizontal, 14)
+                .frame(height: 46)
+                .background(Ink.raised, in: .rect(cornerRadius: 12))
+                .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Ink.line))
             }
             .animation(.snappy, value: parsed != nil)
             .animation(.snappy, value: added?.fingerprint)
         } footer: {
-            "They appear in your contacts once their device answers."
+            "Someone added by code appears in your contacts once their device answers. Someone found by username gets a request to accept."
         }
     }
 
@@ -196,6 +239,14 @@ struct PeopleView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 6)
         }
+    }
+
+    /// Opens their profile in Contacts, where the request is sent from.
+    private func find() {
+        guard let handle = DirectoryProfile.validHandle(username) else { return }
+        username = ""
+        model.openedHandle = handle
+        if inSheet || inSettings { dismiss() }
     }
 
     private func add() {

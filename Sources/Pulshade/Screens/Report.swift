@@ -48,7 +48,7 @@ struct ReportSheet: View {
                 }
             } else {
                 Text("Who are you reporting?").font(.system(size: 13, weight: .medium)).foregroundStyle(Ink.dim)
-                TextField("", text: $handle, prompt: Text("@handle").foregroundStyle(Ink.faint))
+                TextField("", text: $handle, prompt: Text("@username").foregroundStyle(Ink.faint))
                     .textFieldStyle(LargeFieldStyle())
                     #if os(iOS)
                     .textInputAutocapitalization(.never)
@@ -90,7 +90,7 @@ struct ReportSheet: View {
                     Toggle("Say it's from @\(mine)", isOn: $includeHandle).toggleStyle(GlowToggleStyle())
                 }
             }
-            Text(branded: "Only the PULSHADE team reads this. It's sent anonymously unless you add your handle, and the person you report isn't told.")
+            Text(branded: "Only the PULSHADE team reads this. It's sent anonymously unless you add your username, and the person you report isn't told.")
                 .font(.system(size: 12)).foregroundStyle(Ink.faint)
                 .fixedSize(horizontal: false, vertical: true)
             if let problem {
@@ -131,7 +131,7 @@ struct ReportSheet: View {
                 var target = subject
                 if target == nil {
                     guard let found = try await model.findProfile(handle) else {
-                        problem = "No one has that handle"
+                        problem = "No one has that username"
                         sending = false
                         return
                     }

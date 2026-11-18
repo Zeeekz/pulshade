@@ -7,6 +7,9 @@ struct ScanSheet: View {
     @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
     var initial: String?
+    /// Whether a code for linking a new device is taken. Off when the scanner was opened to add a friend: a stranger's
+    /// "add me" code must never be able to turn out to be a request for the whole account.
+    var allowsDevices = true
 
     @State private var scanner = QRScanner()
     @State private var scanning = false
@@ -49,7 +52,8 @@ struct ScanSheet: View {
                         ProblemText(problem)
                             .multilineTextAlignment(.center)
                     }
-                    Text("Point it at the code on a new device you're logging in to, or at a friend's invite.")
+                    Text(allowsDevices ? "Point it at the code on a new device you're logging in to, or at a friend's invite."
+                         : "Point it at your friend's invite code.")
                         .font(.system(size: 12)).foregroundStyle(Ink.dim).multilineTextAlignment(.center)
                     if !scanning {
                         Button("Try again") { start() }.buttonStyle(PrimaryButtonStyle())
@@ -102,7 +106,9 @@ struct ScanSheet: View {
             return
         }
         if preview.kind == .device {
-            if initial != nil {
+            if !allowsDevices {
+                problem = "That is a code for linking a device, not a friend's invite. Never scan one that isn't on your own new device."
+            } else if initial != nil {
                 problem = "Codes for linking a device only work from the camera, pointed at your own new device."
             } else {
                 carryOut(text)
@@ -194,9 +200,10 @@ struct LinkApproval: View {
             VStack(spacing: 14) {
                 Image(systemName: Platform.isPhone ? "laptopcomputer.and.iphone" : "iphone.gen3")
                     .font(.system(size: 40, weight: .light)).foregroundStyle(theme.accent)
-                Text("Link “\(pending.request.name)”?")
+                // The name inside the code is whatever its maker typed, so it is never shown as part of the question.
+                Text("Link a new device to your account?")
                     .font(.system(size: 16, weight: .semibold)).foregroundStyle(Ink.text)
-                Text("It gets your account, contacts, groups and personas. Only link devices you own.")
+                Text("It gets your whole account: contacts, groups and personas. Only do this for a device of your own that you are setting up right now. Nobody adding you as a friend needs it.")
                     .font(.system(size: 12)).foregroundStyle(Ink.dim).multilineTextAlignment(.center)
                 VStack(spacing: 4) {
                     Text(pending.request.checkCode)

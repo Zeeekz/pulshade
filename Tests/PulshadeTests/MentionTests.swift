@@ -109,4 +109,25 @@ import Foundation
         #expect(wav.prefix(4) == Data("RIFF".utf8) && wav.count == 44 + Int(Ringback.cycle * Ringback.sampleRate) * 2)
         if let path = ProcessInfo.processInfo.environment["PULSHADE_RINGBACK_WAV"] { try? wav.write(to: URL(fileURLWithPath: path)) }
     }
+
+    /// A start near the largest number used to overflow when its length was added, which stopped the app of everyone
+    /// in the group each time it read the message.
+    @Test func aMentionPlacedImpossiblyFarIsDroppedNotAddedUp() {
+        let text = "hey @Nova"
+        #expect(Mention.cleaned([Mention(fingerprint: "n", start: Int.max, length: 2)], in: text).isEmpty)
+        #expect(Mention.cleaned([Mention(fingerprint: "n", start: Int.max - 1, length: 200)], in: text).isEmpty)
+        #expect(Mention.cleaned([Mention(fingerprint: "n", start: 4, length: 200)], in: text).isEmpty)
+        #expect(Mention.cleaned([Mention(fingerprint: "n", start: 4, length: 5)], in: text).count == 1)
+    }
+
+    /// A voice note's claimed length is shown as minutes and seconds, which can't be done for a number that isn't one
+    /// or is far too large: it is brought within bounds on the way in.
+    @Test func aVoiceNoteClaimingAnImpossibleLengthIsBroughtWithinBounds() {
+        #expect(VoiceNote(audio: Data(), duration: 1e300, levels: []).checked.duration == VoiceNote.longest)
+        #expect(VoiceNote(audio: Data(), duration: .infinity, levels: []).checked.duration == 0)
+        #expect(VoiceNote(audio: Data(), duration: .nan, levels: []).checked.duration == 0)
+        #expect(VoiceNote(audio: Data(), duration: -5, levels: []).checked.duration == 0)
+        #expect(VoiceNote(audio: Data(), duration: 12.5, levels: [1, 2]).checked == VoiceNote(audio: Data(), duration: 12.5, levels: [1, 2]))
+        #expect(VoiceNote(audio: Data(), duration: 1, levels: Array(repeating: 9, count: 5000)).checked.levels.count == VoiceNote.mostLevels)
+    }
 }

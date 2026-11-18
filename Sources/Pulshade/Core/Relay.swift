@@ -216,10 +216,9 @@ final class RelayPinning: NSObject, URLSessionDataDelegate {
 
     private let collecting = OSAllocatedUnfairLock(initialState: [ObjectIdentifier: Collected]())
 
-    /// Sends the request and returns its answer, failing with `dataLengthExceedsMaximum` (and cancelling the
-    /// transfer) if the body is, or turns out to be, more than `limit` bytes.
-    func collect(_ request: URLRequest, body: Data?, in session: URLSession, limit: Int) async throws -> (Data, URLResponse) {
-        let task = body.map { session.uploadTask(with: request, from: $0) } ?? session.dataTask(with: request)
+    /// Runs a task not yet started and returns its answer, failing with `dataLengthExceedsMaximum` (and cancelling
+    /// the transfer) if the body is, or turns out to be, more than `limit` bytes.
+    func collect(_ task: URLSessionTask, limit: Int) async throws -> (Data, URLResponse) {
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Data, URLResponse), Error>) in
                 let entry = Collected(limit: limit) { continuation.resume(with: $0) }
@@ -366,16 +365,22 @@ struct RelayClient {
     /// This lane's connections, and over Tor its circuits too: Tor isolates by this name.
     private var sessionName: String { "\(lane)|\(base.host() ?? "")|\(Tor.uses(base))" }
 
-    private var session: URLSession {
-        get throws {
-            let name = sessionName
-            return try Self.lock.withLock {
-                if let existing = Self.sessions[name] { return existing }
-                let made = URLSession(configuration: try Self.configuration(for: base, lane: name),
-                                       delegate: RelayPinning.shared, delegateQueue: nil)
-                Self.sessions[name] = made
-                return made
+    /// Makes a request's task on this lane's session, opening the session if there is none. Done under the lock
+    /// that takes sessions out of use: a session is only invalidated after it has left `sessions`, so a task is
+    /// never made on one that already has been. CFNetwork answers that with an exception Swift can't catch, and a
+    /// request that waited (for its proof of work, say) while another failed on the same lane used to be able to hit it.
+    private func task(for request: URLRequest, body: Data?) throws -> (task: URLSessionTask, session: URLSession) {
+        let name = sessionName
+        return try Self.lock.withLock {
+            let session: URLSession
+            if let existing = Self.sessions[name] {
+                session = existing
+            } else {
+                session = URLSession(configuration: try Self.configuration(for: base, lane: name),
+                                     delegate: RelayPinning.shared, delegateQueue: nil)
+                Self.sessions[name] = session
             }
+            return (body.map { session.uploadTask(with: request, from: $0) } ?? session.dataTask(with: request), session)
         }
     }
 
@@ -383,12 +388,18 @@ struct RelayClient {
     /// a circuit into an onion service can stay up while carrying nothing, and every request after would hang
     /// on it until it timed out.
     private func load(_ request: URLRequest, body: Data? = nil, limit: Int = RelayClient.maxResponse) async throws -> (Data, URLResponse) {
-        let session = try self.session
         let name = sessionName
         var request = request
         if Tor.uses(base), !isEstablished { request.timeoutInterval = max(request.timeoutInterval, Self.firstRequestTimeout) }
+        // The session the last attempt went out on, which is the one to retire if it fails.
+        var used: URLSession?
+        func attempt(_ request: URLRequest) async throws -> (Data, URLResponse) {
+            let made = try task(for: request, body: body)
+            used = made.session
+            return try await RelayPinning.shared.collect(made.task, limit: limit)
+        }
         do {
-            var answer = try await RelayPinning.shared.collect(request, body: body, in: session, limit: limit)
+            var answer = try await attempt(request)
             // Too little work for this route right now: the relay says how much, and the request is made once more with it.
             if let http = answer.1 as? HTTPURLResponse, http.statusCode == 429,
                let bits = http.value(forHTTPHeaderField: "X-Pulshade-Pow-Bits").flatMap(Int.init),
@@ -397,7 +408,7 @@ struct RelayClient {
                 Work.learn(bits, for: bound)
                 let again = await Task.detached(priority: .userInitiated) { Work.header(for: bound, bits: bits) }.value
                 request.setValue(again, forHTTPHeaderField: "X-Pulshade-Pow")
-                answer = try await RelayPinning.shared.collect(request, body: body, in: session, limit: limit)
+                answer = try await attempt(request)
             }
             if let http = answer.1 as? HTTPURLResponse, http.statusCode != 429, http.statusCode != 426,
                let sent = request.value(forHTTPHeaderField: "X-Pulshade-Pow") {
@@ -417,13 +428,13 @@ struct RelayClient {
             // alive by the system (after a network change, say) isn't reused by every request that follows.
             if !Task.isCancelled, !slowUpload {
                 if Tor.uses(base) { Tor.renew(lane: name) }
-                let current = Self.lock.withLock {
+                let retired = Self.lock.withLock { () -> URLSession? in
                     Self.established.remove(name)
-                    guard Self.sessions[name] === session else { return false }
+                    guard let used, Self.sessions[name] === used else { return nil }
                     Self.sessions[name] = nil
-                    return true
+                    return used
                 }
-                if current { session.finishTasksAndInvalidate() }
+                retired?.finishTasksAndInvalidate()
             }
             throw error
         }
@@ -454,11 +465,9 @@ struct RelayClient {
             defer { sessions = [:]; established = [] }
             return sessions.values
         }
-        // Dropping them from the cache is enough for the finishing case: a request already under way keeps its
-        // own reference and ends safely, and the session goes once that reference does. Invalidating it here,
-        // even with `finishTasksAndInvalidate`, could catch a request that had just picked it up and make
-        // CFNetwork raise "task created in a session that has been invalidated", which Swift can't catch.
-        if !finishing { old.forEach { $0.invalidateAndCancel() } }
+        // They have left `sessions` under the lock, so no new task can be made on them (see `task(for:body:)`):
+        // requests under way either finish on them or are cut off, as asked.
+        old.forEach { finishing ? $0.finishTasksAndInvalidate() : $0.invalidateAndCancel() }
     }
 
     /// The same plain configuration everywhere, calls included, over Tor when it's on.

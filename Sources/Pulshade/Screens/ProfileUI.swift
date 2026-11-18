@@ -69,7 +69,7 @@ struct ProfileHero<Actions: View>: View {
                                         .padding(.horizontal, 7).padding(.vertical, 3)
                                         .background(theme.accent.opacity(0.14), in: .capsule)
                                         .overlay(Capsule().strokeBorder(theme.accent.opacity(0.35)))
-                                        .help("This handle can only belong to PULSHADE's creator")
+                                        .help("This username can only belong to PULSHADE's creator")
                                 }
                             }
                         }

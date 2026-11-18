@@ -186,6 +186,23 @@ struct SharedGroupFlowTests {
         await until([alice, bob, cara], seconds: 6) { cara.conversation(group.id)?.messages.contains { $0.text == "secret after removal" } == true }
         #expect(cara.conversation(group.id)?.messages.contains { $0.text == "secret after removal" } != true)
         #expect(alice.conversation(group.id)?.messages.contains { $0.text == "secret after removal" } == true)
+        // Cara's device, told she's out, keeps none of the group's keys.
+        await until([alice, bob, cara], seconds: 6) { cara.conversation(group.id)?.shared?.gone == true }
+        #expect(cara.conversation(group.id)?.shared?.gone == true)
+        #expect(cara.conversation(group.id)?.shared?.epochs.isEmpty == true)
+        #expect(cara.conversation(group.id)?.shared?.chains.isEmpty == true)
+
+        // A week after the next epoch began, an old epoch's key (and this device's chain in it) is erased, not kept.
+        let bi = try #require(bob.data.conversations.firstIndex { $0.id == group.id })
+        var shared = try #require(bob.data.conversations[bi].shared)
+        #expect(shared.epochs.contains { $0.number == first })
+        for k in shared.epochs.indices.dropLast() { shared.epochs[k].started = Date().addingTimeInterval(-40 * 86_400) }
+        shared.epochs[shared.epochs.count - 1].started = Date().addingTimeInterval(-20 * 86_400)
+        bob.data.conversations[bi].shared = shared
+        bob.tendSharedGroups()
+        let kept = try #require(bob.conversation(group.id)?.shared)
+        #expect(kept.epochs.map(\.number) == [first + 2], "only the current epoch's key is left")
+        #expect(!kept.chains.keys.contains(String(first)), "and no chain in an erased one")
     }
 
     /// A member's phone never got a new epoch's key (it was away, or the hand-out went astray). It asks again on its own
@@ -324,7 +341,7 @@ struct SharedGroupFlowTests {
         #expect(alice.conversation(group.id)?.shared?.current?.number == before + 1, "a new epoch")
         await until([alice, bob, cara]) { cara.conversation(group.id)?.shared?.gone == true && bob.conversation(group.id)?.shared?.current?.number == before + 1 }
         #expect(cara.conversation(group.id)?.shared?.gone == true)
-        #expect(cara.conversation(group.id)?.shared?.epochs.map(\.number) == [before], "Cara never got the new key")
+        #expect(cara.conversation(group.id)?.shared?.epochs.isEmpty == true, "Cara never got the new key, and her device let go of the old ones")
         #expect(bob.conversation(group.id)?.members.count == 1)
 
         bob.send("just us now", in: group.id)

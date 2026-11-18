@@ -8,6 +8,7 @@ struct NewConversationSheet: View {
 
     @State private var kind: ConversationKind?
     @State private var burner = false
+    @State private var addingFriend = false
     @State private var title = ""
     @State private var avatar: Data?
     @State private var picked: Set<String> = []
@@ -15,6 +16,14 @@ struct NewConversationSheet: View {
     @State private var problem: String?
 
     var body: some View {
+        if addingFriend {
+            PeopleView(openChat: { id in opened(id) }, inSheet: true)
+        } else {
+            sheet
+        }
+    }
+
+    private var sheet: some View {
         SheetBody(width: 480) {
             VStack(spacing: 20) {
                 SheetHeader(symbol: burner ? "link" : kind?.symbol ?? "plus", title: burner ? "One-time chat link" : kind?.label ?? "New")
@@ -35,6 +44,7 @@ struct NewConversationSheet: View {
     private var chooser: some View {
         VStack(spacing: 14) {
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 14), GridItem(.flexible(), spacing: 14)], spacing: 14) {
+                KindTile(symbol: "person.badge.plus", label: "Add a friend") { addingFriend = true }
                 ForEach(ConversationKind.creatable) { k in
                     KindTile(symbol: k.symbol, label: k.label) { kind = k }
                 }
@@ -141,10 +151,10 @@ struct ContactPicker: View {
     var body: some View {
         if model.visibleContacts.isEmpty {
             VStack(spacing: 10) {
-                Image(systemName: "qrcode.viewfinder")
+                Image(systemName: "person.badge.plus")
                     .font(.system(size: 34, weight: .light))
                     .foregroundStyle(theme.gradient)
-                Text("Add someone from Invite first")
+                Text("Add a friend first: go back and choose Add a friend")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(Ink.faint)
             }

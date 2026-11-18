@@ -57,9 +57,11 @@ struct GroupEpoch: Codable, Equatable {
     /// Well-formed as received: a number in range and a whole key.
     var isValid: Bool { groupNumberRange.contains(number) && key.count == 32 && (1...7).contains(days) }
 
-    /// How long the relay keeps a group's mail, in days. Short, since it holds mail even after everyone has read it (it
-    /// mustn't learn who has); a member away longer asks the others for what they missed (`Payload.groupCatchUp`).
-    static let defaultDays = 3
+    /// How long the relay keeps a group's mail, in days: the most it takes (7), so a member whose phone was off over a
+    /// long weekend still gets every post and photo (build 16; it was 3 from build 14). It holds mail even after
+    /// everyone has read it (it mustn't learn who has); a member away longer asks the others for what they missed
+    /// (`Payload.groupCatchUp`), which carries text but little else.
+    static let defaultDays = 7
 
     static func fresh(number: Int, days: Int = defaultDays) -> GroupEpoch {
         GroupEpoch(number: number, key: .random(32), days: min(max(days, 1), 7), started: Date())
@@ -721,7 +723,8 @@ struct HeldGroupMail: Codable, Equatable {
 /// What this device keeps about a group that shares one mailbox.
 struct SharedGroup: Codable, Equatable {
     var settings: GroupSettings
-    /// The epochs this device knows, oldest first. Earlier ones are kept for a while for mail that was late.
+    /// The epochs this device knows, oldest first. Earlier ones are kept until a week after the next began, for mail
+    /// that was late, then erased (`AppModel.tendSharedGroups`).
     var epochs: [GroupEpoch]
     /// This device's sending chain in each epoch, by epoch number (as text, for the vault's JSON).
     var chains: [String: SenderChain] = [:]

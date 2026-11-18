@@ -138,7 +138,9 @@ private struct PhoneMainView: View {
             model.onChatsTab = section == .chats
             if section == .chats { model.dismissBanner() }
         }
-        .background(TabHold(tab: 3, action: { switchingPersona = true }, doubleTap: { model.switchToNextPersona() }))
+        // Only on the Me tab itself, and the double tap only once Me is open (the first tap opens it).
+        .background(TabHold(tab: 3, action: { switchingPersona = true },
+                            doubleTap: { if section == .settings { model.switchToNextPersona() } }))
         .sheet(isPresented: $switchingPersona) {
             PersonaSwitcher(done: { switchingPersona = false })
                 .presentationDetents([.medium, .large])
@@ -255,8 +257,8 @@ private struct TabHold: UIViewRepresentable {
         static let name = "pulshade.tabhold"
         static let doubleName = "pulshade.tabdouble"
 
-        /// Gives the tab's button (and the copy iOS draws for the selection) the long press, once each.
-        func attach(in window: UIWindow) {
+        /// The tab bar's buttons and where each sits on screen.
+        private func tabButtons(in window: UIWindow) -> (buttons: [(view: UIView, frame: CGRect)], target: CGRect)? {
             var buttons: [(view: UIView, frame: CGRect)] = []
             func collect(_ view: UIView) {
                 if String(describing: type(of: view)).contains("TabButton"), view.bounds.width > 0 {
@@ -267,10 +269,22 @@ private struct TabHold: UIViewRepresentable {
             collect(window)
             var places: [CGRect] = []
             for b in buttons where !places.contains(b.frame) { places.append(b.frame) }
-            guard places.count > tab else { return }
+            guard places.count > tab else { return nil }
             let xs = places.map(\.midX), ys = places.map(\.midY)
             let across = (xs.max()! - xs.min()!) >= (ys.max()! - ys.min()!)
-            let target = places.sorted { across ? $0.minX < $1.minX : $0.minY < $1.minY }[tab]
+            return (buttons, places.sorted { across ? $0.minX < $1.minX : $0.minY < $1.minY }[tab])
+        }
+
+        /// iOS moves the copy it draws for the selected tab, gestures and all, to whichever tab is picked next, so a
+        /// gesture only counts if the touch is on this tab's place right now.
+        private func onTab(_ gesture: UIGestureRecognizer) -> Bool {
+            guard let window = gesture.view?.window, let found = tabButtons(in: window) else { return false }
+            return found.target.insetBy(dx: -4, dy: -4).contains(gesture.location(in: window))
+        }
+
+        /// Gives the tab's button (and the copy iOS draws for the selection) the long press, once each.
+        func attach(in window: UIWindow) {
+            guard let (buttons, target) = tabButtons(in: window) else { return }
             for b in buttons where b.frame == target && !(b.view.gestureRecognizers ?? []).contains(where: { $0.name == Self.name }) {
                 let press = UILongPressGestureRecognizer(target: self, action: #selector(pressed(_:)))
                 press.name = Self.name
@@ -293,12 +307,12 @@ private struct TabHold: UIViewRepresentable {
                                shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
 
         @objc func doubleTapped(_ tap: UITapGestureRecognizer) {
-            guard tap.state == .ended else { return }
+            guard tap.state == .ended, onTab(tap) else { return }
             doubleTap?()
         }
 
         @objc func pressed(_ press: UILongPressGestureRecognizer) {
-            guard press.state == .began else { return }
+            guard press.state == .began, onTab(press) else { return }
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             action()
         }
@@ -492,7 +506,8 @@ private struct ChatList: View {
     @State private var confirmDelete: Conversation?
     @State private var confirmClear = false
     @State private var scanningCode = false
-    /// The burn sheet, which only goes ahead once BURN is typed.
+    @State private var addingFriend = false
+    @State private var choosingUsername = false
     /// How tall the search bar and stories are together, so the list can snap past them.
     @State private var storiesHeight: CGFloat = 0
     /// Where the story strip is on screen, kept out of view state: it changes with every scroll frame.
@@ -630,6 +645,8 @@ private struct ChatList: View {
             NewConversationSheet { id in selection = id }
         }
         .sheet(isPresented: $scanningCode) { ScanSheet() }
+        .sheet(isPresented: $addingFriend) { PeopleView(openChat: { id in selection = id }, inSheet: true) }
+        .sheet(isPresented: $choosingUsername) { UsernameSheet() }
         // Each cover on an anchor of its own: two full-screen covers on one view cancel each other out.
         .background { Color.clear.storyCamera(isPresented: $composingStory) }
         .background {
@@ -646,7 +663,7 @@ private struct ChatList: View {
                 Image(systemName: "magnifyingglass")
                     .font(.system(size: Platform.isPhone ? 15 : 12, weight: .medium))
                     .foregroundStyle(Ink.faint)
-                TextField("", text: $search, prompt: Text("Search chats, people or @handle").foregroundStyle(Ink.faint))
+                TextField("", text: $search, prompt: Text("Search chats, people or @username").foregroundStyle(Ink.faint))
                     .textFieldStyle(.plain)
                     .font(.system(size: Platform.isPhone ? 16 : 13))
                     .foregroundStyle(Ink.text)
@@ -686,7 +703,10 @@ private struct ChatList: View {
     }
 
     @ViewBuilder private var rows: some View {
-        if items.isEmpty {
+        if items.isEmpty, filter == nil, search.isEmpty {
+            // Nothing here yet: say how to start, with or without a username.
+            GettingStartedCard(addFriend: { addingFriend = true }, chooseUsername: { choosingUsername = true })
+        } else if items.isEmpty {
             Constellation(symbol: filter?.symbol ?? "bubble.left.and.bubble.right",
                           text: search.isEmpty ? "No conversations" : "No results")
                 .padding(.top, 80)
