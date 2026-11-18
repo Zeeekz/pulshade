@@ -220,6 +220,7 @@ final class AppModel {
                 Task { @MainActor in self?.lock(keepingKeys: true) }
             }
         }
+        DemoContact.shared.start()
         // While locked, announcements still come, as a notification: they're public, so no vault is opened.
         Task { [weak self] in
             while true {
@@ -1046,6 +1047,9 @@ final class AppModel {
             }
         }
         if fromBeforeDeviceKeys { restartSessionsFromBeforeDeviceKeys() }
+        #if os(macOS)
+        DemoContact.shared.takeWaitingRequests(model: self)
+        #endif
     }
 
     /// Once, on the first unlock of data saved by a build before device keys (format 22 or older). Its ratchet sessions
@@ -1165,6 +1169,10 @@ final class AppModel {
     /// they only cover. A lock you press yourself always closes everything.
     func lock(keepingKeys: Bool = false) {
         guard phase == .unlocked else { return }
+        #if os(macOS)
+        // The demo contact stays open for days: only a lock pressed by hand closes it.
+        if keepingKeys, DemoContact.isOn { return }
+        #endif
         if covered { return }
         if keepingKeys, canCover { cover(); return }
         dismissBanner()
@@ -6968,6 +6976,9 @@ final class AppModel {
                 if data.requests.count > Self.maxRequests { data.requests.removeLast(data.requests.count - Self.maxRequests) }
             }
             sync(.requestReceived(incoming))
+            #if os(macOS)
+            DemoContact.shared.requestArrived(incoming.id, model: self)
+            #endif
             if data.security.notifications {
                 Notifier.shared.post(("PULSHADE", "New friend request"), conversation: incoming.id, sound: data.security.notificationSound)
             }
@@ -7780,6 +7791,9 @@ final class AppModel {
             let seen = openConversation == data.conversations[i].id && appActive && sendsReadReceipts(data.conversations[i])
             queueReceipt(wire.id, to: sender, read: seen)
         }
+        #if os(macOS)
+        DemoContact.shared.messageArrived(message, in: data.conversations[i].id, from: sender, model: self)
+        #endif
     }
 
     /// Shows a contact's @handle only once the directory has it signed by their key, so nobody can pass themselves
@@ -9300,6 +9314,14 @@ extension AppModel {
             enqueue(.callAnswer(id: invite.id, accepted: false), to: sender)
             return
         }
+        #if os(macOS)
+        if DemoContact.isOn {
+            // The demo contact doesn't take calls: turned down straight away, without ringing.
+            enqueue(.callAnswer(id: invite.id, accepted: false), to: sender)
+            kick()
+            return
+        }
+        #endif
         call = ActiveCall(invite: invite, peer: sender.fingerprint, persona: sender.persona, outgoing: false, phase: .ringing,
                           speaker: Platform.isPhone)
         let name = data.security.notificationContent == .hidden ? "PULSHADE" : sender.displayName
@@ -10124,7 +10146,12 @@ extension AppModel {
         data.conversations[i].postPolicy = s.postPolicy
         data.conversations[i].version = s.version
         if data.conversations[i].disappearAfter != s.disappearAfter { applyTimer(s.disappearAfter, at: i) }
-        if shared.joining, s.isMember(mine) { data.conversations[i].shared?.joining = false }
+        if shared.joining, s.isMember(mine) {
+            data.conversations[i].shared?.joining = false
+            #if os(macOS)
+            DemoContact.shared.joinedGroup(data.conversations[i].id, model: self)
+            #endif
+        }
     }
 
     /// A member's picture, kept if their card in the settings names it.
