@@ -956,10 +956,12 @@ final class AppModel {
         }
     }
 
-    /// Lock files from before the Secure Enclave binding get it on the next unlock. Only without a decoy or
-    /// panic passcode: their slots can't be rewritten without passcodes this device doesn't know.
+    /// Lock files from before the Secure Enclave binding get it on the next unlock. The other slots stay as they are (a
+    /// decoy or panic passcode may be in one, whatever this account's saved data says) and keep opening without the
+    /// device's secret until they are next rewritten. Only where a binding can be made: otherwise this would rewrite
+    /// the file on every unlock for nothing.
     private func bindToDevice(passcode: String) async {
-        guard isPrimary, data.decoySeed == nil, data.panicSeed == nil, let identity, !vault.isDeviceBound else { return }
+        guard isPrimary, Vault.canBindToDevice, let identity, !vault.isDeviceBound else { return }
         let vault = vault
         try? await Task.detached { try vault.create(identity, passcode: passcode, replacing: true) }.value
     }

@@ -99,7 +99,7 @@ struct Vault {
 
     /// A Secure Enclave key, wrapped so only this device's chip can use it, and the public half of a key it
     /// was paired with. Together they give the device secret mixed into every slot's key.
-    private struct DeviceBinding: Codable {
+    private struct DeviceBinding: Codable, Equatable {
         var enclaveKey: Data
         var ephemeral: Data
     }
@@ -109,6 +109,11 @@ struct Vault {
         var slots: [Slot]
         /// Nil where there's no Secure Enclave, and in files written before version 3.
         var device: DeviceBinding?
+        /// Slots that may have been sealed before this file was bound to the device (`device`): they are also tried
+        /// without its secret. Every slot but the first is listed, real or filler alike, and the list never shrinks when
+        /// one is rewritten (that would say which held a passcode): trying the plain key on a slot sealed with the
+        /// secret since opens nothing.
+        var unbound: [Int]?
     }
 
     /// Version 1 held a single slot.
@@ -131,20 +136,65 @@ struct Vault {
     /// A fresh vault: the identity in slot 0, filler in the rest, bound to this device. Refuses to replace an
     /// existing one unless the caller says so, so a restore or a link can never quietly shred the account already
     /// on this device. (`replacing` is only for adding the Secure Enclave binding to an older lock file.)
+    ///
+    /// Replacing keeps every other slot as it is: a decoy or panic passcode may be in one of them, and this device can't
+    /// tell (nor rewrite them without their passcodes). They are listed as sealed before the binding (`LockFile.unbound`),
+    /// so they still open, and no data file is touched.
     func create(_ identity: Identity, passcode: String, replacing: Bool = false) throws {
-        guard replacing || !exists else { throw VaultError.alreadyExists }
-        let device = Self.makeBinding()
-        let secret = try device.map(Self.deviceSecret)
-        var slots = (0..<Self.slotCount).map { _ in Self.filler() }
-        slots[0] = try Self.seal(.identity, identity.seed, passcode: passcode, device: secret)
-        try writeLock(slots, device: device)
-        rebalance(real: [identity])
+        if replacing {
+            // A file that's gone (a Burn got there first) is never made again from here.
+            guard exists else { throw VaultError.missing }
+            // The binding and the stretching take a while: made before taking the lock, so locking meanwhile isn't held
+            // up. Nothing safe to keep in a file that won't open: refuse rather than write over it.
+            let before = try readLock().device
+            // Already bound: keep that binding, or the other slots, sealed with its secret, would stop opening.
+            let device = before ?? Self.makeBinding()
+            let first = try Self.seal(.identity, identity.seed, passcode: passcode, device: try device.map(Self.deviceSecret))
+            try Self.mutation.withLock {
+                guard exists else { throw VaultError.missing }
+                let current = try readLock()
+                // Changed meanwhile (a panic, another rewrite of the binding): this is no longer the file to change.
+                guard current.device == before else { throw VaultError.corrupt }
+                var slots = current.slots
+                slots[0] = first
+                var unbound = Set(current.unbound ?? [])
+                if current.device == nil, device != nil { unbound.formUnion(1..<Self.slotCount) }
+                unbound.remove(0)
+                try writeLock(slots, device: device, unbound: unbound)
+            }
+            return
+        }
+        try Self.mutation.withLock {
+            guard !exists else { throw VaultError.alreadyExists }
+            let device = Self.makeBinding()
+            let secret = try device.map(Self.deviceSecret)
+            var slots = (0..<Self.slotCount).map { _ in Self.filler() }
+            slots[0] = try Self.seal(.identity, identity.seed, passcode: passcode, device: secret)
+            try writeLock(slots, device: device, unbound: [])
+            rebalance(real: [identity])
+        }
     }
+
+    /// Whether this device can bind a lock file to its Secure Enclave at all. Without one, a file stays unbound, and
+    /// trying again on every unlock would only rewrite it for nothing.
+    static var canBindToDevice: Bool {
+        guard SecureEnclave.isAvailable else { return false }
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["PULSHADE_NO_ENCLAVE"] != nil || bindingOffForTests { return false }
+        #endif
+        return true
+    }
+
+    #if DEBUG
+    /// Tests only: lock files made while this is set aren't bound, as if written before binding existed.
+    nonisolated(unsafe) static var bindingOffForTests = false
+    #endif
 
     /// Tries every slot, always all of them, so timing doesn't reveal which one matched.
     func unlock(passcode: String) throws -> Opened {
-        let (slots, device) = try readLock()
+        let (slots, device, unbound) = try readLock()
         let secret = try device.map(Self.deviceSecret)
+        let beforeBinding = Set(unbound ?? [])
         var opened: Opened?
         for (index, slot) in slots.enumerated() {
             // A malformed salt (only possible in an editable, Keychain-less lock file) would make the KDF
@@ -152,9 +202,16 @@ struct Vault {
             guard !slot.salt.isEmpty else { continue }
             // Derive and decrypt every slot even after one matches: stopping early would let the timing (and
             // the number of decryptions) say which slot a passcode opened, defeating decoy/panic deniability.
-            let key = Self.slotKey(passcode, salt: slot.salt, iterations: Self.safeIterations(slot.iterations), device: secret)
-            let plain = (try? AES.GCM.SealedBox(combined: slot.sealed))
-                .flatMap { try? AES.GCM.open($0, using: key) }
+            let stretched = Self.stretch(passcode, salt: slot.salt, iterations: Self.safeIterations(slot.iterations))
+            var keys = [Self.slotKey(stretched: stretched, salt: slot.salt, device: secret)]
+            // A slot sealed before the file was bound opens without the device's secret (see `LockFile.unbound`).
+            if secret != nil, beforeBinding.contains(index) { keys.append(stretched) }
+            let box = try? AES.GCM.SealedBox(combined: slot.sealed)
+            var plain: Data?
+            // Every key is tried, even after one opens, so a listed slot always does the same work whatever it holds.
+            for key in keys {
+                if let box, let opened = try? AES.GCM.open(box, using: key), plain == nil { plain = opened }
+            }
             guard opened == nil, let plain else { continue }
             if plain.count == 32 {
                 // Written by version 1: a bare seed.
@@ -180,57 +237,81 @@ struct Vault {
     }
 
     /// Whether the lock file is bound to this device's Secure Enclave. Older files aren't until rewritten.
-    var isDeviceBound: Bool { (try? readLock().device) != nil }
+    var isDeviceBound: Bool { (try? readLock())?.device != nil }
 
     /// Puts an identity (or a panic landing identity) behind a passcode in a slot.
     func setSlot(_ index: Int, identity: Identity, passcode: String, panic: Bool = false) throws {
-        var (slots, device) = try readLock()
-        slots[index] = try Self.seal(panic ? .panic : .identity, identity.seed, passcode: passcode,
-                                     device: device.map(Self.deviceSecret))
-        try writeLock(slots, device: device)
+        // Stretching the passcode takes a while: it's done before taking the lock, so locking the app meanwhile
+        // isn't held up, and done again in the rare case the binding changed in between.
+        let binding = try readLock().device
+        var sealed = try Self.seal(panic ? .panic : .identity, identity.seed, passcode: passcode, device: binding.map(Self.deviceSecret))
+        try Self.mutation.withLock {
+            var (slots, device, unbound) = try readLock()
+            if device != binding {
+                // Bound in the meantime (the upgrade): sealed again with its secret. Any other change of binding is a
+                // panic having replaced the whole file: a passcode set for the file before it must not land in it.
+                guard binding == nil, device != nil else { throw VaultError.corrupt }
+                sealed = try Self.seal(panic ? .panic : .identity, identity.seed, passcode: passcode, device: device.map(Self.deviceSecret))
+            }
+            slots[index] = sealed
+            try writeLock(slots, device: device, unbound: Set(unbound ?? []))
+        }
     }
 
     /// The panic passcode was used: the landing identity becomes an ordinary account in the first slot,
     /// under a brand-new device key, every other slot becomes filler, and every other data file is
     /// shredded along with Touch ID.
     func panic(keeping landing: Identity, slot: Int, passcode: String) throws {
-        let device = Self.makeBinding()
-        var slots = (0..<Self.slotCount).map { _ in Self.filler() }
-        slots[0] = try Self.seal(.identity, landing.seed, passcode: passcode, device: device.map(Self.deviceSecret))
-        try writeLock(slots, device: device)
-        let keep = dataURL(for: landing).lastPathComponent
-        let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
-        for url in files where url.pathExtension == "vault" && url.lastPathComponent != keep { shred(url) }
-        disableBiometrics()
-        rebalance(real: [landing])
+        try Self.mutation.withLock {
+            let device = Self.makeBinding()
+            var slots = (0..<Self.slotCount).map { _ in Self.filler() }
+            slots[0] = try Self.seal(.identity, landing.seed, passcode: passcode, device: device.map(Self.deviceSecret))
+            try writeLock(slots, device: device, unbound: [])
+            let keep = dataURL(for: landing).lastPathComponent
+            let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+            for url in files where url.pathExtension == "vault" && url.lastPathComponent != keep { shred(url) }
+            disableBiometrics()
+            rebalance(real: [landing])
+        }
     }
 
     /// Turns a slot back into filler and destroys the data it pointed at.
     func clearSlot(_ index: Int, identity: Identity?) throws {
-        var (slots, device) = try readLock()
-        slots[index] = Self.filler()
-        try writeLock(slots, device: device)
-        if let identity { shred(dataURL(for: identity)) }
+        try Self.mutation.withLock {
+            var (slots, device, unbound) = try readLock()
+            slots[index] = Self.filler()
+            try writeLock(slots, device: device, unbound: Set(unbound ?? []))
+            if let identity { shred(dataURL(for: identity)) }
+        }
     }
 
     /// Rewrites the lock file under a new Keychain key, so every earlier copy stops opening.
     func rotate() {
-        guard let (slots, device) = try? readLock() else { return }
-        try? writeLock(slots, device: device)
+        Self.mutation.withLock {
+            guard let (slots, device, unbound) = try? readLock() else { return }
+            try? writeLock(slots, device: device, unbound: Set(unbound ?? []))
+        }
     }
 
-    private func readLock() throws -> (slots: [Slot], device: DeviceBinding?) {
+    /// Every change to the lock file and the Face ID file reads it, changes it and writes it back, with the Keychain's
+    /// list of keys for it: two at once (a passcode set in the background while locking rotates the key) would undo
+    /// each other, losing the passcode or leaving the file sealed under a key the Keychain has dropped. They take turns.
+    private static let mutation = NSRecursiveLock()
+
+    private func readLock() throws -> (slots: [Slot], device: DeviceBinding?, unbound: [Int]?) {
         let raw = try readSealed(lockURL, keys: lockKeys)
         if let file = try? JSONDecoder().decode(LockFile.self, from: raw), file.slots.count == Self.slotCount {
-            return (file.slots, file.device)
+            return (file.slots, file.device, file.unbound?.filter { (0..<Self.slotCount).contains($0) })
         }
         guard let old = try? JSONDecoder().decode(LegacyLockFile.self, from: raw) else { throw VaultError.corrupt }
         return ([Slot(salt: old.salt, iterations: old.iterations, sealed: old.sealedSeed)]
-            + (1..<Self.slotCount).map { _ in Self.filler() }, nil)
+            + (1..<Self.slotCount).map { _ in Self.filler() }, nil, nil)
     }
 
-    private func writeLock(_ slots: [Slot], device: DeviceBinding?) throws {
-        try writeSealed(Self.encoder.encode(LockFile(slots: slots, device: device)), to: lockURL, keys: lockKeys)
+    private func writeLock(_ slots: [Slot], device: DeviceBinding?, unbound: Set<Int>) throws {
+        // Only listed with a binding: without one every slot opens without a device secret anyway.
+        let listed = device == nil || unbound.isEmpty ? nil : unbound.sorted()
+        try writeSealed(Self.encoder.encode(LockFile(slots: slots, device: device, unbound: listed)), to: lockURL, keys: lockKeys)
     }
 
     /// No slash escaping, so a file is the same size whatever the random bytes are.
@@ -245,6 +326,8 @@ struct Vault {
     /// Seals a file under a brand-new Keychain key. The new key is added before the file is written and
     /// the old one dropped after, so whatever is on disk always has its key.
     private func writeSealed(_ plain: Data, to url: URL, keys: FileKeys) throws {
+        Self.mutation.lock()
+        defer { Self.mutation.unlock() }
         let old = keys.load()
         let fresh = SymmetricKey(size: .bits256)
         do {
@@ -271,6 +354,8 @@ struct Vault {
             if let plain = try? AES.GCM.open(box, using: key) { return plain }
         }
         // Sealed under an older name for this file (iOS moved the app's folder): adopt that key, drop the old item.
+        Self.mutation.lock()
+        defer { Self.mutation.unlock() }
         for stray in keys.others() {
             for key in stray.load() {
                 guard let plain = try? AES.GCM.open(box, using: key) else { continue }
@@ -291,7 +376,10 @@ struct Vault {
 
     /// The stretched passcode, mixed with the device secret when there is one.
     private static func slotKey(_ passcode: String, salt: Data, iterations: UInt32, device: SymmetricKey?) -> SymmetricKey {
-        let stretched = stretch(passcode, salt: salt, iterations: iterations)
+        slotKey(stretched: stretch(passcode, salt: salt, iterations: iterations), salt: salt, device: device)
+    }
+
+    private static func slotKey(stretched: SymmetricKey, salt: Data, device: SymmetricKey?) -> SymmetricKey {
         guard let device else { return stretched }
         return HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: stretched.bytes + device.bytes), salt: salt,
                                       info: Data("pulshade.slot.v3".utf8), outputByteCount: 32)
@@ -305,7 +393,7 @@ struct Vault {
         guard SecureEnclave.isAvailable else { return nil }
         #if DEBUG
         // Tests only. A shipped build never lets its surroundings switch the binding off.
-        if ProcessInfo.processInfo.environment["PULSHADE_NO_ENCLAVE"] != nil { return nil }
+        if ProcessInfo.processInfo.environment["PULSHADE_NO_ENCLAVE"] != nil || bindingOffForTests { return nil }
         #endif
         var error: Unmanaged<CFError>?
         guard let access = SecAccessControlCreateWithFlags(nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
@@ -366,8 +454,10 @@ struct Vault {
 
     /// Revokes the file's Keychain key as well, so a copy of it left on the disk never answers a fingerprint.
     func disableBiometrics() {
-        if hasBiometrics || biometricKeys.inUse { biometricKeys.revoke() }
-        shred(biometricURL)
+        Self.mutation.withLock {
+            if hasBiometrics || biometricKeys.inUse { biometricKeys.revoke() }
+            shred(biometricURL)
+        }
     }
 
     /// Shows the Touch ID prompt. Blocks until the person answers, so call it off the main thread.
@@ -512,6 +602,8 @@ struct Vault {
     /// Overwrites every file with random bytes before deleting them, and revokes their Keychain keys.
     /// `leavingNoTrace` (Burn) deletes the Keychain items and the folder too, rather than leaving revoked keys.
     func destroy(leavingNoTrace: Bool = false) {
+        Self.mutation.lock()
+        defer { Self.mutation.unlock() }
         if leavingNoTrace {
             lockKeys.forget()
             biometricKeys.forget()
