@@ -70,8 +70,8 @@ for name in "${names[@]}"; do
   if hits=$(grep -rlaiF -- "$name" "$check"); then
     found+="${hits//$check\//}"$'\n'
   else
-    status=$?
-    [[ $status -eq 1 ]] || { echo "Name check couldn't read the app (grep exited $status)."; exit 1; }
+    rc=$?
+    [[ $rc -eq 1 ]] || { echo "Name check couldn't read the app (grep exited $rc)."; exit 1; }
   fi
 done
 found=$(printf '%s' "$found" | sort -u | sed '/^$/d')
