@@ -86,6 +86,7 @@ struct LimitsTests {
         _ = Work.proof(for: "backup|speed", bits: Work.heavy)
         let seconds = Date().timeIntervalSince(start)
         print("PoW \(Work.heavy) bits took \(seconds) s")
-        #expect(seconds < 10)
+        // Sanitizers make SHA-256 several times slower; the point here is correctness, not the clock.
+        #expect(seconds < (runningUnderSanitizer ? 180 : 10))
     }
 }

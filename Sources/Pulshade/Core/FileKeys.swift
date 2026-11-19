@@ -38,8 +38,14 @@ struct FileKeys {
         Self.accounts().filter { $0 != account }.map(FileKeys.init(account:))
     }
 
-    /// Tests keep keys in memory, so they don't leave hundreds of items in the login Keychain.
-    nonisolated(unsafe) static var inMemory = false
+    /// Tests keep keys in memory, so they don't leave hundreds of items in the login Keychain. Read from parallel
+    /// tests and written once by the test harness, so it is guarded; in a shipped build it is only ever read false.
+    nonisolated(unsafe) private static var _inMemory = false
+    private static let flagLock = NSLock()
+    static var inMemory: Bool {
+        get { flagLock.withLock { _inMemory } }
+        set { flagLock.withLock { _inMemory = newValue } }
+    }
     nonisolated(unsafe) private static var memory: [String: Data] = [:]
     private static let lock = NSLock()
 

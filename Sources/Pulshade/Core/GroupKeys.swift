@@ -567,9 +567,11 @@ struct GroupRoster: Codable, Equatable {
         var size = 4
         while size < sealedKeys.count { size *= 2 }
         while sealedKeys.count < size { sealedKeys[Data.random(8).hex] = Data.random(32 + GroupPQ.overhead) }
-        // The body is padded to a power of two (at least 1 KiB) before sealing.
+        // The body is padded to a power of two before sealing. The floor is large enough that every roster a small
+        // group makes (a few member cards, each carrying an ML-KEM key) lands in the same bucket: otherwise the
+        // relay could tell a one-member follower list from a three-member one by its size.
         var padded = plain
-        var target = 1_024
+        var target = 8_192
         while target < padded.count + 4 { target *= 2 }
         padded = be32(UInt32(plain.count)) + plain + Data(count: target - plain.count - 4)
         guard let box = try? ChaChaPoly.seal(padded, using: rosterKey).combined else { return nil }

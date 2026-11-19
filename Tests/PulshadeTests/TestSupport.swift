@@ -1,10 +1,31 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 @testable import Pulshade
+
+/// True when the suite is running under Address/Thread/Undefined sanitizer instrumentation, which slows
+/// everything down enough that wall-clock assertions are meaningless.
+var runningUnderSanitizer: Bool {
+    #if canImport(Darwin)
+    // The runtime defines these symbols in the process it instruments; the environment isn't reliable.
+    func present(_ name: String) -> Bool {
+        dlsym(UnsafeMutableRawPointer(bitPattern: -2), name) != nil
+    }
+    return present("__asan_init") || present("__tsan_init") || present("__ubsan_handle_add_overflow")
+    #else
+    return false
+    #endif
+}
+
+/// Set once, thread-safely: tests keep keys in memory so they don't leave hundreds of items in the login
+/// Keychain. Writing this from every `testDirectory` call raced when suites ran in parallel.
+private let inMemoryKeysConfigured: Void = { FileKeys.inMemory = true }()
 
 /// Where tests put throwaway vaults. `PULSHADE_TEST_DIR` overrides the system temp folder,
 /// for sandboxes that don't allow writing there.
 func testDirectory(_ prefix: String) -> URL {
-    FileKeys.inMemory = true
+    _ = inMemoryKeysConfigured
     let base = ProcessInfo.processInfo.environment["PULSHADE_TEST_DIR"].map { URL(fileURLWithPath: $0) }
         ?? FileManager.default.temporaryDirectory
     return base.appendingPathComponent("\(prefix)-\(UUID().uuidString)")
