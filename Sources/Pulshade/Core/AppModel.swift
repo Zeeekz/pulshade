@@ -2463,10 +2463,11 @@ final class AppModel {
     }
 
     /// Answers a friend's story in your chat with them: a like, or words. It arrives as an ordinary message
-    /// quoting the story, so the relay sees nothing new and older builds show it too.
-    func answerStory(_ story: Story, like: Bool = false, text: String = "") async {
+    /// quoting the story, so the relay sees nothing new and older builds show it too. False when nothing was sent.
+    @discardableResult
+    func answerStory(_ story: Story, like: Bool = false, text: String = "") async -> Bool {
         let words = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard story.author != "me", like || !words.isEmpty, contact(story.author, in: story.persona) != nil else { return }
+        guard story.author != "me", like || !words.isEmpty, contact(story.author, in: story.persona) != nil else { return false }
         let picture = await Self.storyPicture(story)
         let convo = startConversation(kind: .direct, title: "", members: [story.author], persona: .some(story.persona))
         let quote = ReplyRef(id: story.id, author: story.author, snippet: Self.snippet(of: story), picture: picture)
@@ -2475,6 +2476,7 @@ final class AppModel {
             data.stories[i].liked = true
             save()
         }
+        return true
     }
 
     /// A photo shrunk for the quote above a reply to it. Nil when there's no photo, or it can't be made small enough.

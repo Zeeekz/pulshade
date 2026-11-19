@@ -70,6 +70,9 @@ final class StoryClip {
 /// A still of a clip, for places that don't play it.
 struct StoryPoster: View {
     var data: Data
+    /// Which clip this is (its story, and how much of it has come): two different clips can be the same size, and a
+    /// hash of the bytes may look at only their start, which clips share.
+    var key: String
     @State private var image: PlatformImage?
 
     var body: some View {
@@ -81,7 +84,7 @@ struct StoryPoster: View {
                 .frame(width: 54, height: 54)
                 .background(.black.opacity(0.4), in: .circle)
         }
-        .task(id: data.count) {
+        .task(id: key) {
             guard !data.isEmpty else { return }
             if let cg = await StoryVideo.poster(of: MemoryClip(data)) { image = PlatformImage.from(cgImage: cg) }
         }
@@ -522,10 +525,14 @@ struct StoryMediaPicker<Label: View>: View {
         panel.allowedContentTypes = [.image, .movie]
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
+        // A locally picked file still can't be allowed to exhaust memory: cap it like one received.
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+        guard size > 0, size <= 100 * 1024 * 1024 else { return }
         if let type = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType, type.conforms(to: .movie) {
             // Read in place and held in memory: no copy is made on disk.
             if let bytes = try? Data(contentsOf: url, options: .mappedIfSafe) { picked(.clip(MemoryClip(bytes), .none)) }
-        } else if let image = NSImage(contentsOf: url) {
+        } else if let bytes = try? Data(contentsOf: url, options: .mappedIfSafe),
+                  ImageLimits.isReasonable(bytes), let image = NSImage(data: bytes) {
             pending = PendingCrop(image: image)
         }
         #else

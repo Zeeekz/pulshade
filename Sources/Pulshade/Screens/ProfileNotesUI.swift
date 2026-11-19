@@ -72,8 +72,6 @@ struct NoteReaderSheet: View {
     @State private var password = ""
     @State private var words: String?
     @State private var working = false
-    @State private var failures = 0
-    @State private var waitUntil = Date.distantPast
     @State private var problem: String?
 
     private var text: String? { note.isLocked ? words : note.text }
@@ -147,7 +145,7 @@ struct NoteReaderSheet: View {
     /// tries this screen makes you wait; that slows a person down, and the slow key derivation is what slows a program.
     private func tryOpen() {
         guard !password.isEmpty, !working else { return }
-        guard Date() >= waitUntil else {
+        guard Date() >= NoteAttempts.wait(for: note.id) else {
             problem = "Wait a few seconds before trying again."
             return
         }
@@ -158,11 +156,10 @@ struct NoteReaderSheet: View {
             let opened = await Task.detached(priority: .userInitiated) { note.open(password: attempt) }.value
             working = false
             if let opened {
-                words = opened; failures = 0
+                words = opened; NoteAttempts.opened(note.id)
             } else {
-                failures += 1
-                if failures >= 3 { waitUntil = Date().addingTimeInterval(Double(min(30, failures * 3))) }
-                problem = "That password didn't open it."
+                let count = NoteAttempts.failed(note.id)
+                problem = count >= 3 ? "Wait a few seconds before trying again." : "That password didn't open it."
             }
         }
     }

@@ -242,7 +242,7 @@ struct StoryFace: View {
                 } else if let clip {
                     LayerView(layer: clip.layer).frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
-                    StoryPoster(data: data)
+                    StoryPoster(data: data, key: "\(story.id.uuidString)-\(data.count)")
                 }
                 if !caption.isEmpty { StoryCaption(text: caption, compact: compact) }
             }
@@ -1871,19 +1871,33 @@ struct StoryViewer: View {
 
     private func like(_ story: Story) {
         guard story.liked != true else { return }
-        flash("Liked")
-        model.playSendSound()
-        Task { await model.answerStory(story, like: true) }
+        Task {
+            let sent = await model.answerStory(story, like: true)
+            guard sent else { return }
+            await MainActor.run {
+                model.playSendSound()
+                flash("Liked")
+            }
+        }
     }
 
     private func sendReply(to story: Story) {
         let words = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !words.isEmpty else { return }
-        Task { await model.answerStory(story, text: words) }
-        model.playSendSound()
-        replyText = ""
-        replying = false
-        flash("Reply sent")
+        Task {
+            let sent = await model.answerStory(story, text: words)
+            await MainActor.run {
+                if sent {
+                    model.playSendSound()
+                    replyText = ""
+                    replying = false
+                    flash("Reply sent")
+                } else {
+                    // Keep the words so they can try again.
+                    flash("Couldn't send")
+                }
+            }
+        }
     }
 
     private func flash(_ note: String) {

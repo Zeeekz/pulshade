@@ -125,7 +125,7 @@ struct LinkLoginFlow: View {
         OnboardingPage(title: "Check the digits",
                        subtitle: linker.senderConfirms
                            ? "Your other device now shows digits. They must be exactly these."
-                           : "Your other device is an older version and can't show digits to check.",
+                           : "This device can't confirm which device sent the account.",
                        back: leave) {
             VStack(spacing: 16) {
                 if linker.senderConfirms, let digits = linker.confirmation {
@@ -133,7 +133,7 @@ struct LinkLoginFlow: View {
                     Text("If they differ, someone else answered first: don't continue.")
                         .font(.system(size: 12, weight: .medium)).foregroundStyle(.orange).multilineTextAlignment(.center)
                 } else {
-                    Text("Update PULSHADE on your other device to check them. Only go on if you started this just now and are sure it was your device.")
+                    Text("The device that sent this account can't show the digits, so there is no way to check it came from the device you approved. Update PULSHADE on the other device and start again.")
                         .font(.system(size: 12, weight: .medium)).foregroundStyle(.orange).multilineTextAlignment(.center)
                 }
             }
@@ -141,14 +141,19 @@ struct LinkLoginFlow: View {
         } actions: {
             if linker.senderConfirms {
                 Button("They match") { linker.confirm() }.buttonStyle(PrimaryButtonStyle())
+                Button("They don't match, cancel") {
+                    linker.cancel()
+                    linker.offer()
+                }
+                .buttonStyle(SecondaryButtonStyle())
             } else {
-                Button("Continue without checking") { linker.confirm() }.buttonStyle(SecondaryButtonStyle())
+                // No digits means no proof: an older or hostile sender must not get the account by omitting them.
+                Button("Start again") {
+                    linker.cancel()
+                    linker.offer()
+                }
+                .buttonStyle(PrimaryButtonStyle())
             }
-            Button("They don't match, cancel") {
-                linker.cancel()
-                linker.offer()
-            }
-            .buttonStyle(SecondaryButtonStyle())
         }
     }
 

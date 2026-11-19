@@ -51,14 +51,45 @@ enum RelayClock {
     /// A relay can correct a clock that is wrong, but not by an unbounded amount: a hostile relay must not be able
     /// to date messages months away, expiring everything or bringing old disappearing messages back.
     private static let maxSkew: TimeInterval = 7 * 86_400
+    /// A correction larger than this needs a second sample that agrees with it. One `Date` header is not enough:
+    /// a single hostile or broken response must not move the clock by days.
+    private static let agreedStep: TimeInterval = 5
+    /// A sample older than this is not evidence for a later one.
+    private static let pendingLife: TimeInterval = 600
+
+    struct Pending {
+        var measured: TimeInterval
+        var at: Date
+    }
+
+    nonisolated(unsafe) private static var pending: Pending?
 
     /// Notes the relay's time from a response. The header is to the second, so small differences are left alone.
     static func note(_ response: URLResponse) {
         guard let header = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Date"),
               let theirs = lock.withLock({ format.date(from: header) }) else { return }
         let measured = theirs.timeIntervalSinceNow
+        lock.withLock {
+            let next = next(offset: offset, pending: pending, measured: measured, now: Date())
+            offset = next.offset
+            pending = next.pending
+        }
+    }
+
+    /// The offset after one sample. Small corrections apply at once; larger ones wait for a second sample that
+    /// agrees within `agreedStep`, so a single header can't move the clock by days. Pure, so tests can drive it.
+    static func next(offset: TimeInterval, pending: Pending?, measured: TimeInterval, now: Date)
+        -> (offset: TimeInterval, pending: Pending?) {
         let bounded = min(max(measured, -maxSkew), maxSkew)
-        lock.withLock { if abs(bounded - offset) > 2 { offset = abs(bounded) > 2 ? bounded : 0 } }
+        if abs(bounded) <= agreedStep {
+            // A small correction, likely a real difference between the device clock and the relay's.
+            return (abs(bounded) > 2 ? bounded : 0, nil)
+        }
+        if let pending, now.timeIntervalSince(pending.at) <= pendingLife,
+           abs(bounded - pending.measured) <= agreedStep {
+            return (bounded, nil)
+        }
+        return (offset, Pending(measured: bounded, at: now))
     }
 }
 
@@ -271,7 +302,8 @@ final class RelayPinning: NSObject, URLSessionDataDelegate {
 
     private static func loaded() -> [String: Set<Data>] {
         guard let configured = Bundle.main.object(forInfoDictionaryKey: "PulshadeRelayPin") as? String,
-              let host = URL(string: AppData.directRelay ?? "")?.host()?.lowercased() else { return [:] }
+              let rawHost = URL(string: AppData.directRelay ?? "")?.host() else { return [:] }
+        let host = hostKey(rawHost)
         let trimmed = configured.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [:] }
         // Accept a file's trailing newlines as well as spaces around each comma-separated hash.
@@ -283,9 +315,16 @@ final class RelayPinning: NSObject, URLSessionDataDelegate {
         return [host: hashes]
     }
 
+    /// A host as it is compared: lowercase, without a trailing dot, so `relay.example.com.` still finds its pin.
+    private static func hostKey(_ raw: String) -> String {
+        var host = raw.lowercased()
+        while host.hasSuffix(".") { host.removeLast() }
+        return host
+    }
+
     /// Whether `host`'s pin, if it has one, accepts this leaf certificate. True when the host isn't pinned.
     static func accepts(host: String, leafDER: Data, leafKeyInfo: Data? = nil) -> Bool {
-        guard let hashes = pins[host.lowercased()] else { return true }
+        guard let hashes = pins[hostKey(host)] else { return true }
         if hashes.contains(Data(SHA256.hash(data: leafDER))) { return true }
         if let info = leafKeyInfo, hashes.contains(Data(SHA256.hash(data: info))) { return true }
         return false
