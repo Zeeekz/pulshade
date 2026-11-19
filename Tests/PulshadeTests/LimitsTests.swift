@@ -86,8 +86,7 @@ struct LimitsTests {
         _ = Work.proof(for: "backup|speed", bits: Work.heavy)
         let seconds = Date().timeIntervalSince(start)
         print("PoW \(Work.heavy) bits took \(seconds) s")
-        // A generous bound: this catches a pathological regression, not the difference between a fast and a loaded
-        // machine. Sanitizers slow SHA-256 several times over.
+        // A loose bound: catches a serious slowdown, tolerates a busy or sanitizer-instrumented machine.
         #expect(seconds < (runningUnderSanitizer ? 180 : 30))
     }
 }

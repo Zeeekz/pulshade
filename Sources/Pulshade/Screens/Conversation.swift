@@ -725,7 +725,8 @@ struct ConversationView: View {
         } else if attachments.isEmpty {
             // Nothing but spaces: don't wipe the draft for a message that won't be sent.
             if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return }
-            model.send(draft, replyTo: replyingTo, preview: preview, mentioning: picks, in: id)
+            // A chat that has become read-only refuses the send; keep what was typed.
+            guard model.send(draft, replyTo: replyingTo, preview: preview, mentioning: picks, in: id) else { return }
         } else {
             for (i, photo) in attachments.enumerated() {
                 model.send(i == 0 ? draft : "", image: photo, replyTo: i == 0 ? replyingTo : nil,

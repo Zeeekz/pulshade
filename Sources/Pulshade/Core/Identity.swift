@@ -318,8 +318,12 @@ enum Base32 {
 
 extension Data {
     static func random(_ count: Int) -> Data {
+        guard count > 0 else { return Data() }
         var bytes = Data(count: count)
-        let status = bytes.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, count, $0.baseAddress!) }
+        let status = bytes.withUnsafeMutableBytes { buffer in
+            guard let base = buffer.baseAddress else { return errSecParam }
+            return SecRandomCopyBytes(kSecRandomDefault, count, base)
+        }
         // Key material must never silently become a run of zeros.
         precondition(status == errSecSuccess, "System random generator failed")
         return bytes

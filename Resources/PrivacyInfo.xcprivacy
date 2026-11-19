@@ -27,7 +27,7 @@
 				<string>C617.1</string>
 			</array>
 		</dict>
-		<!-- Animation timing (CACurrentMediaTime) and elapsed-time measurement on the device. -->
+		<!-- Animation timing (CACurrentMediaTime) and Arti's uptime reads. -->
 		<dict>
 			<key>NSPrivacyAccessedAPIType</key>
 			<string>NSPrivacyAccessedAPICategorySystemBootTime</string>

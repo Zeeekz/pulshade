@@ -72,6 +72,7 @@ open build/Pulshade.app
 
 ```bash
 swift test                        # the tests that run on their own, no server needed
+./scripts/fuzz.sh 60              # mutates the parsers for a minute under AddressSanitizer
 ```
 
 The apps are in `Sources/Pulshade` (the Mac and iPhone share all their code) and the Tor

@@ -1785,13 +1785,14 @@ final class AppModel {
         data.conversations.first { $0.kind == .direct && $0.members == [fingerprint] && $0.persona == persona }
     }
 
+    @discardableResult
     func send(_ text: String, image: Data? = nil, voice: VoiceNote? = nil, replyTo: Message? = nil,
               quote: ReplyRef? = nil, preview: LinkPreview? = nil, collectible: Collectible? = nil, note: NoteCard? = nil,
-              mentioning picks: [(fingerprint: String, name: String)] = [], forwarded: Bool = false, in id: Conversation.ID) {
+              mentioning picks: [(fingerprint: String, name: String)] = [], forwarded: Bool = false, in id: Conversation.ID) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty || image != nil || voice != nil || collectible != nil || note != nil, let i = index(of: id) else { return }
+        guard !trimmed.isEmpty || image != nil || voice != nil || collectible != nil || note != nil, let i = index(of: id) else { return false }
         let convo = data.conversations[i]
-        guard canPost(in: convo) else { return }
+        guard canPost(in: convo) else { return false }
 
         let now = Date()
         // Replying to a photo carries a small copy of it, so the quote shows what was answered.
@@ -1823,13 +1824,13 @@ final class AppModel {
             sync(.sent(ref(convo), wire))
             lastTypingSent[id] = nil
             save()
-            return
+            return true
         }
         if postIfShared(.message(wire), in: id, message: message.id) {
             sync(.sent(ref(convo), wire))
             lastTypingSent[id] = nil
             save()
-            return
+            return true
         }
         let recipients = audience(convo)
         // A big photo or voice note goes to the relay once for everyone whose app takes it that way; the others get it
@@ -1847,6 +1848,7 @@ final class AppModel {
         if recipients.isEmpty { setStatus(.sent, for: [message.id]) }
         lastTypingSent[id] = nil
         save()
+        return true
     }
 
     // MARK: Forwarding

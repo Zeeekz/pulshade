@@ -7,6 +7,12 @@ import Foundation
 @Suite struct RelayClockTests {
     private let t0 = Date(timeIntervalSince1970: 1_800_000_000)
 
+    @Test func ordinaryDeviceDriftAppliesAtOnce() {
+        let next = RelayClock.next(offset: 0, pending: nil, measured: 30, now: t0)
+        #expect(next.offset == 30, "half a minute off is a clock, not an attack")
+        #expect(next.pending == nil)
+    }
+
     @Test func aSmallCorrectionAppliesAtOnce() {
         let next = RelayClock.next(offset: 0, pending: nil, measured: 3, now: t0)
         #expect(next.offset == 3)

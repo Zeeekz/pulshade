@@ -2,6 +2,9 @@ import Foundation
 import CryptoKit
 import CommonCrypto
 import LocalAuthentication
+#if canImport(Darwin)
+import Darwin
+#endif
 
 enum VaultError: Error {
     case wrongPasscode, corrupt, missing, alreadyExists
@@ -611,6 +614,12 @@ struct Vault {
 
     static func stretch(_ passcode: String, salt: Data, iterations: UInt32) -> SymmetricKey {
         var derived = Data(count: 32)
+        // The stretched bytes are copied into the key below; don't leave the working buffer in memory.
+        defer {
+            derived.withUnsafeMutableBytes { buffer in
+                if let base = buffer.baseAddress { _ = memset_s(base, buffer.count, 0, buffer.count) }
+            }
+        }
         let password = Array(passcode.utf8).map { Int8(bitPattern: $0) }
         let status = derived.withUnsafeMutableBytes { out in
             salt.withUnsafeBytes { saltBytes in

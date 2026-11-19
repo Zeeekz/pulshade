@@ -52,8 +52,9 @@ enum RelayClock {
     /// to date messages months away, expiring everything or bringing old disappearing messages back.
     private static let maxSkew: TimeInterval = 7 * 86_400
     /// A correction larger than this needs a second sample that agrees with it. One `Date` header is not enough:
-    /// a single hostile or broken response must not move the clock by days.
-    private static let agreedStep: TimeInterval = 5
+    /// a single hostile or broken response must not move the clock by days. Ordinary device drift (under a minute)
+    /// still corrects on the first response.
+    private static let agreedStep: TimeInterval = 60
     /// A sample older than this is not evidence for a later one.
     private static let pendingLife: TimeInterval = 600
 
