@@ -67,7 +67,16 @@ found=""
 for name in "${names[@]}"; do
   [[ -z "$name" ]] && continue
   # A read error matters here: it could hide a leak, so it is not swallowed. Exit 1 is just "no match".
-  if hits=$(grep -rlaiF -- "$name" "$check"); then
+  # The account name counts only as a whole word, as before build 17: a short one sits inside ordinary words, and the
+  # Tor bridges carry Brotli's built-in dictionary of thousands of them. It's escaped, so still matched literally.
+  if [[ "$name" == "${USER:-}" ]]; then
+    pattern="(^|[^a-z])$(printf '%s' "$name" | sed 's/[][\.*^$+?(){}|/]/\\&/g')([^a-z]|\$)"
+    flags=-rlaiE
+  else
+    pattern="$name"
+    flags=-rlaiF
+  fi
+  if hits=$(grep $flags -- "$pattern" "$check"); then
     found+="${hits//$check\//}"$'\n'
   else
     rc=$?
