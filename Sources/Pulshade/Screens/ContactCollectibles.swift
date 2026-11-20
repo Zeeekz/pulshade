@@ -12,12 +12,12 @@ struct ContactCollectibles: View {
     @State private var viewing: Collectible?
 
     var body: some View {
-        let shown = items.filter { $0.kind != nil }
+        let shown = items
         if !shown.isEmpty {
             ExpandableCard(title: "Collectibles", symbol: "sparkles", count: shown.count, startsOpen: true) {
                 HStack(spacing: -4) {
                     ForEach(shown.prefix(4)) { item in
-                        if let kind = item.kind { CollectibleIcon(item: kind, size: 26) }
+                        CollectibleArtwork(item: item.item, size: 26)
                     }
                 }
             } content: {
@@ -32,11 +32,12 @@ struct ContactCollectibles: View {
     }
 
     private func tile(_ item: Collectible) -> some View {
-        let opens = item.kind?.has3DView == true
+        let info = item.info
+        let opens = info.known
         return Button { if opens { viewing = item } } label: {
             VStack(spacing: 6) {
-                if let kind = item.kind { CollectibleIcon(item: kind, size: 56) }
-                Text(item.kind?.name ?? item.item)
+                CollectibleArtwork(item: item.item, size: 56)
+                Text(branded: info.name)
                     .font(.system(size: 12, weight: .semibold)).foregroundStyle(Ink.text).lineLimit(1).minimumScaleFactor(0.8)
                 Text("#\(item.serial)").font(.system(size: 11, design: .monospaced)).foregroundStyle(Ink.faint)
                 if item.rarity != .common { RarityTag(item: item) }
@@ -48,6 +49,6 @@ struct ContactCollectibles: View {
             .contentShape(.rect(cornerRadius: 12))
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(item.kind?.name ?? item.item), number \(item.serial)")
+        .accessibilityLabel("\(info.name), number \(item.serial)")
     }
 }

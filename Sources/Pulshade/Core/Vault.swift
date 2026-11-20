@@ -61,6 +61,8 @@ struct Vault {
     private var biometricKeys: FileKeys { FileKeys(directory: directory, file: "identity.bio") }
     /// Seals the seed of this device's own keys (`DeviceKey`) inside the data file.
     private var deviceKeyKeys: FileKeys { FileKeys(directory: directory, file: "device.key") }
+    private var catalogKeys: FileKeys { FileKeys(directory: directory, file: "catalog.cache") }
+    private var catalogURL: URL { directory.appendingPathComponent("catalog.cache") }
 
     var exists: Bool { FileManager.default.fileExists(atPath: lockURL.path) }
 
@@ -509,6 +511,22 @@ struct Vault {
         return nil
     }
 
+    // MARK: Collectibles list
+
+    /// The collectibles list and its pictures, kept for the next unlock so they needn't be fetched again. They're the
+    /// same for everyone and say nothing about any account, so there is one file for the device, not one per identity
+    /// (a file per identity would count the real ones). Sealed with a Keychain key like the lock file, and shredded with
+    /// everything else on Burn and Detach.
+    func saveCatalog(_ plain: Data) throws {
+        try writeSealed(plain, to: catalogURL, keys: catalogKeys)
+    }
+
+    func loadCatalog() -> Data? {
+        // Never read a copy that isn't sealed: this file has always been.
+        guard catalogKeys.inUse else { return nil }
+        return try? readSealed(catalogURL, keys: catalogKeys)
+    }
+
     // MARK: Data
 
     /// Each identity's data file is named from its storage key, so names reveal nothing.
@@ -608,13 +626,15 @@ struct Vault {
             lockKeys.forget()
             biometricKeys.forget()
             deviceKeyKeys.forget()
+            catalogKeys.forget()
         } else {
+            if catalogKeys.inUse { catalogKeys.revoke() }
             if deviceKeyKeys.inUse { deviceKeyKeys.revoke() }
             if exists || lockKeys.inUse { lockKeys.revoke() }
             if hasBiometrics || biometricKeys.inUse { biometricKeys.revoke() }
         }
         let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
-        for url in files where ["lock", "vault", "bio"].contains(url.pathExtension) { shred(url) }
+        for url in files where ["lock", "vault", "bio", "cache"].contains(url.pathExtension) { shred(url) }
         if leavingNoTrace {
             // Everything left, other profiles (PULSHADE_PROFILE) included, is overwritten and removed, then the
             // folder itself. A Burn has to leave nothing that says an account was ever here.

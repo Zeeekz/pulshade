@@ -1657,7 +1657,8 @@ extension Collectible {
 
     /// Signed by the Pulshade Admin key this build carries, for the account with `owner`'s key.
     @MainActor func isGenuine(for owner: Data) -> Bool {
-        isGenuine(for: owner, adminKey: AppModel.adminKey, petKey: AppModel.petKey)
+        isGenuine(for: owner, adminKey: AppModel.adminKey, petKey: AppModel.petKey,
+                  transferable: CollectibleLibrary.shared.item(item)?.transferable)
     }
 }
 

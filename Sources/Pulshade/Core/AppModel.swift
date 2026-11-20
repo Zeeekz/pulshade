@@ -1033,6 +1033,8 @@ final class AppModel {
         resendPendingRequests()
         nextAnnouncementCheck = Date().addingTimeInterval(trafficShaping ? 5 : 0)
         nextCollectibleCheck = Date().addingTimeInterval(trafficShaping ? 40 : 3600)
+        loadCatalog()
+        nextCatalogCheck = checksCatalog ? Date().addingTimeInterval(trafficShaping ? 25 : 3) : .distantFuture
         announcementsVersion = nil
         announceProfiles()
         relistStrandedProfiles()
@@ -1217,6 +1219,8 @@ final class AppModel {
         openConversation = nil
         Platform.setBadge(0)
         withAnimation(.smooth(duration: 0.5)) { phase = .locked }
+        CollectibleLibrary.shared.clear(by: self)
+        nextCatalogCheck = .distantFuture
         tendStoryUpload()
     }
 
@@ -1248,6 +1252,7 @@ final class AppModel {
         backupTask = nil
         discardSaves()
         vault.destroy(leavingNoTrace: leavingNoTrace)
+        CollectibleLibrary.shared.clear(by: self)
         // A Burn keeps its order so the server side can still be finished; every other wipe leaves nothing behind.
         if !keepingBurnOrder {
             burnStore.delete()
@@ -3938,7 +3943,7 @@ final class AppModel {
     /// Set when the backup code starts covering something, so an alert can say so. Memory only.
     var codeAlert: CodeAlert?
     /// The next time to look for new collectibles: soon after unlocking, then every half hour.
-    private var nextCollectibleCheck = Date.distantFuture
+    var nextCollectibleCheck = Date.distantFuture
     /// After entering a giveaway code, looking for the new collectible more often until this time.
     private var collectibleWatchUntil = Date.distantPast
 
@@ -3963,7 +3968,7 @@ final class AppModel {
         // arrive rather than make a second code that would break that one.
         if activeProfile.collectionCode == nil, genuine.contains(where: { $0.coded && known[$0.collectible.id] == nil }) { return }
         let code = activeProfile.collectionCode
-        let uncovered = genuine.map(\.collectible).filter { ($0.kind?.transferable ?? true) && (code == nil || known[$0.id] != code) }
+        let uncovered = genuine.map(\.collectible).filter { $0.info.transferable && (code == nil || known[$0.id] != code) }
         guard !uncovered.isEmpty else { return }
         let fresh = code == nil
         let covered = (try? await cover(uncovered, with: code ?? Collectible.newBackupCode())) ?? []
@@ -4045,7 +4050,7 @@ final class AppModel {
     @discardableResult
     func makeNewCollectionCode() async throws -> String {
         let code = Collectible.newBackupCode()
-        let all = (activeProfile.collectibles ?? []).filter { $0.kind?.transferable ?? true }
+        let all = (activeProfile.collectibles ?? []).filter { $0.info.transferable }
         let covered = try await cover(all, with: code)
         if covered.count < all.count { throw DirectoryError.unreachable }
         return code
@@ -4105,6 +4110,17 @@ final class AppModel {
             return .giveaway(item: place.item, place: place.place)
         }
     }
+
+    // MARK: Collectibles list
+
+    /// The next time to ask the relay for the collectibles list: just after unlocking, then every half hour (a relay
+    /// that has nothing new answers with a bare 304), and five minutes after a try that didn't get through.
+    var nextCatalogCheck = Date.distantFuture
+    /// One fetch at a time.
+    var checkingCatalog = false
+    /// Whether the list is checked by itself after unlocking and every half hour. Not under tests (which keep their keys
+    /// in memory): hundreds of test accounts in one process would all ask at once. They ask when they want it.
+    var checksCatalog = !FileKeys.inMemory
 
     // MARK: Announcements
 
@@ -5962,6 +5978,10 @@ final class AppModel {
         if Date() >= nextAnnouncementCheck {
             nextAnnouncementCheck = Date().addingTimeInterval(60)
             Task { await refreshAnnouncements(waiting: false) }
+        }
+        if Date() >= nextCatalogCheck {
+            nextCatalogCheck = Date().addingTimeInterval(30 * 60)
+            Task { await refreshCatalog(waiting: false) }
         }
         #if os(macOS)
         if Date() >= nextUpdateCheck, Updater.enabled, let client = client(nil, lane: "update") {

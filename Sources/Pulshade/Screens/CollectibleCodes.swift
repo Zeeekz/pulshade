@@ -16,7 +16,7 @@ struct BackupCodeSheet: View {
     @State private var confirmReplace = false
 
     private var items: [Collectible] { alert?.items ?? model.activeProfile.collectibles ?? [] }
-    private var names: String { items.map { "\($0.kind?.name ?? $0.item) #\($0.serial)" }.formatted(.list(type: .and)) }
+    private var names: String { items.map { "\($0.info.name) #\($0.serial)" }.formatted(.list(type: .and)) }
 
     private var title: String {
         guard let alert else { return "Backup code" }
@@ -31,7 +31,7 @@ struct BackupCodeSheet: View {
                     HStack(spacing: 12) {
                         ForEach(items.prefix(6)) { item in
                             VStack(spacing: 4) {
-                                if let kind = item.kind { CollectibleIcon(item: kind, size: 52) }
+                                CollectibleArtwork(item: item.item, size: 52)
                                 Text("#\(item.serial)").font(.system(size: 11, design: .monospaced)).foregroundStyle(Ink.faint)
                             }
                         }
@@ -150,11 +150,11 @@ struct ClaimCodeCard: View {
             do {
                 switch try await model.enterCollectibleCode(code) {
                 case let .restored(found):
-                    let names = found.map { "\(Collectible.Kind(rawValue: $0.item)?.name ?? $0.item) #\($0.serial)" }
+                    let names = found.map { "\(CollectibleLibrary.shared.info($0.item).name) #\($0.serial)" }
                         .formatted(.list(type: .and))
                     result = ("\(names) will show up here once PULSHADE has signed \(found.count == 1 ? "it" : "them") over to you.", false)
                 case let .giveaway(item, place):
-                    let name = Collectible.Kind(rawValue: item)?.name ?? item
+                    let name = CollectibleLibrary.shared.info(item).name
                     result = ("You're number \(place) in line for \(name). It shows up here within a few minutes.", false)
                 }
                 code = ""

@@ -138,13 +138,22 @@ public struct Collectible: Codable, Equatable, Hashable, Identifiable {
         return Collectible(item: kind.rawValue, serial: serial, owner: owner, sig: sig)
     }
 
+    /// Made by the admin app for `owner`, for any item: a built-in one or one from the collectibles list.
+    public static func make(item: String, serial: UInt32, owner: Data, signedBy admin: Curve25519.Signing.PrivateKey) throws -> Collectible {
+        let sig = try admin.signature(for: signedPart(item: item, serial: serial, owner: owner))
+        return Collectible(item: item, serial: serial, owner: owner, sig: sig)
+    }
+
     /// Given to `owner`, signed by `adminKey` (the Pulshade Admin key a build carries) or `petKey` (the relay's, for
-    /// hatched and gifted ones), and an item this build knows how to show.
-    public func isGenuine(for owner: Data, adminKey: Data?, petKey: Data? = nil) -> Bool {
-        guard kind != nil, self.owner == owner else { return false }
+    /// hatched and gifted ones). The item needn't be one this build draws: one added later through the collectibles list
+    /// is just as genuine, and shows a placeholder until the list arrives. `transferable` is what the list says of an
+    /// item this build doesn't know; without it such an item takes the admin key only.
+    public func isGenuine(for owner: Data, adminKey: Data?, petKey: Data? = nil, transferable: Bool? = nil) -> Bool {
+        guard CollectibleCatalog.validID(item), self.owner == owner else { return false }
         let message = Self.signedPart(item: item, serial: serial, owner: owner)
         // The relay's key only counts for what can be hatched or passed on. A Guardian is the admin key's alone.
-        return [adminKey, kind?.transferable == true ? petKey : nil].contains { raw in
+        let movable = kind?.transferable ?? transferable ?? false
+        return [adminKey, movable ? petKey : nil].contains { raw in
             guard let raw, let key = try? Curve25519.Signing.PublicKey(rawRepresentation: raw) else { return false }
             return key.isValidSignature(sig, for: message)
         }

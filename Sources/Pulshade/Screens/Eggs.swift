@@ -204,12 +204,12 @@ struct HatchedSheet: View {
         VStack(spacing: 16) {
             Spacer(minLength: 0)
             Text("It hatched!").font(.system(size: 13, weight: .semibold)).foregroundStyle(Ink.dim)
-            if let kind = pet.kind { CollectibleIcon(item: kind, size: 200) }
+            CollectibleArtwork(item: pet.item, size: 200)
             VStack(spacing: 4) {
-                Text(pet.kind?.name ?? pet.item).font(.system(size: 24, weight: .bold)).foregroundStyle(Ink.text)
+                Text(branded: pet.info.name).font(.system(size: 24, weight: .bold)).foregroundStyle(Ink.text)
                 RarityTag(item: pet)
-                if let kind = pet.kind {
-                    Text(branded: kind.blurb).font(.system(size: 13)).foregroundStyle(Ink.faint)
+                if !pet.info.blurb.isEmpty {
+                    Text(branded: pet.info.blurb).font(.system(size: 13)).foregroundStyle(Ink.faint)
                         .multilineTextAlignment(.center).padding(.top, 4)
                 }
             }
@@ -247,7 +247,7 @@ struct GiftSheet: View {
     var body: some View {
         SheetBody(width: 420) {
             VStack(alignment: .leading, spacing: 20) {
-                SheetHeader(symbol: "gift.fill", title: "Gift \(item.kind?.name ?? "collectible") #\(item.serial)")
+                SheetHeader(symbol: "gift.fill", title: "Gift \(item.info.name) #\(item.serial)")
                 SettingsGroup(footer: "It moves to them with its number. It leaves your collection, and you can't take it back.") {
                     if contacts.isEmpty { SettingRow("No contacts yet") { EmptyView() } }
                     ForEach(Array(contacts.enumerated()), id: \.element.id) { i, c in
@@ -280,7 +280,7 @@ struct GiftSheet: View {
                 }
             }
         } message: {
-            Text("\(item.kind?.name ?? "It") #\(item.serial) leaves your collection.")
+            Text("\(item.info.name) #\(item.serial) leaves your collection.")
         }
     }
 }

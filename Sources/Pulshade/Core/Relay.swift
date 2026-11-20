@@ -799,6 +799,32 @@ struct RelayClient {
         return (try JSONDecoder().decode([Announcement].self, from: data), http.value(forHTTPHeaderField: "X-Pulshade-Version"))
     }
 
+    /// The signed collectibles list, or nil when the relay's is still `version`, the one this app has. The same for every
+    /// app, so asking says nothing about who asks.
+    func catalog(since version: UInt64?) async throws -> CollectibleCatalog.Signed? {
+        var request = URLRequest(url: base.appending(path: "v1/catalog"))
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        if let version { request.setValue(String(version), forHTTPHeaderField: "X-Pulshade-Version") }
+        await prove(&request, "catalog")
+        guard let (data, response) = try? await load(request, limit: 128 * 1024), let http = response as? HTTPURLResponse else {
+            throw DirectoryError.unreachable
+        }
+        if http.statusCode == 304 || http.statusCode == 404 { return nil }
+        guard http.statusCode == 200 else { throw DirectoryError.unreachable }
+        return try JSONDecoder().decode(CollectibleCatalog.Signed.self, from: data)
+    }
+
+    /// One picture of the collectibles list, by its SHA-256. The caller checks it against the signed list.
+    func catalogArt(_ sha256: String, bytes: Int) async throws -> Data {
+        guard CollectibleCatalog.validHash(sha256) else { throw DirectoryError.invalid }
+        var request = URLRequest(url: base.appending(path: "v1/catalog/art/\(sha256)"))
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        await prove(&request, "catalog")
+        guard let (data, response) = try? await load(request, limit: min(bytes, CollectibleCatalog.Limits.artBytes)),
+              (response as? HTTPURLResponse)?.statusCode == 200 else { throw DirectoryError.unreachable }
+        return data
+    }
+
     /// Every handle this key owns. The relay only answers with a fresh signature from the key.
     func owned(key: String, sig: String, ts: UInt64) async throws -> [(handle: String, entry: DirectoryEntry)] {
         struct Proof: Encodable { var key: String; var sig: String; var ts: UInt64 }

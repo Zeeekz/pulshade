@@ -58,10 +58,8 @@ struct QuickSendSheet: View {
                         Item(id: "n" + note.id, symbol: note.isLocked ? "lock.fill" : note.isRestricted ? "person.fill.checkmark" : "doc.text",
                              title: note.title, detail: note.subtitle, send: { sendNote(note) })
                     })
-                    section("Collectibles", collectibles.compactMap { c in
-                        c.kind.map { kind in
-                            Item(id: "c" + c.id, symbol: "", kind: kind, title: kind.name, detail: "#\(c.serial)", send: { sendCollectible(c, kind) })
-                        }
+                    section("Collectibles", collectibles.map { c in
+                        Item(id: "c" + c.id, symbol: "", collectible: c.item, title: c.info.name, detail: "#\(c.serial)", send: { sendCollectible(c) })
                     })
                 }
                 .padding(20)
@@ -85,7 +83,7 @@ struct QuickSendSheet: View {
         var id: String
         var symbol: String
         /// A collectible's drawing, shown instead of the symbol.
-        var kind: Collectible.Kind?
+        var collectible: String?
         var title: String
         var detail: String
         var send: () -> Void
@@ -109,8 +107,8 @@ struct QuickSendSheet: View {
         finish()
     }
 
-    private func sendCollectible(_ collectible: Collectible, _ kind: Collectible.Kind) {
-        model.send("\(kind.name) #\(collectible.serial)", collectible: collectible, in: conversation)
+    private func sendCollectible(_ collectible: Collectible) {
+        model.send("\(collectible.info.name) #\(collectible.serial)", collectible: collectible, in: conversation)
         finish()
     }
 
@@ -166,8 +164,8 @@ struct QuickSendSheet: View {
             item.send()
         } label: {
             HStack(spacing: 12) {
-                if let kind = item.kind {
-                    CollectibleIcon(item: kind, size: 34).frame(width: 34, height: 34)
+                if let collectible = item.collectible {
+                    CollectibleArtwork(item: collectible, size: 34).frame(width: 34, height: 34)
                 } else {
                     Image(systemName: item.symbol)
                         .font(.system(size: 14, weight: .semibold)).foregroundStyle(theme.accent)

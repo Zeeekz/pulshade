@@ -35,7 +35,7 @@ struct SettingsView: View {
                                     value: "Code, link or @username")
                             RowDivider(inset: 54)
                             MenuRow(page: .collectibles, symbol: "crown.fill", color: .hex(0xE5383B), title: "Collectibles",
-                                    value: model.activeProfile.badge?.kind?.name)
+                                    value: model.activeProfile.badge?.info.name)
                             RowDivider(inset: 54)
                             MenuRow(page: .pets, symbol: "pawprint.fill", color: .hex(0xFF9F0A), title: "Pets")
                         }

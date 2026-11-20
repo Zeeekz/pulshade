@@ -1452,17 +1452,18 @@ private struct CollectibleCard: View {
     var mine: Bool
 
     var body: some View {
-        if let kind = collectible.kind {
+        let info = collectible.info
+        do {
             VStack(spacing: 4) {
-                CollectibleIcon(item: kind, size: 132)
-                Text(kind.name).font(.system(size: 14, weight: .semibold))
+                CollectibleArtwork(item: collectible.item, size: 132)
+                Text(branded: info.name).font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(mine ? Ink.onAccent : Ink.text).lineLimit(1)
                 Text("#\(collectible.serial)").font(.system(size: 12, weight: .medium))
                     .foregroundStyle(mine ? Ink.onAccent.opacity(0.7) : Ink.dim)
             }
             .padding(.vertical, 6).padding(.horizontal, 10)
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel("\(kind.name), number \(collectible.serial)")
+            .accessibilityLabel("\(info.name), number \(collectible.serial)")
         }
     }
 }

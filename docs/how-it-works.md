@@ -153,6 +153,19 @@ show one given to someone else: every app checks the signature before showing it
 to fetch with a fresh signature, sealed like the directory. One taken back stops showing the next time its owner's app
 checks. You choose one to show after your name, to your contacts and on your public profile.
 
+**The collectibles list.** New collectibles can come without an app update. Pulshade Admin publishes a list (each
+item's id, name, a line of words, whether it can be passed on, and its picture as an animated PNG named by its SHA-256),
+signed by the admin key over the list's exact bytes. The relay hands the same list and pictures to anyone who asks, with
+no account attached, and apps check about every half hour. An app checks the signature before reading the list and
+each picture's hash before decoding it, so nothing the admin app didn't sign is ever opened; it refuses a list older
+than one it already has, so the relay can only hold a list back, not take items away by replaying an old one. Every
+picture is fetched whenever the list changes, never one at a time, so fetching says nothing about whose collectibles
+you've seen. Pictures are kept small (512 by 512, 72 frames and 512 KB at most each, 6 MB for the whole list), and the
+device keeps the list sealed with a Keychain key, shredded on Burn and Detach. It's data only: names, words and
+pictures; what a collectible can do is the same for all of them and stays in the app. A collectible of an item an
+app doesn't have the picture for yet (the list hasn't arrived) shows a plain placeholder until it does. Builds before
+the list don't show list collectibles at all.
+
 One **backup code** covers all of an account's collectibles. The app makes it with the first collectible and adds each
 later one to it (an alert says so, and Collectibles shows the code any time). It stays on your own devices; the relay
 keeps only its hash, beside each collectible it covers. When an account burns, the relay forgets whose its

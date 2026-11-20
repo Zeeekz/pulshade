@@ -14,6 +14,7 @@ struct CollectibleViewerSheet: View {
     var readOnly = false
 
     private var wearing: Bool { model.activeProfile.badge == item }
+    private var info: CollectibleInfo { item.info }
     @State private var gifting = false
     @State private var letting = false
     @State private var problem: String?
@@ -39,10 +40,10 @@ struct CollectibleViewerSheet: View {
                     .font(.system(size: 15, weight: .semibold)).foregroundStyle(theme.accent)
             }
             VStack(spacing: 4) {
-                Text(item.kind?.name ?? item.item).font(.system(size: 22, weight: .bold)).foregroundStyle(Ink.text)
+                Text(branded: info.name).font(.system(size: 22, weight: .bold)).foregroundStyle(Ink.text)
                 RarityTag(item: item)
-                if let kind = item.kind {
-                    Text(branded: kind.blurb).font(.system(size: 13)).foregroundStyle(Ink.faint)
+                if !info.blurb.isEmpty {
+                    Text(branded: info.blurb).font(.system(size: 13)).foregroundStyle(Ink.faint)
                         .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
                         .padding(.top, 2)
                 }
@@ -54,8 +55,10 @@ struct CollectibleViewerSheet: View {
                     DragonViewer(golden: item.kind == .goldPulze)
                 } else if item.kind == .bitcoin {
                     BitcoinViewer()
-                } else if let kind = item.kind {
-                    ObjectViewer3D(kind: kind)
+                } else if info.kind != nil || info.listed.flatMap(CollectibleLibrary.shared.artData) != nil {
+                    ObjectViewer3D(item: item.item)
+                } else {
+                    CollectiblePlaceholder(size: 160)
                 }
             }
             .frame(maxWidth: .infinity, minHeight: 300)
@@ -77,7 +80,7 @@ struct CollectibleViewerSheet: View {
             }
             .buttonStyle(.plain)
             HStack(spacing: 10) {
-                if item.kind?.transferable ?? true {
+                if info.transferable {
                     otherButton("Gift", symbol: "gift") { gifting = true }
                 }
                 otherButton("Let go", symbol: "xmark.bin", tint: .red) { letting = true }
@@ -86,7 +89,7 @@ struct CollectibleViewerSheet: View {
             }
         }
         .sheet(isPresented: $gifting) { GiftSheet(item: item) { dismiss() } }
-        .confirmationDialog("Let \(item.kind?.name ?? "it") #\(item.serial) go?", isPresented: $letting, titleVisibility: .visible) {
+        .confirmationDialog("Let \(info.name) #\(item.serial) go?", isPresented: $letting, titleVisibility: .visible) {
             Button("Let it go", role: .destructive) {
                 Task {
                     do { try await model.release(item); dismiss() }

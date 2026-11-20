@@ -13,7 +13,7 @@ import UIKit
 /// with a lit face front and back and shaded edges, swaying gently until you take hold of it. Drag to turn, pinch
 /// or scroll to zoom. (Pulze The Dragon has its own, fully modelled viewer.)
 struct ObjectViewer3D: View {
-    var kind: Collectible.Kind
+    var item: String
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var object: ObjectScene?
 
@@ -29,28 +29,37 @@ struct ObjectViewer3D: View {
                 ProgressView().controlSize(.small)
             }
         }
-        .task(id: kind) { object = ObjectScene(kind, still: reduceMotion) }
-        .accessibilityLabel("\(kind.name), a 3D view you can turn")
+        .task(id: item) { object = ObjectScene(item, still: reduceMotion) }
+        .accessibilityLabel("\(CollectibleLibrary.shared.info(item).name), a 3D view you can turn")
     }
 }
 
 @MainActor final class ObjectScene {
     let scene = SCNScene()
-    private let kind: Collectible.Kind
+    private let item: String
     private let face = SCNMaterial()
     private let side = SCNMaterial()
 
     /// The collectible's art on a clear background, as an image to stack. Drawn at the moment it's asked for, so
     /// its animation is wherever it has got to.
-    static func picture(_ kind: Collectible.Kind) -> CGImage? {
+    static func picture(_ item: String, still: Bool = false) -> CGImage? {
+        guard let kind = Collectible.Kind(rawValue: item) else {
+            // One from the collectibles list: its animated picture's frame for this moment, as decoded already.
+            guard let listed = CollectibleLibrary.shared.item(item), let data = CollectibleLibrary.shared.artData(listed) else { return nil }
+            let index = still ? 0 : CatalogFrames.index(at: Date(), art: listed.art)
+            return CatalogFrames.shared.frame(art: listed.art, data: data, index: index, pixels: 512)
+        }
         let renderer = ImageRenderer(content: CollectibleIcon(item: kind, size: 320).frame(width: 320, height: 320))
         renderer.scale = 2
         renderer.isOpaque = false
         return renderer.cgImage
     }
 
-    init(_ kind: Collectible.Kind, still: Bool) {
-        self.kind = kind
+    private let still: Bool
+
+    init(_ item: String, still: Bool) {
+        self.item = item
+        self.still = still
         let object = SCNNode()
         for material in [face, side] {
             material.lightingModel = .constant
@@ -102,7 +111,7 @@ struct ObjectViewer3D: View {
         let now = Date()
         guard now.timeIntervalSince(lastFrame) >= 0.009 || lastFrame == .distantPast else { return }
         lastFrame = now
-        guard let image = Self.picture(kind) else { return }
+        guard let image = Self.picture(item, still: still) else { return }
         framesDrawn += 1
         face.diffuse.contents = image
         side.diffuse.contents = image

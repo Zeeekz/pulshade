@@ -1052,10 +1052,11 @@ public struct BadgeMark: View {
     }
 
     public var body: some View {
-        if let badge, let kind = badge.kind {
-            CollectibleIcon(item: kind, size: size)
-                .help("\(kind.name) #\(badge.serial)")
-                .accessibilityLabel("\(kind.name) number \(badge.serial)")
+        if let badge {
+            let name = CollectibleLibrary.shared.info(badge.item).name
+            CollectibleArtwork(item: badge.item, size: size)
+                .help("\(name) #\(badge.serial)")
+                .accessibilityLabel("\(name) number \(badge.serial)")
         }
     }
 }

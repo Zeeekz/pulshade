@@ -18,8 +18,12 @@ struct CollectiblesView: View {
 
     private var owned: [Collectible] { model.activeProfile.collectibles ?? [] }
     private var worn: Collectible? { model.activeProfile.badge }
-    /// Kinds this persona has none of yet, shown faded so people know what exists.
-    private var missing: [Collectible.Kind] { Collectible.Kind.allCases.filter { kind in !owned.contains { $0.kind == kind } } }
+    /// Collectibles this persona has none of yet, built in or from the collectibles list, shown faded so people know
+    /// what exists.
+    private var missing: [CollectibleInfo] {
+        let all = Collectible.Kind.allCases.map(\.rawValue) + (CollectibleLibrary.shared.catalog?.items.map(\.id) ?? [])
+        return all.filter { item in !owned.contains { $0.item == item } }.map { CollectibleLibrary.shared.info($0) }
+    }
 
     var body: some View {
         Group {
@@ -53,7 +57,7 @@ struct CollectiblesView: View {
     @State private var tab = Tab.collectibles
     private var showPets: Bool { pets ?? (tab == .pets) }
 
-    private func isPet(_ item: Collectible) -> Bool { item.kind?.category == .pets }
+    private func isPet(_ item: Collectible) -> Bool { item.info.category == .pets }
     private var collectibleCount: Int { owned.filter { !isPet($0) }.count }
     private var petCount: Int { owned.filter(isPet).count }
 
@@ -84,7 +88,7 @@ struct CollectiblesView: View {
             if !notYet.isEmpty {
                 DisclosureGroup {
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 12)], spacing: 12) {
-                        ForEach(notYet) { kind in missingCard(kind) }
+                        ForEach(notYet, id: \.item) { info in missingCard(info) }
                     }
                     .padding(.top, 10)
                 } label: {
@@ -114,7 +118,7 @@ struct CollectiblesView: View {
                     Text(model.activeProfile.displayName).font(.system(size: 17, weight: .semibold)).foregroundStyle(Ink.text)
                     BadgeMark(badge: worn, size: 18)
                 }
-                Text(worn.flatMap { w in w.kind.map { "Showing \($0.name) #\(w.serial)" } } ?? "Nothing after your name")
+                Text(worn.map { "Showing \($0.info.name) #\($0.serial)" } ?? "Nothing after your name")
                     .font(.system(size: 12)).foregroundStyle(Ink.faint)
             }
             Spacer(minLength: 0)
@@ -158,14 +162,15 @@ struct CollectiblesView: View {
 
     private func ownedCard(_ item: Collectible) -> some View {
         let wearing = worn == item
-        let opens = item.kind?.has3DView == true
+        let info = item.info
+        let opens = info.known
         return Button {
             if opens { viewing = item } else { withAnimation(.snappy) { model.wear(wearing ? nil : item) } }
         } label: {
             VStack(spacing: 10) {
-                if let kind = item.kind { CollectibleIcon(item: kind, size: 84) }
+                CollectibleArtwork(item: item.item, size: 84)
                 VStack(spacing: 2) {
-                    Text(item.kind?.name ?? item.item).font(.system(size: 15, weight: .semibold)).foregroundStyle(Ink.text)
+                    Text(branded: info.name).font(.system(size: 15, weight: .semibold)).foregroundStyle(Ink.text)
                     RarityTag(item: item)
                 }
                 Text(wearing ? "After your name" : (opens ? "View in 3D" : "Show after your name"))
@@ -183,12 +188,12 @@ struct CollectiblesView: View {
         .buttonStyle(.plain)
     }
 
-    private func missingCard(_ kind: Collectible.Kind) -> some View {
+    private func missingCard(_ info: CollectibleInfo) -> some View {
         VStack(spacing: 10) {
-            CollectibleIcon(item: kind, size: 84).saturation(0).opacity(0.3)
+            CollectibleArtwork(item: info.item, size: 84).saturation(0).opacity(0.3)
             VStack(spacing: 2) {
-                Text(kind.name).font(.system(size: 15, weight: .semibold)).foregroundStyle(Ink.dim)
-                Text(branded: kind.blurb).font(.system(size: 12)).foregroundStyle(Ink.faint)
+                Text(branded: info.name).font(.system(size: 15, weight: .semibold)).foregroundStyle(Ink.dim)
+                Text(branded: info.blurb).font(.system(size: 12)).foregroundStyle(Ink.faint)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
             }

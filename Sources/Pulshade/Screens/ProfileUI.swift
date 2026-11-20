@@ -228,7 +228,7 @@ struct ProfileTabs: View {
         if !media.isEmpty { out.append(.media) }
         if !files.isEmpty { out.append(.files) }
         if !linkMessages.isEmpty { out.append(.links) }
-        if !collectibles.filter({ $0.kind != nil }).isEmpty { out.append(.collectibles) }
+        if !collectibles.isEmpty { out.append(.collectibles) }
         if !ProfileNote.cleaned(notes).isEmpty { out.append(.notes) }
         if !groups.isEmpty { out.append(.groups) }
         return out
