@@ -46,6 +46,8 @@ struct ConversationView: View {
     @State private var unreadBelow = 0
     @State private var hovered: UUID?
     @State private var swipe: (id: UUID, dx: CGFloat)?
+    /// A message held on the phone, lifted over the chat with its reactions and actions.
+    @State private var lifted: LiftedMessage?
     #if os(macOS)
     @State private var scrollMonitor: Any?
     #endif
@@ -64,6 +66,7 @@ struct ConversationView: View {
                 messages(c)
                 if model.canPost(in: c) { composer(c) } else { ReadOnlyBar(kind: c.kind, announcements: c.isAnnouncements, oldFormat: c.isOldFormat, needsUpdate: model.peerNeedingUpdate(in: c), reason: model.cantPostReason(in: c)) }
             }
+            .overlay { if let lifted { focus(lifted, in: c) } }
             // Fills the whole screen, keyboard or not, so the background doesn't jump when it opens.
             .background { ChatBackdrop(background: model.data.chatBackground, theme: model.theme).equatable().ignoresSafeArea() }
             .onAppear {
@@ -259,6 +262,77 @@ struct ConversationView: View {
 
     // MARK: Messages
 
+    /// One message's bubble. The copy lifted over the chat (`focus`) is drawn by the same code, with nothing to tap.
+    private func bubble(_ m: Message, prev: Message?, next: Message?, in c: Conversation, unsent: Set<UUID>,
+                        proxy: ScrollViewProxy?, copy: Bool = false) -> Bubble {
+        Bubble(message: m, kind: c.kind,
+               senderName: m.isMine ? nil : model.displayName(m.sender),
+               senderAvatar: m.isMine ? nil : model.contact(m.sender)?.avatar,
+               tint: model.signature(m.sender),
+               quoteAuthor: m.reply.map { $0.author == "me" ? "You" : model.displayName($0.author) },
+               first: prev?.sender != m.sender || prev?.isSystem == true,
+               last: next?.sender != m.sender,
+               canReact: c.kind != .broadcast,
+               highlighted: !copy && flash == m.id,
+               swipe: !copy && swipe?.id == m.id ? swipe?.dx ?? 0 : 0,
+               react: { model.react($0, to: m.id, in: id) },
+               reply: { startReply(m) },
+               unsend: { model.unsend(m.id, in: id) },
+               jump: { target in if let proxy { jump(to: target, proxy: proxy) } },
+               hover: { inside in if inside { hovered = m.id } else if hovered == m.id { hovered = nil } },
+               notSent: unsent.contains(m.id),
+               retry: { model.retrySend(m.id, in: id) },
+               canForward: model.canForward(m, in: c),
+               canCopy: model.canCopy(m),
+               forward: { forwarding = m },
+               openSender: { profileOf = MemberRef(fingerprint: m.sender) },
+               lift: copy || !Platform.isPhone ? nil : { frame in
+                   guard lifted == nil, swipe == nil else { return }
+                   lifted = LiftedMessage(id: m.id, frame: frame)
+               },
+               isLifted: !copy && lifted?.id == m.id)
+    }
+
+    /// The held message over the blurred chat, with its reactions and what can be done with it.
+    @ViewBuilder private func focus(_ held: LiftedMessage, in c: Conversation) -> some View {
+        if let i = c.messages.firstIndex(where: { $0.id == held.id }) {
+            let m = c.messages[i]
+            let unsent = model.unsentMessages
+            MessageFocus(frame: held.frame,
+                         lead: !m.isMine && c.kind == .group ? 34 : 0,
+                         mine: m.isMine,
+                         current: m.reactions["me"],
+                         canReact: c.kind != .broadcast,
+                         actions: focusActions(m, in: c, notSent: unsent.contains(m.id)),
+                         content: AnyView(bubble(m, prev: i > 0 ? c.messages[i - 1] : nil,
+                                                 next: i + 1 < c.messages.count ? c.messages[i + 1] : nil,
+                                                 in: c, unsent: unsent, proxy: nil, copy: true)),
+                         react: { model.react($0, to: m.id, in: id) },
+                         close: { lifted = nil })
+                .transition(.identity)
+        }
+    }
+
+    private func focusActions(_ m: Message, in c: Conversation, notSent: Bool) -> [MessageFocus.Action] {
+        var actions: [MessageFocus.Action] = []
+        if notSent && m.isMine {
+            actions.append(.init(title: "Try sending again", symbol: "arrow.clockwise") { model.retrySend(m.id, in: id) })
+        }
+        actions.append(.init(title: "Reply", symbol: "arrowshape.turn.up.left") { startReply(m) })
+        if model.canForward(m, in: c) {
+            actions.append(.init(title: "Forward", symbol: "arrowshape.turn.up.right") { forwarding = m })
+        }
+        if let wallet = Bubble.wallet(in: m) {
+            actions.append(.init(title: "Copy address", symbol: "doc.on.doc") { copyToClipboard(wallet.address, clearAfter: 120) })
+        } else if !m.text.isEmpty, model.canCopy(m) {
+            actions.append(.init(title: "Copy", symbol: "doc.on.doc") { copyToClipboard(m.text, clearAfter: 60) })
+        }
+        if m.isMine {
+            actions.append(.init(title: "Unsend for everyone", symbol: "trash", destructive: true) { model.unsend(m.id, in: id) })
+        }
+        return actions
+    }
+
     private func messages(_ c: Conversation) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -283,28 +357,8 @@ struct ConversationView: View {
                             if m.isSystem {
                                 SystemPill(text: m.text).padding(.vertical, 8)
                             } else {
-                                Bubble(message: m, kind: c.kind,
-                                       senderName: m.isMine ? nil : model.displayName(m.sender),
-                                       senderAvatar: m.isMine ? nil : model.contact(m.sender)?.avatar,
-                                       tint: model.signature(m.sender),
-                                       quoteAuthor: m.reply.map { $0.author == "me" ? "You" : model.displayName($0.author) },
-                                       first: prev?.sender != m.sender || prev?.isSystem == true,
-                                       last: next?.sender != m.sender,
-                                       canReact: c.kind != .broadcast,
-                                       highlighted: flash == m.id,
-                                       swipe: swipe?.id == m.id ? swipe?.dx ?? 0 : 0,
-                                       react: { model.react($0, to: m.id, in: id) },
-                                       reply: { startReply(m) },
-                                       unsend: { model.unsend(m.id, in: id) },
-                                       jump: { target in jump(to: target, proxy: proxy) },
-                                       hover: { inside in if inside { hovered = m.id } else if hovered == m.id { hovered = nil } },
-                                       notSent: unsent.contains(m.id),
-                                       retry: { model.retrySend(m.id, in: id) },
-                                       canForward: model.canForward(m, in: c),
-                                       canCopy: model.canCopy(m),
-                                       forward: { forwarding = m },
-                                       openSender: { profileOf = MemberRef(fingerprint: m.sender) })
-                                .equatable()
+                                bubble(m, prev: prev, next: next, in: c, unsent: unsent, proxy: proxy)
+                                    .equatable()
                             }
                         }
                         .id(m.id)
@@ -892,6 +946,13 @@ fileprivate struct Bubble: View, Equatable {
     var forward: () -> Void = {}
     /// Opens the sender's profile (their name was tapped).
     var openSender: () -> Void = {}
+    /// On the phone, holding the message lifts it into `MessageFocus`, given where its row is on screen. Nil keeps the
+    /// system menu (the Mac, and the lifted copy itself).
+    var lift: ((CGRect) -> Void)? = nil
+    /// Lifted right now: the copy over the blur stands in for it.
+    var isLifted = false
+    /// Where the row is on screen, kept out of view state: it changes with every scroll frame.
+    @State private var rowBox = RowBox()
     @State private var hovering = false
     @State private var picking = false
     @State private var viewingImage = false
@@ -909,7 +970,7 @@ fileprivate struct Bubble: View, Equatable {
         a.message == b.message && a.kind == b.kind && a.senderName == b.senderName && a.senderAvatar == b.senderAvatar
             && a.tint == b.tint && a.quoteAuthor == b.quoteAuthor && a.first == b.first && a.last == b.last
             && a.canReact == b.canReact && a.highlighted == b.highlighted && a.swipe == b.swipe && a.notSent == b.notSent
-            && a.canForward == b.canForward && a.canCopy == b.canCopy
+            && a.canForward == b.canForward && a.canCopy == b.canCopy && a.isLifted == b.isLifted
     }
 
     /// Message text: a size up from before, so chats read easily at a glance.
@@ -1001,23 +1062,32 @@ fileprivate struct Bubble: View, Equatable {
             withAnimation(.easeOut(duration: 0.12)) { hovering = h }
             hover(h)
         }
-        .contextMenu {
-            if notSent && mine { Button("Try sending again", action: retry) }
-            Button("Reply", action: reply)
-            if canForward { Button("Forward", action: forward) }
-            if let wallet {
-                Button("Copy address") { copyAddress(wallet) }
-            } else if !message.text.isEmpty, canCopy {
-                Button("Copy") { copyToClipboard(message.text, clearAfter: 60) }
+        .opacity(isLifted ? 0 : 1)
+        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { rowBox.rect = $0 }
+        .modifier(HoldToLift(lift: lift.map { lift in { lift(rowBox.rect) } }, menu: AnyView(menuItems)))
+    }
+
+    /// The Mac's right-click menu; the reactions sit in one submenu instead of a line each.
+    @ViewBuilder private var menuItems: some View {
+        let mine = message.isMine
+        if notSent && mine { Button("Try sending again", action: retry) }
+        Button("Reply", action: reply)
+        if canForward { Button("Forward", action: forward) }
+        if let wallet {
+            Button("Copy address") { copyAddress(wallet) }
+        } else if !message.text.isEmpty, canCopy {
+            Button("Copy") { copyToClipboard(message.text, clearAfter: 60) }
+        }
+        if canReact {
+            Menu("React") {
+                ForEach(Self.quick, id: \.self) { e in
+                    Button(message.reactions["me"] == e ? "\(e)  ✓" : e) { react(e) }
+                }
             }
-            if canReact {
-                Divider()
-                ForEach(Self.quick, id: \.self) { e in Button(e) { react(e) } }
-            }
-            if mine {
-                Divider()
-                Button("Unsend for everyone", role: .destructive, action: unsend)
-            }
+        }
+        if mine {
+            Divider()
+            Button("Unsend for everyone", role: .destructive, action: unsend)
         }
     }
 
@@ -1039,7 +1109,9 @@ fileprivate struct Bubble: View, Equatable {
     }
 
     /// A wallet address sent from someone's pinned sheet: drawn as its card, whatever picture came with it.
-    private var wallet: WalletMessage? {
+    private var wallet: WalletMessage? { Self.wallet(in: message) }
+
+    static func wallet(in message: Message) -> WalletMessage? {
         guard message.collectible == nil, message.note == nil, message.voice == nil, !message.isVideo else { return nil }
         return WalletMessage(text: message.text)
     }
@@ -2502,6 +2574,33 @@ private struct AddPeopleSheet: View {
             }
         }
     }
+}
+
+/// Where a message's row is on screen (`Bubble.rowBox`).
+private final class RowBox {
+    var rect = CGRect.zero
+}
+
+/// Holding a message: on the phone it lifts into `MessageFocus`; elsewhere the system menu opens.
+private struct HoldToLift: ViewModifier {
+    var lift: (() -> Void)?
+    var menu: AnyView
+    func body(content: Content) -> some View {
+        if let lift {
+            content.simultaneousGesture(LongPressGesture(minimumDuration: 0.3).onEnded { _ in
+                Haptics.tick()
+                lift()
+            })
+        } else {
+            content.contextMenu { menu }
+        }
+    }
+}
+
+/// A message lifted into `MessageFocus`, and where its row was.
+private struct LiftedMessage: Equatable {
+    var id: UUID
+    var frame: CGRect
 }
 
 /// Adds the swipe-to-reply drag on iPhone only; on the Mac a drag would fight with selecting text.
