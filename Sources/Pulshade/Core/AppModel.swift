@@ -8036,7 +8036,8 @@ final class AppModel {
     @discardableResult
     func addMembers(_ id: Conversation.ID, _ fingerprints: [String]) -> [String] {
         guard let i = index(of: id), data.conversations[i].shared != nil, data.conversations[i].amAdmin else { return [] }
-        return invite(fingerprints.filter { !data.conversations[i].members.contains($0) }, at: i)
+        let already = contactsIn(data.conversations[i])
+        return invite(fingerprints.filter { !data.conversations[i].members.contains($0) && !already.contains($0) }, at: i)
     }
 
     /// Owners can remove anyone; admins can remove people who aren't admins; mods only ordinary members.
@@ -9560,10 +9561,14 @@ extension AppModel {
         return shared.invited.sorted { $0.value < $1.value }.map(\.key).filter { contact($0, in: convo.persona) != nil }
     }
 
-    /// The contacts already in a group, or invited to it, as this device knows them.
+    /// The contacts already in a group, or invited to it, as this device knows them: the member list (contact
+    /// fingerprints), anyone whose group key (`knownAs`, by contact) is a member or in a channel's staff-only roster of
+    /// followers, and anyone invited.
     func contactsIn(_ convo: Conversation) -> Set<String> {
         guard let shared = convo.shared else { return Set(convo.members) }
-        return Set(shared.knownAs.filter { convo.members.contains($0.value) }.map(\.key)).union(shared.invited.keys)
+        let following = Set(shared.roster?.live.map { Identity.fingerprint(of: $0.signingKey) } ?? [])
+        let keyed = shared.knownAs.filter { convo.members.contains($0.value) || following.contains($0.value) }.map(\.key)
+        return Set(convo.members).union(keyed).union(shared.invited.keys)
     }
 
     /// This account's keys in a group: made with the group secret the group is on (`SharedGroup.memberSecret`), or the

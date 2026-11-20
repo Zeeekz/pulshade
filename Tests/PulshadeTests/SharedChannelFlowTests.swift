@@ -125,6 +125,21 @@ struct SharedChannelFlowTests {
         #expect(bob.conversation(channel.id)?.shared?.epochs.map(\.number) == [epochBefore], "the new key never reached him")
     }
 
+    @Test func aFollowerAlreadyInTheChannelCantBeAddedAgain() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let channel = alice.startConversation(kind: .channel, title: "Drops", members: [bobFP])
+        await until([alice, bob]) { joined(channel.id, bob) && alice.conversation(channel.id)?.shared?.roster?.live.count == 1 }
+        let c = try #require(alice.conversation(channel.id))
+        #expect(c.shared?.invited[bobFP] == nil, "his invite is used up once he's in")
+        #expect(alice.contactsIn(c).contains(bobFP), "so the Add followers list must still count him as here")
+        #expect(!alice.contactsIn(c).contains(caraFP))
+        alice.addMembers(channel.id, [bobFP])
+        await settle(alice, bob)
+        #expect(alice.conversation(channel.id)?.shared?.roster?.live.count == 1, "adding him again changes nothing")
+        #expect(alice.conversation(channel.id)?.shared?.invited[bobFP] == nil)
+    }
+
     @Test func aFollowerMadeAdminPostsAndTheStaffShareOneRoster() async throws {
         let (alice, bob, cara, bobFP, caraFP) = try await trio()
         defer { for m in [alice, bob, cara] { m.lock() } }
