@@ -11,16 +11,17 @@ struct EggsSection: View {
     @State private var viewing: RelayClient.EggInfo?
 
     var body: some View {
-        if !model.eggs.isEmpty {
-            VStack(alignment: .leading, spacing: 10) {
+        // The sheets hang off a view that stays when the last egg hatches, so what came out of it still shows.
+        VStack(alignment: .leading, spacing: 10) {
+            if !model.eggs.isEmpty {
                 Text("Eggs").font(.system(size: 13, weight: .semibold)).foregroundStyle(Ink.dim)
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 12)], spacing: 12) {
                     ForEach(model.eggs) { egg in EggCard(egg: egg, view: { viewing = egg }) { revealed = $0 } }
                 }
             }
-            .sheet(item: $viewing) { egg in EggSheet(eggID: egg.id) { revealed = $0 } }
-            .sheet(item: $revealed) { pet in HatchedSheet(pet: pet) }
         }
+        .sheet(item: $viewing) { egg in EggSheet(eggID: egg.id) { revealed = $0 } }
+        .sheet(item: $revealed) { pet in HatchedSheet(pet: pet) }
     }
 }
 
@@ -228,15 +229,22 @@ private struct Cracks: Shape {
 
 /// What came out of the egg.
 struct HatchedSheet: View {
+    @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @Environment(\.theme) private var theme
     let pet: Collectible
+    @State private var opened = false
+
+    private var wearing: Bool { model.activeProfile.badge == pet }
 
     var body: some View {
         VStack(spacing: 16) {
             Spacer(minLength: 0)
             Text("It hatched!").font(.system(size: 13, weight: .semibold)).foregroundStyle(Ink.dim)
-            CollectibleArtwork(item: pet.item, size: 200)
+            // Tapping the pet opens its page, as it does in the collection.
+            Button { opened = true } label: { CollectibleArtwork(item: pet.item, size: 200) }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Open \(pet.info.name)")
             VStack(spacing: 4) {
                 Text(branded: pet.info.name).font(.system(size: 24, weight: .bold)).foregroundStyle(Ink.text)
                 RarityTag(item: pet)
@@ -248,8 +256,26 @@ struct HatchedSheet: View {
             Text("It's yours now. Gift it or let it go from its page.")
                 .font(.system(size: 12)).foregroundStyle(Ink.faint).multilineTextAlignment(.center)
             Spacer(minLength: 0)
+            Button { withAnimation(.snappy) { model.wear(wearing ? nil : pet) } } label: {
+                Text(wearing ? "Showing after your name" : "Show after your name")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(wearing ? Ink.onAccent : theme.accent)
+                    .frame(maxWidth: .infinity).frame(height: 44)
+                    .background(wearing ? theme.accent : theme.accent.opacity(0.12), in: .capsule)
+                    .contentShape(.capsule)
+            }
+            .buttonStyle(.plain)
+            Button { opened = true } label: {
+                Label("View in 3D", systemImage: "cube")
+                    .font(.system(size: 14, weight: .semibold)).foregroundStyle(Ink.text)
+                    .frame(maxWidth: .infinity).frame(height: 40)
+                    .background(Ink.raised, in: .capsule)
+                    .contentShape(.capsule)
+            }
+            .buttonStyle(.plain)
             Button("Done") { dismiss() }.buttonStyle(PrimaryButtonStyle())
         }
+        .sheet(isPresented: $opened) { CollectibleViewerSheet(item: pet) }
         .padding(24)
         .frame(maxWidth: 420)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
