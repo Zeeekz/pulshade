@@ -1947,6 +1947,8 @@ final class AppModel {
 
     /// Shared groups whose outbox is being posted right now.
     @ObservationIgnored var groupFlushing: Set<UUID> = []
+    /// `flushPartingPosts` is running.
+    @ObservationIgnored var partingFlushing = false
     /// When each group mailbox was last read to the end in this run, by group and epoch: a post that hasn't come back is
     /// only posted again once its mailbox has been read since it was sent.
     @ObservationIgnored var groupFetchedAt: [String: Date] = [:]
@@ -2761,6 +2763,32 @@ final class AppModel {
         save()
     }
 
+    /// Pins, or unpins, several chats at once.
+    func setPinned(_ ids: [Conversation.ID], _ on: Bool) {
+        withAnimation(.snappy) { for id in ids { if let i = index(of: id) { data.conversations[i].pinned = on } } }
+        save()
+    }
+
+    func setMuted(_ ids: [Conversation.ID], _ on: Bool) {
+        for id in ids { if let i = index(of: id) { data.conversations[i].muted = on } }
+        Platform.setBadge(unreadTotal)
+        save()
+    }
+
+    /// Moves chats to Archived, or back. An archived chat keeps its place in search and comes back to the list with
+    /// its next message, unless it's muted.
+    func setArchived(_ ids: [Conversation.ID], _ on: Bool) {
+        withAnimation(.snappy) { for id in ids { if let i = index(of: id) { data.conversations[i].archived = on } } }
+        save()
+    }
+
+    func markRead(_ ids: [Conversation.ID]) { for id in ids { markRead(id) } }
+
+    func delete(_ ids: [Conversation.ID]) { for id in ids { delete(id) } }
+
+    /// The active persona's archived chats, newest first.
+    var archivedConversations: [Conversation] { sortedConversations.filter(\.archived) }
+
     /// Deleting a chat deletes it for everyone in it. Followers deleting a channel just unfollow;
     /// broadcast lists are your own send list, so they only go here.
     func delete(_ id: Conversation.ID) {
@@ -2776,17 +2804,55 @@ final class AppModel {
                 // A follower says nothing in the channel; the staff member who invited them is told over that chat, so
                 // they are taken out and the next key isn't sent to them.
                 _ = noticeToInviter(.channelLeave(group: convo.wireID), of: convo)
-            // Posted straight away: the chat is about to go from this device, outbox and all. A group in the older format
-            // has no mailbox to tell: it is only removed from this device.
-            } else if convo.shared != nil, let i = index(of: id), let client = client(nil, lane: Outgoing.lane(for: convo.persona)) {
+            // The chat is about to go from this device, outbox and all, so what it still has to say is kept apart and sent
+            // with retries until it's on the relay (`partingPosts`). A group in the older format has no mailbox to tell: it
+            // is only removed from this device.
+            } else if convo.shared != nil, let i = index(of: id) {
                 post(signal, at: i)
-                let waiting = data.conversations[i].shared?.outbox ?? []
-                Task { for item in waiting { _ = try? await client.depositGroup(item.blob, to: item.sendID, days: item.days, wake: item.wake) } }
+                if let shared = data.conversations[i].shared {
+                    let parting = shared.outbox.filter { !$0.ephemeral }.map {
+                        PartingPost(post: $0, persona: convo.persona, known: shared.postedTo.contains($0.sendID.hex))
+                    }
+                    data.partingPosts = Array((data.partingPosts + parting).suffix(Self.partingPostsKept))
+                }
             }
         }
         sync(.deleted(ref(convo)))
         removeLocally(id)
         save()
+        if !data.partingPosts.isEmpty { kick() }
+    }
+
+    /// How many posts of gone groups are kept waiting at most, and for how long.
+    static let partingPostsKept = 200
+    static let partingPostsKeepFor: TimeInterval = 7 * 86_400
+
+    /// Posts what deleted or left groups still have to say (`AppData.partingPosts`), oldest first. One that can't go yet
+    /// stops the rest until the next pass; past a week they're dropped.
+    func flushPartingPosts() async {
+        guard !partingFlushing else { return }
+        partingFlushing = true
+        defer { partingFlushing = false }
+        let cutoff = Date().addingTimeInterval(-Self.partingPostsKeepFor)
+        if data.partingPosts.contains(where: { $0.post.queued < cutoff }) { data.partingPosts.removeAll { $0.post.queued < cutoff } }
+        while let next = data.partingPosts.first {
+            guard let client = client(nil, lane: Outgoing.lane(for: next.persona)) else { break }
+            let post = next.post
+            do {
+                do {
+                    try await client.depositGroup(post.blob, to: post.sendID, days: post.days, wake: post.wake, prove: !next.known)
+                } catch let refused as RelayRefused where refused.status == 429 && next.known {
+                    // The mailbox may have run out on the relay (or it lost it): starting it again needs the proof.
+                    try await client.depositGroup(post.blob, to: post.sendID, days: post.days, wake: post.wake, prove: true)
+                }
+            } catch is RelayTooLarge {
+                // Never going to fit: dropped.
+            } catch {
+                break
+            }
+            data.partingPosts.removeAll { $0.post.id == post.id }
+            save()
+        }
     }
 
     private func removeLocally(_ id: Conversation.ID) {
@@ -6598,7 +6664,8 @@ final class AppModel {
     /// everything as it stands, and if it still isn't on the disk it says no: the envelopes stay queued and go on a later
     /// pass, once a write has landed. The write itself happens off the main thread; this only waits for it.
     func stateIsOnDiskBeforeSending() async -> Bool {
-        let waiting = !data.outbox.isEmpty || data.conversations.contains { !($0.shared?.outbox.isEmpty ?? true) }
+        let waiting = !data.outbox.isEmpty || !data.partingPosts.isEmpty
+            || data.conversations.contains { !($0.shared?.outbox.isEmpty ?? true) }
         guard waiting else { return true }
         if saveHealth.lastWriteFailed { save() }
         await settleSavesAsync()
@@ -6613,6 +6680,7 @@ final class AppModel {
     private func flush() async {
         guard await stateIsOnDiskBeforeSending() else { return }
         await flushSharedGroups()
+        await flushPartingPosts()
         let owner = identity?.fingerprint
         var down: Set<String> = []
         // Mailboxes that are full this time: what's written to them waits, nothing else does. And those a big upload
@@ -7820,6 +7888,7 @@ final class AppModel {
         withAnimation(.snappy(duration: 0.4)) { data.conversations[i].messages.append(message) }
         if Self.isPending(message) { assembleClip(wire.id, persona: data.conversations[i].persona) }
         if openConversation != data.conversations[i].id || !appActive { data.conversations[i].unread += 1 }
+        if !data.conversations[i].muted { data.conversations[i].archived = false }
         notify(message, at: i)
         // Only a direct chat has ticks (a group's mail is "sent" once it's in the mailbox). Seen straight away when the chat
         // is open in front of you.

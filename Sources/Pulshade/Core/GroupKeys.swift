@@ -987,6 +987,15 @@ struct GroupInvite: Codable, Equatable {
 }
 
 /// A post waiting to go into a group's mailbox, already sealed (its chain has moved on, so it must go as it is).
+/// A post of a group that is gone from this device, still to reach the group's mailbox (`AppData.partingPosts`).
+struct PartingPost: Codable, Equatable {
+    var post: GroupOutgoing
+    /// The persona the group was under, whose connection it goes on.
+    var persona: UUID?
+    /// Whether this device had posted to that mailbox before, so the relay knows it and no proof of work is needed.
+    var known: Bool
+}
+
 struct GroupOutgoing: Codable, Equatable {
     var id = UUID()
     var sendID: Data

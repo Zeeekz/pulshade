@@ -387,6 +387,27 @@ struct SharedGroupFlowTests {
         #expect(bob.conversation(group.id) == nil && cara.conversation(group.id) == nil)
     }
 
+    /// The owner deleting a group while the relay can't be reached: the group goes from their device at once, and the
+    /// others are still told once it can (it used to be one try, and lost if that failed).
+    @Test func theOwnerDeletingAGroupOfflineStillRemovesItForEveryoneLater() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let group = alice.startConversation(kind: .group, title: "Gone soon", members: [bobFP, caraFP])
+        await until([alice, bob, cara]) { bob.conversation(group.id)?.shared?.joining == false && cara.conversation(group.id)?.shared?.joining == false }
+        let relay = alice.data.relay
+        alice.data.relay = "http://127.0.0.1:9"  // nothing listens here
+        alice.delete(group.id)
+        #expect(alice.conversation(group.id) == nil)
+        #expect(!alice.data.partingPosts.isEmpty, "what it had to say waits")
+        await settle(alice)
+        #expect(!alice.data.partingPosts.isEmpty, "and is still waiting after a try that failed")
+        #expect(bob.conversation(group.id) != nil)
+        alice.data.relay = relay
+        await until([alice, bob, cara]) { bob.conversation(group.id) == nil && cara.conversation(group.id) == nil }
+        #expect(bob.conversation(group.id) == nil && cara.conversation(group.id) == nil)
+        #expect(alice.data.partingPosts.isEmpty)
+    }
+
     /// Someone added after the group was made, and people already in it, see each other's messages both ways,
     /// including a member who isn't the owner and a newcomer who isn't anyone's friend but the owner's.
     @Test func membersAddedLaterAndEarlierHearEachOther() async throws {

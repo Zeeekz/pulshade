@@ -516,13 +516,47 @@ private struct ChatList: View {
     @State private var storiesHeight: CGFloat = 0
     /// Where the story strip is on screen, kept out of view state: it changes with every scroll frame.
     @State private var stripBox = FrameBox()
+    /// Showing the archived chats instead of the rest.
+    @State private var showingArchive = false
+    /// The chats picked (held on a picture, or Cmd-clicked on the Mac). Empty while not picking.
+    @State private var picked: Set<Conversation.ID> = []
+    /// The last chat picked or let go by a tap, where a Shift-click range starts.
+    @State private var lastPicked: Conversation.ID?
+    /// A hold-and-slide over the pictures under way.
+    @State private var paint: Paint?
+    /// Where each chat row on screen is in the list, for the slide to find the row under the finger. Kept out of view
+    /// state, like `stripBox`.
+    @State private var rowFrames = RowFrames()
+    /// A row being swiped left, and the one left open with its buttons showing.
+    @State private var swipe: RowSwipe?
+    @State private var opened: Conversation.ID?
+    /// Several chats waiting for "Delete" to be confirmed.
+    @State private var confirmDeleteMany: [Conversation.ID] = []
     #if os(iOS)
     @Environment(CameraSlide.self) private var slide
     #endif
 
+    private var picking: Bool { !picked.isEmpty }
+
+    private struct Paint {
+        /// Picking the rows passed over, or letting them go: whichever the first row wasn't.
+        var adding: Bool
+        var anchor: Int
+        var before: Set<Conversation.ID>
+    }
+
+    private struct RowSwipe: Equatable {
+        var id: Conversation.ID
+        var dx: CGFloat
+    }
+
+    /// How far a swiped row stays open to show its two buttons, and past where letting go archives it.
+    private static let revealWidth: CGFloat = 168
+    private static let fullSwipe: CGFloat = 230
+
     private var items: [Conversation] {
         model.sortedConversations.filter { c in
-            (filter == nil || c.kind == filter) &&
+            (filter == nil || c.kind == filter) && c.archived == showingArchive &&
                 (search.isEmpty || c.title.localizedCaseInsensitiveContains(search))
         }
     }
@@ -626,6 +660,32 @@ private struct ChatList: View {
                 })
             #endif
         }
+        .overlay(alignment: .bottom) {
+            if picking {
+                pickBar
+                    .padding(.bottom, Platform.isPhone ? 10 : 14)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.snappy(duration: 0.3), value: picking)
+        .onChange(of: filter) { picked = []; opened = nil }
+        .onChange(of: searching) { picked = []; opened = nil }
+        .onChange(of: model.archivedConversations.isEmpty) { _, empty in
+            if empty, showingArchive { withAnimation(.snappy) { showingArchive = false } }
+        }
+        .confirmationDialog(manyWarning.title,
+                            isPresented: Binding(get: { !confirmDeleteMany.isEmpty }, set: { if !$0 { confirmDeleteMany = [] } }),
+                            titleVisibility: .visible) {
+            Button("Delete", role: .destructive) {
+                let ids = confirmDeleteMany
+                if let s = selection, ids.contains(s) { selection = nil }
+                withAnimation(.smooth(duration: 0.35)) { model.delete(ids) }
+                picked = []
+                confirmDeleteMany = []
+            }
+        } message: {
+            Text(manyWarning.detail)
+        }
         .confirmationDialog(confirmDelete?.deleteWarning.title ?? "",
                             isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } }),
                             titleVisibility: .visible, presenting: confirmDelete) { c in
@@ -707,40 +767,338 @@ private struct ChatList: View {
     }
 
     @ViewBuilder private var rows: some View {
-        if items.isEmpty, filter == nil, search.isEmpty {
+        let archived = model.archivedConversations
+        if model.sortedConversations.isEmpty, filter == nil, search.isEmpty {
             // Nothing here yet: say how to start, with or without a username.
             GettingStartedCard(addFriend: { addingFriend = true }, chooseUsername: { choosingUsername = true })
-        } else if items.isEmpty {
-            Constellation(symbol: filter?.symbol ?? "bubble.left.and.bubble.right",
-                          text: search.isEmpty ? "No conversations" : "No results")
-                .padding(.top, 80)
         } else {
             LazyVStack(spacing: 1) {
-                ForEach(items) { c in row(c) }
+                if showingArchive {
+                    archiveHeader(count: archived.count)
+                } else if filter == nil, search.isEmpty, !archived.isEmpty {
+                    archivedRow(archived)
+                }
+                if items.isEmpty {
+                    Constellation(symbol: showingArchive ? "archivebox" : (filter?.symbol ?? "bubble.left.and.bubble.right"),
+                                  text: !search.isEmpty ? "No results" : showingArchive ? "Nothing archived" : "No conversations")
+                        .padding(.top, 80)
+                } else {
+                    ForEach(items) { c in row(c) }
+                }
             }
             .padding(.horizontal, 8)
-            .padding(.bottom, 12)
+            // Room for the bar of actions while picking, so the last chat can scroll out from under it.
+            .padding(.bottom, picking ? 90 : 12)
         }
     }
 
     private func row(_ c: Conversation) -> some View {
-        Button {
-            selection = c.id
-            model.markRead(c.id)
-        } label: {
-            ChatRow(conversation: c, selected: selection == c.id) { viewingStory = $0 }
+        let dx = swipe?.id == c.id ? swipe!.dx : (opened == c.id ? -Self.revealWidth : 0)
+        return ZStack(alignment: .trailing) {
+            if dx < 0 { swipeButtons(c, dx: dx) }
+            Button { tap(c) } label: {
+                ChatRow(conversation: c, selected: !picking && selection == c.id, openStory: { viewingStory = $0 },
+                        picked: picking ? picked.contains(c.id) : nil, hold: hold(for: c), menu: AnyView(rowMenu(c)))
+                    .background(dx < 0 ? Ink.base : .clear)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(c.title)
+            .offset(x: dx)
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(c.title)
-        .contextMenu { rowMenu(c) }
+        .clipShape(.rect(cornerRadius: 10))
+        .modifier(MacRowMenu(menu: Platform.isPhone ? nil : AnyView(rowMenu(c))))
+        #if os(iOS)
+        .simultaneousGesture(swipeGesture(c), including: picking ? .none : .all)
+        #endif
+        .onGeometryChange(for: CGRect.self) { $0.frame(in: .named("chatlist")) } action: { rowFrames.frames[c.id] = $0 }
+        .onDisappear { rowFrames.frames[c.id] = nil }
         .transition(.asymmetric(insertion: .scale(scale: 0.9).combined(with: .opacity), removal: .opacity))
     }
 
     @ViewBuilder private func rowMenu(_ c: Conversation) -> some View {
         Button(c.pinned ? "Unpin" : "Pin") { model.togglePin(c.id) }
         Button(c.muted ? "Unmute" : "Mute") { model.toggleMute(c.id) }
+        Button(c.archived ? "Unarchive" : "Archive") { model.setArchived([c.id], !c.archived) }
+        Button("Select") { Haptics.tick(); picked = [c.id]; lastPicked = c.id; opened = nil }
         Divider()
         Button("Delete…", role: .destructive) { confirmDelete = c }
+    }
+
+    // MARK: Picking chats
+
+    private func tap(_ c: Conversation) {
+        if opened != nil {
+            withAnimation(.snappy(duration: 0.3)) { opened = nil }
+            return
+        }
+        #if os(macOS)
+        let keys = NSEvent.modifierFlags
+        if keys.contains(.shift), let from = lastPicked.flatMap({ id in items.firstIndex { $0.id == id } }),
+           let to = items.firstIndex(where: { $0.id == c.id }) {
+            picked.formUnion(items[min(from, to)...max(from, to)].map(\.id))
+            return
+        }
+        if keys.contains(.command) {
+            // The chat open now joins the first pick, as in Finder.
+            if !picking, let open = selection, open != c.id, items.contains(where: { $0.id == open }) { picked.insert(open) }
+            toggle(c)
+            return
+        }
+        #endif
+        if picking {
+            toggle(c)
+            return
+        }
+        selection = c.id
+        model.markRead(c.id)
+    }
+
+    private func toggle(_ c: Conversation) {
+        Haptics.tick()
+        if picked.contains(c.id) { picked.remove(c.id) } else { picked.insert(c.id) }
+        lastPicked = c.id
+    }
+
+    private func hold(for c: Conversation) -> PickHold {
+        PickHold(began: {
+            guard paint == nil, let anchor = items.firstIndex(where: { $0.id == c.id }) else { return }
+            Haptics.tick()
+            opened = nil
+            let next = Paint(adding: !picked.contains(c.id), anchor: anchor, before: picked)
+            paint = next
+            lastPicked = c.id
+            apply(next, upTo: anchor)
+        }, moved: { point in
+            guard let paint,
+                  let id = rowFrames.frames.first(where: { $0.value.minY <= point.y && point.y < $0.value.maxY })?.key,
+                  let index = items.firstIndex(where: { $0.id == id }) else { return }
+            apply(paint, upTo: index)
+        }, ended: {
+            paint = nil
+        }, tapped: {
+            toggle(c)
+        })
+    }
+
+    /// Picks, or lets go of, every row from where the hold started to `index`, and gives back the rest to how they were.
+    private func apply(_ paint: Paint, upTo index: Int) {
+        let span = Set(items[min(paint.anchor, index)...max(paint.anchor, index)].map(\.id))
+        let next = paint.adding ? paint.before.union(span) : paint.before.subtracting(span)
+        guard next != picked else { return }
+        if picked.count != next.count && !(picked.isEmpty && paint.adding) { Haptics.tick() }
+        picked = next
+    }
+
+    private var manyWarning: (title: String, detail: String) {
+        Conversation.deleteWarning(confirmDeleteMany.compactMap { model.conversation($0) })
+    }
+
+    /// The actions for the picked chats, floating over the bottom of the list.
+    private var pickBar: some View {
+        let chats = picked.compactMap { model.conversation($0) }
+        let ids = chats.map(\.id)
+        let allPinned = !chats.isEmpty && chats.allSatisfy(\.pinned)
+        let allMuted = !chats.isEmpty && chats.allSatisfy(\.muted)
+        let anyUnread = chats.contains { $0.unread > 0 }
+        func done() { withAnimation(.snappy(duration: 0.3)) { picked = [] } }
+        return HStack(spacing: 2) {
+            Text("\(chats.count)")
+                .font(.system(size: 14, weight: .bold).monospacedDigit())
+                .foregroundStyle(Ink.onAccent)
+                .frame(minWidth: 30, minHeight: 30)
+                .background(theme.accent, in: .circle)
+                .contentTransition(.numericText())
+                .padding(.trailing, 6)
+                .accessibilityLabel("\(chats.count) selected")
+            pickAction("Read", symbol: "envelope.open", enabled: anyUnread) { model.markRead(ids); done() }
+            pickAction(allPinned ? "Unpin" : "Pin", symbol: allPinned ? "pin.slash" : "pin") { model.setPinned(ids, !allPinned); done() }
+            pickAction(allMuted ? "Unmute" : "Mute", symbol: allMuted ? "bell" : "bell.slash") { model.setMuted(ids, !allMuted); done() }
+            pickAction(showingArchive ? "Unarchive" : "Archive", symbol: showingArchive ? "tray.and.arrow.up" : "archivebox") {
+                model.setArchived(ids, !showingArchive)
+                done()
+            }
+            pickAction("Delete", symbol: "trash", tint: .red) { confirmDeleteMany = ids }
+            Rectangle().fill(Ink.faint.opacity(0.4)).frame(width: 1, height: 26).padding(.horizontal, 4)
+            Button { done() } label: {
+                Image(systemName: "xmark").font(.system(size: 13, weight: .bold)).foregroundStyle(Ink.dim)
+                    .frame(width: 34, height: 34).contentShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut(.cancelAction)
+            .help("Done  esc")
+            .accessibilityLabel("Done selecting")
+        }
+        .padding(.horizontal, 8).padding(.vertical, 6)
+        .background(.regularMaterial, in: .capsule)
+        .overlay(Capsule().strokeBorder(Ink.raised, lineWidth: 1))
+        .shadow(color: .black.opacity(0.25), radius: 16, y: 6)
+        .animation(.snappy(duration: 0.25), value: chats.count)
+    }
+
+    private func pickAction(_ label: String, symbol: String, tint: Color? = nil, enabled: Bool = true,
+                            action: @escaping () -> Void) -> some View {
+        Button { Haptics.tick(); action() } label: {
+            VStack(spacing: 2) {
+                Image(systemName: symbol).font(.system(size: 15, weight: .medium))
+                Text(label).font(.system(size: 9.5, weight: .medium))
+            }
+            .foregroundStyle(tint ?? Ink.text)
+            .frame(width: Platform.isPhone ? 50 : 54, height: 40)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.35)
+        .help(label)
+    }
+
+    // MARK: Swiping a chat
+
+    /// Behind a row swiped left: Delete, and Archive at the edge, which stretches with the finger and is what a long
+    /// swipe does.
+    private func swipeButtons(_ c: Conversation, dx: CGFloat) -> some View {
+        let archiveWidth = max(Self.revealWidth / 2, -dx - Self.revealWidth / 2)
+        return HStack(spacing: 0) {
+            Spacer(minLength: 0)
+            Button {
+                withAnimation(.snappy(duration: 0.3)) { opened = nil }
+                confirmDelete = c
+            } label: {
+                swipeLabel("Delete", symbol: "trash.fill").frame(width: Self.revealWidth / 2).frame(maxHeight: .infinity).background(.red)
+            }
+            .buttonStyle(.plain)
+            Button {
+                withAnimation(.snappy(duration: 0.3)) { opened = nil; model.setArchived([c.id], !c.archived) }
+            } label: {
+                swipeLabel(c.archived ? "Unarchive" : "Archive", symbol: c.archived ? "tray.and.arrow.up.fill" : "archivebox.fill")
+                    .frame(width: archiveWidth, alignment: dx < -Self.fullSwipe ? .leading : .center)
+                    .padding(.leading, dx < -Self.fullSwipe ? 22 : 0)
+                    .frame(maxHeight: .infinity)
+                    .background(Ink.dim)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private func swipeLabel(_ text: String, symbol: String) -> some View {
+        VStack(spacing: 4) {
+            Image(systemName: symbol).font(.system(size: 17, weight: .semibold))
+            Text(text).font(.system(size: 11, weight: .semibold))
+        }
+        .foregroundStyle(.white)
+    }
+
+    #if os(iOS)
+    /// Left only: right is the story camera's. A short swipe leaves Delete and Archive showing; a long one archives.
+    private func swipeGesture(_ c: Conversation) -> some Gesture {
+        DragGesture(minimumDistance: 14)
+            .onChanged { value in
+                let base: CGFloat = opened == c.id ? -Self.revealWidth : 0
+                if swipe?.id != c.id {
+                    guard abs(value.translation.width) > abs(value.translation.height) * 1.4,
+                          value.translation.width < 0 || opened == c.id else { return }
+                    if opened != c.id { opened = nil }
+                }
+                let raw = min(0, base + value.translation.width)
+                // Past the long-swipe point it follows less, and ticks once on crossing it.
+                let dx = raw < -Self.fullSwipe ? -Self.fullSwipe + (raw + Self.fullSwipe) * 0.6 : raw
+                if let before = swipe?.dx, (before < -Self.fullSwipe) != (dx < -Self.fullSwipe) { Haptics.tick() }
+                swipe = RowSwipe(id: c.id, dx: dx)
+            }
+            .onEnded { value in
+                guard let current = swipe, current.id == c.id else { return }
+                let base: CGFloat = opened == c.id ? -Self.revealWidth : 0
+                let flung = base + value.predictedEndTranslation.width
+                withAnimation(.snappy(duration: 0.3)) {
+                    if current.dx < -Self.fullSwipe {
+                        opened = nil
+                        model.setArchived([c.id], !c.archived)
+                    } else if current.dx < -Self.revealWidth / 2 || flung < -Self.revealWidth {
+                        opened = c.id
+                    } else {
+                        opened = nil
+                    }
+                    swipe = nil
+                }
+            }
+    }
+    #endif
+
+    // MARK: Archived
+
+    private var rowAvatar: CGFloat { Platform.isPhone ? 56 : 46 }
+
+    /// At the top of the chats: the archived ones, folded into one row.
+    private func archivedRow(_ archived: [Conversation]) -> some View {
+        let unread = archived.filter { !$0.muted }.reduce(0) { $0 + $1.unread }
+        let muted = archived.filter(\.muted).reduce(0) { $0 + $1.unread }
+        return Button {
+            withAnimation(.snappy(duration: 0.3)) { showingArchive = true; picked = []; opened = nil }
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "archivebox.fill")
+                    .font(.system(size: rowAvatar * 0.36))
+                    .foregroundStyle(Ink.dim)
+                    .frame(width: rowAvatar, height: rowAvatar)
+                    .background(Ink.raised, in: .circle)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Archived").font(.system(size: Platform.isPhone ? 16.5 : 14.5, weight: .semibold)).foregroundStyle(Ink.text)
+                    Text(archived.prefix(5).map(\.title).joined(separator: ", "))
+                        .font(.system(size: Platform.isPhone ? 15 : 13.5)).foregroundStyle(Ink.dim).lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                if unread + muted > 0 {
+                    Text("\(unread + muted)")
+                        .font(.system(size: Platform.isPhone ? 12.5 : 11.5, weight: .semibold))
+                        .foregroundStyle(Ink.onAccent.opacity(0.85))
+                        .padding(.horizontal, 7).frame(minWidth: 21, minHeight: 21)
+                        .background(unread > 0 ? theme.accent : Ink.faint, in: .capsule)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, Platform.isPhone ? 11 : 9)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Archived, \(archived.count) chats")
+        .transition(.opacity)
+    }
+
+    /// Over the archived chats: the way back, and what keeps a chat here.
+    private func archiveHeader(count: Int) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Button {
+                withAnimation(.snappy(duration: 0.3)) { showingArchive = false; picked = []; opened = nil }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.left").font(.system(size: 13, weight: .semibold))
+                    Text("Archived").font(.system(size: 15, weight: .semibold))
+                    Text("\(count)").font(.system(size: 13)).foregroundStyle(Ink.faint)
+                    Spacer()
+                }
+                .foregroundStyle(Ink.text)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut(picking ? nil : .cancelAction)
+            .accessibilityLabel("Back to chats")
+            Text("A new message brings a chat back, unless it's muted.")
+                .font(.system(size: 11.5)).foregroundStyle(Ink.faint)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 8)
+    }
+}
+
+/// Where each chat row is in the list (`ChatList.rowFrames`).
+private final class RowFrames {
+    var frames: [Conversation.ID: CGRect] = [:]
+}
+
+/// On the Mac the whole row has the menu; on the phone it's kept off the picture (`ChatRow.menu`).
+private struct MacRowMenu: ViewModifier {
+    var menu: AnyView?
+    func body(content: Content) -> some View {
+        if let menu { content.contextMenu { menu } } else { content }
     }
 }
 
@@ -795,6 +1153,13 @@ struct ChatRow: View {
     var selected: Bool
     /// Opens their story when the picture is tapped and they have one.
     var openStory: (StoryReel) -> Void = { _ in }
+    /// While chats are being picked: whether this one is. Nil while nothing is.
+    var picked: Bool? = nil
+    /// Holding the picture starts picking, and sliding up or down picks the rows passed over (`ChatList`). Nil where
+    /// rows can't be picked.
+    var hold: PickHold? = nil
+    /// The long-press menu. On the phone it's kept off the picture, where holding picks instead.
+    var menu: AnyView? = nil
     @State private var hover = false
     /// Rows are roomier on the phone, like Telegram's and WhatsApp's; the Mac's sidebar is narrower.
     private var avatarSize: CGFloat { Platform.isPhone ? 56 : 46 }
@@ -813,28 +1178,47 @@ struct ChatRow: View {
         let stories = stories
         HStack(spacing: 12) {
             ZStack(alignment: .bottomTrailing) {
-                Avatar(image: c.avatar ?? (c.kind == .direct ? model.contact(c.members.first ?? "")?.avatar : nil),
-                       seed: c.kind == .direct ? (c.members.first ?? c.id.uuidString) : c.id.uuidString,
-                       size: avatarSize, symbol: c.kind == .direct ? nil : c.kind.symbol, showsStory: false)
-                    .overlay {
-                        if c.kind == .direct, let fp = c.members.first {
-                            Circle().strokeBorder(model.signature(fp).opacity(0.8), lineWidth: 1.5).padding(-2.5)
+                ZStack {
+                    Avatar(image: c.avatar ?? (c.kind == .direct ? model.contact(c.members.first ?? "")?.avatar : nil),
+                           seed: c.kind == .direct ? (c.members.first ?? c.id.uuidString) : c.id.uuidString,
+                           size: avatarSize, symbol: c.kind == .direct ? nil : c.kind.symbol, showsStory: false)
+                        .overlay {
+                            if c.kind == .direct, let fp = c.members.first {
+                                Circle().strokeBorder(model.signature(fp).opacity(0.8), lineWidth: 1.5).padding(-2.5)
+                            }
                         }
-                    }
-                    .overlay {
-                        if !stories.isEmpty {
-                            let fresh = stories.contains { !$0.seen }
-                            Circle().strokeBorder(fresh ? theme.accent : Ink.faint, lineWidth: 2.5).padding(-5)
-                                .shadow(color: theme.accent.opacity(fresh ? 0.85 : 0), radius: fresh ? 5 : 0)
+                        .overlay {
+                            if !stories.isEmpty {
+                                let fresh = stories.contains { !$0.seen }
+                                Circle().strokeBorder(fresh ? theme.accent : Ink.faint, lineWidth: 2.5).padding(-5)
+                                    .shadow(color: theme.accent.opacity(fresh ? 0.85 : 0), radius: fresh ? 5 : 0)
+                            }
                         }
-                    }
-                    .contentShape(Circle())
-                    .onTapGesture {
-                        guard !stories.isEmpty else { return }
-                        Haptics.tick()
-                        openStory(StoryReel(stories: stories, start: stories.firstIndex { !$0.seen } ?? 0))
-                    }
-                    .accessibilityAddTraits(stories.isEmpty ? [] : .isButton)
+                        .opacity(picked == true ? 0 : 1)
+                        .overlay {
+                            // Picking: an empty ring around the ones not picked yet.
+                            if picked == false { Circle().strokeBorder(theme.accent.opacity(0.55), lineWidth: 2).padding(-5) }
+                        }
+                    // The picture turns over to a tick when the chat is picked.
+                    Circle().fill(theme.accent)
+                        .overlay {
+                            Image(systemName: "checkmark").font(.system(size: avatarSize * 0.38, weight: .bold)).foregroundStyle(Ink.onAccent)
+                        }
+                        .frame(width: avatarSize, height: avatarSize)
+                        .rotation3DEffect(.degrees(180), axis: (x: 0, y: 1, z: 0))
+                        .opacity(picked == true ? 1 : 0)
+                }
+                .rotation3DEffect(.degrees(picked == true ? 180 : 0), axis: (x: 0, y: 1, z: 0), perspective: 0.4)
+                .animation(.spring(duration: 0.4, bounce: 0.3), value: picked)
+                .contentShape(Circle())
+                .gesture(pickGesture.exclusively(before: TapGesture().onEnded {
+                    if picked != nil, let hold { hold.tapped(); return }
+                    guard !stories.isEmpty else { return }
+                    Haptics.tick()
+                    openStory(StoryReel(stories: stories, start: stories.firstIndex { !$0.seen } ?? 0))
+                }), including: hold == nil && stories.isEmpty && picked == nil ? .none : .all)
+                .accessibilityAddTraits(stories.isEmpty && picked == nil ? [] : .isButton)
+                .accessibilityValue(picked == true ? "Selected" : "")
                 if let burner = model.burner(c.persona) {
                     Image(systemName: "flame.fill")
                         .font(.system(size: 9, weight: .bold))
@@ -899,6 +1283,8 @@ struct ChatRow: View {
                     }
                 }
             }
+            .contentShape(Rectangle())
+            .modifier(PhoneRowMenu(menu: Platform.isPhone ? menu : nil, conversation: c))
         }
         .padding(.horizontal, 10)
         .padding(.vertical, Platform.isPhone ? 11 : 9)
@@ -908,6 +1294,43 @@ struct ChatRow: View {
         }
         .contentShape(Rectangle())
         .onHover { h in withAnimation(.easeOut(duration: 0.15)) { hover = h } }
+    }
+
+    /// Hold the picture, then slide: the hold starts picking, the slide reports where the finger is in the list.
+    private var pickGesture: some Gesture {
+        LongPressGesture(minimumDuration: 0.3)
+            .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .named("chatlist")))
+            .onChanged { value in
+                guard let hold, case .second(true, let drag) = value else { return }
+                if let drag { hold.moved(drag.location) } else { hold.began() }
+            }
+            .onEnded { _ in hold?.ended() }
+    }
+}
+
+/// What a chat row's picture does while picking chats (`ChatRow.hold`).
+struct PickHold {
+    var began: () -> Void
+    var moved: (CGPoint) -> Void
+    var ended: () -> Void
+    var tapped: () -> Void
+}
+
+/// The phone's long-press menu on a chat, shown over a full copy of the row.
+private struct PhoneRowMenu: ViewModifier {
+    @Environment(AppModel.self) private var model
+    @Environment(\.theme) private var theme
+    var menu: AnyView?
+    var conversation: Conversation
+    func body(content: Content) -> some View {
+        if let menu {
+            content.contextMenu { menu } preview: {
+                ChatRow(conversation: conversation, selected: false).frame(width: 360).background(Ink.base)
+                    .environment(model).environment(\.theme, theme)
+            }
+        } else {
+            content
+        }
     }
 }
 

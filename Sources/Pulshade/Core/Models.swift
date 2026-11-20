@@ -833,6 +833,8 @@ struct Conversation: Codable, Identifiable, Equatable {
     var createdAt = Date()
     var pinned = false
     var muted = false
+    /// Kept out of the chat list, under Archived. A new message brings it back, unless it's muted.
+    var archived = false
     var unread = 0
     /// Disappearing-message timer in seconds, or nil for off.
     var disappearAfter: TimeInterval?
@@ -869,7 +871,7 @@ struct Conversation: Codable, Identifiable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, kind, title, avatar, members, messages, createdAt, pinned, muted, unread, disappearAfter, persona
+        case id, kind, title, avatar, members, messages, createdAt, pinned, muted, archived, unread, disappearAfter, persona
         case about, owner, admins, mods, postPolicy, version, isOwner, shared, groupID
     }
 
@@ -884,6 +886,7 @@ struct Conversation: Codable, Identifiable, Equatable {
         createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
         pinned = try c.decodeIfPresent(Bool.self, forKey: .pinned) ?? false
         muted = try c.decodeIfPresent(Bool.self, forKey: .muted) ?? false
+        archived = try c.decodeIfPresent(Bool.self, forKey: .archived) ?? false
         unread = try c.decodeIfPresent(Int.self, forKey: .unread) ?? 0
         disappearAfter = try c.decodeIfPresent(TimeInterval.self, forKey: .disappearAfter)
         persona = try c.decodeIfPresent(UUID.self, forKey: .persona)
@@ -915,6 +918,7 @@ struct Conversation: Codable, Identifiable, Equatable {
         try c.encode(createdAt, forKey: .createdAt)
         try c.encode(pinned, forKey: .pinned)
         try c.encode(muted, forKey: .muted)
+        if archived { try c.encode(archived, forKey: .archived) }
         try c.encode(unread, forKey: .unread)
         try c.encodeIfPresent(disappearAfter, forKey: .disappearAfter)
         try c.encodeIfPresent(persona, forKey: .persona)
@@ -1005,6 +1009,21 @@ struct Conversation: Codable, Identifiable, Equatable {
         case .channel: ("Leave this channel?", "The channel stays for everyone else.")
         case .broadcast: ("Delete this broadcast list?", "Messages already sent stay in each person's chat with you.")
         }
+    }
+
+    /// What deleting several chats at once does, said once for all of them.
+    static func deleteWarning(_ chats: [Conversation]) -> (title: String, detail: String) {
+        if chats.count == 1, let only = chats.first { return only.deleteWarning }
+        var lines: [String] = []
+        if chats.contains(where: { $0.kind == .direct }) { lines.append("One-to-one chats disappear for both sides.") }
+        if chats.contains(where: { ($0.kind == .group || $0.kind == .channel) && $0.amOwner && !$0.isAnnouncements }) {
+            lines.append("Groups and channels you own are deleted for everyone in them.")
+        }
+        if chats.contains(where: { ($0.kind == .group || $0.kind == .channel) && !$0.amOwner && !$0.isAnnouncements }) {
+            lines.append("Ones you're only in, you leave.")
+        }
+        lines.append("This can't be undone.")
+        return ("Delete \(chats.count) chats?", lines.joined(separator: " "))
     }
 }
 
@@ -1444,7 +1463,9 @@ struct AppData: Codable {
     /// 25: the account's group secret (`groupSecret`), which group keys are made from and which is replaced when a
     /// device is unlinked; a group can still be on the one before (`SharedGroup.memberSecret`).
     /// 26: devices a contact's account unlinked are remembered and refused (`Contact.revoked`, `contested`).
-    static let currentFormat = 26
+    /// 27: a deleted or left group's last posts, kept until they reach its mailbox (`partingPosts`); a chat can be
+    /// archived (`Conversation.archived`).
+    static let currentFormat = 27
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []
@@ -1526,6 +1547,10 @@ struct AppData: Codable {
     /// When this device may move groups still on an older group secret to the current one: at once on the device that
     /// made it, a while after on the others (so the one that made it goes first).
     var groupRenewAfter: Date?
+    /// The last posts of groups deleted or left on this device (the owner's "deleted", a member's "left", and anything
+    /// still waiting to go), kept after the group itself is gone and tried with the rest of the outbox until they're on
+    /// the relay, for a week at most. Without them one failed try (Tor still connecting, say) meant nobody was told.
+    var partingPosts: [PartingPost] = []
     init() {}
 
     /// The relay new identities use. A build can set `PulshadeRelay` in its Info.plist (the iPhone
@@ -1627,6 +1652,7 @@ struct AppData: Codable {
         backupDigest = try? c.decodeIfPresent(Data.self, forKey: .backupDigest)
         groupSecret = try c.decodeIfPresent(Data.self, forKey: .groupSecret)
         groupRenewAfter = try? c.decodeIfPresent(Date.self, forKey: .groupRenewAfter)
+        partingPosts = (try? c.decodeIfPresent([PartingPost].self, forKey: .partingPosts)) ?? []
     }
 }
 
