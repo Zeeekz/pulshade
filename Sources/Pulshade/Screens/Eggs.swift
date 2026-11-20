@@ -28,6 +28,11 @@ enum EggNames {
     static func name(_ kind: String) -> String {
         switch kind {
         case "dragon": "Dragon Egg"
+        case "jelly": "Jellyfish Egg"
+        case "fox": "Fox Egg"
+        case "owl": "Owl Egg"
+        case "cat": "Cat Egg"
+        case "raven": "Raven Egg"
         default: "Egg"
         }
     }
@@ -52,7 +57,7 @@ private struct EggCard: View {
             let progress = left.map { 1 - $0 / Double(max(egg.seconds, 1)) } ?? 0
             VStack(spacing: 10) {
                 Button(action: view) {
-                    EggArt(progress: progress, ready: left == 0, started: left != nil)
+                    EggArt(palette: egg.palette, progress: progress, ready: left == 0, started: left != nil)
                         .frame(width: 84, height: 100)
                         .overlay(alignment: .bottomTrailing) {
                             Image(systemName: "view.3d").font(.system(size: 11, weight: .semibold)).foregroundStyle(.white)
@@ -63,7 +68,10 @@ private struct EggCard: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel("Look at the egg in 3D")
                 VStack(spacing: 2) {
-                    Text(EggNames.name(egg.kind)).font(.system(size: 15, weight: .semibold)).foregroundStyle(Ink.text)
+                    Text(egg.title).font(.system(size: 15, weight: .semibold)).foregroundStyle(Ink.text)
+                    if let rarity = egg.rarity, !rarity.isEmpty {
+                        Text(String(rarity.prefix(20))).font(.system(size: 11, weight: .semibold)).foregroundStyle(egg.palette?.lightColor ?? Ink.dim)
+                    }
                     Text(status(left)).font(.system(size: 12, weight: .medium)).foregroundStyle(left == 0 ? theme.accent : Ink.faint)
                         .monospacedDigit()
                 }
@@ -113,10 +121,34 @@ private struct EggCard: View {
     }
 }
 
+/// An egg's two shell colours, light then dark, as the relay names them for each sort of egg.
+struct EggPalette: Equatable {
+    var light: (r: Double, g: Double, b: Double)
+    var dark: (r: Double, g: Double, b: Double)
+
+    init?(hex: [String]?) {
+        guard let hex, hex.count == 2, let light = Self.rgb(hex[0]), let dark = Self.rgb(hex[1]) else { return nil }
+        (self.light, self.dark) = (light, dark)
+    }
+
+    private static func rgb(_ hex: String) -> (r: Double, g: Double, b: Double)? {
+        guard hex.count == 6, let v = UInt32(hex, radix: 16) else { return nil }
+        return (Double(v >> 16 & 0xff) / 255, Double(v >> 8 & 0xff) / 255, Double(v & 0xff) / 255)
+    }
+
+    var lightColor: Color { Color(red: light.r, green: light.g, blue: light.b) }
+    var darkColor: Color { Color(red: dark.r, green: dark.g, blue: dark.b) }
+
+    static func == (a: EggPalette, b: EggPalette) -> Bool {
+        a.light == b.light && a.dark == b.dark
+    }
+}
+
 /// An egg that cracks as its time runs out, and wobbles when it's ready.
 private struct EggArt: View {
     @Environment(\.theme) private var theme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    var palette: EggPalette?
     var progress: Double
     var ready: Bool
     var started: Bool
@@ -125,7 +157,7 @@ private struct EggArt: View {
     var body: some View {
         ZStack {
             EggShape()
-                .fill(LinearGradient(colors: [theme.accent.opacity(0.95), Color(red: 0.16, green: 0.12, blue: 0.4)],
+                .fill(LinearGradient(colors: [palette?.lightColor ?? theme.accent.opacity(0.95), palette?.darkColor ?? Color(red: 0.16, green: 0.12, blue: 0.4)],
                                      startPoint: .topLeading, endPoint: .bottomTrailing))
             EggShape().strokeBorder(.white.opacity(0.25), lineWidth: 1.5)
             // Spots.
@@ -139,7 +171,7 @@ private struct EggArt: View {
             .clipShape(EggShape())
             if started { Cracks(amount: ready ? 1 : max(0, min(progress, 1)) * 0.85).stroke(.white.opacity(0.85), style: StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round)) }
         }
-        .shadow(color: theme.accent.opacity(ready ? 0.7 : 0.25), radius: ready ? 14 : 6)
+        .shadow(color: (palette?.lightColor ?? theme.accent).opacity(ready ? 0.7 : 0.25), radius: ready ? 14 : 6)
         .rotationEffect(.degrees(ready && wobble ? 5 : ready ? -5 : 0), anchor: .bottom)
         .onAppear {
             guard ready, !reduceMotion else { return }

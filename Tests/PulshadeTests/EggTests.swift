@@ -31,4 +31,19 @@ struct EggTests {
             }
         }
     }
+
+    @Test func eachEggTakesItsNameColoursAndRarityFromTheRelayAndOldRelaysStillWork() throws {
+        let new = try JSONDecoder().decode(RelayClient.EggInfo.self, from: Data(#"{"id":"a","kind":"raven","hatches_at":null,"seconds":86400,"now":1,"name":"Raven Egg","colors":["ffce60","10122a"],"rarity":"Legendary"}"#.utf8))
+        #expect(new.title == "Raven Egg" && new.rarity == "Legendary")
+        let palette = try #require(new.palette)
+        #expect(abs(palette.light.r - 1) < 0.01 && abs(palette.dark.b - 42.0 / 255) < 0.01)
+        let old = try JSONDecoder().decode(RelayClient.EggInfo.self, from: Data(#"{"id":"b","kind":"dragon","seconds":600,"now":1}"#.utf8))
+        #expect(old.title == "Dragon Egg" && old.palette == nil && old.rarity == nil)
+        #expect(EggPalette(hex: ["zzzzzz", "000000"]) == nil && EggPalette(hex: ["ffffff"]) == nil)
+        // A coloured shell draws differently from the plain one.
+        let plain = EggStage(still: true), raven = EggStage(still: true, palette: palette)
+        plain.update(progress: 0, ready: false, started: false)
+        raven.update(progress: 0, ready: false, started: false)
+        #expect(try snapshot(plain).tiffRepresentation != snapshot(raven).tiffRepresentation)
+    }
 }

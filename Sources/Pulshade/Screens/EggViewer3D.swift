@@ -12,6 +12,7 @@ import UIKit
 /// An egg in 3D, to turn with a finger or the mouse. It cracks along its middle as its time runs out and, once
 /// it's ready, glows, and rocks as if something inside wants out.
 struct EggViewer3D: View {
+    var palette: EggPalette? = nil
     var progress: Double
     var ready: Bool
     var started: Bool
@@ -27,7 +28,7 @@ struct EggViewer3D: View {
                 ProgressView().controlSize(.small)
             }
         }
-        .task { stage = EggStage(still: reduceMotion) }
+        .task { stage = EggStage(still: reduceMotion, palette: palette) }
         .onChange(of: progress, initial: true) { stage?.update(progress: progress, ready: ready, started: started) }
         .onChange(of: ready) { stage?.update(progress: progress, ready: ready, started: started) }
         .onChange(of: started) { stage?.update(progress: progress, ready: ready, started: started) }
@@ -43,9 +44,11 @@ struct EggViewer3D: View {
     private var lastBucket = -1
     private var wasReady = false
     private let still: Bool
+    private let palette: EggPalette?
 
-    init(still: Bool) {
+    init(still: Bool, palette: EggPalette? = nil) {
         self.still = still
+        self.palette = palette
         let sphere = SCNSphere(radius: 1)
         sphere.segmentCount = 96
         // Bring the sphere to an egg: longer, and narrower towards the top.
@@ -53,7 +56,7 @@ struct EggViewer3D: View {
         shell.lightingModel = .physicallyBased
         shell.roughness.contents = 0.34
         shell.metalness.contents = 0.12
-        shell.diffuse.contents = Self.texture(crack: 0, started: false)
+        shell.diffuse.contents = Self.texture(crack: 0, started: false, palette: palette)
         shell.shaderModifiers = [.geometry: """
         float y = _geometry.position.y;
         float k = 1.0 - 0.17 * y;
@@ -117,12 +120,12 @@ struct EggViewer3D: View {
         let bucket = started ? Int(amount * 40) : -1
         if bucket != lastBucket {
             lastBucket = bucket
-            shell.diffuse.contents = Self.texture(crack: started ? amount : 0, started: started)
+            shell.diffuse.contents = Self.texture(crack: started ? amount : 0, started: started, palette: palette)
         }
         guard ready != wasReady else { return }
         wasReady = ready
         if ready {
-            shell.emission.contents = Self.accent
+            shell.emission.contents = Self.platformColor(palette?.light ?? (r: 0.5, g: 0.6, b: 1))
             shell.emission.intensity = 0.35
             glow.runAction(.fadeIn(duration: 0.6))
             if !still {
@@ -138,21 +141,22 @@ struct EggViewer3D: View {
         }
     }
 
-    private static var accent: Any {
+    private static func platformColor(_ c: (r: Double, g: Double, b: Double)) -> Any {
         #if os(macOS)
-        NSColor(red: 0.5, green: 0.6, blue: 1, alpha: 1)
+        NSColor(red: c.r, green: c.g, blue: c.b, alpha: 1)
         #else
-        UIColor(red: 0.5, green: 0.6, blue: 1, alpha: 1)
+        UIColor(red: c.r, green: c.g, blue: c.b, alpha: 1)
         #endif
     }
 
     /// The shell's colour all the way round: a deep gradient, pale spots and, once it's started, a jagged crack.
-    static func texture(crack: Double, started: Bool) -> CGImage? {
+    static func texture(crack: Double, started: Bool, palette: EggPalette? = nil) -> CGImage? {
         let w = 1024, h = 512
         guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
                                   space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
         let space = CGColorSpace(name: CGColorSpace.sRGB)!
-        let colors = [CGColor(red: 0.22, green: 0.19, blue: 0.62, alpha: 1), CGColor(red: 0.45, green: 0.35, blue: 0.95, alpha: 1)] as CFArray
+        let dark = palette?.dark ?? (r: 0.22, g: 0.19, b: 0.62), light = palette?.light ?? (r: 0.45, g: 0.35, b: 0.95)
+        let colors = [CGColor(red: dark.r, green: dark.g, blue: dark.b, alpha: 1), CGColor(red: light.r, green: light.g, blue: light.b, alpha: 1)] as CFArray
         if let gradient = CGGradient(colorsSpace: space, colors: colors, locations: [0, 1]) {
             ctx.drawLinearGradient(gradient, start: CGPoint(x: 0, y: 0), end: CGPoint(x: 0, y: CGFloat(h)), options: [])
         }
@@ -245,11 +249,14 @@ struct EggSheet: View {
                     let progress = left.map { 1 - $0 / Double(max(egg.seconds, 1)) } ?? 0
                     VStack(spacing: 16) {
                         VStack(spacing: 4) {
-                            Text(EggNames.name(egg.kind)).font(.system(size: 22, weight: .bold)).foregroundStyle(Ink.text)
+                            Text(egg.title).font(.system(size: 22, weight: .bold)).foregroundStyle(Ink.text)
+                            if let rarity = egg.rarity, !rarity.isEmpty {
+                                Text(String(rarity.prefix(20))).font(.system(size: 12, weight: .semibold)).foregroundStyle(egg.palette?.lightColor ?? Ink.dim)
+                            }
                             Text(status(egg, left)).font(.system(size: 13, weight: .medium)).monospacedDigit()
                                 .foregroundStyle(left == 0 ? theme.accent : Ink.faint)
                         }
-                        EggViewer3D(progress: progress, ready: left == 0, started: left != nil)
+                        EggViewer3D(palette: egg.palette, progress: progress, ready: left == 0, started: left != nil)
                             .frame(maxWidth: .infinity, minHeight: 300).frame(maxHeight: 440)
                             .background(
                                 RadialGradient(colors: [Color(red: 0.07, green: 0.11, blue: 0.26), Color(red: 0.03, green: 0.04, blue: 0.09)],

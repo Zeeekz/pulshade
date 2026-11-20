@@ -910,6 +910,14 @@ struct RelayClient {
         var seconds: UInt64
         /// The relay's clock when this was said.
         var now: UInt64
+        /// What it's called, its shell colours (hex, light then dark) and how rare it is. A relay from before these
+        /// were sent leaves them out, and the egg is drawn the old way.
+        var name: String?
+        var colors: [String]?
+        var rarity: String?
+
+        var title: String { name.flatMap { $0.isEmpty ? nil : String($0.prefix(40)) } ?? EggNames.name(kind) }
+        var palette: EggPalette? { EggPalette(hex: colors) }
     }
 
     enum HatchError: Error { case notStarted, notReady, soldOut, unreachable }
