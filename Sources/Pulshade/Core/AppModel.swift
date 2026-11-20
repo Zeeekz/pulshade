@@ -1051,6 +1051,10 @@ final class AppModel {
             }
         }
         if fromBeforeDeviceKeys { restartSessionsFromBeforeDeviceKeys() }
+        // Every unlock brings the saved format up to date, not only the one that restarted sessions: data left at 23 to 25
+        // stayed there, and each start then took its shared groups for ones from before format 24 and closed them.
+        data.format = AppData.currentFormat
+        save()
         #if os(macOS)
         DemoContact.shared.takeWaitingRequests(model: self)
         #endif
@@ -1099,7 +1103,6 @@ final class AppModel {
                 startHandshake(contact: i, device: d)
             }
         }
-        data.format = AppData.currentFormat
         save()
     }
 
@@ -7897,6 +7900,15 @@ final class AppModel {
         // A group or channel kept in the older format (a copy sent to each member) can still be read, but nothing goes in it.
         case .group, .channel: !convo.isOldFormat && convo.canPost("me") && !(convo.shared.map { $0.joining || $0.gone } ?? false)
         }
+    }
+
+    /// Why you can't post in a group or channel when the cause isn't who may post: still joining, or no longer in it.
+    func cantPostReason(in convo: Conversation) -> String? {
+        guard convo.kind == .group || convo.kind == .channel, let shared = convo.shared else { return nil }
+        let noun = convo.kind == .channel ? "channel" : "group"
+        if shared.gone { return "You're no longer in this \(noun)." }
+        if shared.joining { return "Joining. You can post once an admin's phone has added you." }
+        return nil
     }
 
     /// In a chat with one friend: their name, if their app is from before the sparse post-quantum ratchet and has to update

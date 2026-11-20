@@ -437,6 +437,94 @@ struct SharedGroupFlowTests {
         #expect(cara.conversation(group.id)?.messages.contains { $0.text == "fresh hi from bob" } == true, "the newcomer sees Bob")
     }
 
+    /// A new group set so everyone can post still lets everyone post after the app is closed and opened again, on the
+    /// owner's device and a member's. (Reported: reopening a new group showed "Only admins can post in this group".)
+    @Test func everyoneCanStillPostAfterTheAppIsReopened() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let group = alice.startConversation(kind: .group, title: "Open mic", members: [bobFP, caraFP])
+        await until([alice, bob, cara]) {
+            bob.conversation(group.id)?.shared?.joining == false && cara.conversation(group.id)?.shared?.joining == false
+        }
+        for m in [alice, bob, cara] {
+            let c = try #require(m.conversation(group.id))
+            #expect(c.postPolicy == .everyone)
+            #expect(m.canPost(in: c), "before reopening")
+        }
+        for m in [alice, bob, cara] {
+            m.lock()
+            #expect(await m.unlock(passcode: "test-passcode"))
+        }
+        for (name, m) in [("Alice", alice), ("Bob", bob), ("Cara", cara)] {
+            let c = try #require(m.conversation(group.id))
+            #expect(m.canPost(in: c), "\(name) can post after reopening")
+        }
+        await settle(alice, bob, cara)
+        for (name, m) in [("Alice", alice), ("Bob", bob), ("Cara", cara)] {
+            let c = try #require(m.conversation(group.id))
+            #expect(m.canPost(in: c), "\(name) can post after reopening and syncing")
+        }
+    }
+
+    /// Data saved at format 23 (an account from before build 17) was never brought up to date on unlock, so every start
+    /// took its new shared groups for old ones and closed them: "You're no longer in this group" after reopening.
+    @Test func dataSavedAtAnOlderFormatKeepsNewGroupsAfterAColdStart() async throws {
+        let (alice0, bob, cara, bobFP, caraFP) = try await trio()
+        func coldStart(_ m: AppModel) async throws -> AppModel {
+            m.lock()
+            let fresh = AppModel(vault: Vault(directory: m.vault.directory), watchSystem: false)
+            fresh.callAudio = false; fresh.trafficShaping = false; fresh.cutOffOnLock = false
+            #expect(await fresh.unlock(passcode: "test-passcode"))
+            return fresh
+        }
+        // Saved by an older build, at format 23.
+        alice0.data.format = 23
+        alice0.save()
+        let alice1 = try await coldStart(alice0)
+        #expect(alice1.data.format == AppData.currentFormat, "the first unlock brings it up to date")
+        let group = alice1.startConversation(kind: .group, title: "Open mic", members: [bobFP, caraFP])
+        await until([alice1, bob, cara]) { bob.conversation(group.id)?.shared?.joining == false }
+        let alice = try await coldStart(alice1)
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let c = try #require(alice.conversation(group.id))
+        #expect(c.shared?.gone == false && c.shared?.epochs.isEmpty == false, "still in the group after reopening")
+        #expect(alice.canPost(in: c))
+    }
+
+    /// Same, with the app quit and started fresh from what's on disk, straight after the group is made (before anyone
+    /// else's phone has answered) and again once everyone is in.
+    @Test func everyoneCanStillPostAfterAColdStart() async throws {
+        let (alice0, bob0, cara0, bobFP, caraFP) = try await trio()
+        func coldStart(_ m: AppModel) async throws -> AppModel {
+            m.lock()
+            let fresh = AppModel(vault: Vault(directory: m.vault.directory), watchSystem: false)
+            fresh.callAudio = false; fresh.trafficShaping = false; fresh.cutOffOnLock = false
+            #expect(await fresh.unlock(passcode: "test-passcode"))
+            return fresh
+        }
+        func report(_ tag: String, _ models: [(String, AppModel)], _ id: UUID) {
+            for (name, m) in models {
+                guard let c = m.conversation(id) else { Issue.record("\(tag) \(name): no group"); continue }
+                #expect(m.canPost(in: c), "\(tag) \(name)")
+            }
+        }
+        let group = alice0.startConversation(kind: .group, title: "Open mic", members: [bobFP, caraFP])
+        let alice = try await coldStart(alice0)
+        report("COLD-AT-ONCE", [("Alice", alice)], group.id)
+        var bob = bob0, cara = cara0
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        await until([alice, bob, cara]) {
+            bob.conversation(group.id)?.shared?.joining == false && cara.conversation(group.id)?.shared?.joining == false
+        }
+        report("JOINED", [("Alice", alice), ("Bob", bob), ("Cara", cara)], group.id)
+        let alice2 = try await coldStart(alice)
+        bob = try await coldStart(bob); cara = try await coldStart(cara)
+        report("COLD", [("Alice", alice2), ("Bob", bob), ("Cara", cara)], group.id)
+        await settle(alice2, bob, cara)
+        report("COLD-SYNCED", [("Alice", alice2), ("Bob", bob), ("Cara", cara)], group.id)
+        alice2.lock()
+    }
+
     /// Locking and reopening between adding someone and talking changes nothing.
     @Test func addedLaterStillHearEachOtherAfterReopening() async throws {
         let (alice, bob, cara, bobFP, caraFP) = try await trio()
@@ -513,6 +601,87 @@ struct SharedGroupFlowTests {
         #expect(bob.conversation(group.id)?.messages.last?.sender == "me")
         let tags = [bob, bobsMac].compactMap { $0.conversation(group.id)?.shared?.myTag }
         #expect(tags.count == 2 && tags[0] != tags[1], "each device its own chain")
+    }
+
+    /// The owner has a second device: a new group set so everyone can post still lets both devices post after each is
+    /// quit and started fresh from disk.
+    @Test func ownersTwoDevicesCanStillPostAfterAColdStart() async throws {
+        let (alice0, bob, cara, bobFP, caraFP) = try await trio()
+        let mac0 = try await linkNewDevice(to: alice0)
+        await settle(alice0, bob, cara, mac0)
+        func coldStart(_ m: AppModel, _ pass: String) async throws -> AppModel {
+            m.lock()
+            let fresh = AppModel(vault: Vault(directory: m.vault.directory), watchSystem: false)
+            fresh.callAudio = false; fresh.trafficShaping = false; fresh.cutOffOnLock = false
+            #expect(await fresh.unlock(passcode: pass))
+            return fresh
+        }
+        func report(_ tag: String, _ models: [(String, AppModel)], _ id: UUID) {
+            for (name, m) in models {
+                guard let c = m.conversation(id) else { Issue.record("\(tag) \(name): no group"); continue }
+                #expect(m.canPost(in: c), "\(tag) \(name)")
+            }
+        }
+        let group = alice0.startConversation(kind: .group, title: "Open mic", members: [bobFP, caraFP])
+        let alice = try await coldStart(alice0, "test-passcode")
+        await until([alice, bob, cara, mac0]) {
+            mac0.conversation(group.id)?.shared != nil && bob.conversation(group.id)?.shared?.joining == false
+                && cara.conversation(group.id)?.shared?.joining == false
+        }
+        report("SETTLED", [("Phone", alice), ("Mac", mac0)], group.id)
+        let phone = try await coldStart(alice, "test-passcode"), mac = try await coldStart(mac0, "second-device")
+        defer { for m in [phone, mac, bob, cara] { m.lock() } }
+        report("COLD", [("Phone", phone), ("Mac", mac)], group.id)
+        await settle(phone, mac, bob, cara)
+        report("COLD-SYNCED", [("Phone", phone), ("Mac", mac)], group.id)
+        // And one made on the Mac.
+        let second = mac.startConversation(kind: .group, title: "From the Mac", members: [bobFP, caraFP])
+        await until([phone, mac, bob, cara]) { phone.conversation(second.id)?.shared != nil && bob.conversation(second.id)?.shared?.joining == false }
+        report("MAC-GROUP", [("Phone", phone), ("Mac", mac)], second.id)
+        let phone2 = try await coldStart(phone, "test-passcode"), mac2 = try await coldStart(mac, "second-device")
+        await settle(phone2, mac2, bob, cara)
+        report("MAC-GROUP-COLD", [("Phone", phone2), ("Mac", mac2)], second.id)
+        phone2.lock(); mac2.lock()
+    }
+
+    /// Made while a persona is in use, with a second device linked: still open to everyone after both are started fresh.
+    @Test func aPersonasGroupCanStillBePostedInAfterAColdStart() async throws {
+        let alice0 = try await makeUser("Alice"), bob = try await makeUser("Bob")
+        let mask = try #require(alice0.createPersona(name: "Mask"))
+        _ = try #require(bob.addContact(code: alice0.makeInviteCode(persona: .some(mask.id)), nickname: ""))
+        let mac0 = try await linkNewDevice(to: alice0)
+        await settle(alice0, bob, mac0)
+        alice0.switchPersona(mask.id)
+        let bobFP = try #require(alice0.data.contacts.first { $0.persona == mask.id && !$0.hidden }).fingerprint
+        let chat = alice0.startConversation(kind: .direct, title: "", members: [bobFP])
+        alice0.send("hi", in: chat.id)
+        await settle(alice0, bob, mac0)
+        if let c = bob.data.conversations.first(where: { $0.kind == .direct }) { bob.send("hey", in: c.id) }
+        await settle(alice0, bob, mac0)
+        func coldStart(_ m: AppModel, _ pass: String) async throws -> AppModel {
+            m.lock()
+            let fresh = AppModel(vault: Vault(directory: m.vault.directory), watchSystem: false)
+            fresh.callAudio = false; fresh.trafficShaping = false; fresh.cutOffOnLock = false
+            #expect(await fresh.unlock(passcode: pass))
+            return fresh
+        }
+        func report(_ tag: String, _ models: [(String, AppModel)], _ wire: UUID) {
+            for (name, m) in models {
+                guard let c = m.data.conversations.first(where: { $0.wireID == wire && $0.kind == .group }) else { Issue.record("\(tag) \(name): no group"); continue }
+                #expect(m.canPost(in: c), "\(tag) \(name)")
+            }
+        }
+        let group = alice0.startConversation(kind: .group, title: "Masked", members: [bobFP])
+        #expect(group.shared != nil && group.persona == mask.id)
+        let alice = try await coldStart(alice0, "test-passcode")
+        await until([alice, bob, mac0]) { bob.data.conversations.first { $0.kind == .group }?.shared?.joining == false
+            && mac0.data.conversations.contains { $0.kind == .group && $0.shared != nil } }
+        report("SETTLED", [("Phone", alice), ("Mac", mac0)], group.wireID)
+        let phone = try await coldStart(alice, "test-passcode"), mac = try await coldStart(mac0, "second-device")
+        defer { for m in [phone, mac, bob] { m.lock() } }
+        report("COLD", [("Phone", phone), ("Mac", mac)], group.wireID)
+        await settle(phone, mac, bob)
+        report("COLD-SYNCED", [("Phone", phone), ("Mac", mac)], group.wireID)
     }
 
     /// Someone in the group (or once in it) who is also your friend can't rewrite it for you with a forged invite:

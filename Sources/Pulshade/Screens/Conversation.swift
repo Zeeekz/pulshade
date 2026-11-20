@@ -62,7 +62,7 @@ struct ConversationView: View {
                 header(c)
                 verifyPrompt(c)
                 messages(c)
-                if model.canPost(in: c) { composer(c) } else { ReadOnlyBar(kind: c.kind, announcements: c.isAnnouncements, oldFormat: c.isOldFormat, needsUpdate: model.peerNeedingUpdate(in: c)) }
+                if model.canPost(in: c) { composer(c) } else { ReadOnlyBar(kind: c.kind, announcements: c.isAnnouncements, oldFormat: c.isOldFormat, needsUpdate: model.peerNeedingUpdate(in: c), reason: model.cantPostReason(in: c)) }
             }
             // Fills the whole screen, keyboard or not, so the background doesn't jump when it opens.
             .background { ChatBackdrop(background: model.data.chatBackground, theme: model.theme).equatable().ignoresSafeArea() }
@@ -844,10 +844,12 @@ private struct ReadOnlyBar: View {
     var oldFormat = false
     /// The friend in a one-to-one chat whose app has to update first.
     var needsUpdate: String?
+    /// Why posting is closed when it isn't who-can-post (joining, left), so the bar never blames the admins wrongly.
+    var reason: String?
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: "lock")
-            Text(needsUpdate.map { "\($0) needs to update Pulshade first." } ?? (oldFormat ? "This \(kind == .channel ? "channel" : "group") is on an old format and can't be used. Ask the owner to start it again."
+            Text(needsUpdate.map { "\($0) needs to update Pulshade first." } ?? reason ?? (oldFormat ? "This \(kind == .channel ? "channel" : "group") is on an old format and can't be used. Ask the owner to start it again."
                  : announcements ? "Only PULSHADE can post here"
                  : kind == .channel ? "Only admins can post in this channel" : "Only admins can post in this group"))
                 .multilineTextAlignment(.center)
