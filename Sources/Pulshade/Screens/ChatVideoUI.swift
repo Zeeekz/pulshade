@@ -1,5 +1,89 @@
 import SwiftUI
 import AVKit
+#if os(iOS)
+import Photos
+#else
+import UniformTypeIdentifiers
+#endif
+
+/// Before a photo or video leaves Pulshade for Photos (or a file on the Mac): what that means, with Save, Save and
+/// don't ask again, and Cancel. Skipped once "Don't ask again" is chosen; Settings › Privacy brings it back.
+struct SaveWarning: ViewModifier {
+    @Environment(AppModel.self) private var model
+    @Binding var isPresented: Bool
+    /// "photo" or "video".
+    var kind: String
+    var save: () -> Void
+
+    static func text(_ kind: String) -> (title: String, detail: String) {
+        if Platform.isPhone {
+            return ("Save to Photos?",
+                    "In Pulshade this \(kind) is encrypted and erased when you Burn. Saving puts a copy in your Photos library, outside Pulshade: it isn't encrypted by Pulshade, Burn and Detach can't remove it, and it can sync to iCloud and be seen by anyone or any app that can open your photos.")
+        }
+        return ("Save this \(kind)?",
+                "In Pulshade this \(kind) is encrypted and erased when you Burn. Saving writes an ordinary file wherever you choose, outside Pulshade: it isn't encrypted by Pulshade, Burn and Detach can't remove it, and other apps and backups can read it.")
+    }
+
+    func body(content: Content) -> some View {
+        let text = Self.text(kind)
+        content.alert(text.title, isPresented: $isPresented) {
+            Button("Save") { save() }
+            Button("Save, don't ask again") {
+                model.updateSecurity { $0.warnBeforeSaving = false }
+                save()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(text.detail)
+        }
+    }
+}
+
+extension View {
+    func saveWarning(isPresented: Binding<Bool>, kind: String, save: @escaping () -> Void) -> some View {
+        modifier(SaveWarning(isPresented: isPresented, kind: kind, save: save))
+    }
+}
+
+/// Saving a chat video where you choose: Photos on iPhone (only ever added to), a file on the Mac. Pulshade itself
+/// never writes the video to disk: on iPhone the bytes go to Photos straight from memory, and if Photos won't take
+/// them that's said, never worked around with a file.
+enum VideoSaver {
+    enum Outcome { case saved, notAllowed, refused, failed, cancelled }
+
+    @MainActor static func save(_ clip: Data) async -> Outcome {
+        guard !clip.isEmpty else { return .failed }
+        #if os(iOS)
+        let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+        guard status == .authorized || status == .limited else { return .notAllowed }
+        do {
+            try await PHPhotoLibrary.shared().performChanges {
+                PHAssetCreationRequest.forAsset().addResource(with: .video, data: clip, options: nil)
+            }
+            return .saved
+        } catch {
+            return .refused
+        }
+        #else
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.mpeg4Movie]
+        panel.nameFieldStringValue = "Video.mp4"
+        guard panel.runModal() == .OK, let url = panel.url else { return .cancelled }
+        do { try clip.write(to: url, options: .atomic); return .saved } catch { return .failed }
+        #endif
+    }
+
+    /// What to say once it's done.
+    static func notice(_ outcome: Outcome) -> (text: String, symbol: String)? {
+        switch outcome {
+        case .saved: (Platform.isPhone ? "Saved to Photos" : "Saved", "checkmark")
+        case .notAllowed: ("Allow saving to Photos in Settings", "lock")
+        case .refused: ("This video couldn't be downloaded", "exclamationmark.triangle")
+        case .failed: ("This video couldn't be downloaded", "exclamationmark.triangle")
+        case .cancelled: nil
+        }
+    }
+}
 
 /// A video being got ready in the message box: a still once there is one, a spinner until then.
 struct VideoDraft: Equatable {
@@ -113,7 +197,7 @@ struct VideoBubble: View {
         .clipShape(.rect(cornerRadius: fill == nil ? 10 : 0))
         .contentShape(.rect)
         .onTapGesture { if ready { playing = true } }
-        .modifier(VideoPlayerCover(isPresented: $playing, clip: message.video ?? Data()))
+        .modifier(VideoPlayerCover(isPresented: $playing, clip: message.video ?? Data(), canSave: model.canCopy(message)))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(ready ? "Video" : loadingLabel)
         .accessibilityAddTraits(ready ? .isButton : [])
@@ -123,12 +207,14 @@ struct VideoBubble: View {
 struct VideoPlayerCover: ViewModifier {
     @Binding var isPresented: Bool
     var clip: Data
+    /// Offers Save: not on the video of someone who asked that their messages aren't passed on.
+    var canSave = true
 
     func body(content: Content) -> some View {
         #if os(iOS)
-        content.fullScreenCover(isPresented: $isPresented) { ChatVideoPlayer(clip: clip) }
+        content.fullScreenCover(isPresented: $isPresented) { ChatVideoPlayer(clip: clip, canSave: canSave) }
         #else
-        content.sheet(isPresented: $isPresented) { ChatVideoPlayer(clip: clip).frame(minWidth: 520, minHeight: 620) }
+        content.sheet(isPresented: $isPresented) { ChatVideoPlayer(clip: clip, canSave: canSave).frame(minWidth: 520, minHeight: 620) }
         #endif
     }
 }
@@ -137,7 +223,12 @@ struct VideoPlayerCover: ViewModifier {
 /// show or hide the controls. On the Mac it uses the system's own controls.
 private struct ChatVideoPlayer: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(AppModel.self) private var model
     var clip: Data
+    var canSave = true
+    @State private var saving = false
+    @State private var warning = false
+    @State private var notice: (text: String, symbol: String)?
     @State private var player: AVPlayer?
     /// Kept for as long as the player is: the asset reads its bytes through it.
     @State private var source: MemoryClip?
@@ -178,6 +269,7 @@ private struct ChatVideoPlayer: View {
         #endif
         .onAppear(perform: start)
         .onDisappear(perform: stop)
+        .saveWarning(isPresented: $warning, kind: "video") { save() }
     }
 
     private var overlay: some View {
@@ -193,8 +285,30 @@ private struct ChatVideoPlayer: View {
                 .keyboardShortcut(.cancelAction)
                 .accessibilityLabel("Close")
                 Spacer()
+                if canSave {
+                    Button { if model.data.security.warnBeforeSaving { warning = true } else { save() } } label: {
+                        Group {
+                            if saving { ProgressView().tint(.white) } else { Image(systemName: "arrow.down.to.line") }
+                        }
+                        .font(.system(size: 15, weight: .semibold)).foregroundStyle(.white)
+                        .frame(width: 40, height: 40)
+                        .background(.black.opacity(0.5), in: .circle)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(saving)
+                    .keyboardShortcut("s")
+                    .help("Save video  ⌘S")
+                    .accessibilityLabel("Save video")
+                }
             }
             .padding(14)
+            if let notice {
+                Label(notice.text, systemImage: notice.symbol)
+                    .font(.system(size: 14, weight: .semibold)).foregroundStyle(.white)
+                    .padding(.horizontal, 16).padding(.vertical, 10)
+                    .background(.black.opacity(0.6), in: .capsule)
+                    .transition(.opacity.combined(with: .scale(scale: 0.9)))
+            }
             Spacer()
             #if os(iOS)
             if player != nil {
@@ -227,6 +341,22 @@ private struct ChatVideoPlayer: View {
                 .background(LinearGradient(colors: [.clear, .black.opacity(0.55)], startPoint: .top, endPoint: .bottom).ignoresSafeArea())
             }
             #endif
+        }
+    }
+
+    private func save() {
+        saving = true
+        hideTask?.cancel()
+        Task {
+            let outcome = await VideoSaver.save(clip)
+            saving = false
+            if outcome == .saved { Haptics.tick() }
+            if let said = VideoSaver.notice(outcome) {
+                withAnimation(.snappy) { notice = said }
+                try? await Task.sleep(for: .seconds(1.8))
+                withAnimation(.easeOut) { notice = nil }
+            }
+            scheduleHide()
         }
     }
 

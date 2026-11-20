@@ -970,6 +970,11 @@ private struct LockSettings: View {
                 RowDivider()
                 SecurityToggle(title: "Block screenshots & recording", key: \.blockCapture)
             }
+            SettingsGroup("Saving", footer: Platform.isPhone
+                          ? "Photos and videos you save go to your Photos library, outside Pulshade's encryption, and Burn can't erase them. On, Pulshade says so each time before saving."
+                          : "Photos and videos you save become ordinary files, outside Pulshade's encryption, and Burn can't erase them. On, Pulshade says so each time before saving.") {
+                SecurityToggle(title: "Warn before saving photos and videos", key: \.warnBeforeSaving)
+            }
         }
         .onAppear { biometrics = model.biometricsOn }
         .sheet(isPresented: $changing) { ChangePasscodeSheet() }

@@ -45,6 +45,8 @@ struct ImageViewer: View {
     var caption: String?
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(AppModel.self) private var model
+    @State private var warning = false
     @State private var zoom: CGFloat = 1
     @State private var settledZoom: CGFloat = 1
     @State private var pan: CGSize = .zero
@@ -151,7 +153,10 @@ struct ImageViewer: View {
                                 .buttonStyle(.plain)
                                 .accessibilityLabel("Share")
                         }
-                        glassButton("arrow.down.to.line", label: "Save") { save() }
+                        glassButton("arrow.down.to.line", label: "Save") {
+                            if model.data.security.warnBeforeSaving { warning = true } else { save() }
+                        }
+                        .saveWarning(isPresented: $warning, kind: "photo") { save() }
                         glassButton("doc.on.doc", label: "Copy") { copy() }
                     }
                 }

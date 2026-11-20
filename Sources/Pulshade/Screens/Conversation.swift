@@ -48,6 +48,10 @@ struct ConversationView: View {
     @State private var swipe: (id: UUID, dx: CGFloat)?
     /// A message held on the phone, lifted over the chat with its reactions and actions.
     @State private var lifted: LiftedMessage?
+    /// A short note over the chat after saving a video from the hold menu.
+    @State private var saveNotice: (text: String, symbol: String)?
+    /// A video from the hold menu, waiting on the warning about saving it out of Pulshade.
+    @State private var videoToSave: Data?
     #if os(macOS)
     @State private var scrollMonitor: Any?
     #endif
@@ -67,6 +71,19 @@ struct ConversationView: View {
                 if model.canPost(in: c) { composer(c) } else { ReadOnlyBar(kind: c.kind, announcements: c.isAnnouncements, oldFormat: c.isOldFormat, needsUpdate: model.peerNeedingUpdate(in: c), reason: model.cantPostReason(in: c)) }
             }
             .overlay { if let lifted { focus(lifted, in: c) } }
+            .saveWarning(isPresented: Binding(get: { videoToSave != nil }, set: { if !$0 { videoToSave = nil } }), kind: "video") {
+                if let clip = videoToSave { saveVideo(clip) }
+            }
+            .overlay(alignment: .top) {
+                if let saveNotice {
+                    Label(saveNotice.text, systemImage: saveNotice.symbol)
+                        .font(.system(size: 14, weight: .semibold)).foregroundStyle(Ink.text)
+                        .padding(.horizontal, 16).padding(.vertical, 10)
+                        .background(.regularMaterial, in: .capsule)
+                        .padding(.top, 70)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
             // Fills the whole screen, keyboard or not, so the background doesn't jump when it opens.
             .background { ChatBackdrop(background: model.data.chatBackground, theme: model.theme).equatable().ignoresSafeArea() }
             .onAppear {
@@ -313,6 +330,17 @@ struct ConversationView: View {
         }
     }
 
+    private func saveVideo(_ clip: Data) {
+        Task {
+            let outcome = await VideoSaver.save(clip)
+            if outcome == .saved { Haptics.tick() }
+            guard let said = VideoSaver.notice(outcome) else { return }
+            withAnimation(.snappy) { saveNotice = said }
+            try? await Task.sleep(for: .seconds(2))
+            withAnimation(.easeOut) { saveNotice = nil }
+        }
+    }
+
     private func focusActions(_ m: Message, in c: Conversation, notSent: Bool) -> [MessageFocus.Action] {
         var actions: [MessageFocus.Action] = []
         if notSent && m.isMine {
@@ -326,6 +354,11 @@ struct ConversationView: View {
             actions.append(.init(title: "Copy address", symbol: "doc.on.doc") { copyToClipboard(wallet.address, clearAfter: 120) })
         } else if !m.text.isEmpty, model.canCopy(m) {
             actions.append(.init(title: "Copy", symbol: "doc.on.doc") { copyToClipboard(m.text, clearAfter: 60) })
+        }
+        if let clip = m.video, !clip.isEmpty, model.canCopy(m) {
+            actions.append(.init(title: "Save video", symbol: "arrow.down.to.line") {
+                if model.data.security.warnBeforeSaving { videoToSave = clip } else { saveVideo(clip) }
+            })
         }
         if m.isMine {
             actions.append(.init(title: "Unsend for everyone", symbol: "trash", destructive: true) { model.unsend(m.id, in: id) })

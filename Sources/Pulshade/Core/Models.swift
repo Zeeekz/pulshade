@@ -1358,6 +1358,9 @@ struct SecuritySettings: Codable, Equatable {
     var onlineStatus = false
     /// Pulse icon with an unread count in the menu bar.
     var menuBarIcon = true
+    /// Say what saving a photo or video out of Pulshade means before it's saved (`SaveWarning`), until "Don't ask
+    /// again" is chosen.
+    var warnBeforeSaving = true
     /// Reach the relay over Tor, so it never sees your IP address. On, unless this build's relay is on your own
     /// network, which Tor can't reach.
     var tor = SecuritySettings.torByDefault
@@ -1408,6 +1411,7 @@ struct SecuritySettings: Codable, Equatable {
         pushWake = pushWakeChosen ? (try c.decodeIfPresent(Bool.self, forKey: .pushWake) ?? d.pushWake) : d.pushWake
         linkPreviews = try c.decodeIfPresent(Bool.self, forKey: .linkPreviews) ?? d.linkPreviews
         menuBarIcon = try c.decodeIfPresent(Bool.self, forKey: .menuBarIcon) ?? d.menuBarIcon
+        warnBeforeSaving = try c.decodeIfPresent(Bool.self, forKey: .warnBeforeSaving) ?? d.warnBeforeSaving
         readReceipts = try c.decodeIfPresent(Bool.self, forKey: .readReceipts) ?? d.readReceipts
         typingIndicators = try c.decodeIfPresent(Bool.self, forKey: .typingIndicators) ?? d.typingIndicators
         allowForwarding = try c.decodeIfPresent(Bool.self, forKey: .allowForwarding) ?? d.allowForwarding
@@ -1464,7 +1468,8 @@ struct AppData: Codable {
     /// device is unlinked; a group can still be on the one before (`SharedGroup.memberSecret`).
     /// 26: devices a contact's account unlinked are remembered and refused (`Contact.revoked`, `contested`).
     /// 27: a deleted or left group's last posts, kept until they reach its mailbox (`partingPosts`); a chat can be
-    /// archived (`Conversation.archived`).
+    /// archived (`Conversation.archived`); whether to warn before saving a photo or video out of Pulshade
+    /// (`SecuritySettings.warnBeforeSaving`).
     static let currentFormat = 27
     var profile = Profile()
     var contacts: [Contact] = []
