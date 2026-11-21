@@ -29,6 +29,18 @@ struct ProfileLinksTests {
         #expect(ProfileLinkKind.litecoin.normalize(btcSegwit) == nil)
     }
 
+    @Test func checksumOnlyBech32StringsAreRefusedNotFatal() {
+        // A data part holding only the six checksum characters has no witness program: slicing out the program used
+        // to build the invalid range `1..<0` and trap. A contact sending one of these as a wallet link could crash
+        // the app on every profile refresh, so each must simply be refused.
+        for address in ["ltc1pdtjxt", "bc1gmk9yu", "bc1a8xfp7"] {
+            #expect(ProfileLinkKind.litecoin.normalize(address) == nil, Comment(rawValue: address))
+            #expect(ProfileLinkKind.bitcoin.normalize(address) == nil, Comment(rawValue: address))
+        }
+        // A real witness-v0 address (20-byte program) is still accepted, so the fix only refuses the malformed ones.
+        #expect(ProfileLinkKind.litecoin.normalize("ltc1qqurswpc8qurswpc8qurswpc8qurswpc8p4r4uu") != nil)
+    }
+
     @Test func ethereumChecksum() {
         #expect(ProfileLinkKind.ethereum.normalize(ethChecksummed) == ethChecksummed)
         #expect(ProfileLinkKind.ethereum.normalize(ethChecksummed.lowercased()) != nil)

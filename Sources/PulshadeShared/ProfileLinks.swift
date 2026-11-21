@@ -417,7 +417,10 @@ public enum WalletCheck {
         let expanded = hrp.utf8.map { $0 >> 5 } + [0] + hrp.utf8.map { $0 & 31 }
         let sum = polymod(expanded + values)
         if segwitOnly {
-            guard let version = values.first, version <= 16, sum == (version == 0 ? 1 : 0x2bc830a3),
+            // The data part is the witness version, then the program, then the six-character checksum. A program is
+            // at least one byte, so the whole data part is longer than the checksum alone: checking that before
+            // slicing stops a checksum-only string (whose program range would be empty, `1..<0`) from trapping.
+            guard values.count > 6, let version = values.first, version <= 16, sum == (version == 0 ? 1 : 0x2bc830a3),
                   let program = convertBits(Array(values[1..<values.count - 6]), from: 5, to: 8) else { return false }
             // BIP-141: 2 to 40 bytes; version 0 is exactly a 20-byte key hash or a 32-byte script hash.
             return (2...40).contains(program.count) && (version != 0 || program.count == 20 || program.count == 32)
