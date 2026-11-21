@@ -4,7 +4,8 @@ import Observation
 
 /// The collectibles list this app has checked, and the pictures it names, held in memory for every view to draw from.
 /// The app fills it from its sealed copy at unlock and whenever the relay has a newer list; Pulshade Admin fills it
-/// with the list it is editing, to preview. Empty, only the built-in collectibles have pictures.
+/// with the list it is editing, to preview. Every collectible's name, words and picture come from it: until it
+/// arrives, they show a placeholder.
 @MainActor @Observable
 public final class CollectibleLibrary {
     public static let shared = CollectibleLibrary()
@@ -47,18 +48,15 @@ public final class CollectibleLibrary {
     /// Whether every picture the list names is here.
     public var hasAllArt: Bool { catalog?.items.allSatisfy { art[$0.art.sha256] != nil } ?? true }
 
-    /// Everything a screen needs to show `item`, whether this build draws it, the list has it, or neither (yet).
+    /// Everything a screen needs to show `item`, from the list, or a placeholder until the list has it.
     public func info(_ item: String) -> CollectibleInfo {
-        if let kind = Collectible.Kind(rawValue: item) {
-            return CollectibleInfo(item: item, name: kind.name, blurb: kind.blurb, category: kind.category,
-                                   transferable: kind.transferable, kind: kind, listed: nil)
-        }
         if let listed = self.item(item) {
             return CollectibleInfo(item: item, name: listed.name, blurb: listed.blurb, category: listed.category.kindCategory,
-                                   transferable: listed.transferable, kind: nil, listed: listed)
+                                   transferable: listed.transferable && item != Collectible.guardian, listed: listed)
         }
+        // Until the list arrives, the classics can still be passed on and backed up, as they always could.
         return CollectibleInfo(item: item, name: CollectibleInfo.unknownName, blurb: CollectibleInfo.unknownBlurb,
-                               category: .items, transferable: false, kind: nil, listed: nil)
+                               category: .items, transferable: Collectible.classicTransferable.contains(item), listed: nil)
     }
 }
 
@@ -67,15 +65,16 @@ public struct CollectibleInfo: Equatable {
     public var item: String
     public var name: String
     public var blurb: String
-    public var category: Collectible.Kind.Category
+    public var category: Collectible.Category
     public var transferable: Bool
-    /// Set when this build draws it itself.
-    public var kind: Collectible.Kind?
-    /// Set when it comes from the collectibles list.
+    /// Its entry in the collectibles list, once the list has arrived.
     public var listed: CollectibleCatalog.Item?
 
-    /// Neither drawn by this build nor in the list it has: shown with a placeholder until the list arrives.
-    public var known: Bool { kind != nil || listed != nil }
+    /// Not in the list this app has: shown with a placeholder until the list arrives.
+    public var known: Bool { listed != nil }
+
+    /// The 3D model to open it in, if the list names one this build has.
+    public var viewer: CollectibleCatalog.Viewer? { listed?.viewer.flatMap(CollectibleCatalog.Viewer.init(rawValue:)) }
 
     public static let unknownName = "New collectible"
     public static let unknownBlurb = "Its picture hasn't arrived yet. It shows once Pulshade has fetched the latest collectibles."
@@ -86,7 +85,7 @@ extension Collectible {
     @MainActor public var info: CollectibleInfo { CollectibleLibrary.shared.info(item) }
 }
 
-/// Any collectible's picture: drawn by this build, played from the list's animated PNG, or a plain placeholder.
+/// Any collectible's picture: played from the list's animated PNG, or a plain placeholder until it's here.
 public struct CollectibleArtwork: View {
     var item: String
     var size: CGFloat
@@ -97,9 +96,7 @@ public struct CollectibleArtwork: View {
     }
 
     public var body: some View {
-        if let kind = Collectible.Kind(rawValue: item) {
-            CollectibleIcon(item: kind, size: size)
-        } else if let listed = CollectibleLibrary.shared.item(item), let data = CollectibleLibrary.shared.artData(listed) {
+        if let listed = CollectibleLibrary.shared.item(item), let data = CollectibleLibrary.shared.artData(listed) {
             CatalogArt(art: listed.art, data: data, size: size)
                 .accessibilityLabel(listed.name)
         } else {

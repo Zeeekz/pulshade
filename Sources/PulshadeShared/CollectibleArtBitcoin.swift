@@ -1,29 +1,7 @@
 import SwiftUI
 
-/// A Bitcoin coin in glossy orange gold: a minted rim of beads, a bevelled face with the white B and its two strokes
-/// top and bottom, which spins once on the spot to show the pulse on its back, then catches a sheen sweeping over it
-/// while blocks of light rise behind it and glints flash off its rim, then round again every 6 seconds at the
-/// display's full frame rate. Every motion is a whole number of turns per loop, so it joins up without a jump. Facing
-/// front, shining and still, when the system asks for less motion.
-public struct BitcoinArt: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    public init() {}
-
-    public var body: some View {
-        Group {
-            if reduceMotion {
-                BitcoinFrame(time: 4.2)
-            } else {
-                TimelineView(.animation) { context in
-                    BitcoinFrame(time: context.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: BitcoinFrame.loop))
-                }
-            }
-        }
-        .accessibilityLabel("Bitcoin")
-    }
-}
-
+/// The Bitcoin coin's faces, painted for the coin viewer (`BitcoinViewer`), which the collectibles list can ask for by
+/// name. The flat picture comes from the list like every other collectible's.
 /// The coin at `time` seconds into its loop.
 struct BitcoinFrame: View {
     static let loop = 6.0

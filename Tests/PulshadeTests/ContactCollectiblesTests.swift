@@ -65,9 +65,9 @@ struct ContactCollectiblesDeliveryTests {
         }
         let aliceKey = try #require(alice.me(nil)?.card.signing)
 
-        let real = try Collectible.make(.pumpkin, serial: 3, owner: aliceKey, signedBy: admin)
-        let forged = try Collectible.make(.topHat, serial: 1, owner: aliceKey, signedBy: Curve25519.Signing.PrivateKey())
-        let someoneElses = try Collectible.make(.partyHat, serial: 2, owner: Data(repeating: 9, count: 32), signedBy: admin)
+        let real = try Collectible.make(item: "pumpkin", serial: 3, owner: aliceKey, signedBy: admin)
+        let forged = try Collectible.make(item: "tophat", serial: 1, owner: aliceKey, signedBy: Curve25519.Signing.PrivateKey())
+        let someoneElses = try Collectible.make(item: "partyhat", serial: 2, owner: Data(repeating: 9, count: 32), signedBy: admin)
         alice.updateProfile { $0.collectibles = [real, forged, someoneElses] }
         await settle(alice, bob, seconds: 30) { bob.contact(alice.fingerprint)?.collectibles != nil }
         #expect(bob.contact(alice.fingerprint)?.collectibles == [real])

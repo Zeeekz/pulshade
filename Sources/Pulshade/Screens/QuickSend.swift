@@ -14,7 +14,7 @@ struct QuickSendSheet: View {
 
     private var links: [ProfileLink] { ProfileLink.cleaned(model.activeProfile.links ?? []) }
     private var notes: [ProfileNote] { ProfileNote.cleaned(model.activeProfile.notes ?? []) }
-    private var collectibles: [Collectible] { (model.activeProfile.collectibles ?? []).filter { $0.kind != nil } }
+    private var collectibles: [Collectible] { (model.activeProfile.collectibles ?? []).filter { CollectibleCatalog.validID($0.item) } }
     /// A note for chosen contacts, about to be sent to someone who can't read it yet: asks first.
     @State private var sharing: (note: ProfileNote, fingerprint: String, name: String)?
 

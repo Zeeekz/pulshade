@@ -51,14 +51,16 @@ struct CollectibleViewerSheet: View {
             .frame(maxWidth: .infinity)
 
             Group {
-                if item.kind == .pulze || item.kind == .goldPulze {
-                    DragonViewer(golden: item.kind == .goldPulze)
-                } else if item.kind == .bitcoin {
-                    BitcoinViewer()
-                } else if info.kind != nil || info.listed.flatMap(CollectibleLibrary.shared.artData) != nil {
+                switch info.viewer {
+                case .dragon: DragonViewer(golden: false)
+                case .golddragon: DragonViewer(golden: true)
+                case .bitcoin: BitcoinViewer()
+                case nil:
+                if info.listed.flatMap(CollectibleLibrary.shared.artData) != nil {
                     ObjectViewer3D(item: item.item)
                 } else {
                     CollectiblePlaceholder(size: 160)
+                }
                 }
             }
             .frame(maxWidth: .infinity, minHeight: 300)

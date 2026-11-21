@@ -32,46 +32,6 @@ extension DragonStage {
     }
 }
 
-/// The two pictures, made the first time they're wanted and kept.
-@MainActor enum DragonStillCache {
-    private static var made: [String: CGImage] = [:]
-
-    private static func key(_ head: Bool, _ golden: Bool) -> String { "\(head)\(golden)" }
-
-    static func peek(head wantHead: Bool, golden: Bool = false) -> CGImage? { made[key(wantHead, golden)] }
-
-    static func image(head wantHead: Bool, golden: Bool = false) -> CGImage? {
-        if let cached = peek(head: wantHead, golden: golden) { return cached }
-        let image = DragonStage.still(head: wantHead, pixels: wantHead ? 256 : 512, golden: golden)
-        if let image { made[key(wantHead, golden)] = image }
-        return image
-    }
-}
-
-/// The dragon as a picture, for the Collectibles list and beside a name. Its head when small, so it can still be told
-/// from the rest; all of it when there's room.
-struct DragonStill: View {
-    var size: CGFloat
-    var golden = false
-    @State private var made: CGImage?
-
-    var body: some View {
-        let head = size < 40
-        let picture = DragonStillCache.peek(head: head, golden: golden) ?? made
-        Group {
-            if let picture {
-                Image(decorative: picture, scale: 1).resizable().interpolation(.high).scaledToFit()
-            } else {
-                Image(systemName: "lizard.fill").resizable().scaledToFit().padding(size * 0.15)
-                    .foregroundStyle(Color(red: 0.2, green: 0.75, blue: 0.35))
-            }
-        }
-        .frame(width: size, height: size)
-        .task { made = DragonStillCache.image(head: head, golden: golden) }
-        .accessibilityLabel(golden ? "Golden Pulze The Dragon" : "Pulze The Dragon")
-    }
-}
-
 // MARK: The 3D view
 
 #if os(macOS)

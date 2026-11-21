@@ -238,7 +238,8 @@ An optional public name you can claim per persona, so people can look you up. It
 your choice. A username you let go of is held for a while so nobody takes it straight away.
 
 **What are collectibles and pets?**
-Numbered items, drawn in code, that the operator gives to an account. You can gift them or let them go; pets have their
+Numbered items that the operator gives to an account or that hatch from an egg. Each gets a random free number from its
+run, so a low or special number is luck; the app marks the wanted ones. You can gift them or let them go; pets have their
 own group in the Collectibles tab. They aren't secret: the item, its number and a hash of its code are kept so the
 owner can claim it again with a backup code.
 

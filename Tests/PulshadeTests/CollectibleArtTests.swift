@@ -17,66 +17,6 @@ struct CollectibleArtTests {
         return rep.representation(using: .png, properties: [:])
     }
 
-    @Test func everyCollectibleDrawsAtEverySize() throws {
-        for kind in Collectible.Kind.allCases {
-            for size in [15.0, 52, 84, 256] {
-                let image = try #require(render(CollectibleIcon(item: kind, size: size), size: size), "\(kind.name) at \(size)")
-                #expect(image.size.width > 0)
-            }
-        }
-    }
-
-    /// The frame of each collectible that moves, at a time in its loop, and how long its loop is.
-    private let animated: [(name: String, loop: Double, draw: (Double) -> AnyView)] = [
-        ("partyhat", PartyHatFrame.loop, { AnyView(PartyHatFrame(time: $0)) }),
-        ("pumpkin", PumpkinFrame.loop, { AnyView(PumpkinFrame(time: $0)) }),
-        ("tophat", TopHatShape.loop, { AnyView(TopHatShape(time: $0)) }),
-        ("bonfire", BonfireFrame.loop, { AnyView(BonfireFrame(time: $0)) }),
-        ("christmastree", ChristmasTreeFrame.loop, { AnyView(ChristmasTreeFrame(time: $0)) }),
-        ("bitcoin", BitcoinFrame.loop, { AnyView(BitcoinFrame(time: $0)) }),
-        ("winnie", WinnieFrame.loop, { AnyView(WinnieFrame(time: $0)) }),
-        ("honeyjar", HoneyJarFrame.loop, { AnyView(HoneyJarFrame(time: $0)) }),
-    ]
-
-    private func frame(_ index: Int, _ time: Double, _ size: CGFloat) throws -> Data {
-        let image = try #require(render(animated[index].draw(time), size: size))
-        return try #require(png(image))
-    }
-
-    /// How much of the picture differs noticeably. The renderer isn't exact to the last bit from one run to the next.
-    private func difference(_ a: Data, _ b: Data) throws -> Double {
-        let x = try #require(NSBitmapImageRep(data: a)), y = try #require(NSBitmapImageRep(data: b))
-        let left = try #require(x.bitmapData), right = try #require(y.bitmapData)
-        let count = x.bytesPerRow * x.pixelsHigh
-        var differing = 0
-        for i in 0..<count where abs(Int(left[i]) - Int(right[i])) > 16 { differing += 1 }
-        return Double(differing) / Double(count)
-    }
-
-    @Test func everyAnimatedCollectibleMovesAndJoinsUpAtTheLoop() throws {
-        for (index, item) in animated.enumerated() {
-            #expect(try difference(frame(index, item.loop * 0.13, 120), frame(index, item.loop * 0.31, 120)) > 0.005, "\(item.name) moves")
-            #expect(try difference(frame(index, 0, 120), frame(index, item.loop, 120)) < 0.002, "\(item.name): the last frame is the first, so the loop has no jump")
-        }
-    }
-
-    @Test func savesFramesToLookAt() throws {
-        guard let dir = ProcessInfo.processInfo.environment["PULSHADE_ART_DIR"] else { return }
-        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        for (index, item) in animated.enumerated() {
-            for (i, fraction) in [0.06, 0.2, 0.34, 0.5, 0.66, 0.82].enumerated() {
-                try frame(index, item.loop * fraction, 420).write(to: URL(fileURLWithPath: "\(dir)/\(item.name)-\(i).png"))
-            }
-            for size in [15.0, 24, 52] {
-                try frame(index, item.loop * 0.4, size).write(to: URL(fileURLWithPath: "\(dir)/\(item.name)-small-\(Int(size)).png"))
-            }
-        }
-        for (i, sweep) in [0.15, 0.5].enumerated() {
-            let image = try #require(render(GuardianFrame(sweep: sweep), size: 420))
-            try #require(png(image)).write(to: URL(fileURLWithPath: "\(dir)/guardian-\(i).png"))
-        }
-    }
-
     @Test func theGoldenDragonRendersAndIsNotTheBlueOne() throws {
         let blue = try #require(DragonStage.still(head: false, pixels: 300))
         let gold = try #require(DragonStage.still(head: false, pixels: 300, golden: true))

@@ -58,7 +58,10 @@ func catalogTestItem(_ id: String, frames: Int = 4, transferable: Bool = true, s
             return (try? list.validate()) == nil
         }
         #expect(!refused { _ in })
-        #expect(refused { $0.items[0].id = "partyhat" }, "a built-in collectible can't be taken over")
+        #expect(!refused { $0.items[0].id = "partyhat" }, "the classics come from the list like the rest")
+        #expect(!refused { $0.items[0].viewer = "dragon" })
+        #expect(!refused { $0.items[0].viewer = "spaceship" }, "a 3D view a build doesn't have falls back to the solid")
+        #expect(refused { $0.items[0].viewer = "Not A View" })
         #expect(refused { $0.items[0].id = "Snow Globe" })
         #expect(refused { $0.items[0].id = String(repeating: "a", count: 33) })
         #expect(refused { $0.items.append($0.items[0]) }, "listed twice")
@@ -74,10 +77,10 @@ func catalogTestItem(_ id: String, frames: Int = 4, transferable: Bool = true, s
         #expect(refused { $0.format = 2 })
         #expect(refused { list in list.items = (0...60).map { var i = item; i.id = "item\($0)"; return i } })
         #expect(refused { list in
-            list.items = (0..<13).map { n in
+            list.items = (0..<29).map { n in
                 var i = item; i.id = "big\(n)"; i.art.bytes = 500 * 1024; i.art.sha256 = String(format: "%064x", n); return i
             }
-        }, "over 6 MB of pictures together")
+        }, "over 14 MB of pictures together")
         // A list from a later build's format is set aside, not misread.
         var later = CollectibleCatalog(version: 1, issued: 0, items: [item])
         later.format = 2
@@ -88,15 +91,15 @@ func catalogTestItem(_ id: String, frames: Int = 4, transferable: Bool = true, s
         }
     }
 
-    /// A list made before a later build drew one of its items itself: that build opens it without that item.
-    @Test func anItemALaterBuildDrawsItselfIsLeftOutNotTheWholeList() throws {
+    /// The first collectibles, which builds up to 1.0.1 drew themselves, are list items like the rest now.
+    @Test func aClassicInTheListIsKeptLikeAnyOtherItem() throws {
         let (item, _) = catalogTestItem("snowglobe")
         var taken = item
         taken.id = "partyhat"
         let manifest = try JSONEncoder().encode(CollectibleCatalog(version: 4, issued: 0, items: [item, taken]))
         let sig = try admin.signature(for: CollectibleCatalog.signedPart(manifest))
         let opened = try CollectibleCatalog.open(.init(manifest: manifest.base64EncodedString(), sig: sig.base64EncodedString()), adminKey: adminKey)
-        #expect(opened.items == [item])
+        #expect(opened.items == [item, taken])
     }
 
     @Test func aPictureIsCheckedAgainstTheListBeforeItIsUsed() throws {
@@ -169,7 +172,8 @@ func catalogTestItem(_ id: String, frames: Int = 4, transferable: Bool = true, s
         #expect(!library.info("snowglobe").known)
         #expect(library.info("snowglobe").name == CollectibleInfo.unknownName)
         #expect(!library.info("snowglobe").transferable, "nothing is passed on until the list says so")
-        #expect(library.info("partyhat").kind == .partyHat, "built-ins need no list")
+        #expect(library.info("partyhat").transferable && !library.info("guardian").transferable, "except the classics, as always")
+        #expect(!library.info("partyhat").known, "the classics come from the list too")
         // The medal's picture didn't come: it's listed, but has no picture, so it's left to the placeholder.
         library.install(CollectibleCatalog(version: 1, issued: 0, items: [item, other]), art: [item.art.sha256: data])
         #expect(library.info("snowglobe").name == "Snow Globe")
@@ -180,6 +184,40 @@ func catalogTestItem(_ id: String, frames: Int = 4, transferable: Bool = true, s
         #expect(!library.info("medal").transferable)
         library.clear()
         #expect(library.catalog == nil && !library.info("snowglobe").known)
+    }
+
+    @Test func aClassicFromTheListOpensInItsOwn3DViewAndKeepsItsRules() throws {
+        let library = CollectibleLibrary()
+        var (dragon, data) = catalogTestItem("greendragon")
+        dragon.viewer = "dragon"
+        var (guardian, _) = catalogTestItem("guardian", transferable: true, seed: 0.3)
+        guardian.viewer = nil
+        var (rocket, _) = catalogTestItem("rocket", seed: 0.6)
+        rocket.viewer = "spaceship"
+        library.install(CollectibleCatalog(version: 1, issued: 0, items: [dragon, guardian, rocket]), art: [dragon.art.sha256: data])
+        #expect(library.info("greendragon").viewer == .dragon)
+        #expect(library.info("rocket").viewer == nil, "a view this build doesn't have")
+        #expect(!library.info("guardian").transferable, "a Guardian is never passed on, whatever the list says")
+        // The viewer field round-trips, and a list without it (as older admin apps wrote) still reads.
+        let encoded = try JSONEncoder().encode(dragon)
+        #expect(try JSONDecoder().decode(CollectibleCatalog.Item.self, from: encoded).viewer == "dragon")
+        var old = try #require(try JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        old["viewer"] = nil
+        let plain = try JSONDecoder().decode(CollectibleCatalog.Item.self, from: try JSONSerialization.data(withJSONObject: old))
+        #expect(plain.viewer == nil)
+    }
+
+    @Test func aClassicSignedByTheRelayIsGenuineBeforeTheListArrives() throws {
+        let relay = Curve25519.Signing.PrivateKey()
+        let owner = Curve25519.Signing.PrivateKey().publicKey.rawRepresentation
+        let petKey = relay.publicKey.rawRepresentation
+        func byRelay(_ item: String) throws -> Collectible {
+            Collectible(item: item, serial: 9, owner: owner, sig: try relay.signature(for: Collectible.signedPart(item: item, serial: 9, owner: owner)))
+        }
+        #expect(try byRelay("greendragon").isGenuine(for: owner, adminKey: adminKey, petKey: petKey), "a hatched Pulze, no list yet")
+        #expect(try !byRelay("guardian").isGenuine(for: owner, adminKey: adminKey, petKey: petKey, transferable: true))
+        #expect(try !byRelay("snowglobe").isGenuine(for: owner, adminKey: adminKey, petKey: petKey), "unknown and no list: admin key only")
+        #expect(try !byRelay("greendragon").isGenuine(for: owner, adminKey: adminKey, petKey: petKey, transferable: false), "the list has the last word")
     }
 
     @Test func theListIsKeptSealedAndGoesWithABurn() throws {

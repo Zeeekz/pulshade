@@ -211,5 +211,5 @@ struct ModeratorTag: View {
 
 extension Collectible? {
     /// Whether this is a Guardian, the badge of a moderator.
-    var isModerator: Bool { self?.kind == .guardian }
+    var isModerator: Bool { self?.item == Collectible.guardian }
 }

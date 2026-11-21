@@ -146,8 +146,12 @@ anyone who asks, about once a minute, with no account attached, so fetching them
 are. The @announcements handle is reserved, so no account can pass itself off as it. One taken back disappears from the
 apps the next time they check.
 
-**Collectibles.** Numbered items (a Party Hat under falling confetti, a candle-lit Halloween Pumpkin, a Top Hat that keeps changing colour, a can of Pulse Pop that pops itself open, a Bonfire Night bonfire under fireworks a Christmas Tree with twinkling lights and snow, and Pulze The Dragon, a dark blue pet crackling with electricity, so far, all drawn in code in the same animated style; Pulze is a real 3D model built in code that you can open, turn all the way round, zoom and tap to make it zap, and pets are kept in their own group in the Collectibles tab) that the operator gives to an account
-from Pulshade Admin, a separate Mac app. Each is signed by the admin key, which never leaves that Mac, over the item,
+**Collectibles.** Numbered items (a Party Hat under falling confetti, a candle-lit Halloween Pumpkin, a Top Hat that
+keeps changing colour, Pulze The Dragon and the egg pets, among others; pets are kept in their own group in the
+Collectibles tab) that the operator gives to an account from Pulshade Admin, a separate Mac app, or that hatch from an
+egg. Every one, the first ones included, comes from the collectibles list below. A few open in a 3D model the app keeps
+(Pulze, which you can turn all the way round, zoom and tap to make it zap, and the Bitcoin coin); the rest open as a
+solid made from their picture. Each is signed by the admin key, which never leaves that Mac, over the item,
 its number and the owner's key. Pulshade carries the admin key's public half, so no app can make its own and nobody can
 show one given to someone else: every app checks the signature before showing it. The relay keeps them for their owner
 to fetch with a fresh signature, sealed like the directory. One taken back stops showing the next time its owner's app
@@ -160,11 +164,12 @@ no account attached, and apps check about every half hour. An app checks the sig
 each picture's hash before decoding it, so nothing the admin app didn't sign is ever opened; it refuses a list older
 than one it already has, so the relay can only hold a list back, not take items away by replaying an old one. Every
 picture is fetched whenever the list changes, never one at a time, so fetching says nothing about whose collectibles
-you've seen. Pictures are kept small (512 by 512, 72 frames and 512 KB at most each, 6 MB for the whole list), and the
+you've seen. Pictures are kept small (512 by 512, 72 frames and 512 KB at most each, 14 MB for the whole list), and the
 device keeps the list sealed with a Keychain key, shredded on Burn and Detach. It's data only: names, words and
-pictures; what a collectible can do is the same for all of them and stays in the app. A collectible of an item an
-app doesn't have the picture for yet (the list hasn't arrived) shows a plain placeholder until it does. Builds before
-the list don't show list collectibles at all.
+pictures, plus the name of a 3D model the app keeps, for the few that have one; what a collectible can do is the same
+for all of them and stays in the app. A collectible of an item an app doesn't have the picture for yet (the list hasn't
+arrived) shows a plain placeholder until it does. Builds before the list don't show list collectibles at all, and
+builds that drew the first collectibles themselves (1.0 and 1.0.1) keep drawing those and leave their list entries out.
 
 One **backup code** covers all of an account's collectibles. The app makes it with the first collectible and adds each
 later one to it (an alert says so, and Collectibles shows the code any time). It stays on your own devices; the relay
@@ -172,16 +177,24 @@ keeps only its hash, beside each collectible it covers. When an account burns, t
 collectibles were and keeps only the coded ones' hashes and numbers. Entering the code in another account (signed by
 that account's key, limited to a few tries an hour) claims them all for it, and Pulshade Admin signs each over by
 itself, same item and number; they then join that account's own code. A code works once, and making a new one stops
-the old one working. Burned collectibles keep their numbers, so a number is never given out twice.
+the old one working. Burned collectibles keep their numbers, so a number is never given out twice while someone has it.
 
 **Giveaways.** Pulshade Admin can open a giveaway: a collectible, a code, a window of time and a number to give. The
 relay keeps only a hash of the code (typed any way: case, spaces and dashes don't matter), the window and the claims in
 the order they came. Entering the code in the Collectibles tab sends a proof signed by the account's key, so it can only
 be claimed for that account; each account gets one place, and a banned one can't enter. The admin app signs a collectible
-for each claim in order, one number at a time, as for any other, and the app checks it like the rest. A burned account's
+for each claim in order, with a random free number, as for any other, and the app checks it like the rest. A burned account's
 place stays used but names nobody. A **Guardian** can't be moved with a backup code (the relay refuses to code it, and a
-code claim skips it): it's earned by the account that wears it. The first ten numbers of any collectible, the first
-twenty-five and the last of a hundred are marked as rare in the app, from the number alone.
+code claim skips it): it's earned by the account that wears it.
+
+**Numbers and eggs.** Every collectible has a run (#1 to #100 unless the operator sets another size; the egg pets have
+runs from 25 to 1,000). A new one gets a number picked at random from the numbers in its run that nobody has, whether
+it hatches from an egg or the operator gives it, so a good number is luck, not being early; one let go goes back into the
+draw. The app marks the wanted ones from the number alone: #1, the top ten, numbers with a pattern (lucky 7s, repeated
+digits like 22 or 444, runs like 123 or 4321, and round numbers like 50, 100, 500 and 1,000), the top twenty-five, and
+the last of the run. Eggs are given by the operator; each sort has a pool, so there are never more unhatched eggs out
+than pets left to hatch, and the operator can cap it lower. When an egg hatches, the relay rolls what's inside, picks
+its number and signs it to the owner with its own key, which Pulshade carries too.
 
 There are 100 of each collectible unless the operator changes it, #1 to #100; the relay refuses one past the limit. Pulshade Admin's "Amount in rotation" sets how many of each there can be, from 1 to 10,000, up or down but never below how many are already given out, and nobody's number changes; the relay tells the app the size of the run so the last number is marked "Last one". Pulshade Admin can also reset them
 all: every collectible is taken back from everyone, backup codes stop working, and each item's numbering starts again

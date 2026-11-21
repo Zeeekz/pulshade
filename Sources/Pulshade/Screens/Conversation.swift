@@ -1405,13 +1405,13 @@ fileprivate struct Bubble: View, Equatable {
             if message.attachment?.kind == .file {
                 FileBubble(message: message, mine: mine)
             }
-            if let collectible = message.collectible, collectible.kind != nil {
+            if let collectible = message.collectible, CollectibleCatalog.validID(collectible.item) {
                 CollectibleCard(collectible: collectible, mine: mine)
             }
             if let card = message.note {
                 NoteCardView(card: card, message: message, mine: mine)
             }
-            if message.collectible?.kind != nil || message.note != nil {
+            if message.collectible.map({ CollectibleCatalog.validID($0.item) }) == true || message.note != nil {
                 // The card says it all; the words are only for apps that don't know cards.
             } else if bare {
                 BigEmoji(text: message.text, fresh: Date().timeIntervalSince(message.date) < 6)

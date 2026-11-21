@@ -552,7 +552,7 @@ private struct ProfileSettings: View {
     @ViewBuilder private var addPrompts: some View {
         let hasLinks = !ProfileLink.cleaned(model.activeProfile.links ?? []).isEmpty
         let hasNotes = !ProfileNote.cleaned(model.activeProfile.notes ?? []).isEmpty
-        let hasCollectibles = !(model.activeProfile.collectibles ?? []).filter { $0.kind != nil }.isEmpty
+        let hasCollectibles = !(model.activeProfile.collectibles ?? []).filter { CollectibleCatalog.validID($0.item) }.isEmpty
         if !hasLinks || !hasNotes || !hasCollectibles {
             VStack(spacing: 8) {
                 if !hasLinks { addPrompt(.pinned, "link", "Add links and wallets", "Show your socials and wallets on your profile.") }

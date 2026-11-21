@@ -43,16 +43,10 @@ struct ObjectViewer3D: View {
     /// The collectible's art on a clear background, as an image to stack. Drawn at the moment it's asked for, so
     /// its animation is wherever it has got to.
     static func picture(_ item: String, still: Bool = false) -> CGImage? {
-        guard let kind = Collectible.Kind(rawValue: item) else {
-            // One from the collectibles list: its animated picture's frame for this moment, as decoded already.
-            guard let listed = CollectibleLibrary.shared.item(item), let data = CollectibleLibrary.shared.artData(listed) else { return nil }
-            let index = still ? 0 : CatalogFrames.index(at: Date(), art: listed.art)
-            return CatalogFrames.shared.frame(art: listed.art, data: data, index: index, pixels: 512)
-        }
-        let renderer = ImageRenderer(content: CollectibleIcon(item: kind, size: 320).frame(width: 320, height: 320))
-        renderer.scale = 2
-        renderer.isOpaque = false
-        return renderer.cgImage
+        // Its animated picture's frame for this moment, as decoded already.
+        guard let listed = CollectibleLibrary.shared.item(item), let data = CollectibleLibrary.shared.artData(listed) else { return nil }
+        let index = still ? 0 : CatalogFrames.index(at: Date(), art: listed.art)
+        return CatalogFrames.shared.frame(art: listed.art, data: data, index: index, pixels: 512)
     }
 
     private let still: Bool

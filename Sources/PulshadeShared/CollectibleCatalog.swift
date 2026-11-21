@@ -29,8 +29,7 @@ public struct CollectibleCatalog: Codable, Equatable, Sendable {
     }
 
     public struct Item: Codable, Equatable, Hashable, Sendable, Identifiable {
-        /// The item string collectibles carry: 1 to 32 lowercase letters and digits, as the relay allows, and never one a
-        /// build already has its own drawing for.
+        /// The item string collectibles carry: 1 to 32 lowercase letters and digits, as the relay allows.
         public var id: String
         public var name: String
         public var blurb: String
@@ -38,21 +37,30 @@ public struct CollectibleCatalog: Codable, Equatable, Sendable {
         /// Whether a backup code or a gift can move it to another account. False makes it earned, like the Guardian.
         public var transferable: Bool
         public var art: Art
+        /// A 3D model the app keeps, to open it in instead of the solid made from its picture: one of `Viewer`'s names.
+        /// Builds that don't know the name (or the field) use the solid.
+        public var viewer: String?
 
-        public init(id: String, name: String, blurb: String, category: Category, transferable: Bool, art: Art) {
+        public init(id: String, name: String, blurb: String, category: Category, transferable: Bool, art: Art, viewer: String? = nil) {
             self.id = id
             self.name = name
             self.blurb = blurb
             self.category = category
             self.transferable = transferable
             self.art = art
+            self.viewer = viewer
         }
     }
 
     public enum Category: String, Codable, Sendable {
         case items, pets
 
-        public var kindCategory: Collectible.Kind.Category { self == .pets ? .pets : .items }
+        public var kindCategory: Collectible.Category { self == .pets ? .pets : .items }
+    }
+
+    /// The 3D models this build has, by the name a list item gives in `viewer`.
+    public enum Viewer: String, CaseIterable, Sendable {
+        case dragon, golddragon, bitcoin
     }
 
     /// An animated PNG (a plain PNG is one frame), played round every `loop` seconds.
@@ -95,7 +103,9 @@ public struct CollectibleCatalog: Codable, Equatable, Sendable {
         public static let manifestBytes = 64 * 1024
         public static let items = 60
         public static let artBytes = 512 * 1024
-        public static let totalArtBytes = 6 * 1024 * 1024
+        /// Room for every collectible, the ones the first builds drew themselves included. Builds from before those moved
+        /// into the list leave them out and count only the rest against their own 6 MB.
+        public static let totalArtBytes = 14 * 1024 * 1024
         public static let side = 512
         public static let frames = 72
         public static let nameLength = 40
@@ -147,14 +157,9 @@ public struct CollectibleCatalog: Codable, Equatable, Sendable {
         guard let head = try? JSONDecoder().decode(Head.self, from: manifest) else { throw Problem.unreadable }
         guard head.format == currentFormat else { throw Problem.unknownFormat }
         guard var catalog = try? JSONDecoder().decode(CollectibleCatalog.self, from: manifest) else { throw Problem.unreadable }
-        // An item a later build draws itself is that build's, not the list's: left out rather than refusing the list.
-        catalog.items.removeAll { builtInIDs.contains($0.id) }
         try catalog.validate()
         return catalog
     }
-
-    /// Ids the build draws itself. A list can't take one over.
-    public static var builtInIDs: Set<String> { Set(Collectible.Kind.allCases.map(\.rawValue)) }
 
     public static func validID(_ id: String) -> Bool {
         (1...32).contains(id.utf8.count) && id.unicodeScalars.allSatisfy { ("a"..."z").contains($0) || ("0"..."9").contains($0) }
@@ -167,7 +172,9 @@ public struct CollectibleCatalog: Codable, Equatable, Sendable {
         var seen = Set<String>(), hashes = Set<String>(), total = 0
         for item in items {
             guard Self.validID(item.id) else { throw Problem.invalid("“\(item.id)” isn't a valid id: 1 to 32 lowercase letters and digits") }
-            guard !Self.builtInIDs.contains(item.id) else { throw Problem.invalid("“\(item.id)” is already a built-in collectible") }
+            if let viewer = item.viewer {
+                guard Self.validID(viewer), viewer.count <= 16 else { throw Problem.invalid("“\(item.id)” names a 3D view that isn't valid") }
+            }
             guard seen.insert(item.id).inserted else { throw Problem.invalid("“\(item.id)” is listed twice") }
             let name = item.name.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !name.isEmpty, name == item.name, item.name.count <= Limits.nameLength,

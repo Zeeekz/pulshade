@@ -6,7 +6,7 @@ import CryptoKit
 /// checked against the owner, so nobody can wear one given to someone else.
 public struct Collectible: Codable, Equatable, Hashable, Identifiable {
     public var item: String
-    /// Which one of its kind it is: #1 was the first given out.
+    /// Which one of its kind it is, from #1 to the end of its run. Hatched ones get a random free number.
     public var serial: UInt32
     /// The signing key of the account it was given to.
     public var owner: Data
@@ -36,96 +36,84 @@ public struct Collectible: Codable, Equatable, Hashable, Identifiable {
 
     public var id: String { "\(item)#\(serial)" }
 
-    /// How rare its number makes it. The first ten are the ones people brag about, and the last of a run is the end of
-    /// it. Only the number decides, so it can't be faked or bought.
+    /// What makes its number wanted, best first. Low numbers are the ones people brag about, then numbers with a
+    /// pattern, then the end of the run. Numbers are given at random when an egg hatches, so a good one is luck: it can't
+    /// be faked or bought, only traded.
     public enum Rarity: Equatable {
-        case legendary, rare, last, common
+        /// #1.
+        case first
+        /// #2 to #10.
+        case topTen
+        /// A number with a pattern: lucky 7, the same digit over and over, a run like 123, or a round number.
+        case special(Pattern)
+        /// #11 to #25.
+        case topTwentyFive
+        /// The final number of the run.
+        case last
+        case common
+
+        public enum Pattern: Equatable {
+            case lucky, repeated, run, round
+        }
 
         public var name: String? {
             switch self {
-            case .legendary: "Top 10"
-            case .rare: "Top 25"
+            case .first: "Number one"
+            case .topTen: "Top 10"
+            case .special(.lucky): "Lucky 7"
+            case .special(.repeated): "Repeater"
+            case .special(.run): "Straight"
+            case .special(.round): "Round"
+            case .topTwentyFive: "Top 25"
             case .last: "Last one"
             case .common: nil
             }
         }
     }
 
-    public var rarity: Rarity {
+    public var rarity: Rarity { Self.rarity(of: serial, edition: edition ?? Self.defaultLimit) }
+
+    /// How wanted `serial` is in a run of `edition`. Pure, so the app, Admin and tests agree.
+    public static func rarity(of serial: UInt32, edition: UInt32) -> Rarity {
         switch serial {
-        case 1...10: .legendary
-        case 11...25: .rare
-        case edition ?? Self.defaultLimit: .last
-        default: .common
+        case 1: return .first
+        case 2...10: return serial == 7 ? .special(.lucky) : .topTen
+        default: break
         }
+        if let pattern = pattern(of: serial) { return .special(pattern) }
+        if serial <= 25 { return .topTwentyFive }
+        if serial == edition { return .last }
+        return .common
     }
+
+    /// The pattern a number of two digits or more has, if any: 77 and 777 are lucky, 11, 222 and 4444 repeat, 123,
+    /// 234, 1234 and 321 run, and 50, 100, 500 and 1000 are round.
+    public static func pattern(of serial: UInt32) -> Rarity.Pattern? {
+        let digits = Array(String(serial)).compactMap { $0.wholeNumberValue }
+        guard digits.count >= 2 else { return serial == 7 ? .lucky : nil }
+        if Set(digits).count == 1 { return digits[0] == 7 ? .lucky : .repeated }
+        let steps = zip(digits, digits.dropFirst()).map { $1 - $0 }
+        if digits.count >= 3, Set(steps).count == 1, steps[0] == 1 || steps[0] == -1 { return .run }
+        if serial >= 50, digits[0] == 1 || digits[0] == 5, digits.dropFirst().allSatisfy({ $0 == 0 }) { return .round }
+        return nil
+    }
+
     /// How many of each there are unless the operator has said otherwise: #1 to #100.
     public static let defaultLimit: UInt32 = 100
-    public var kind: Kind? { Kind(rawValue: item) }
 
-    public enum Kind: String, CaseIterable, Identifiable {
-        case partyHat = "partyhat"
-        case pumpkin = "pumpkin"
-        case topHat = "tophat"
-        case pulsePop = "pulsepop"
-        case bonfire = "bonfire"
-        case christmasTree = "christmastree"
-        case bitcoin = "bitcoin"
-        case winnie = "winnie"
-        case honeyJar = "honeyjar"
-        /// Its id is still `greendragon`, from before it was renamed, so any already given out keep counting.
-        case pulze = "greendragon"
-        case guardian = "guardian"
-        /// The rare dragon: one in seven of the eggs that hatch Pulze.
-        case goldPulze = "golddragon"
-
-        public var id: String { rawValue }
-        public var name: String {
-            switch self {
-            case .partyHat: "Party Hat"
-            case .pumpkin: "Halloween Pumpkin"
-            case .topHat: "Top Hat"
-            case .pulsePop: "Pulse Pop"
-            case .bonfire: "Bonfire Night"
-            case .christmasTree: "Christmas Tree"
-            case .bitcoin: "Bitcoin"
-            case .winnie: "Winnie The Pooh"
-            case .honeyJar: "Honey Jar"
-            case .pulze: "Pulze The Dragon"
-            case .guardian: "Guardian"
-            case .goldPulze: "Golden Pulze The Dragon"
-            }
-        }
-        /// What sort of thing it is, so the Collectibles tab can keep pets together.
-        public enum Category: CaseIterable {
-            case items, pets
-        }
-
-        public var category: Category { self == .pulze || self == .goldPulze ? .pets : .items }
-        /// Whether it can be opened to look at from every side.
-        /// Every collectible opens in 3D: the dragon in its own modelled viewer, the rest as solid objects.
-        public var has3DView: Bool { true }
-
-        /// Whether a backup code can move it to another account. A Guardian is earned by whoever wears it, so it can't.
-        public var transferable: Bool { self != .guardian }
-
-        public var blurb: String {
-            switch self {
-            case .partyHat: "A folded paper crown. The first PULSHADE collectible."
-            case .pumpkin: "A carved pumpkin, lit from inside."
-            case .topHat: "A top hat that never settles on a colour."
-            case .pulsePop: "A can of Pulse Pop that won't stay shut."
-            case .bonfire: "A roaring bonfire with fireworks bursting overhead. Remember, remember."
-            case .christmasTree: "A Christmas tree with twinkling lights and snow drifting down. Hush now."
-            case .bitcoin: "A glossy Bitcoin coin that spins to show its pulse. Number one, or number one hundred."
-            case .winnie: "A silly old bear in a little red jumper, waving hello. Oh, bother."
-            case .honeyJar: "A jar of honey brimming over, with a bee that won't leave it alone. Just a smackerel."
-            case .pulze: "A dark blue dragon, crackling with electricity."
-            case .guardian: "Awarded to the people who keep Pulshade safe. Earned, never passed on."
-            case .goldPulze: "A rare golden dragon, crackling with sparks. Hatched from a dragon egg, and not often."
-            }
-        }
+    /// What sort of thing it is, so the Collectibles tab can keep pets together.
+    public enum Category: CaseIterable {
+        case items, pets
     }
+
+    /// The Guardian: given only to moderators, and earned, so never passed on.
+    public static let guardian = "guardian"
+
+    /// The collectibles the first builds drew themselves, which could always be gifted or moved with a backup code. Kept
+    /// so one of them is still taken as genuine before the collectibles list has arrived; the list says the same.
+    public static let classicTransferable: Set<String> = [
+        "partyhat", "pumpkin", "tophat", "pulsepop", "bonfire", "christmastree", "bitcoin", "winnie", "honeyjar", "greendragon", "golddragon",
+    ]
 
     public static func signedPart(item: String, serial: UInt32, owner: Data) -> Data {
         Data("pulshade.collectible.v1".utf8) + Data(item.utf8) + Data([0])
@@ -133,26 +121,20 @@ public struct Collectible: Codable, Equatable, Hashable, Identifiable {
     }
 
     /// Made by the admin app for `owner`.
-    public static func make(_ kind: Kind, serial: UInt32, owner: Data, signedBy admin: Curve25519.Signing.PrivateKey) throws -> Collectible {
-        let sig = try admin.signature(for: signedPart(item: kind.rawValue, serial: serial, owner: owner))
-        return Collectible(item: kind.rawValue, serial: serial, owner: owner, sig: sig)
-    }
-
-    /// Made by the admin app for `owner`, for any item: a built-in one or one from the collectibles list.
     public static func make(item: String, serial: UInt32, owner: Data, signedBy admin: Curve25519.Signing.PrivateKey) throws -> Collectible {
         let sig = try admin.signature(for: signedPart(item: item, serial: serial, owner: owner))
         return Collectible(item: item, serial: serial, owner: owner, sig: sig)
     }
 
     /// Given to `owner`, signed by `adminKey` (the Pulshade Admin key a build carries) or `petKey` (the relay's, for
-    /// hatched and gifted ones). The item needn't be one this build draws: one added later through the collectibles list
-    /// is just as genuine, and shows a placeholder until the list arrives. `transferable` is what the list says of an
-    /// item this build doesn't know; without it such an item takes the admin key only.
+    /// hatched and gifted ones). Every item comes from the collectibles list and shows a placeholder until the list
+    /// arrives. `transferable` is what the list says of it; without the list only the classic ones count as movable,
+    /// and anything else takes the admin key only.
     public func isGenuine(for owner: Data, adminKey: Data?, petKey: Data? = nil, transferable: Bool? = nil) -> Bool {
         guard CollectibleCatalog.validID(item), self.owner == owner else { return false }
         let message = Self.signedPart(item: item, serial: serial, owner: owner)
         // The relay's key only counts for what can be hatched or passed on. A Guardian is the admin key's alone.
-        let movable = kind?.transferable ?? transferable ?? false
+        let movable = item != Self.guardian && (transferable ?? Self.classicTransferable.contains(item))
         return [adminKey, movable ? petKey : nil].contains { raw in
             guard let raw, let key = try? Curve25519.Signing.PublicKey(rawRepresentation: raw) else { return false }
             return key.isValidSignature(sig, for: message)

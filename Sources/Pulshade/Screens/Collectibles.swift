@@ -18,10 +18,9 @@ struct CollectiblesView: View {
 
     private var owned: [Collectible] { model.activeProfile.collectibles ?? [] }
     private var worn: Collectible? { model.activeProfile.badge }
-    /// Collectibles this persona has none of yet, built in or from the collectibles list, shown faded so people know
-    /// what exists.
+    /// Collectibles from the list this persona has none of yet, shown faded so people know what exists.
     private var missing: [CollectibleInfo] {
-        let all = Collectible.Kind.allCases.map(\.rawValue) + (CollectibleLibrary.shared.catalog?.items.map(\.id) ?? [])
+        let all = CollectibleLibrary.shared.catalog?.items.map(\.id) ?? []
         return all.filter { item in !owned.contains { $0.item == item } }.map { CollectibleLibrary.shared.info($0) }
     }
 

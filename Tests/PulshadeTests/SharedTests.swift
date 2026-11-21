@@ -27,7 +27,7 @@ struct SharedTests {
 
     @Test func collectiblesCountOnlyFromTheAdminKeyForTheirOwner() throws {
         let admin = Curve25519.Signing.PrivateKey(), owner = Data(repeating: 1, count: 32)
-        let hat = try Collectible.make(.pumpkin, serial: 3, owner: owner, signedBy: admin)
+        let hat = try Collectible.make(item: "pumpkin", serial: 3, owner: owner, signedBy: admin)
         let adminKey = admin.publicKey.rawRepresentation
         #expect(hat.isGenuine(for: owner, adminKey: adminKey))
         #expect(!hat.isGenuine(for: Data(repeating: 2, count: 32), adminKey: adminKey))
@@ -40,11 +40,10 @@ struct SharedTests {
 
     @Test func petsCountFromTheRelayKeyToo() throws {
         let admin = Curve25519.Signing.PrivateKey(), relay = Curve25519.Signing.PrivateKey(), owner = Data(repeating: 1, count: 32)
-        let pet = try Collectible.make(.goldPulze, serial: 2, owner: owner, signedBy: relay)
+        let pet = try Collectible.make(item: "golddragon", serial: 2, owner: owner, signedBy: relay)
         #expect(pet.isGenuine(for: owner, adminKey: admin.publicKey.rawRepresentation, petKey: relay.publicKey.rawRepresentation))
         #expect(!pet.isGenuine(for: owner, adminKey: admin.publicKey.rawRepresentation), "a build without the relay key trusts none")
         #expect(!pet.isGenuine(for: Data(repeating: 2, count: 32), adminKey: nil, petKey: relay.publicKey.rawRepresentation))
-        #expect(pet.kind?.category == .pets)
     }
 
     @Test func announcementsCountOnlyFromTheAdminKeyAndUnchanged() throws {
