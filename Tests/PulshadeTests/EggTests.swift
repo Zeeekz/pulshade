@@ -32,6 +32,12 @@ struct EggTests {
         }
     }
 
+    @Test func aRepeatedEggIsKeptOnce() {
+        let a = RelayClient.EggInfo(id: "a", kind: "dragon", hatches_at: nil, seconds: 600, now: 1, name: nil, colors: nil, rarity: nil)
+        let b = RelayClient.EggInfo(id: "b", kind: "fox", hatches_at: nil, seconds: 900, now: 1, name: "Fox Egg", colors: nil, rarity: nil)
+        #expect(RelayClient.EggInfo.unique([a, b, a, a]).map(\.id) == ["a", "b"])
+    }
+
     @Test func eachEggTakesItsNameColoursAndRarityFromTheRelayAndOldRelaysStillWork() throws {
         let new = try JSONDecoder().decode(RelayClient.EggInfo.self, from: Data(#"{"id":"a","kind":"raven","hatches_at":null,"seconds":86400,"now":1,"name":"Raven Egg","colors":["ffce60","10122a"],"rarity":"Legendary"}"#.utf8))
         #expect(new.title == "Raven Egg" && new.rarity == "Legendary")

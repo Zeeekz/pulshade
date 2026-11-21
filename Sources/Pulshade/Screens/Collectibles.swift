@@ -16,7 +16,7 @@ struct CollectiblesView: View {
     @State private var showingCode = false
     @State private var viewing: Collectible?
 
-    private var owned: [Collectible] { model.activeProfile.collectibles ?? [] }
+    private var owned: [Collectible] { Collectible.unique(model.activeProfile.collectibles ?? []) }
     private var worn: Collectible? { model.activeProfile.badge }
     /// Collectibles from the list this persona has none of yet, shown faded so people know what exists.
     private var missing: [CollectibleInfo] {

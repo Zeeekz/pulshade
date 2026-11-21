@@ -15,7 +15,7 @@ struct BackupCodeSheet: View {
     @State private var problem: String?
     @State private var confirmReplace = false
 
-    private var items: [Collectible] { alert?.items ?? model.activeProfile.collectibles ?? [] }
+    private var items: [Collectible] { Collectible.unique(alert?.items ?? model.activeProfile.collectibles ?? []) }
     private var names: String { items.map { "\($0.info.name) #\($0.serial)" }.formatted(.list(type: .and)) }
 
     private var title: String {

@@ -918,6 +918,13 @@ struct RelayClient {
 
         var title: String { name.flatMap { $0.isEmpty ? nil : String($0.prefix(40)) } ?? EggNames.name(kind) }
         var palette: EggPalette? { EggPalette(hex: colors) }
+
+        /// One entry per id, at most 200: a relay answer may repeat an egg, and two sharing an identity are duplicate IDs,
+        /// which SwiftUI draws unreliably (a display glitch and a runtime warning).
+        static func unique(_ list: [EggInfo]) -> [EggInfo] {
+            var seen = Set<String>()
+            return Array(list.prefix(200).filter { seen.insert($0.id).inserted })
+        }
     }
 
     enum HatchError: Error { case notStarted, notReady, soldOut, unreachable }

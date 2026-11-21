@@ -22,6 +22,38 @@ struct ContactCollectiblesTests {
         #expect(again.collectibles == [item])
     }
 
+    /// A profile (a malicious contact's, say) may name one collectible many times, or sign one number twice: every list
+    /// that draws them would be handed duplicate IDs, which SwiftUI draws unreliably (a display glitch, and a runtime
+    /// warning). One per item and number is kept.
+    @MainActor @Test func aRepeatedCollectibleIsKeptOnce() {
+        let first = Collectible(item: "partyhat", serial: 1, owner: item.owner, sig: Data(repeating: 2, count: 64))
+        let sameNumberOtherSignature = Collectible(item: "partyhat", serial: 1, owner: item.owner, sig: Data(repeating: 3, count: 64))
+        let second = Collectible(item: "partyhat", serial: 2, owner: item.owner, sig: Data(repeating: 2, count: 64))
+        let unique = Collectible.unique([first, sameNumberOtherSignature, first, second, second])
+        #expect(unique.map(\.id) == ["partyhat#1", "partyhat#2"])
+        #expect(unique.count == 2)
+        // What a profile shares is trimmed the same way, and an empty list still means "nothing to show".
+        var profile = Profile()
+        profile.collectibles = [first, sameNumberOtherSignature, first, second]
+        #expect(AppModel.sharedCollectibles(profile)?.map(\.id) == ["partyhat#1", "partyhat#2"])
+        profile.collectibles = []
+        #expect(AppModel.sharedCollectibles(profile) == nil)
+        // As many distinct numbers as a hostile list can hold still come out at the old cap.
+        let many = (1...60).map { Collectible(item: "partyhat", serial: UInt32($0), owner: item.owner, sig: item.sig) }
+        #expect(Collectible.unique(many).count == 40)
+    }
+
+    /// A profile can be megabytes. Its collectibles are cut to a few hundred *before* any signature is checked, so a
+    /// hostile contact can't make the app do tens of thousands of Ed25519 checks on one profile message.
+    @MainActor @Test func aHugeProfileIsCutBeforeVerification() {
+        let huge = (1...25_000).map { Collectible(item: "partyhat", serial: UInt32($0), owner: item.owner, sig: item.sig) }
+        #expect(huge.count == 25_000)
+        // Only this many entries are ever handed to `isGenuine`, whatever the payload's size.
+        #expect(AppModel.profileCollectibleCandidates(huge).count == AppModel.maxProfileCollectibles)
+        // And the real path verifies only that cut: these signatures are fake, so nothing is kept.
+        #expect(AppModel.profileCollectibles(huge, for: item.owner).isEmpty)
+    }
+
     @MainActor @Test func sharingSendsOnlyTheListAndCapsIt() {
         var profile = Profile()
         profile.collectionCode = "SECRET-BACKUP-CODE"

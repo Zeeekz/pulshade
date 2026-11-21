@@ -12,7 +12,8 @@ struct ContactCollectibles: View {
     @State private var viewing: Collectible?
 
     var body: some View {
-        let shown = items
+        // One entry per number: a profile may name the same one twice.
+        let shown = Collectible.unique(items)
         if !shown.isEmpty {
             ExpandableCard(title: "Collectibles", symbol: "sparkles", count: shown.count, startsOpen: true) {
                 HStack(spacing: -4) {

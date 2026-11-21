@@ -126,6 +126,20 @@ public struct Collectible: Codable, Equatable, Hashable, Identifiable {
         return Collectible(item: item, serial: serial, owner: owner, sig: sig)
     }
 
+    /// `list` with one entry per item and number, at most `limit` entries. Anything a profile or the relay hands over may
+    /// repeat an entry, or carry two signatures for the same number (the admin key's and the relay's): two entries sharing
+    /// an identity are duplicate IDs, which SwiftUI draws unreliably (a display glitch and a runtime warning).
+    public static func unique(_ list: [Collectible], limit: Int = 40) -> [Collectible] {
+        var seen = Set<String>()
+        var out: [Collectible] = []
+        for collectible in list.prefix(limit * 10) {
+            guard seen.insert(collectible.id).inserted else { continue }
+            out.append(collectible)
+            if out.count == limit { break }
+        }
+        return out
+    }
+
     /// Given to `owner`, signed by `adminKey` (the Pulshade Admin key a build carries) or `petKey` (the relay's, for
     /// hatched and gifted ones). Every item comes from the collectibles list and shows a placeholder until the list
     /// arrives. `transferable` is what the list says of it; without the list only the classic ones count as movable,

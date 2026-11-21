@@ -1734,8 +1734,8 @@ final class AppModel {
     /// What a profile shows contacts of its collectibles: the genuine ones, never the backup code or anything else.
     static func sharedCollectibles(_ profile: Profile) -> [Collectible]? {
         // Each was checked against this account's key when it was fetched, and the receiver checks again.
-        let mine = (profile.collectibles ?? []).prefix(40)
-        return mine.isEmpty ? nil : Array(mine)
+        let mine = Collectible.unique(profile.collectibles ?? [])
+        return mine.isEmpty ? nil : mine
     }
 
     private func profilePayload(_ persona: UUID?, for contact: String) -> Payload {
@@ -4014,6 +4014,22 @@ final class AppModel {
     /// After entering a giveaway code, looking for the new collectible more often until this time.
     private var collectibleWatchUntil = Date.distantPast
 
+    /// The most collectibles one profile message may put through signature checks. A profile can be megabytes, and a
+    /// signature check per entry would let a hostile contact make the app check tens of thousands of them.
+    static let maxProfileCollectibles = 400
+
+    /// The entries of a profile message worth checking, cut *before* any signature is verified.
+    static func profileCollectibleCandidates(_ list: [Collectible]?) -> ArraySlice<Collectible> {
+        (list ?? []).prefix(Self.maxProfileCollectibles)
+    }
+
+    /// What one profile message's collectibles may add to a contact: the first few hundred, verified, one per item and
+    /// number. Only what's shared with contacts is capped at 40 (`sharedCollectibles`); this is someone else's list.
+    @MainActor
+    static func profileCollectibles(_ list: [Collectible]?, for owner: Data) -> [Collectible] {
+        Collectible.unique(profileCollectibleCandidates(list).filter { $0.isGenuine(for: owner) })
+    }
+
     /// Asks the relay which collectibles the active persona has been given, keeping only ones that check out.
     /// If the one shown after its name is no longer among them, it stops being shown. A new one joins the backup code
     /// (made the first time), and an alert asks you to keep the code safe.
@@ -4024,7 +4040,11 @@ final class AppModel {
         let given: [(collectible: Collectible, coded: Bool)]
         do { given = try await client.collectibles(key: key, sig: sig, ts: ts) } catch { throw DirectoryError.unreachable }
         guard activePersona == persona else { return }
-        let genuine = given.filter { $0.collectible.isGenuine(for: me.card.signing) }
+        // A relay answer may repeat an entry, or sign the same number twice: one of each number is kept. This is the
+        // account's own collection, so it isn't capped: the 40 limit belongs only on what's shared with contacts.
+        var seen = Set<String>()
+        let genuine = given
+            .filter { $0.collectible.isGenuine(for: me.card.signing) && seen.insert($0.collectible.id).inserted }
             .sorted { ($0.collectible.item, $0.collectible.serial) < ($1.collectible.item, $1.collectible.serial) }
         updateProfile { profile in
             profile.collectibles = genuine.map(\.collectible)
@@ -4056,7 +4076,7 @@ final class AppModel {
               let (key, sig, ts) = try? ownerProof("pulshade.eggs.mine.v1", about: me.card.signing, by: me),
               let list = try? await client.eggs(key: key, sig: sig, ts: ts), activePersona == persona else { return }
         eggsAsked = Date()
-        withAnimation(.smooth) { eggs = list }
+        withAnimation(.smooth) { eggs = RelayClient.EggInfo.unique(list) }
     }
 
     /// Seconds until an egg is ready, by the relay's clock: nil if it hasn't been started, 0 when it's ready.
@@ -7498,7 +7518,10 @@ final class AppModel {
         case let .profile(name, avatar, color, banner, bio, handle, badge, links, collectibles, notes):
             sender.name = String(name.prefix(64))
             sender.badge = badge.flatMap { $0.isGenuine(for: sender.signingKey) ? $0 : nil }
-            sender.collectibles = collectibles.map { Array($0.prefix(40).filter { $0.isGenuine(for: sender.signingKey) }) }.flatMap { $0.isEmpty ? nil : $0 }
+            // Never trust what arrives: genuine entries only, one per item and number (a profile may repeat one). The
+            // list is cut before any signature is checked, so a megabyte profile can't make the app do thousands of them.
+            let genuine = Self.profileCollectibles(collectibles, for: sender.signingKey)
+            sender.collectibles = genuine.isEmpty ? nil : genuine
             sender.bio = bio.map { String($0.prefix(160)) }
             // Never trust what arrives: keep only entries that pass the same checks as ours.
             let newLinks = Optional(ProfileLink.cleaned(links)).flatMap { $0.isEmpty ? nil : $0 }
