@@ -105,6 +105,9 @@ struct CollectiblesView: View {
             if let problem {
                 ProblemText(problem)
             }
+            if let catalogProblem = model.catalogProblem {
+                ProblemText("Couldn't get the latest collectibles. \(catalogProblem)")
+            }
         }
     }
 
@@ -207,6 +210,8 @@ struct CollectiblesView: View {
         loading = true
         do {
             await model.refreshEggs()
+            // A new collectibles list shows as soon as the screen opens, not at the next half-hourly check.
+            await model.refreshCatalog()
             try await model.refreshCollectibles()
             problem = nil
         } catch {

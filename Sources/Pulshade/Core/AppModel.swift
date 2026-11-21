@@ -4184,6 +4184,8 @@ final class AppModel {
     var nextCatalogCheck = Date.distantFuture
     /// One fetch at a time.
     var checkingCatalog = false
+    /// Why the last check for a new collectibles list failed, in words for the Collectibles screen. Nil once one works.
+    var catalogProblem: String?
     /// Whether the list is checked by itself after unlocking and every half hour. Not under tests (which keep their keys
     /// in memory): hundreds of test accounts in one process would all ask at once. They ask when they want it.
     var checksCatalog = !FileKeys.inMemory

@@ -112,7 +112,7 @@ public struct Collectible: Codable, Equatable, Hashable, Identifiable {
     /// The collectibles the first builds drew themselves, which could always be gifted or moved with a backup code. Kept
     /// so one of them is still taken as genuine before the collectibles list has arrived; the list says the same.
     public static let classicTransferable: Set<String> = [
-        "partyhat", "pumpkin", "tophat", "pulsepop", "bonfire", "christmastree", "bitcoin", "winnie", "honeyjar", "greendragon", "golddragon",
+        "partyhat", "pumpkin", "tophat", "pulsepop", "bonfire", "christmastree", "bitcoin", "greendragon", "golddragon",
     ]
 
     public static func signedPart(item: String, serial: UInt32, owner: Data) -> Data {

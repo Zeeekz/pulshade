@@ -35,7 +35,7 @@ extension AppModel {
         let have = library.catalog
         do {
             // Missing a picture, it asks for the whole list again rather than hear "nothing new" and never get it.
-            guard let signed = try await client.catalog(since: library.hasAllArt ? have?.version : nil) else { return }
+            guard let signed = try await client.catalog(since: library.hasAllArt ? have?.version : nil) else { catalogProblem = nil; return }
             let catalog = try CollectibleCatalog.open(signed, adminKey: Self.adminKey)
             if let have {
                 if catalog.version < have.version { return }
@@ -48,8 +48,16 @@ extension AppModel {
                     art[item.art.sha256] = held
                     continue
                 }
-                let data = try await client.catalogArt(item.art.sha256, bytes: item.art.bytes)
-                try CollectibleCatalog.checkArt(data, against: item.art)
+                let data: Data
+                do { data = try await client.catalogArt(item.art.sha256, bytes: item.art.bytes) } catch {
+                    throw CatalogFailure("\(item.name)'s picture didn't download")
+                }
+                do { try CollectibleCatalog.checkArt(data, against: item.art) } catch {
+                    let facts = CollectibleCatalog.artFacts(data)
+                    throw CatalogFailure("\(item.name)'s picture was refused: \(error). This device reads it as "
+                        + (facts.map { "\($0.width)×\($0.height), \($0.frames) frames" } ?? "unreadable")
+                        + "; the list says \(item.art.width)×\(item.art.height), \(item.art.frames) frames")
+                }
                 art[item.art.sha256] = data
             }
             // Locked, or a newer list taken, while the pictures came.
@@ -60,8 +68,17 @@ extension AppModel {
             // Collectibles signed by the relay's key (hatched or gifted) of an item this app only now knows were left out
             // until it knew whether they can be passed on: ask again.
             nextCollectibleCheck = Date()
+            catalogProblem = nil
         } catch {
+            catalogProblem = (error as? CatalogFailure)?.text ?? (error as? CollectibleCatalog.Problem).map { "The list was refused: \($0)" }
+                ?? "The relay didn't answer"
             nextCatalogCheck = min(nextCatalogCheck, Date().addingTimeInterval(5 * 60))
         }
     }
+}
+
+/// A failed list check, said plainly.
+struct CatalogFailure: Error {
+    var text: String
+    init(_ text: String) { self.text = text }
 }
