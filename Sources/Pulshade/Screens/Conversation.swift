@@ -286,7 +286,7 @@ struct ConversationView: View {
                senderName: m.isMine ? nil : model.displayName(m.sender),
                senderAvatar: m.isMine ? nil : model.contact(m.sender)?.avatar,
                tint: model.signature(m.sender),
-               quoteAuthor: m.reply.map { $0.author == "me" ? "You" : model.displayName($0.author) },
+               quoteAuthor: m.reply.flatMap { $0.author.isEmpty ? nil : ($0.author == "me" ? "You" : model.displayName($0.author)) },
                first: prev?.sender != m.sender || prev?.isSystem == true,
                last: next?.sender != m.sender,
                canReact: c.kind != .broadcast,
@@ -1221,9 +1221,11 @@ fileprivate struct Bubble: View, Equatable {
                             .accessibilityHidden(true)
                     }
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(quoteAuthor ?? "")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(mine ? Ink.onAccent.opacity(0.7) : tint)
+                        if let quoteAuthor, !quoteAuthor.isEmpty {
+                            Text(quoteAuthor)
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(mine ? Ink.onAccent.opacity(0.7) : tint)
+                        }
                         Text(quote.snippet)
                             .font(.system(size: 13))
                             .foregroundStyle(mine ? Ink.onAccent.opacity(0.6) : Ink.dim)

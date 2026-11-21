@@ -7893,9 +7893,14 @@ final class AppModel {
         let expires = wire.expiresIn.map { date.addingTimeInterval(min($0, Disappear.week.rawValue)) }
         if let expires, expires <= Date() { return }
         let mine = myFingerprint(in: data.conversations[i])
-        let reply = wire.reply.map {
-            ReplyRef(id: $0.id, author: $0.author == mine ? "me" : $0.author, snippet: String($0.snippet.prefix(120)),
-                     picture: $0.picture.flatMap { $0.count <= ReplyRef.maxPicture && PlatformImage.checked($0) != nil ? $0 : nil })
+        let reply = wire.reply.map { quoted in
+            // Attribute a quote only from what this device already holds: a message in this chat, or a story here.
+            // Never trust the author the sender claims, and never show an author for something not found locally.
+            let known = data.conversations[i].messages.first { $0.id == quoted.id }?.sender
+                ?? data.stories.first { $0.id == quoted.id }?.author
+            let author = known.map { $0 == mine ? "me" : $0 } ?? ""
+            return ReplyRef(id: quoted.id, author: author, snippet: String(quoted.snippet.prefix(120)),
+                            picture: quoted.picture.flatMap { $0.count <= ReplyRef.maxPicture && PlatformImage.checked($0) != nil ? $0 : nil })
         }
         let preview = wire.preview.flatMap { p in
             !LinkPreviews.isWebLink(p.url) ? nil  // only plain http(s) links
