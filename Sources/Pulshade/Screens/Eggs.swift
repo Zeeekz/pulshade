@@ -234,8 +234,25 @@ struct HatchedSheet: View {
     @Environment(\.theme) private var theme
     let pet: Collectible
     @State private var opened = false
+    /// Set just after the sheet appears, so a wanted number lands with a little moment of its own.
+    @State private var landed = false
 
     private var wearing: Bool { model.activeProfile.badge == pet }
+
+    /// What to say about a wanted number, or nil for an everyday one. Numbers are random, so this is luck.
+    static func flourish(_ rarity: Collectible.Rarity) -> String? {
+        switch rarity {
+        case .first: "Number one. There's only ever one."
+        case .topTen: "A top-ten number."
+        case .special(.lucky): "Lucky sevens!"
+        case .special(.repeated): "A repeater: every digit the same."
+        case .special(.run): "A straight: digits in a row."
+        case .special(.round): "A round number."
+        case .topTwentyFive: "A top-25 number."
+        case .last: "The very last one of the run."
+        case .common: nil
+        }
+    }
 
     var body: some View {
         VStack(spacing: 16) {
@@ -245,9 +262,25 @@ struct HatchedSheet: View {
             Button { opened = true } label: { CollectibleArtwork(item: pet.item, size: 200) }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Open \(pet.info.name)")
+                .background {
+                    // A soft light behind a wanted number, swelling in as the sheet opens.
+                    if Self.flourish(pet.rarity) != nil {
+                        Circle().fill(RadialGradient(colors: [theme.accent.opacity(0.45), .clear], center: .center, startRadius: 0, endRadius: 150))
+                            .frame(width: 300, height: 300)
+                            .scaleEffect(landed ? 1 : 0.4).opacity(landed ? 1 : 0)
+                    }
+                }
             VStack(spacing: 4) {
                 Text(branded: pet.info.name).font(.system(size: 24, weight: .bold)).foregroundStyle(Ink.text)
                 RarityTag(item: pet)
+                if let flourish = Self.flourish(pet.rarity) {
+                    Label(flourish, systemImage: "sparkles")
+                        .font(.system(size: 13, weight: .semibold)).foregroundStyle(theme.accent)
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                        .background(theme.accent.opacity(0.14), in: .capsule)
+                        .padding(.top, 6)
+                        .scaleEffect(landed ? 1 : 0.6).opacity(landed ? 1 : 0)
+                }
                 if !pet.info.blurb.isEmpty {
                     Text(branded: pet.info.blurb).font(.system(size: 13)).foregroundStyle(Ink.faint)
                         .multilineTextAlignment(.center).padding(.top, 4)
@@ -276,6 +309,11 @@ struct HatchedSheet: View {
             Button("Done") { dismiss() }.buttonStyle(PrimaryButtonStyle())
         }
         .sheet(isPresented: $opened) { CollectibleViewerSheet(item: pet) }
+        .sensoryFeedback(.success, trigger: landed) { _, now in now && Self.flourish(pet.rarity) != nil }
+        .task {
+            try? await Task.sleep(for: .milliseconds(350))
+            withAnimation(.spring(duration: 0.6, bounce: 0.35)) { landed = true }
+        }
         .padding(24)
         .frame(maxWidth: 420)
         .frame(maxWidth: .infinity, maxHeight: .infinity)

@@ -1,4 +1,5 @@
 import Testing
+@testable import Pulshade
 @testable import PulshadeShared
 
 /// Which numbers are wanted: what the badges say, for the app, Admin and trades to agree on.
@@ -32,5 +33,11 @@ struct CollectibleNumberTests {
         #expect(all.allSatisfy { $0.name != nil })
         #expect(Collectible.Rarity.common.name == nil)
         #expect(Set(all.compactMap(\.name)).count == all.count)
+    }
+
+    @Test func theHatchScreenCelebratesEveryWantedNumberAndNoOther() {
+        let all: [Collectible.Rarity] = [.first, .topTen, .special(.lucky), .special(.repeated), .special(.run), .special(.round), .topTwentyFive, .last]
+        #expect(all.allSatisfy { HatchedSheet.flourish($0) != nil })
+        #expect(HatchedSheet.flourish(.common) == nil)
     }
 }

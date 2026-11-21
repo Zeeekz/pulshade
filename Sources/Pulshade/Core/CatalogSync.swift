@@ -35,7 +35,7 @@ extension AppModel {
         let have = library.catalog
         do {
             // Missing a picture, it asks for the whole list again rather than hear "nothing new" and never get it.
-            guard let signed = try await client.catalog(since: library.hasAllArt ? have?.version : nil) else { catalogProblem = nil; return }
+            guard let signed = try await client.catalog(since: library.hasAllArt ? have?.version : nil) else { catalogProblem = nil; catalogFailures = 0; return }
             let catalog = try CollectibleCatalog.open(signed, adminKey: Self.adminKey)
             if let have {
                 if catalog.version < have.version { return }
@@ -69,10 +69,14 @@ extension AppModel {
             // until it knew whether they can be passed on: ask again.
             nextCollectibleCheck = Date()
             catalogProblem = nil
+            catalogFailures = 0
         } catch {
             catalogProblem = (error as? CatalogFailure)?.text ?? (error as? CollectibleCatalog.Problem).map { "The list was refused: \($0)" }
                 ?? "The relay didn't answer"
-            nextCatalogCheck = min(nextCatalogCheck, Date().addingTimeInterval(5 * 60))
+            // Soon, not in five minutes: the usual failure is the first check after unlocking going out before Tor
+            // has a circuit, and the list should still arrive while the app is open.
+            catalogFailures += 1
+            nextCatalogCheck = min(nextCatalogCheck, Date().addingTimeInterval(catalogFailures <= 3 ? 30 : 5 * 60))
         }
     }
 }
