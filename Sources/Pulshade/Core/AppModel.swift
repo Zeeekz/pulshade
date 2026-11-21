@@ -1923,6 +1923,20 @@ final class AppModel {
     static let mediaInline = 48_000
     /// The biggest photo or voice note taken from the relay or in pieces.
     static let maxMediaBytes = 8_000_000
+    /// The most bytes one story's clip (or a chat video's pieces) may hold while it is still arriving.
+    static func storyClipFits(_ parts: [Int: Data]) -> Bool {
+        parts.values.reduce(0) { $0 + $1.count } <= maxMediaBytes
+    }
+    /// A story may say only so much: its words and caption are short, whatever a payload claims.
+    static func cleanedStoryStyle(_ style: StoryStyle) -> StoryStyle {
+        switch style {
+        case let .text(text, palette): .text(String(text.prefix(2_000)), palette: palette)
+        case let .image(data, caption): .image(data, caption: String(caption.prefix(2_000)))
+        case let .video(data, caption): .video(data, caption: String(caption.prefix(2_000)))
+        }
+    }
+    /// The most stories one sender's account may have live here at once, for one persona.
+    static let maxStoriesPerAuthor = 100
 
     /// What goes to people whose app takes a message's photo or voice note on its own: the message with a tiny preview
     /// of the photo, or the voice note without its sound, and the bytes that follow. Nil when nothing in it is worth it.
@@ -2467,6 +2481,7 @@ final class AppModel {
         guard !bytes.isEmpty else { return false }
         switch data.stories[i].style {
         case let .video(have, caption) where have.isEmpty:
+            guard bytes.count <= Self.maxMediaBytes else { return false }
             withAnimation(.snappy) { data.stories[i].style = .video(bytes, caption: caption) }
         case let .image(have, caption) where have.isEmpty:
             guard bytes.count <= Self.maxMediaBytes, PlatformImage.checked(bytes) != nil else { return false }
@@ -2508,7 +2523,8 @@ final class AppModel {
         let image: PlatformImage?
         switch story.style {
         case let .image(data, _):
-            image = PlatformImage(data: data)
+            // A story comes from a contact: a tiny file can claim an enormous picture. Cap it before decoding.
+            image = PlatformImage.checked(data)
         case let .video(data, _):
             guard !data.isEmpty else { return nil }
             image = await StoryVideo.poster(of: MemoryClip(data)).map { PlatformImage.from(cgImage: $0) }
@@ -6296,6 +6312,13 @@ final class AppModel {
         if data.clipParts.contains(where: { $0.value.date <= clipCutoff }) {
             data.clipParts = data.clipParts.filter { $0.value.date > clipCutoff }
         }
+        // Stalled videos that never completed: their asking bookkeeping goes with the story's life.
+        if clipActivity.contains(where: { $0.value <= clipCutoff }) {
+            clipActivity = clipActivity.filter { $0.value > clipCutoff }
+        }
+        if clipAsks.contains(where: { $0.value.at <= clipCutoff }) {
+            clipAsks = clipAsks.filter { $0.value.at > clipCutoff }
+        }
         refileOldClipParts()
         askForStalledClips()
         sendDueReceipts()
@@ -7551,13 +7574,14 @@ final class AppModel {
             // Already taken back: a late or repeated copy mustn't bring it back. And only a friend's: someone you only
             // share a group with doesn't get to show you stories, whatever their app sends.
             guard removedStories["\(fp)|\(id)"] == nil, !sender.hidden, !sender.awaitingAcceptance else { break }
+            let cleanedStyle = Self.cleanedStoryStyle(style)
             let lifetime = lasts.map { min(max($0, 3600), StoryLifetime.twoDays.rawValue) }
             // The same story can reach two of your personas (one friend in both): each keeps its own copy, so
             // only the copy for this persona counts as "sent before". The id is never taken from someone else.
             guard !data.stories.contains(where: { $0.id == id && $0.author != fp }) else { break }
             if let i = data.stories.firstIndex(where: { $0.id == id && $0.author == fp && $0.persona == persona }) {
                 // A new version of one they sent before.
-                var style = style
+                var style = cleanedStyle
                 // A new caption on a clip they already sent comes without the clip.
                 if case let .video(bytes, caption) = style, bytes.isEmpty, case let .video(have, _) = data.stories[i].style, !have.isEmpty {
                     style = .video(have, caption: caption)
@@ -7577,12 +7601,21 @@ final class AppModel {
                 assembleClip(id, persona: persona)
                 break
             }
-            var story = Story(id: id, author: fp, style: style, date: dated(date))
+            var story = Story(id: id, author: fp, style: cleanedStyle, date: dated(date))
             if !story.isReady { clipActivity[ClipKey(id, persona)] = Date() }
             story.persona = persona
             story.lifetime = lifetime
             story.loops = loops == true ? true : nil
-            if story.isLive { withAnimation(.snappy) { data.stories.append(story) } }
+            if story.isLive {
+                // A contact may send as many distinct story ids as they like. Past a hundred live ones for this author
+                // and persona, the oldest go, so a flood can't fill the vault or make every scan grow without end.
+                let theirs = data.stories.filter { $0.author == fp && $0.persona == persona }
+                if theirs.count >= Self.maxStoriesPerAuthor {
+                    let keep = Set(theirs.sorted { $0.date > $1.date }.prefix(Self.maxStoriesPerAuthor - 1).map(\.id))
+                    data.stories.removeAll { $0.author == fp && $0.persona == persona && !keep.contains($0.id) }
+                }
+                withAnimation(.snappy) { data.stories.append(story) }
+            }
             assembleClip(id, persona: persona)
             acknowledgeStory(id, author: fp, persona: persona)
         case let .storyPart(id, index, of, bytes):
@@ -7601,6 +7634,9 @@ final class AppModel {
             // Cut differently from the pieces already here (their app or mine updated part-way): start over with these.
             if pending.of != of { pending = ClipParts(id: id, author: fp, persona: persona, of: of) }
             pending.parts[index] = bytes
+            // A clip arrives a piece at a time; keep the pieces to the size the finished clip is allowed, so a sender
+            // can't park megabytes of parts here waiting to be joined.
+            guard Self.storyClipFits(pending.parts) else { break }
             data.clipParts[key.stored] = pending
             clipActivity[key] = Date()
             assembleClip(id, persona: persona)

@@ -26,6 +26,57 @@ struct StoryTests {
         #expect(Payload.storyViewedAck(id: id).storyViewID == nil)
     }
 
+    /// A story's words and caption are cut to a sane length, and a clip still arriving is kept to the size the finished
+    /// clip may be: both come from another person.
+    @MainActor @Test func aStoryFromSomeoneElseIsBounded() {
+        let huge = String(repeating: "a", count: 100_000)
+        guard case let .text(text, _) = AppModel.cleanedStoryStyle(.text(huge, palette: 0)) else {
+            Issue.record("not a text story"); return
+        }
+        #expect(text.count == 2_000)
+        guard case let .image(_, caption) = AppModel.cleanedStoryStyle(.image(Data([1]), caption: huge)) else {
+            Issue.record("not a photo story"); return
+        }
+        #expect(caption.count == 2_000)
+        #expect(AppModel.storyClipFits([0: Data(count: 2_000_000), 1: Data(count: 2_000_000)]))
+        #expect(!AppModel.storyClipFits([0: Data(count: 5_000_000), 1: Data(count: 5_000_000)]))
+    }
+
+    /// A contact may send as many distinct story ids as they like; only the newest hundred of theirs are kept.
+    @MainActor @Test func aContactCannotFillTheStoryList() async throws {
+        let alice = testModel("pulshade-storyflood")
+        try await alice.create(identity: .generate(), profile: Profile(name: "Alice"), passcode: "test-passcode")
+        let bob = testModel("pulshade-storyflood")
+        try await bob.create(identity: .generate(), profile: Profile(name: "Bob"), passcode: "test-passcode")
+        defer { alice.lock(); bob.lock() }
+        let aliceOnBob = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        for n in 0..<(AppModel.maxStoriesPerAuthor + 10) {
+            bob.receiveForTests(.story(id: UUID(), style: .text("s\(n)", palette: 0), date: Date(), lasts: 3600),
+                                from: aliceOnBob)
+        }
+        #expect(bob.data.stories.filter { $0.author == alice.fingerprint }.count == AppModel.maxStoriesPerAuthor)
+    }
+
+    /// Video pieces waiting to be joined are capped like the finished clip, so a sender can't park megabytes here.
+    @MainActor @Test func aStoryClipIsCappedWhileItArrives() async throws {
+        let alice = testModel("pulshade-storyclip")
+        try await alice.create(identity: .generate(), profile: Profile(name: "Alice"), passcode: "test-passcode")
+        let bob = testModel("pulshade-storyclip")
+        try await bob.create(identity: .generate(), profile: Profile(name: "Bob"), passcode: "test-passcode")
+        defer { alice.lock(); bob.lock() }
+        let aliceOnBob = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        let id = UUID()
+        bob.receiveForTests(.story(id: id, style: .video(Data(), caption: ""), date: Date(), lasts: 3600), from: aliceOnBob)
+        let piece = Data(count: StoryClipPieces.framedSize)
+        for index in 0..<StoryClipPieces.maxPieces {
+            bob.receiveForTests(.storyPart(id: id, index: index, of: StoryClipPieces.maxPieces, bytes: piece), from: aliceOnBob)
+        }
+        let parts = bob.data.clipParts[ClipKey(id, nil).stored]?.parts ?? [:]
+        #expect(parts.values.reduce(0) { $0 + $1.count } <= AppModel.maxMediaBytes)
+        #expect(parts.count < StoryClipPieces.maxPieces)
+        #expect(bob.data.stories.first { $0.id == id }?.isReady != true)
+    }
+
     @Test func aStoryFromAnOlderAppStillDecodes() throws {
         let payload = Payload.story(id: UUID(), style: .text("hi", palette: 0), date: Date())
         let decoded = try JSONDecoder.pulshade.decode(Payload.self, from: JSONEncoder.pulshade.encode(payload))
