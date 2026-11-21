@@ -229,7 +229,7 @@ Trade-off: a member away longer than the life depends on someone online still ho
 
 Waiting bytes ≈ installs × (share active × envelopes a day ÷ 24 × hours a closed app waits × size) + stranded mail.
 Envelope sizes are 2 KB, 8 KB, 32 KB, 128 KB (`EnvelopeCore` buckets); most are 2 KB. Mail from an iPhone user's contacts
-waits whenever the app is closed and "Wake when locked" is off (it is on by default, so this is mostly phones whose owners turned it off).
+waits whenever the app is closed and notifications are off (they're on by default and wake-ups always come with them, so this is mostly phones whose owners turned notifications off).
 Stranded mail is mail to phones that are off, lost or uninstalled, until its 7 days end. The budget counts envelope bytes;
 resident memory at the cap was about 1.35 × that (511 MiB in the 2026-11-10 test).
 

@@ -62,41 +62,35 @@ struct PushTests {
         #expect(item.lane == nil)
     }
 
-    @Test func pushIsOnWithNotificationsUnlessTurnedOff() {
-        #expect(SecuritySettings().pushWake == true)
+    @Test func pushIsAlwaysOnWithNotifications() {
+        let s = SecuritySettings()
+        #expect(s.notifications && s.pushWake && s.pushRequests && s.keepReceivingLocked)
     }
 
-    @Test func settingsFromBeforePushExistedStillOpen() throws {
-        let json = try JSONSerialization.data(withJSONObject: ["autoLockMinutes": 5, "notifications": true])
-        let settings = try JSONDecoder.pulshade.decode(SecuritySettings.self, from: json)
-        #expect(settings.pushWake == true)
+    /// Waking, friend request wake-ups and receiving while locked are no longer choices: an "off" saved by an older
+    /// build is ignored, and none of them is saved any more.
+    @Test func anOffSavedBeforeIsIgnored() throws {
+        let old = try JSONSerialization.data(withJSONObject: ["autoLockMinutes": 5, "notifications": true, "pushWake": false,
+                                                              "pushWakeChosen": true, "pushRequests": false, "keepReceivingLocked": false])
+        let settings = try JSONDecoder.pulshade.decode(SecuritySettings.self, from: old)
+        #expect(settings.pushWake && settings.pushRequests && settings.keepReceivingLocked)
+        let saved = String(decoding: try JSONEncoder.pulshade.encode(settings), as: UTF8.self)
+        #expect(!saved.contains("pushWake") && !saved.contains("pushRequests") && !saved.contains("keepReceivingLocked"))
     }
 
-    /// Off was everyone's default once, so an "off" saved then is not a choice; one made by hand is kept.
-    @MainActor @Test func onlyAnOffChosenByHandStaysOff() async throws {
-        let unchosen = try JSONSerialization.data(withJSONObject: ["pushWake": false])
-        #expect(try JSONDecoder.pulshade.decode(SecuritySettings.self, from: unchosen).pushWake == true)
-
-        let model = testModel("pulshade-push")
-        defer { model.lock() }
-        try await model.create(identity: .generate(), profile: Profile(name: "P"), passcode: "test-passcode")
-        model.updateSecurity { $0.pushWake = false }
-        let saved = try JSONEncoder.pulshade.encode(model.data.security)
-        #expect(try JSONDecoder.pulshade.decode(SecuritySettings.self, from: saved).pushWake == false)
+    /// Even the strictest choices on the sign-up screen keep them; turning notifications off is what stops wake-ups.
+    @Test func theStrictestChoicesKeepThemOn() {
+        let s = SecuritySettings.strictest
+        #expect(!s.notifications && s.pushWake && s.pushRequests && s.keepReceivingLocked)
     }
 
-    /// With "keep receiving while locked" on, an automatic lock only hides the app behind the passcode: the keys stay
-    /// loaded so mail still comes in and receipts go out. A lock pressed by hand, or with the setting off, closes it.
+    /// An automatic lock only hides the app behind the passcode: the keys stay loaded so mail still comes in and receipts
+    /// go out. A lock pressed by hand closes it.
     @MainActor @Test func autoLockCanKeepReceivingBehindThePasscode() async throws {
         let model = testModel("pulshade-cover")
         defer { model.lock() }
         try await model.create(identity: .generate(), profile: Profile(name: "C"), passcode: "test-passcode")
 
-        model.lock(keepingKeys: true)
-        #expect(model.phase == .locked, "off by default: an automatic lock closes everything")
-        #expect(await model.unlock(passcode: "test-passcode"))
-
-        model.updateSecurity { $0.keepReceivingLocked = true }
         model.lock(keepingKeys: true)
         #expect(model.phase == .unlocked && model.covered && model.identity != nil)
         #expect(!model.isOpen)
@@ -107,6 +101,16 @@ struct PushTests {
 
         model.lock()
         #expect(model.phase == .locked && model.identity == nil, "a lock pressed by hand always closes it")
+    }
+
+    /// With a decoy passcode set, an automatic lock still closes everything: the passcode has to pick the account.
+    @MainActor @Test func aDecoyStillMakesAutoLockCloseEverything() async throws {
+        let model = testModel("pulshade-cover-decoy")
+        defer { model.lock() }
+        try await model.create(identity: .generate(), profile: Profile(name: "D"), passcode: "test-passcode")
+        try await model.setDecoy(passcode: "decoy-passcode")
+        model.lock(keepingKeys: true)
+        #expect(model.phase == .locked && !model.covered && model.identity == nil)
     }
 
     /// What was chosen on the sign-up screen goes to the account made next, and nowhere else.

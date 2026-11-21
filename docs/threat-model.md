@@ -51,7 +51,7 @@ claim that every mechanism has been independently verified.
 ## Out of scope (and why)
 
 - **APNs.** Apple sees that a device received a push. The payload is sealed, but the token and timing are
-  visible to Apple. Push can be turned off; the app documents this rather than claiming otherwise.
+  visible to Apple. Push stops when notifications are turned off (there is no separate switch); the app documents this rather than claiming otherwise.
 - **Traffic analysis by a global observer.** Sizes are padded and Tor hides the address, but timing and
   volume can still say "someone is active".
 - **A compromised endpoint.** Malware, a keylogger or someone reading an unlocked screen is outside the

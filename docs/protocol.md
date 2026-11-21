@@ -613,12 +613,13 @@ What this costs, honestly:
 - The helper cannot run Tor, so it reaches the relay **directly**, and the relay sees your IP for that moment. It is
   therefore only available in Fast mode: turning Tor on forces locked-phone collection off, so a Tor user can never
   make those requests directly by accident.
-- It needs "Wake when locked" on. It covers the main identity only (not personas), and Burn and Detach remove
+- It needs notifications on (they bring wake-ups with them). It covers the main identity only (not personas), and Burn and Detach remove
   everything the helper holds. If a decoy or panic passcode is set, it is off for the whole device, not only for those
   accounts.
-- **Wake when locked is on by default** (iOS asks first for notification permission). Apple learns that your phone
-  was woken and when, never who wrote or what. The relay holds your push token. People who need the strongest anonymity
-  should turn it off.
+- **Waking a locked iPhone is always on while notifications are on** (iOS asks first for notification permission;
+  there is no separate switch from build 19). It covers new messages and friend requests. Apple learns that your phone
+  was woken and when, never who wrote or what. The relay holds your push token, tied to your mailboxes and your
+  @handle's request mailbox. People who need the strongest anonymity should turn notifications off.
 
 ## 11. Tor and Fast
 
@@ -735,7 +736,7 @@ or who you are behind Tor.
 | Which mailboxes a fetch asks for, and when mail is collected | Your contacts, groups, or who is in them |
 | Roughly when you are online (a fetch waits up to 25 seconds) | File names, types, or what a file is |
 | Fast mode: your IP address and rough location while connected | Over Tor: your IP address |
-| Which mailboxes share a push token, if "Wake when locked" is on | Anything that ties your personas together, apart from Fast-mode IP or a shared push token (main identity only) |
+| Which mailboxes share a push token (your @handle's request mailbox among them), while notifications are on | Anything that ties your personas together, apart from Fast-mode IP or a shared push token (main identity only) |
 | When a backup, spare or file is written, read or erased, and how big | A backup's or a spare's contents, or whose it is |
 | A burst of equal-size envelopes landing in many mailboxes at once (a group message) | |
 | Whether a deposit is a message, a signal or a call; that tagged signals to one mailbox within ten minutes come from one sender device | Which device that is, or that two windows are the same one |
@@ -758,7 +759,7 @@ The relay's connection to Tor is encrypted by Tor; Fast uses https.
 
 ### Apple (push notifications, app store)
 
-With "Wake when locked": that your device got a push, and when. Never who wrote, or what ("New message" only). The
+While notifications are on: that your device got a push, and when. Never who wrote, or what ("New message" only). The
 App Store knows you downloaded the app; Apple also checks a Mac app when it first opens. Your phone or computer may also
 keep its own records of notifications and app use, which Pulshade cannot control. By default notification text is only
 "New message".
@@ -768,7 +769,7 @@ keep its own records of notifications and app use, which Pulshade cannot control
 | What the attacker faces | |
 | --- | --- |
 | The vault | Sealed with the passcode (PBKDF2-SHA256, 600,000 rounds, AES-GCM), **mixed with a key only that phone's Secure Enclave can use**. A copy taken off the phone cannot be guessed at elsewhere. On iPhone the files are also unreadable while locked. |
-| The Keychain | Only if **Wake when locked** and **Collect messages when locked** are both on. Collecting is **off by default**; it is a choice made by hand, with a warning. Then the notification helper keeps in the Keychain ("after first unlock": readable once the phone has been unlocked since it started) this account's raw **signing and agreement keys**, this device's id, and each friend's agreement key and mailbox key, plus short sealed envelopes waiting in its inbox. An attacker who can extract Keychain items from such a phone can **impersonate the account** (sign as you, and open new sessions with your friends), open the envelope wrappers sent to you, and so **read what is sent to you from then on**. They cannot read **past** messages: the chat keys (ratchet state) are in the vault, behind your passcode and the Secure Enclave. Turning the setting off removes the bundle. |
+| The Keychain | Only if notifications and **Collect messages when locked** are both on. Collecting is **off by default**; it is a choice made by hand, with a warning. Then the notification helper keeps in the Keychain ("after first unlock": readable once the phone has been unlocked since it started) this account's raw **signing and agreement keys**, this device's id, and each friend's agreement key and mailbox key, plus short sealed envelopes waiting in its inbox. An attacker who can extract Keychain items from such a phone can **impersonate the account** (sign as you, and open new sessions with your friends), open the envelope wrappers sent to you, and so **read what is sent to you from then on**. They cannot read **past** messages: the chat keys (ratchet state) are in the vault, behind your passcode and the Secure Enclave. Turning the setting off removes the bundle. |
 | Decoy / panic passcodes | A decoy opens an empty identity; the panic passcode shreds the real one. The lock file always has three equal slots and four data files, so the disk does not show which are real. |
 | Old copies | The whole lock file is sealed again with a Keychain key that changes every time Pulshade locks, so an old copy recovered from flash storage no longer opens (unless the attacker also recovers that key's old Keychain entry and knows the old passcode). |
 
@@ -825,7 +826,7 @@ the apps.
   by Apple's video code (AVFoundation) in Pulshade's paths, and this is one of the questions we ask auditors to check.
 - **Keychain items after first unlock** (section 10) when locked-phone collection is on.
 - **One operator.** The official app sends your messages and account traffic only to Pulshade's own servers. It also contacts Apple's push
-  service (while Wake when locked is on, the default), the sites behind link previews you turn on (over Tor if Tor is on),
+  service (while notifications are on, the default), the sites behind link previews you turn on (over Tor if Tor is on),
   and, if you pick the Snowflake bridge, its CDN front and public STUN servers; links you tap open in the browser. A modified app
   could point at other servers; the rate limits and the terms of use, not the code, hold that back.
 - **Disappearing messages** and **deleted stories** depend on the other person's app.

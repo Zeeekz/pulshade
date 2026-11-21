@@ -1068,18 +1068,15 @@ struct PrivacyChoice: View {
                 toggle("Sealed backup", $s.keepBackup, "A sealed copy of your profile, contacts, groups and chat keys (never messages) that only your recovery code opens.")
             }
             group("Notifications") {
-                toggle("Notifications", $s.notifications, "Banners for new messages.")
-                #if os(iOS)
-                toggle("Wake a locked iPhone", $s.pushWake, "Apple wakes your phone for new mail. Apple learns when, never what for.")
-                #endif
+                toggle("Notifications", $s.notifications, Platform.isPhone
+                       ? "Banners for new messages and friend requests, even while your iPhone is locked: Apple wakes it, learning when, never what for."
+                       : "Banners for new messages.")
                 choice("On the lock screen", $s.notificationContent, NotificationContent.allCases.map { ($0, $0.label) },
                        "How much a notification shows: nothing, who it's from, or the message.")
             }
             group("Lock & screen") {
                 choice("Auto-lock", $s.autoLockMinutes, [(1, "1 min"), (5, "5 min"), (15, "15 min"), (0, "Never")],
                        "Locks PULSHADE after this long, so a borrowed or stolen phone shows nothing.")
-                toggle("Keep receiving while locked", $s.keepReceivingLocked,
-                       "Auto-lock keeps PULSHADE running so messages still arrive. Off closes everything until you unlock.")
                 toggle("Block screenshots & recording", $s.blockCapture, "Keeps chats out of screenshots and screen recordings.")
                 toggle(Platform.isPhone ? "Hide in app switcher" : "Blur when in background", $s.blurWhenInactive,
                        "Blurs your chats whenever PULSHADE isn't in front.")

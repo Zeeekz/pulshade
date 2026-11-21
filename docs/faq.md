@@ -222,9 +222,10 @@ Settings → Network → Anonymity Report shows the address the server sees for 
 ## Notifications
 
 **Why don't I get messages when the app is closed?**
-On iPhone, **Wake when locked** (Settings → Notifications) is on by default and lets the server wake your phone through
-Apple; with it off, messages arrive only while the app is open. Apple then learns your phone was woken, and when, though never what was said.
-Turn it off if you need the strongest anonymity.
+On iPhone, while notifications are on (the default), the server wakes your locked phone through Apple for new
+messages and friend requests; turn notifications off in Settings → Notifications and messages arrive only while the
+app is open. Apple learns your phone was woken, and when, though never what was said. Turn notifications off if you
+need the strongest anonymity.
 
 **What do notifications show?**
 Only "New message" unless you choose otherwise, because the system stores notification text outside Pulshade's

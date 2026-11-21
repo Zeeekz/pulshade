@@ -959,12 +959,6 @@ private struct LockSettings: View {
                     model.updateSecurity { $0.autoLockMinutes = m }
                 }
             }
-            SettingsGroup("While locked", footer: model.biometricsBlocked
-                          ? "Not available while a decoy or panic passcode is set."
-                          : "Auto-lock keeps PULSHADE running so messages still arrive. Off closes everything until you unlock. Pressing Lock always closes everything.") {
-                SecurityToggle(title: "Keep receiving while locked", key: \.keepReceivingLocked)
-                    .disabled(model.biometricsBlocked)
-            }
             SettingsGroup("Screen", footer: "Keeps chats out of screenshots, screen recordings and the app switcher.") {
                 SecurityToggle(title: Platform.isPhone ? "Hide in app switcher" : "Blur when in background", key: \.blurWhenInactive)
                 RowDivider()
@@ -1190,30 +1184,24 @@ private struct NotificationSettings: View {
                         }
                     }
                     #if os(iOS)
-                    RowDivider()
-                    SecurityToggle(title: "Wake when locked", key: \.pushWake)
-                    if security.pushWake {
+                    if AppModel.lockedDeliveryAvailable {
                         RowDivider()
-                        SecurityToggle(title: "Friend request alerts when locked", key: \.pushRequests)
-                        if AppModel.lockedDeliveryAvailable {
-                            RowDivider()
-                            LockedDeliveryRow()
-                        }
+                        LockedDeliveryRow()
                     }
                     #endif
                 }
             }
             #if os(iOS)
-            if on, security.pushWake, !model.pushStatus.isEmpty {
-                // Where it stands: registered with how many mailboxes, or why not. The count goes up by your request
-                // mailboxes when friend request alerts are on.
+            if on, !model.pushStatus.isEmpty {
+                // Where it stands: registered with how many mailboxes (yours for friends and for friend requests), or
+                // why not.
                 Text(model.pushStatus)
                     .font(.system(size: 12)).foregroundStyle(Ink.faint)
                     .padding(.horizontal, 14)
                     .fixedSize(horizontal: false, vertical: true)
             }
             // Collecting while locked is parked (`AppModel.lockedDeliveryAvailable`), so nothing here speaks of it.
-            if on, AppModel.lockedDeliveryAvailable, security.pushWake, security.tor {
+            if on, AppModel.lockedDeliveryAvailable, security.tor {
                 Text("Collecting while locked is off while Tor is on: the helper can't use Tor, so it would connect directly and the server would see this phone's address.")
                     .font(.system(size: 12)).foregroundStyle(Ink.faint)
                     .padding(.horizontal, 14)
@@ -1221,7 +1209,7 @@ private struct NotificationSettings: View {
             }
             if on {
                 LearnMore(title: "Waking a locked iPhone",
-                          text: "Apple wakes your iPhone with a note that only says \"New message\". Apple learns when, and the relay keeps your push token. Off, you only hear about messages while PULSHADE is open."
+                          text: "While notifications are on, Apple wakes your locked iPhone for new messages and friend requests with a note that only says \"New message\", and PULSHADE keeps receiving behind the lock. Apple learns when, and the relay keeps your push token, tied to your mailboxes. Turn notifications off and you only hear about messages while PULSHADE is open."
                               + (AppModel.lockedDeliveryAvailable ? " Collect messages when locked lets a small helper take short messages off the server into a sealed inbox on this iPhone, without opening them, so they don't wait on the server until you open PULSHADE. Photos and videos still wait there, and friends also get their second tick. It uses keys kept on this iPhone after you first unlock it." : ""))
             }
             #endif

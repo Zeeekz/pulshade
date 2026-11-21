@@ -1276,11 +1276,8 @@ extension SecuritySettings {
         onlineStatus = c.onlineStatus
         linkPreviews = c.linkPreviews
         notifications = c.notifications
-        if pushWake != c.pushWake { pushWake = c.pushWake; pushWakeChosen = true }
-        pushRequests = c.pushRequests
         notificationContent = c.notificationContent
         autoLockMinutes = c.autoLockMinutes
-        keepReceivingLocked = c.keepReceivingLocked
         blockCapture = c.blockCapture
         blurWhenInactive = c.blurWhenInactive
         keepBackup = c.keepBackup
@@ -1297,11 +1294,8 @@ extension SecuritySettings {
         s.onlineStatus = false
         s.linkPreviews = false
         s.notifications = false
-        s.pushWake = false
-        s.pushRequests = false
         s.notificationContent = .hidden
         s.autoLockMinutes = 1
-        s.keepReceivingLocked = false
         s.blockCapture = true
         s.blurWhenInactive = true
         s.allowForwarding = false
@@ -1315,9 +1309,10 @@ struct SecuritySettings: Codable, Equatable {
     /// Minutes of inactivity before locking. 0 means never.
     var autoLockMinutes = 5
     /// Auto-lock hides PULSHADE behind the passcode but keeps it running, so a locked phone still takes in messages and
-    /// sends delivery receipts, as other messengers do. Off: auto-lock closes everything and drops the keys from memory.
-    /// Never with a decoy or panic passcode set, and a lock you press yourself always closes everything.
-    var keepReceivingLocked = false
+    /// sends delivery receipts, as other messengers do. Always (from build 19, no longer a choice), except with a decoy
+    /// or panic passcode set, which needs the passcode to pick the account (`AppModel.canCover`). A lock you press
+    /// yourself always closes everything.
+    var keepReceivingLocked: Bool { true }
     /// Hide the window from screenshots and screen recording.
     var blockCapture = true
     /// Blur chats whenever Pulshade isn't the front app.
@@ -1327,17 +1322,15 @@ struct SecuritySettings: Codable, Equatable {
     var notificationSound = true
     /// The sound of a new message, when sound is on.
     var messageTone: MessageTone = .standard
-    /// Let the relay wake this iPhone through Apple when mail arrives, so a locked phone hears about it. On with
-    /// notifications, as in any messenger: without it a locked iPhone hears about nothing. Apple learns that the
-    /// device was woken and when, and the relay holds its push token; anyone who'd rather not turns it off.
-    var pushWake = true
-    /// Whether `pushWake` was set by hand. It used to be off by default, so everyone from then saved "off"
-    /// without choosing it: only a choice made by hand is kept.
-    var pushWakeChosen = false
-    /// Also wake a locked iPhone for friend requests. Off unless chosen: a request arrives at the public mailbox of
-    /// your @handle, and waking the phone for it means telling the relay that this device owns that mailbox as well as
-    /// the ones for your contacts, which it otherwise has no way to tie together.
-    var pushRequests = false
+    /// Let the relay wake this iPhone through Apple when mail arrives, so a locked phone hears about it. Always, with
+    /// notifications (from build 19 there's no switch of its own): without it a locked iPhone hears about nothing.
+    /// Apple learns that the device was woken and when, and the relay holds its push token. Turning notifications off
+    /// stops it (`AppModel.pushWanted`).
+    var pushWake: Bool { true }
+    /// Also wake a locked iPhone for friend requests. Always, with notifications (from build 19): a request arrives at
+    /// the public mailbox of your @handle, so the relay is told that this device owns that mailbox as well as the ones
+    /// for your contacts.
+    var pushRequests: Bool { true }
     /// Build a preview when you send a link. Off by default: building one visits the website from your own
     /// connection. Received previews never contact the website.
     var linkPreviews = false
@@ -1398,7 +1391,6 @@ struct SecuritySettings: Codable, Equatable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = SecuritySettings()
         autoLockMinutes = try c.decodeIfPresent(Int.self, forKey: .autoLockMinutes) ?? d.autoLockMinutes
-        keepReceivingLocked = try c.decodeIfPresent(Bool.self, forKey: .keepReceivingLocked) ?? d.keepReceivingLocked
         lockedDelivery = try? c.decodeIfPresent(Bool.self, forKey: .lockedDelivery)
         blockCapture = try c.decodeIfPresent(Bool.self, forKey: .blockCapture) ?? d.blockCapture
         blurWhenInactive = try c.decodeIfPresent(Bool.self, forKey: .blurWhenInactive) ?? d.blurWhenInactive
@@ -1406,9 +1398,6 @@ struct SecuritySettings: Codable, Equatable {
         notificationContent = (try? c.decodeIfPresent(NotificationContent.self, forKey: .notificationContent)) ?? d.notificationContent
         notificationSound = try c.decodeIfPresent(Bool.self, forKey: .notificationSound) ?? d.notificationSound
         messageTone = (try? c.decodeIfPresent(MessageTone.self, forKey: .messageTone)) ?? d.messageTone
-        pushWakeChosen = try c.decodeIfPresent(Bool.self, forKey: .pushWakeChosen) ?? false
-        pushRequests = try c.decodeIfPresent(Bool.self, forKey: .pushRequests) ?? false
-        pushWake = pushWakeChosen ? (try c.decodeIfPresent(Bool.self, forKey: .pushWake) ?? d.pushWake) : d.pushWake
         linkPreviews = try c.decodeIfPresent(Bool.self, forKey: .linkPreviews) ?? d.linkPreviews
         menuBarIcon = try c.decodeIfPresent(Bool.self, forKey: .menuBarIcon) ?? d.menuBarIcon
         warnBeforeSaving = try c.decodeIfPresent(Bool.self, forKey: .warnBeforeSaving) ?? d.warnBeforeSaving
@@ -1469,7 +1458,8 @@ struct AppData: Codable {
     /// 26: devices a contact's account unlinked are remembered and refused (`Contact.revoked`, `contested`).
     /// 27: a deleted or left group's last posts, kept until they reach its mailbox (`partingPosts`); a chat can be
     /// archived (`Conversation.archived`); whether to warn before saving a photo or video out of Pulshade
-    /// (`SecuritySettings.warnBeforeSaving`).
+    /// (`SecuritySettings.warnBeforeSaving`). Waking a locked iPhone, friend request wake-ups and receiving while
+    /// auto-locked stop being saved: they're always on.
     static let currentFormat = 27
     var profile = Profile()
     var contacts: [Contact] = []

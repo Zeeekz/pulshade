@@ -134,7 +134,6 @@ import Foundation
         let me = Identity.generate()
         try await model.create(identity: me, profile: Profile(name: "T"), passcode: "test-passcode")
         model.setWipeAfterAttempts(3)
-        model.updateSecurity { $0.keepReceivingLocked = true }
         let transient: [VaultError] = [.keychain(-25308), .corrupt, .missing]
 
         // Fully locked.

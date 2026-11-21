@@ -34,7 +34,7 @@ is never written to its disk. Here is every kind of thing, in plain words:
 | **Public @handle and profile** (only if you choose one) | The server's disk | Until you let it go | Yes, it is public by your choice. |
 | **Collectibles you own** | The server's disk | While they exist | They're not secret: the item, its number and a hash of its code. |
 | **The server's own records and keys** (handle directory, held handles, moderation lists, collectible records, announcements; its push, pet-signing and onion keys) | The server's disk | While the service runs | Only the server, which needs them to work. Sealed with its storage key, which is held in memory only and never written to the disk; after a reboot the server stays locked until we unlock it. The admin password is kept only as a hash. |
-| **Wake-up token** (on iPhone while "Wake when locked" is on, which is the default) | The server's memory, and a sealed file on its disk | While it's on (gone within seconds of turning it off; dropped after 7 days without a renewal) | It is a device token and nothing else. |
+| **Wake-up token** (on iPhone while notifications are on, which is the default) | The server's memory, and a sealed file on its disk | While notifications are on (gone within seconds of turning them off; dropped after 7 days without a renewal) | It is a device token and nothing else. |
 
 Photos, voice notes and text travel inside the encrypted message itself, so they wait like any message: sealed on the server's disk, until collected.
 
@@ -163,11 +163,12 @@ word it for each region.]
 
 - Wherever you download Pulshade from, such as the App Store or our website, sees your IP address and what you
   download. Apple also checks the app when a Mac first opens it. These services have their own policies.
-- "Wake when locked" on iPhone is on by default (you can turn it off in Settings → Notifications). While it is on,
-  the app asks Apple's push service for a device token, outside Tor, and notifications go through Apple's service:
-  Apple sees your device token and when a notification is delivered, never message contents, and Pulshade's server
-  keeps your token, in memory and in a sealed file on its disk, linked to your mailboxes while it's on. Pulshade
-  recommends turning this off if you need the strongest anonymity.
+- On iPhone, while notifications are on (the default; you can turn them off in Settings → Notifications), Pulshade
+  wakes your locked phone for new messages and friend requests. The app asks Apple's push service for a device token,
+  outside Tor, and notifications go through Apple's service: Apple sees your device token and when a notification is
+  delivered, never message contents, and Pulshade's server keeps your token, in memory and in a sealed file on its
+  disk, linked to your mailboxes (including your public @handle's request mailbox, if you have one) while
+  notifications are on. Pulshade recommends turning notifications off if you need the strongest anonymity.
 - Link previews are off by default. When you turn them on, your device fetches the page you link to (and its picture)
   from that site, over Tor if Tor is on, otherwise directly, so the site sees that fetch. The people you send the preview
   to never contact it.
@@ -197,7 +198,7 @@ word it for each region.]
   in the EU or UK.]
 - **How long things are kept**, in one place: messages up to 30 days, sealed on the server's disk; files up to 30 days (7 in groups); the sealed backup
   until you switch it off or Burn, or 180 days after its last update; handles and collectibles until you let them go;
-  the wake-up token while the setting is on; and request counts for an hour. Nothing is kept "just in case".
+  the wake-up token while notifications are on; and request counts for an hour. Nothing is kept "just in case".
 
 ## Children
 
@@ -216,7 +217,7 @@ announcements. The code and documentation show what the app does at any time.
   waits; before, it dropped the oldest.
 - **Build 10:** waiting messages are now also kept in a journal on the server's disk, every record sealed with a key that
   is never written to the disk, so a restart, crash or reboot no longer loses them; collected mail is overwritten in the
-  journal within minutes. They used to be in memory only, never on the disk. Wake-up tokens are kept the same way, only for phones with "Wake when locked" on. Calls and rate-limit counts
+  journal within minutes. They used to be in memory only, never on the disk. Wake-up tokens are kept the same way, only for phones with notifications on. Calls and rate-limit counts
   are still memory only.
 - **Build 10:** the server's own records and keys are sealed with a key that is never written to its disk; the admin
   password is kept only as a hash; what Fast means for your IP address, and that the web proxy keeps no access log;

@@ -4705,7 +4705,6 @@ final class AppModel {
     func updateSecurity(_ change: (inout SecuritySettings) -> Void) {
         let before = data.security
         change(&data.security)
-        if data.security.pushWake != before.pushWake { data.security.pushWakeChosen = true }
         if data.security.onlineStatus != before.onlineStatus {
             if data.security.onlineStatus { resetPresenceSchedule() } else { sendPresence(false); online = [:] }
         }

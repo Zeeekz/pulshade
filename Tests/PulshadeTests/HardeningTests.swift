@@ -151,11 +151,11 @@ import PulshadeShared
 
     @Test func maximumPrivacyTurnsOffEveryOutboundLever() {
         let s = SecuritySettings.strictest
-        #expect(!s.notifications && !s.pushWake && !s.pushRequests && !s.readReceipts)
+        #expect(!s.notifications && !s.readReceipts)
         #expect(!s.typingIndicators && !s.onlineStatus && !s.linkPreviews && !s.allowForwarding && s.lockedDelivery == false)
         var adopted = SecuritySettings()
         adopted.adopt(s)
-        #expect(!adopted.notifications && !adopted.pushWake && !adopted.pushRequests && !adopted.allowForwarding)
+        #expect(!adopted.notifications && !adopted.allowForwarding)
         #expect(adopted.lockedDelivery == false)
     }
 
