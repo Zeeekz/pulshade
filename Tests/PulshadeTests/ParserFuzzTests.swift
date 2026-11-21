@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import PulshadeShared
 @testable import Pulshade
 
 /// Crash-only robustness tests for every parser that touches bytes or text from another person or the relay.
@@ -47,6 +48,36 @@ import Foundation
             _ = Invite.allowedRelay(text)
             _ = Data(hexString: text)
             if let url = URL(string: text) { _ = LinkPreviews.openable(url) }
+        }
+    }
+
+    /// Wallet addresses and links arrive in other people's profiles and are parsed on every refresh. Bech32 in
+    /// particular slices out a witness program: a data part holding only the six checksum characters once produced the
+    /// empty range `1..<0` and trapped, which a contact could turn into a crash on every profile refresh. Fuzz it with
+    /// short, checksum-shaped and arbitrary inputs.
+    @Test func walletAndProfileLinkParsersNeverTrap() {
+        var dice = Dice(state: 0xBEEF_0BAD_1234_5678)
+        let bech32 = Array("qpzry9x8gf2tvdw0s3jn54khce6mua7l")
+        let bases = ["", "bc1", "ltc1", "npub1", "bc", "ltc", "npub", "0x", "1", "3", "4", "8"]
+        // The exact strings that used to trap, kept as seeds so a regression is caught immediately.
+        for seed in ["ltc1pdtjxt", "bc1gmk9yu", "bc1a8xfp7"] {
+            for kind in ProfileLinkKind.allCases { _ = kind.normalize(seed) }
+        }
+        for _ in 0..<6_000 {
+            let base = bases.randomElement(using: &dice) ?? ""
+            let length = Int.random(in: 0...30, using: &dice)
+            let body = String((0..<length).map { _ in bech32[Int.random(in: 0..<bech32.count, using: &dice)] })
+            let text = base + body
+            for kind in ProfileLinkKind.allCases {
+                _ = kind.normalize(text)
+                _ = ProfileLink.make(kind, from: text)
+            }
+            _ = ProfileLink.cleaned(ProfileLinkKind.allCases.map { ProfileLink(kind: $0, value: text) })
+        }
+        // Arbitrary printable text through every kind as well.
+        for _ in 0..<2_000 {
+            let text = randomText(length: Int.random(in: 0...120, using: &dice), dice: &dice)
+            for kind in ProfileLinkKind.allCases { _ = kind.normalize(text) }
         }
     }
 

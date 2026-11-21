@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import PulshadeShared
 @testable import Pulshade
 
 /// A deterministic mutation fuzzer for every parser that takes bytes or text from another person or the relay.
@@ -29,6 +30,10 @@ import Foundation
             Data("pshcall1AAAAAAAAAAAAAAAA".utf8),
             Data("@handle".utf8),
             Data("https://example.com/x".utf8),
+            Data("ltc1pdtjxt".utf8),
+            Data("bc1gmk9yu".utf8),
+            Data("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".utf8),
+            Data("npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg".utf8),
             Data([0, 0, 0, 0, 3, 1, 2, 3]),
         ]
 
@@ -41,6 +46,7 @@ import Foundation
             _ = JoinCode(text)
             _ = ChatLink(text)
             _ = Data(hexString: text)
+            for kind in ProfileLinkKind.allCases { _ = kind.normalize(text) }
             if let url = URL(string: text) { _ = LinkPreviews.openable(url) }
         }
 

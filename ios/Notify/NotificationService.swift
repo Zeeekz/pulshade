@@ -1,6 +1,7 @@
 import UserNotifications
 import Foundation
 import CryptoKit
+import Security
 
 /// Pulshade's notification helper. iOS runs it for a few seconds whenever a message push arrives, even with the
 /// phone locked or the app swiped away. It confirms to friends that their messages reached this phone (see
@@ -200,8 +201,15 @@ private final class Pinning: NSObject, URLSessionDataDelegate {
         }
     }
 
+    /// A host as it is compared: lowercase, without a trailing dot, so `relay.example.com.` still finds its pin.
+    private static func hostKey(_ raw: String) -> String {
+        var host = raw.lowercased()
+        while host.hasSuffix(".") { host.removeLast() }
+        return host
+    }
+
     init(host: String?) {
-        self.host = host?.lowercased()
+        self.host = host.map(Self.hostKey)
         let configured = (Bundle.main.object(forInfoDictionaryKey: "PulshadeRelayPin") as? String ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         // A pin that's set but unreadable fails closed, as in the app.
@@ -218,14 +226,41 @@ private final class Pinning: NSObject, URLSessionDataDelegate {
             return
         }
         guard SecTrustEvaluateWithError(trust, nil) else { completionHandler(.cancelAuthenticationChallenge, nil); return }
-        if let hashes, space.host.lowercased() == host {
-            guard let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate], let leaf = chain.first,
-                  hashes.contains(Data(SHA256.hash(data: SecCertificateCopyData(leaf) as Data))) else {
+        if let hashes {
+            // The helper only ever talks to the relay it was configured with. If the certificate's host is not that
+            // one (a redirect, which is refused, or a different address), there is nothing to check it against:
+            // refuse rather than fall back to plain WebPKI trust while believing the relay is pinned.
+            guard let host, Self.hostKey(space.host) == host,
+                  let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate], let leaf = chain.first,
+                  // Same as the app: a pin is either the leaf certificate's hash or its public key's (which survives
+                  // renewals). Checking only the certificate hash would make a key-only pin fail the helper shut.
+                  Self.accepts(hashes, leaf: leaf) else {
                 completionHandler(.cancelAuthenticationChallenge, nil)
                 return
             }
         }
         completionHandler(.useCredential, URLCredential(trust: trust))
+    }
+
+    private static func accepts(_ hashes: Set<Data>, leaf: SecCertificate) -> Bool {
+        if hashes.contains(Data(SHA256.hash(data: SecCertificateCopyData(leaf) as Data))) { return true }
+        return keyInfo(of: leaf).map { hashes.contains(Data(SHA256.hash(data: $0))) } ?? false
+    }
+
+    /// The leaf's public key as DER SubjectPublicKeyInfo, the form the app's pin check uses. Only P-256 and P-384
+    /// keys (what Let's Encrypt issues) are rebuilt; any other kind is left to the certificate hash.
+    private static func keyInfo(of certificate: SecCertificate) -> Data? {
+        guard let key = SecCertificateCopyKey(certificate),
+              let point = SecKeyCopyExternalRepresentation(key, nil) as Data? else { return nil }
+        let header: [UInt8]
+        switch point.count {
+        case 65: header = [0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+                           0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00]
+        case 97: header = [0x30, 0x76, 0x30, 0x10, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+                           0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22, 0x03, 0x62, 0x00]
+        default: return nil
+        }
+        return Data(header) + point
     }
 
     /// The relay address is the relay: a redirect would only take mailbox keys somewhere else.
