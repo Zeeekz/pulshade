@@ -212,7 +212,7 @@ struct ProfileTabs: View {
     private var media: [Message] {
         messages.filter { m in
             guard !m.isSystem, m.voice == nil, m.attachment?.kind != .file else { return false }
-            return m.isVideo || (m.image != nil && m.awaiting == nil)
+            return m.isVideo || ((m.image != nil || m.imageFile != nil) && m.awaiting == nil)
         }.sorted { $0.date > $1.date }
     }
     private var files: [Message] { messages.filter { $0.attachment?.kind == .file }.sorted { $0.date > $1.date } }
@@ -316,16 +316,17 @@ private struct ProfileMediaGrid: View {
 }
 
 private struct MediaTile: View {
+    @Environment(AppModel.self) private var model
     var message: Message
     @State private var open = false
 
-    private var ready: Bool { message.video?.isEmpty == false }
+    private var ready: Bool { model.videoData(for: message)?.isEmpty == false }
 
     var body: some View {
         Color.clear.aspectRatio(1, contentMode: .fit)
             .overlay {
                 ZStack {
-                    if let data = message.image, let img = DecodedImages.image(data, fit: 400) {
+                    if let data = model.imageData(for: message), let img = DecodedImages.image(data, fit: 400) {
                         Image(platformImage: img).resizable().scaledToFill()
                     } else {
                         Rectangle().fill(Ink.raised)
@@ -353,14 +354,16 @@ private struct MediaTile: View {
 }
 
 private struct MediaOpener: ViewModifier {
+    @Environment(AppModel.self) private var model
     var message: Message
     @Binding var open: Bool
 
     func body(content: Content) -> some View {
         if message.isVideo {
-            content.modifier(VideoPlayerCover(isPresented: $open, clip: message.video ?? Data()))
+            content.modifier(VideoPlayerCover(isPresented: $open, clip: model.videoData(for: message) ?? Data()))
         } else {
-            content.modifier(ImageViewerCover(isPresented: $open, data: message.image ?? Data(), date: message.date,
+            content.modifier(ImageViewerCover(isPresented: $open, data: model.imageData(for: message) ?? Data(),
+                                              date: message.date,
                                               caption: message.text.isEmpty ? nil : message.text))
         }
     }

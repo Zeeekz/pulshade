@@ -91,7 +91,7 @@ struct AppDataFormatTests {
     /// `setAside` and `setAsideUnseen` came without a format bump on purpose (see `AppData.setAside`): a build before
     /// them only drops pieces it couldn't read anyway, and a bump would lock out anyone who ends up back on that build.
     static let appKeys = ["activePersona", "announcementsSeen", "backupDigest", "backupSavedAt", "blobWipes", "blocked", "blockedNames", "bornAt", "chatBackground", "chatCodes", "clipParts", "contacts", "conversations", "decoySeed", "deviceID", "deviceKey",
-                          "facade", "followsAsked", "format", "friendInvites", "groupOffers", "groupRenewAfter", "groupSecret", "handlesTidied", "inviteRelay", "invites", "joinAsks", "linkOffers", "outbox", "panicSeed", "partingPosts", "pendingBackupForget", "personas", "profile",
+                          "facade", "followsAsked", "format", "friendInvites", "groupOffers", "groupRenewAfter", "groupSecret", "handlesTidied", "inviteRelay", "invites", "joinAsks", "linkOffers", "mediaFillers", "outbox", "panicSeed", "partingPosts", "pendingBackupForget", "personas", "profile",
                           "profileShared", "relay", "requests", "security", "seenEnvelopes", "sentDigests", "setAside", "setAsideUnseen", "stories", "storyChoices", "theme"]
     /// The collectible fields (`badge`, `collectibles`, `collectionCode`, `collectibleCodes`) were removed without a bump on
     /// purpose: data that still has them opens, the keys are just ignored (see `dataSavedWithCollectiblesStillOpens`).

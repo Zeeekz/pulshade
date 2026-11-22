@@ -45,14 +45,16 @@ struct Vault {
     }
 
     /// `PULSHADE_PROFILE=name` keeps a separate identity, handy for running two copies side by side.
-    static var standard: Vault {
+    static var standardDirectory: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         var dir = base.appendingPathComponent("Pulshade", isDirectory: true)
         if let profile = ProcessInfo.processInfo.environment["PULSHADE_PROFILE"], !profile.isEmpty {
             dir = dir.appendingPathComponent("profiles/\(profile)", isDirectory: true)
         }
-        return Vault(directory: dir)
+        return dir
     }
+
+    static var standard: Vault { Vault(directory: standardDirectory) }
 
     private var lockURL: URL { directory.appendingPathComponent("identity.lock") }
     private var legacyDataURL: URL { directory.appendingPathComponent("data.vault") }
@@ -275,6 +277,10 @@ struct Vault {
             for url in files where url.pathExtension == "vault" && url.lastPathComponent != keep { shred(url) }
             disableBiometrics()
             rebalance(real: [landing])
+            // The landing account is always new and empty, so every media file is the destroyed accounts' (or their
+            // filler). Left behind, a pool of hundreds of files beside an account with nothing in it would say there
+            // was another account; its keys are gone with the vault files above, and the files go too.
+            MediaPool(directory: directory).wipe()
         }
     }
 
@@ -638,6 +644,8 @@ struct Vault {
             if exists || lockKeys.inUse { lockKeys.revoke() }
             if hasBiometrics || biometricKeys.inUse { biometricKeys.revoke() }
         }
+        // The keys are gone above; only then are the media files and fillers wiped.
+        MediaPool(directory: directory).wipe()
         let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
         for url in files where ["lock", "vault", "bio", "cache"].contains(url.pathExtension) { shred(url) }
         if leavingNoTrace {
@@ -653,6 +661,8 @@ struct Vault {
     /// are shared with every other app, so only Pulshade's own cache folder and its own temporary files go, never
     /// anything of anyone else's. The overwriting runs in the background, since it can take a moment.
     static func scrubLeftovers() {
+        // Not the sealed media pool: Burn and Detach (`destroy`) and a panic unlock (`panic`) remove it themselves, after
+        // its keys are gone.
         URLCache.shared.removeAllCachedResponses()
         HTTPCookieStorage.shared.removeCookies(since: .distantPast)
         let files = FileManager.default
@@ -748,6 +758,245 @@ struct Vault {
         }
         precondition(status == kCCSuccess, "Key stretching failed")
         return SymmetricKey(data: derived)
+    }
+}
+
+/// One received media item kept outside AppData: a random file name and its own random AES-GCM key. The key belongs
+/// only in the encrypted vault's reference; the file body alone opens nothing.
+struct MediaFileRef: Codable, Equatable {
+    var name: String
+    var key: Data
+    var size: Int
+    var sha256: Data
+}
+
+/// The sealed media pool beside the vault. Real items and random filler files use the same random names, padded bucket
+/// sizes drawn from the account's own items, and one uniform timestamp. The pool only ever grows, in doubling steps to
+/// at least twice what this account keeps in it, so its file count shows no more than a rough size, and arrivals and
+/// deletions don't show in names, sizes or set dates. (The inode change time can't be set from an app, so it still
+/// shows when the pool last changed.)
+///
+/// Several accounts can share the pool (the real one, a decoy, a panic landing), and none can tell another's files from
+/// filler. So an account only ever reuses filler it made itself (`ownFillers`, kept in its own sealed data) and never
+/// overwrites or removes a file it doesn't know: another account's media stays safe, and a file nobody claims looks
+/// like any other filler. Only Burn and Detach (`wipe`) remove the pool. Keys are supplied by the caller and live in
+/// AppData; nothing here writes plaintext.
+final class MediaPool {
+    /// The smallest pool, so a new account's first item changes nothing on disk either.
+    static let smallest = 16
+    /// Filler sizes before the account has items of its own to copy: the smaller padded buckets, where photos and voice
+    /// notes land. Later fillers copy the sizes of real items, so the pool's total stays about twice what it keeps and
+    /// its size histogram looks like the account's own.
+    static let startingBuckets = [65_536, 131_072, 262_144, 524_288, 1_048_576]
+
+    let directory: URL
+    private(set) var realNames: Set<String>
+    /// Filler files this account made and may reuse. Anything else that isn't one of its items is left alone.
+    private(set) var ownFillers: Set<String>
+    /// The sealed (on-disk) sizes of this account's items, which new filler copies.
+    private(set) var realSizes: [Int]
+
+    init(directory: URL, realNames: Set<String> = [], ownFillers: Set<String> = [], realSizes: [Int] = []) {
+        self.directory = directory
+        self.realNames = realNames.filter(Self.isValidName)
+        self.ownFillers = ownFillers.filter(Self.isValidName).subtracting(realNames)
+        self.realSizes = realSizes
+    }
+
+    /// Every name the pool makes is 32 lowercase hex characters. Anything else (a reference that came from another
+    /// device, say) is never opened, overwritten or counted as this account's.
+    static func isValidName(_ name: String) -> Bool {
+        name.utf8.count == 32 && name.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+    }
+
+    /// The size a sealed item of `plainCount` bytes takes on disk.
+    static func sealedSize(ofPlain plainCount: Int) -> Int { Vault.paddedSize(plainCount + 8 + 28) }
+
+    var mediaDirectory: URL { directory.appendingPathComponent("media", isDirectory: true) }
+
+    /// The file count the pool grows to for `real` items of this account: a power of two, at least twice as many.
+    static func target(forReal real: Int, files: Int) -> Int {
+        var size = smallest
+        while size < max(2 * real, files) { size *= 2 }
+        return size
+    }
+
+    /// Writes a new sealed item into one of this account's filler files (growing the pool first if it has none) and
+    /// returns the reference the vault must keep. Fails rather than writing anything unencrypted.
+    func store(_ plaintext: Data) throws -> MediaFileRef {
+        try prepare()
+        let key = SymmetricKey(size: .bits256)
+        let keyData = key.withUnsafeBytes { Data($0) }
+        guard let sealed = try AES.GCM.seal(Self.pad(plaintext), using: key).combined else { throw VaultError.corrupt }
+        realSizes.append(sealed.count)
+        let existing = Set(allFiles().map(\.lastPathComponent))
+        ownFillers.formIntersection(existing)
+        if ownFillers.isEmpty || existing.count < Self.target(forReal: realNames.count + 1, files: existing.count) {
+            try grow(toHold: realNames.count + 1)
+        }
+        // Still none of its own (the pool is full of another account's files, which it can't tell from filler): double
+        // the pool with filler of its own rather than ever borrowing a file it doesn't know.
+        if ownFillers.isEmpty { try grow(toHold: realNames.count + 1, doubling: true) }
+        guard let name = ownFillers.sorted().first else { throw VaultError.corrupt }
+        let url = mediaDirectory.appendingPathComponent(name)
+        try write(sealed, to: url)
+        ownFillers.remove(name)
+        realNames.insert(name)
+        stamp([url])
+        return MediaFileRef(name: name, key: keyData, size: plaintext.count,
+                            sha256: Data(SHA256.hash(data: plaintext)))
+    }
+
+    /// Opens a reference. A missing file, a wrong key or any changed byte is an error; never a crash and never a
+    /// plaintext fallback.
+    func load(_ file: MediaFileRef) throws -> Data {
+        guard file.key.count == 32, Self.isValidName(file.name) else { throw VaultError.corrupt }
+        let raw = try Data(contentsOf: mediaDirectory.appendingPathComponent(file.name))
+        let box = try AES.GCM.SealedBox(combined: raw)
+        let padded = try AES.GCM.open(box, using: SymmetricKey(data: file.key))
+        let plain = try Self.unpad(padded)
+        guard plain.count == file.size, Data(SHA256.hash(data: plain)) == file.sha256 else {
+            throw VaultError.corrupt
+        }
+        return plain
+    }
+
+    /// Overwrites a deleted item in place with random bytes of the same size and keeps it as this account's filler.
+    /// The file, its name and its size stay, so a deletion is not visible on disk.
+    func delete(_ file: MediaFileRef) throws {
+        try release(file.name)
+    }
+
+    /// `delete` by name, for an item whose reference is already gone from the account's data.
+    func release(_ name: String) throws {
+        guard Self.isValidName(name) else { return }
+        let url = mediaDirectory.appendingPathComponent(name)
+        guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize else { return }
+        if size > 0 { try overwriteInPlace(url, size: size) }
+        realNames.remove(name)
+        ownFillers.insert(name)
+        stamp([url])
+    }
+
+    /// Adds filler (this account's own) until the pool is the size it should be for `real` items. Never removes.
+    func grow(toHold real: Int, doubling: Bool = false) throws {
+        try prepare()
+        var count = allFiles().count
+        let wanted = doubling ? max(Self.smallest, count * 2) : Self.target(forReal: real, files: count)
+        var made: [URL] = []
+        while count < wanted {
+            let url = try makeFiller()
+            made.append(url)
+            ownFillers.insert(url.lastPathComponent)
+            count += 1
+        }
+        if !made.isEmpty { stamp(made) }
+    }
+
+    var fileCount: Int { allFiles().count }
+    var fillerCount: Int { allFiles().filter { !realNames.contains($0.lastPathComponent) }.count }
+    var ownFillerCount: Int { ownFillers.count }
+
+    /// Keys are destroyed by the vault before this is called; then every real file and filler is overwritten and removed.
+    func wipe() {
+        guard FileManager.default.fileExists(atPath: mediaDirectory.path) else { return }
+        Vault.scrub(item: mediaDirectory)
+        try? FileManager.default.removeItem(at: mediaDirectory)
+        realNames = []
+        ownFillers = []
+    }
+
+    // MARK: Files
+
+    private func prepare() throws {
+        var url = mediaDirectory
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? url.setResourceValues(values)
+    }
+
+    private func allFiles() -> [URL] {
+        let files = (try? FileManager.default.contentsOfDirectory(at: mediaDirectory,
+                                                                  includingPropertiesForKeys: [.isRegularFileKey])) ?? []
+        return files.filter { (try? $0.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true }
+    }
+
+    private func freshName() throws -> String {
+        for _ in 0..<32 {
+            let name = Data.random(16).hex
+            if !FileManager.default.fileExists(atPath: mediaDirectory.appendingPathComponent(name).path) { return name }
+        }
+        throw VaultError.corrupt
+    }
+
+    private func makeFiller() throws -> URL {
+        let size = realSizes.randomElement() ?? Self.startingBuckets.randomElement() ?? 65_536
+        let name = try freshName()
+        let url = mediaDirectory.appendingPathComponent(name)
+        try write(Data.random(size), to: url)
+        return url
+    }
+
+    /// Gives the files just written, and the folder, the date every file in the pool shares: picked once at random when
+    /// the pool is made, then copied, so only the touched files are stamped and no write shows by its date.
+    private func stamp(_ touched: [URL]) {
+        let names = Set(touched.map(\.lastPathComponent))
+        let shared = allFiles().lazy.filter { !names.contains($0.lastPathComponent) }
+            .compactMap { (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate }.first
+        let when = shared ?? Date(timeIntervalSince1970: Double.random(in: 1_600_000_000...Date().timeIntervalSince1970))
+        for url in touched + [mediaDirectory] {
+            try? FileManager.default.setAttributes([.modificationDate: when, .creationDate: when],
+                                                   ofItemAtPath: url.path)
+        }
+    }
+
+    /// Writes random bytes over the file's own blocks (no new file and rename, which would leave the old bytes where
+    /// they were).
+    private func overwriteInPlace(_ url: URL, size: Int) throws {
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: 0)
+        var left = size
+        while left > 0 {
+            let chunk = min(left, 1_048_576)
+            try handle.write(contentsOf: Data.random(chunk))
+            left -= chunk
+        }
+        try handle.truncate(atOffset: UInt64(size))
+        try handle.synchronize()
+    }
+
+    private func write(_ data: Data, to url: URL) throws {
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: mediaDirectory.path)
+        #if os(iOS)
+        try data.write(to: url, options: [.atomic, .completeFileProtectionUnlessOpen])
+        #else
+        try data.write(to: url, options: [.atomic])
+        #endif
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    // MARK: Padding
+
+    private static let padMagic = Data("PSM1".utf8)
+
+    static func pad(_ plain: Data) -> Data {
+        var out = padMagic
+        withUnsafeBytes(of: UInt32(plain.count).bigEndian) { out.append(contentsOf: $0) }
+        out.append(plain)
+        let target = Vault.paddedSize(out.count + 28) - 28
+        out.append(Data(count: target - out.count))
+        return out
+    }
+
+    static func unpad(_ padded: Data) throws -> Data {
+        guard padded.count >= 8, padded.prefix(4) == padMagic else { throw VaultError.corrupt }
+        let length = padded.dropFirst(4).prefix(4).reduce(0) { $0 << 8 | Int($1) }
+        guard length <= padded.count - 8 else { throw VaultError.corrupt }
+        return Data(padded.dropFirst(8).prefix(length))
     }
 }
 

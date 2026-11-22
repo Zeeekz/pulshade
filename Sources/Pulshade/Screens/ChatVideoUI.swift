@@ -153,7 +153,8 @@ struct VideoBubble: View {
     var fill: CGSize? = nil
     @State private var playing = false
 
-    private var ready: Bool { message.video?.isEmpty == false }
+    private var clip: Data? { model.videoData(for: message) }
+    private var ready: Bool { clip?.isEmpty == false }
 
     private var loadingLabel: String {
         guard let got = model.clipProgress(ofMessage: message.id), got.have > 0, got.of > 1 else { return "Loading video" }
@@ -162,7 +163,7 @@ struct VideoBubble: View {
 
     var body: some View {
         ZStack {
-            if let data = message.image, let img = DecodedImages.image(data, fit: 1100) {
+            if let data = model.imageData(for: message), let img = DecodedImages.image(data, fit: 1100) {
                 if let fill {
                     Image(platformImage: img).resizable().scaledToFill().frame(width: fill.width, height: fill.height).clipped()
                 } else {
@@ -173,7 +174,13 @@ struct VideoBubble: View {
             } else {
                 Rectangle().fill(.black).aspectRatio(9 / 16, contentMode: .fit)
             }
-            if ready {
+            if message.videoFile != nil, clip == nil {
+                Text("Media unavailable")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14).padding(.vertical, 10)
+                    .background(.black.opacity(0.5), in: .rect(cornerRadius: 12))
+            } else if ready {
                 Image(systemName: "play.fill")
                     .font(.system(size: 20)).foregroundStyle(.white)
                     .frame(width: 52, height: 52)
@@ -197,7 +204,7 @@ struct VideoBubble: View {
         .clipShape(.rect(cornerRadius: fill == nil ? 10 : 0))
         .contentShape(.rect)
         .onTapGesture { if ready { playing = true } }
-        .modifier(VideoPlayerCover(isPresented: $playing, clip: message.video ?? Data(), canSave: model.canCopy(message)))
+        .modifier(VideoPlayerCover(isPresented: $playing, clip: clip ?? Data(), canSave: model.canCopy(message)))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(ready ? "Video" : loadingLabel)
         .accessibilityAddTraits(ready ? .isButton : [])

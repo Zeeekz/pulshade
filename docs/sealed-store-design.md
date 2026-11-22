@@ -28,7 +28,7 @@ Labels: **[checked]** read in the code or docs; **[brief]** taken from the reque
 | Relay seals every file it writes | **Right** [checked, `sealed.rs`, `journal.rs`, `groups.rs`, `blob.rs`, `docs/how-it-works.md`]. |
 | 1:1 mail served from RAM, cap 384 MB, `PULSHADE_MAIL_MIB` | **Right** [checked, `main.rs`: `BUDGET`, 384 MiB default]. |
 | What happens at the cap | **Worth knowing, it is not a refusal.** When full, waiting mail *makes way*: oldest story pieces first, then photos, then, only when nothing big is left, short messages (`make_room`). The dropped mail is also removed from the journal. So hitting the cap means offline people silently lose their oldest mail. A 507 only happens if making room is not enough [checked]. |
-| Group mail is on disk until the epoch's life ends, 3 days, not erased on read | **Right** [checked, `GroupEpoch.defaultDays = 3`, `groups.rs`]. |
+| Group mail is on disk until the epoch's life ends, 7 days, not erased on read | **Right** [checked, `GroupEpoch.defaultDays = 7`, `groups.rs`]. |
 
 Two things the brief did not say, found while reading:
 
@@ -38,14 +38,14 @@ Two things the brief did not say, found while reading:
   vault left in the SSD's spare blocks still opens with the identity key. The rule "deleting must really delete" is not met
   for chats today, only for the identity file. Section 3.3 fixes this with the same mechanism as the media store.
 - **Group media outlives group mail.** A photo or voice note over 48 KB in a shared-mailbox group goes up once with no reader
-  tokens and lives its full 7 days on the relay's disk (`docs/blob-store.md`), while the message lives 3 days.
+  tokens and lives its full 7 days on the relay's disk (`docs/blob-store.md`), while the message lives 7 days.
 
 ## 2. How Signal does it (from memory, not checked)
 
 | | Signal [memory] | Pulshade today | Pulshade proposed |
 | --- | --- | --- | --- |
 | Server mail | Held per recipient device, deleted when the device acknowledges; undelivered mail kept up to about 30 days | Held in RAM + sealed journal, deleted on ack, 7 days max | Same, plus a bigger or tiered store (section 5) |
-| Groups | Sender encrypts once for all members, the server splits it into each member's own queue. Server sees the recipient list of a send, not which group it is. Deleted on ack. | One shared mailbox, not deleted on read, 3 days | One shared mailbox, 7 days by default (section 4) |
+| Groups | Sender encrypts once for all members, the server splits it into each member's own queue. Server sees the recipient list of a send, not which group it is. Deleted on ack. | One shared mailbox, not deleted on read, 7 days | One shared mailbox, 7 days by default (section 4) |
 | Attachments | Uploaded encrypted to a CDN, kept about 30 days, key in the message | Relay disk, erased on collect (1:1) or 7 days | Same on the relay; **kept on the phone** |
 | Phone store | Messages in an encrypted database, key held by the OS keystore. Attachments: on Android encrypted per file; iOS and desktop have changed over versions and I am not sure of the current state | Vault for chats, nothing for received files | Sealed shelf with per-item keys, rotating wrapper key |
 | Delete | Removes the row and file; secure-delete in the database; no guarantee against flash copies | Overwrite then unlink | Destroy the item's key and rotate the wrapper |
@@ -421,3 +421,20 @@ memory). A code comment in the relay says deposits are refused (507) at the cap,
 - **F. Moving to a new phone:** accepted. A new phone starts without old media unless linked from a working old one.
 - **G. Review:** an in-house security check, done (section 8b), and an independent review of
   stages 1 and 2 before they ship, arranged by Zeekz.
+
+## 10. As built: the phone's media pool (build 21)
+
+- Received photos, voice notes, clips and story media go into `media/` beside the vault, each sealed with its own random
+  AES-GCM key that lives only in the encrypted vault. A file opens only with its key, size and SHA-256 all matching.
+- Real files and filler share random 32-hex names, padded sizes and one shared date. Filler copies the sizes of the
+  account's own items. The pool grows in doubling steps to at least twice the item count and never shrinks.
+- An account reuses only filler it made itself (`AppData.mediaFillers`) and never touches a file it doesn't know, so a
+  decoy and the real account can share the pool.
+- A deleted item is overwritten in place and kept as filler. Every way a message or story can go is caught at the next
+  save (`releaseDroppedMedia`).
+- The budget counts each item at its padded size on disk, so tiny items can't grow the pool past it.
+- Burn, Detach and a panic unlock remove the whole pool after its keys are gone. The panic landing account starts empty.
+- A newly linked device gets the bytes inside the sealed history, never file references.
+- **What still shows:** the pool's file count and total size give a rough idea of how much media one account on the
+  device keeps. An empty decoy beside a large pool can't explain it. The inode change time can't be set by an app, so it
+  shows when the pool last changed.

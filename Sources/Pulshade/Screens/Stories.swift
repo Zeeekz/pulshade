@@ -235,9 +235,16 @@ struct StoryFace: View {
                     .padding(compact ? 16 : 40)
             case let .image(data, caption):
                 Color.black
+                let shown = model?.storyData(for: story) ?? data
                 if story.mediaDropped == true {
                     mediaMissing
-                } else if data.isEmpty {
+                } else if !shown.isEmpty, let img = StoryImages.image(id: story.id, data: shown) {
+                    Image(platformImage: img).resizable().scaledToFill()
+                } else if story.mediaFile != nil {
+                    Text("Media unavailable")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.8))
+                } else {
                     // Still arriving: it shows as soon as the picture is in.
                     VStack(spacing: 10) {
                         ProgressView().tint(.white)
@@ -245,15 +252,22 @@ struct StoryFace: View {
                     }
                     .accessibilityElement(children: .combine)
                     .accessibilityLabel(loadingLabel)
-                } else if let img = StoryImages.image(id: story.id, data: data) {
-                    Image(platformImage: img).resizable().scaledToFill()
                 }
                 if !caption.isEmpty { StoryCaption(text: caption, compact: compact) }
             case let .video(data, caption):
                 Color.black
+                let shown = model?.storyData(for: story) ?? data
                 if story.mediaDropped == true {
                     mediaMissing
-                } else if data.isEmpty {
+                } else if let clip {
+                    LayerView(layer: clip.layer).frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if !shown.isEmpty {
+                    StoryPoster(data: shown, key: "\(story.id.uuidString)-\(shown.count)")
+                } else if story.mediaFile != nil {
+                    Text("Media unavailable")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.8))
+                } else {
                     // Still arriving: it plays as soon as the last piece is in.
                     VStack(spacing: 10) {
                         ProgressView().tint(.white)
@@ -261,10 +275,6 @@ struct StoryFace: View {
                     }
                     .accessibilityElement(children: .combine)
                     .accessibilityLabel(loadingLabel)
-                } else if let clip {
-                    LayerView(layer: clip.layer).frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    StoryPoster(data: data, key: "\(story.id.uuidString)-\(data.count)")
                 }
                 if !caption.isEmpty { StoryCaption(text: caption, compact: compact) }
             }
@@ -1808,7 +1818,8 @@ struct StoryViewer: View {
         clip?.close()
         clip = nil
         clock.progress = 0
-        guard current.indices.contains(index), case let .video(data, _) = current[index].style, !data.isEmpty else { return }
+        guard current.indices.contains(index), case .video = current[index].style,
+              let data = model.storyData(for: current[index]), !data.isEmpty else { return }
         clip = StoryClip(data: data)
         if !paused { clip?.play() }
     }

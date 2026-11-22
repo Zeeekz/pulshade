@@ -581,6 +581,8 @@ struct StatusTicks: View {
 /// A recorded voice note. Lives only in memory and in the encrypted vault, never as a loose file.
 struct VoiceNote: Codable, Equatable {
     var audio: Data
+    /// Where the sound lives when it is in the sealed media pool; `audio` is then empty.
+    var audioFile: MediaFileRef? = nil
     var duration: TimeInterval
     /// 0...255 loudness samples for drawing the waveform.
     var levels: [UInt8]
@@ -626,6 +628,8 @@ struct Message: Codable, Identifiable, Equatable {
     var sender: String
     var text: String
     var image: Data?
+    /// Where a received photo lives in the sealed media pool; `image` is then empty.
+    var imageFile: MediaFileRef? = nil
     var voice: VoiceNote?
     var date = Date()
     var status: MessageStatus = .queued
@@ -636,8 +640,10 @@ struct Message: Codable, Identifiable, Equatable {
     var reply: ReplyRef?
     var preview: LinkPreview?
     /// A video's clip. Nil when the message isn't a video; empty while its pieces are still arriving (`image` is a
-    /// still from it meanwhile).
+    /// still from it meanwhile). A received completed clip may live in the pool and leave `video` empty with a
+    /// `videoFile` reference.
     var video: Data?
+    var videoFile: MediaFileRef? = nil
     /// How long the video runs.
     var clipSeconds: Double?
     /// A note of the sender's profile, shown as a card: only its title travels. Opening it reads the note from their
@@ -662,7 +668,7 @@ struct Message: Codable, Identifiable, Equatable {
     /// A dropped item that can no longer be fetched: the sender no longer has it, or it would not fit even on request.
     var mediaGone: Bool? = nil
 
-    var isVideo: Bool { video != nil }
+    var isVideo: Bool { video != nil || videoFile != nil }
     /// Whether this message @-mentions you.
     var mentionsMe: Bool { mentions.contains { $0.fingerprint == "me" } }
     var isMine: Bool { sender == "me" }
@@ -696,6 +702,8 @@ struct Message: Codable, Identifiable, Equatable {
         reply = try? c.decodeIfPresent(ReplyRef.self, forKey: .reply)
         preview = try? c.decodeIfPresent(LinkPreview.self, forKey: .preview)
         video = try? c.decodeIfPresent(Data.self, forKey: .video)
+        imageFile = try? c.decodeIfPresent(MediaFileRef.self, forKey: .imageFile)
+        videoFile = try? c.decodeIfPresent(MediaFileRef.self, forKey: .videoFile)
         clipSeconds = try? c.decodeIfPresent(Double.self, forKey: .clipSeconds)
         note = try? c.decodeIfPresent(NoteCard.self, forKey: .note)
         mentions = (try? c.decodeIfPresent([Mention].self, forKey: .mentions)) ?? []
@@ -1157,6 +1165,8 @@ struct Story: Codable, Identifiable, Equatable {
     var clipBlob: Attachment?
     /// A video story only: when it ends it plays again from the start, until the viewer moves on. Nil is no.
     var loops: Bool?
+    /// Where a received story's picture or clip lives in the sealed media pool; the style's `Data` is then empty.
+    var mediaFile: MediaFileRef? = nil
     /// Received media that was not stored because this device is holding too much already.
     var mediaDropped: Bool? = nil
     /// A dropped story that can no longer be fetched.
@@ -1170,7 +1180,8 @@ struct Story: Codable, Identifiable, Equatable {
 
     /// A video story is only shown once its whole clip has arrived, and a photo one once its picture has.
     var isReady: Bool {
-        switch style {
+        if mediaFile != nil { return true }
+        return switch style {
         case let .video(clip, _): !clip.isEmpty
         case let .image(photo, _): !photo.isEmpty
         case .text: true
@@ -1586,6 +1597,10 @@ struct AppData: Codable {
     var setAside: [String: [Data]]?
     /// How many pieces the last unlock set aside that haven't been mentioned yet.
     var setAsideUnseen: Int?
+    /// The sealed media pool's filler files this account made (`MediaPool.ownFillers`): the only ones it may reuse. Files
+    /// it doesn't know may be another account's on this device, so it never touches them. This device only: not in a
+    /// backup.
+    var mediaFillers: [String]?
     init() {}
 
     /// The relay new identities use. A build can set `PulshadeRelay` in its Info.plist (the iPhone
@@ -1692,6 +1707,7 @@ struct AppData: Codable {
         partingPosts = (try? c.decodeIfPresent([PartingPost].self, forKey: .partingPosts)) ?? []
         setAside = try? c.decodeIfPresent([String: [Data]].self, forKey: .setAside)
         setAsideUnseen = try? c.decodeIfPresent(Int.self, forKey: .setAsideUnseen)
+        mediaFillers = try? c.decodeIfPresent([String].self, forKey: .mediaFillers)
     }
 }
 

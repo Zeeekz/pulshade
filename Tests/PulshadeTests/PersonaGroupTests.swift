@@ -76,8 +76,8 @@ struct PersonaGroupTests {
         // A photo big enough to follow on its own reaches the other persona's copy whole.
         let photo = Self.bigPhoto()
         laptop.send("pic", image: photo, in: mainCopy.id)
-        await until([phone, laptop]) { laptop.conversation(maskCopy.id)?.messages.contains { $0.text == "pic" && $0.image == photo } == true }
-        #expect(laptop.conversation(maskCopy.id)?.messages.contains { $0.text == "pic" && $0.image == photo } == true, "the photo arrived")
+        await until([phone, laptop]) { laptop.conversation(maskCopy.id)?.messages.contains { $0.text == "pic" && laptop.imageData(for: $0) == photo } == true }
+        #expect(laptop.conversation(maskCopy.id)?.messages.contains { $0.text == "pic" && laptop.imageData(for: $0) == photo } == true, "the photo arrived")
         #expect(laptop.conversation(mainCopy.id)?.messages.first { $0.text == "pic" }?.image == photo, "the sender's copy keeps it")
         // Each copy keeps its own sent message as its own, and the other's as someone else's.
         #expect(laptop.conversation(mainCopy.id)?.messages.first { $0.text == "from main" }?.isMine == true)

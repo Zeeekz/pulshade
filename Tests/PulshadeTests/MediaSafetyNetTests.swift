@@ -8,6 +8,10 @@ import Foundation
     private func makeModel() async throws -> AppModel {
         let model = testModel("pulshade-media-net")
         try await model.create(identity: .generate(), profile: Profile(name: "Me"), passcode: "test-passcode")
+        // These exercise the step-4 refusal behaviour; step 5d's eviction is tested separately.
+        model.mediaSoftLimitForTests = 96 * 1024 * 1024
+        model.mediaHardLimitForTests = 128 * 1024 * 1024
+        model.evictsForTests = false
         return model
     }
 
@@ -50,9 +54,9 @@ import Foundation
         model.deliver(WireMessage(id: UUID(), conversation: nil, kind: .direct, text: "after delete", voice: afterDelete,
                                   date: Date()), from: them)
         let stored = try #require(model.data.conversations.first?.messages.last)
-        #expect(stored.voice?.audio.count == afterDelete.audio.count)
+        #expect(model.voiceAudio(for: stored)?.count == afterDelete.audio.count, "stored, in the sealed pool")
         #expect(stored.mediaDropped != true, "room again without locking")
-        #expect(model.receivedMediaBytes == afterDelete.audio.count)
+        #expect(model.receivedMediaBytes == MediaPool.sealedSize(ofPlain: afterDelete.audio.count), "counted at its size on disk")
     }
 
     @Test func aStoryUpdateRecountsAfterMediaIsDeleted() async throws {
@@ -78,10 +82,44 @@ import Foundation
                                      date: Date(), lasts: 3600), from: them)
 
         let story = try #require(model.data.stories.first { $0.id == storyID })
-        guard case let .image(data, _) = story.style else { Issue.record("story did not update"); return }
-        #expect(data.count == replacement.count)
+        guard case .image = story.style else { Issue.record("story did not update"); return }
+        #expect(model.storyData(for: story)?.count == replacement.count, "stored, in the sealed pool")
         #expect(story.mediaDropped != true, "the update was not refused for a stale total")
-        #expect(model.receivedMediaBytes == replacement.count)
+        #expect(model.receivedMediaBytes == MediaPool.sealedSize(ofPlain: replacement.count), "counted at its size on disk")
+    }
+
+    @Test func theCapEvictsFromTheBiggestHolderFirst() async throws {
+        let model = try await makeModel()
+        defer { model.lock() }
+        model.mediaSoftLimitForTests = 5 * 1024 * 1024
+        model.mediaHardLimitForTests = 5 * 1024 * 1024
+        model.evictsForTests = true
+
+        let a = makeContact()
+        let b = makeContact()
+        model.data.contacts = [a, b]
+        let size = 2 * 1024 * 1024
+        let old = Date().addingTimeInterval(-3_600)
+        var convoA = Conversation(kind: .direct, title: "A", members: [a.fingerprint])
+        convoA.messages = [Message(sender: a.fingerprint, text: "oldest", image: Data(count: size), date: old),
+                           Message(sender: a.fingerprint, text: "newer", image: Data(count: size), date: Date())]
+        var convoB = Conversation(kind: .direct, title: "B", members: [b.fingerprint])
+        convoB.messages = [Message(sender: b.fingerprint, text: "b", image: Data(count: size),
+                                   date: old.addingTimeInterval(-3_600))]
+        model.data.conversations = [convoA, convoB]
+        model.rebuildReceivedMedia()
+        #expect(model.receivedMediaBytes == 6 * 1024 * 1024)
+
+        model.deliver(WireMessage(id: UUID(), conversation: nil, kind: .direct, text: "new",
+                                  voice: VoiceNote(audio: Data(count: 1_048_576 - 100), duration: 1, levels: []), date: Date()), from: a)
+
+        #expect(model.data.conversations[0].messages[0].image == nil, "the biggest holder's oldest media went")
+        #expect(model.data.conversations[0].messages[0].mediaGone == true)
+        #expect(model.data.conversations[0].messages[1].image?.count == size)
+        #expect(model.data.conversations[1].messages[0].image?.count == size, "the smaller holder was untouched")
+        #expect(model.data.conversations[0].messages.last?.voice?.audioFile != nil, "the new item was stored")
+        #expect(model.storageNotice != nil, "one notice")
+        #expect(model.receivedMediaBytes == 5 * 1024 * 1024)
     }
 
     @Test func ownAndSyncedMediaNeverCount() async throws {
@@ -111,7 +149,12 @@ import Foundation
         model.save()
         model.lock()
         #expect(await model.unlock(passcode: "test-passcode"))
-        #expect(model.receivedMediaBytes == before)
+        // Opening moves the inline photo into the sealed pool, where it counts at its padded size on disk.
+        #expect(model.receivedMediaBytes == MediaPool.sealedSize(ofPlain: media.count))
+        model.save()
+        model.lock()
+        #expect(await model.unlock(passcode: "test-passcode"))
+        #expect(model.receivedMediaBytes == MediaPool.sealedSize(ofPlain: media.count), "and the same after the next unlock")
         model.lock()
     }
 }

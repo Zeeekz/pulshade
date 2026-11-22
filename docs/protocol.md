@@ -415,7 +415,7 @@ What it changes, honestly:
 
 - **Healing.** A 1:1 chat heals at the next reply after a key is stolen. In a group, a stolen epoch key reads everything
   in that epoch (every member's chain starts from it), so epochs are short: a removal, a newcomer after the group has
-  talked, or 3 days / 300 posts. Within an epoch each sender's chain still only moves forward, so a member's
+  talked, or 7 days / 1,000 posts. Within an epoch each sender's chain still only moves forward, so a member's
   device holds no key of a message it has already read from a sender it has heard; but it can work out the chain of any
   sender it has not, from the epoch key, so **there is no per-message forward secrecy against someone who steals an
   epoch key** (see `docs/groups-design.md`, "Forward secrecy inside an epoch").
@@ -437,7 +437,7 @@ Someone on an older app is refused until they update.
   the epoch key and a group key of their own, with a card that has no name or picture, and posts nothing: the app
   refuses, and mail from an unlisted sender in a channel is dropped.
 - **Staff roster.** The staff keep the follower list in a signed `GroupRoster` (follower keys and when they were added,
-  no names; at most 1,500). It is posted in a second, staff-only mailbox (an "epoch 0") that opens with a 32-byte staff
+  no names; at most 500). It is posted in a second, staff-only mailbox (an "epoch 0") that opens with a 32-byte staff
   key the owner gives each admin with the ask to be staff. Followers never have the key, so they cannot see joins and
   leaves as they happen. The owner's phone posts the roster again every three days, since the relay keeps mail a week,
   and makes a new staff key whenever an admin is let go. Dates in the roster are clamped to a few minutes ahead, and a
@@ -461,7 +461,7 @@ Someone on an older app is refused until they update.
   `groupInvite` (current settings and epoch key), at most once every ten minutes per follower whatever arrives. A follower's
   phone answers such an invite with its card, and takes a staff key or a new inviter from it, only from the account that invited
   it (another contact's copy only refreshes keys). A follower asks at most
-  once every ten minutes. A channel's code lets in at most 60 new followers an hour (repeat hellos from one identity count once); the rest wait, earliest first, and the list drops the newest when it is full (1,500). Nothing is
+  once every ten minutes. A channel's code lets in at most 60 new followers an hour (repeat hellos from one identity count once); the rest wait, earliest first, and the list drops the newest when it is full (500). Nothing is
   posted in any mailbox. With no answer (an older app, an absent phone, or a follower already taken out) the follower is just
   told that none came.
 - **Announcements** is not a group on the wire: the relay hands every app the same admin-signed list, with no account

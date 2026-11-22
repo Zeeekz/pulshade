@@ -834,10 +834,10 @@ struct SharedGroupFlowTests {
         #expect(photo.count > AppModel.mediaInline)
         alice.send("sunset", image: photo, in: group.id)
         await until([alice, bob, cara], seconds: 30) {
-            bob.conversation(group.id)?.messages.last?.image == photo && cara.conversation(group.id)?.messages.last?.image == photo
+            bob.conversation(group.id)?.messages.last.map(bob.shown)?.image == photo && cara.conversation(group.id)?.messages.last.map(cara.shown)?.image == photo
         }
-        #expect(bob.conversation(group.id)?.messages.last?.image == photo)
-        #expect(cara.conversation(group.id)?.messages.last?.image == photo)
+        #expect(bob.conversation(group.id)?.messages.last.map(bob.shown)?.image == photo)
+        #expect(cara.conversation(group.id)?.messages.last.map(cara.shown)?.image == photo)
         #expect(bob.conversation(group.id)?.messages.last?.text == "sunset")
         let pointer = try #require(alice.conversation(group.id)?.messages.last?.attachment, "it went to the relay as a file")
         #expect(pointer.kind == .photo)
@@ -847,11 +847,11 @@ struct SharedGroupFlowTests {
         let note = VoiceNote(audio: Data.random(90_000), duration: 22, levels: [10, 200, 90])
         bob.send("", voice: note, in: group.id)
         await until([alice, bob, cara], seconds: 30) {
-            alice.conversation(group.id)?.messages.last?.voice?.audio == note.audio
-                && cara.conversation(group.id)?.messages.last?.voice?.audio == note.audio
+            alice.conversation(group.id)?.messages.last.map(alice.shown)?.voice?.audio == note.audio
+                && cara.conversation(group.id)?.messages.last.map(cara.shown)?.voice?.audio == note.audio
         }
-        #expect(alice.conversation(group.id)?.messages.last?.voice?.audio == note.audio)
-        #expect(cara.conversation(group.id)?.messages.last?.voice?.audio == note.audio)
+        #expect(alice.conversation(group.id)?.messages.last.map(alice.shown)?.voice?.audio == note.audio)
+        #expect(cara.conversation(group.id)?.messages.last.map(cara.shown)?.voice?.audio == note.audio)
     }
 
     /// A member who missed several versions catches up on the newest the owner signed.

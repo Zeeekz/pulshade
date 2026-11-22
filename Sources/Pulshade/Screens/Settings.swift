@@ -5,7 +5,7 @@ import PulshadeShared
 
 /// The pages Settings opens, each from a row on the main list.
 enum SettingsPage: String, Hashable {
-    case profile, invite, handles, pinned, privacy, privacyLock, privacyMessages, privacyPasscodes, privacyBackup, blocked, notifications, appearance, devices, network, networkWaiting, anonymity, account, updates
+    case profile, invite, handles, pinned, privacy, privacyLock, privacyMessages, privacyPasscodes, privacyBackup, blocked, notifications, appearance, devices, storage, network, networkWaiting, anonymity, account, updates
 }
 
 /// Settings, laid out like a phone's own: your profile on top, then a short list of rows,
@@ -46,6 +46,9 @@ struct SettingsView: View {
                         RowDivider(inset: 54)
                         MenuRow(page: .devices, symbol: "laptopcomputer.and.iphone", color: .hex(0xFF9F0A), title: "Devices",
                                 value: "\(model.linkedDevices.count + 1)")
+                        RowDivider(inset: 54)
+                        MenuRow(page: .storage, symbol: "internaldrive.fill", color: .hex(0x8E8E93), title: "Storage",
+                                value: ByteCountFormatter.string(fromByteCount: Int64(model.receivedMediaBytes), countStyle: .file))
                     }
                     SettingsGroup {
                         MenuRow(page: .network, symbol: "antenna.radiowaves.left.and.right", color: .hex(0x30D158), title: "Network",
@@ -94,6 +97,7 @@ struct SettingsView: View {
                     case .notifications: NotificationSettings()
                     case .appearance: AppearanceSettings()
                     case .devices: DevicesSettings()
+                    case .storage: StorageSettings()
                     case .network: NetworkSettings()
                     case .networkWaiting: WaitingToSendView()
                     case .anonymity: AnonymityReport()
@@ -1366,6 +1370,55 @@ private struct EditingPhoto: Identifiable {
 }
 
 // MARK: - Devices
+
+private struct StorageSettings: View {
+    @Environment(AppModel.self) private var model
+
+    private func size(_ bytes: Int) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+
+    var body: some View {
+        SettingsScreen(title: "Storage") {
+            SettingsGroup(footer: "Only received photos, videos, voice notes and story media are counted. Your own messages, text and media from your other devices are never removed.") {
+                SettingRow("Received media") {
+                    Text(size(model.receivedMediaBytes)).font(.system(size: 14)).foregroundStyle(Ink.faint)
+                }
+            }
+            if let notice = model.storageNotice {
+                Text(notice)
+                    .font(.system(size: 13))
+                    .foregroundStyle(Ink.dim)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 4)
+            }
+            let usage = model.mediaUsage()
+            if usage.isEmpty {
+                Text("No received media is stored.")
+                    .font(.system(size: 14))
+                    .foregroundStyle(Ink.faint)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 4)
+            } else {
+                SettingsGroup("By chat") {
+                    ForEach(usage.indices, id: \.self) { index in
+                        let row = usage[index]
+                        if index > 0 { RowDivider(inset: 54) }
+                        SettingRow(row.name) {
+                            HStack(spacing: 14) {
+                                Text(size(row.bytes)).font(.system(size: 14)).foregroundStyle(Ink.faint)
+                                Button("Clear") { model.clearMedia(scopeID: row.id) }
+                                    .buttonStyle(.plain)
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.red.opacity(0.85))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 private struct DevicesSettings: View {
     var body: some View {

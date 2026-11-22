@@ -1267,7 +1267,7 @@ struct ChatRow: View {
                         if last.expiresAt != nil || c.disappearAfter != nil {
                             Image(systemName: "timer").font(.system(size: 10)).foregroundStyle(Ink.faint)
                         }
-                        Text(last.text.isEmpty ? (last.voice != nil ? "Voice message" : last.image != nil ? "Photo" : "") : last.text)
+                        Text(last.text.isEmpty ? (last.voice != nil ? "Voice message" : (last.image != nil || last.imageFile != nil) ? "Photo" : "") : last.text)
                             .font(.system(size: lineSize))
                             .foregroundStyle(Ink.dim)
                             .lineLimit(1)

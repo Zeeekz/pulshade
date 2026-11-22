@@ -355,7 +355,7 @@ struct ConversationView: View {
         } else if !m.text.isEmpty, model.canCopy(m) {
             actions.append(.init(title: "Copy", symbol: "doc.on.doc") { copyToClipboard(m.text, clearAfter: 60) })
         }
-        if let clip = m.video, !clip.isEmpty, model.canCopy(m) {
+        if let clip = model.videoData(for: m), !clip.isEmpty, model.canCopy(m) {
             actions.append(.init(title: "Save video", symbol: "arrow.down.to.line") {
                 if model.data.security.warnBeforeSaving { videoToSave = clip } else { saveVideo(clip) }
             })
@@ -612,7 +612,7 @@ struct ConversationView: View {
                 ComposerContext(symbol: "arrowshape.turn.up.left.fill",
                                 title: replyingTo.isMine ? "Replying to yourself" : "Replying to \(model.displayName(replyingTo.sender))",
                                 detail: AppModel.snippet(of: replyingTo),
-                                image: replyingTo.image) {
+                                image: model.imageData(for: replyingTo)) {
                     withAnimation(.snappy(duration: 0.2)) { self.replyingTo = nil }
                 }
                 .transition(.move(edge: .bottom).combined(with: .opacity))
@@ -954,6 +954,7 @@ private struct ReadOnlyBar: View {
 
 fileprivate struct Bubble: View, Equatable {
     @Environment(\.theme) private var theme
+    @Environment(AppModel.self) private var model
     var message: Message
     var kind: ConversationKind
     var senderName: String?
@@ -1187,7 +1188,7 @@ fileprivate struct Bubble: View, Equatable {
 
     /// The shape of the photo or video this message shows, if it shows one.
     private var mediaSize: CGSize? {
-        guard let data = message.image, let img = DecodedImages.image(data, fit: 1100) else {
+        guard let data = model.imageData(for: message), let img = DecodedImages.image(data, fit: 1100) else {
             return message.isVideo ? CGSize(width: 9, height: 16) : nil
         }
         return img.size.width > 0 && img.size.height > 0 ? img.size : CGSize(width: 1, height: 1)
@@ -1385,7 +1386,7 @@ fileprivate struct Bubble: View, Equatable {
             .clipped()
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("Photo, loading")
-        } else if let data = message.image, let img = DecodedImages.image(data, fit: 1100) {
+        } else if let data = model.imageData(for: message), let img = DecodedImages.image(data, fit: 1100) {
             Image(platformImage: img).resizable().scaledToFill()
                 .frame(width: size.width, height: size.height)
                 .clipped()
@@ -1399,6 +1400,27 @@ fileprivate struct Bubble: View, Equatable {
                 .accessibilityLabel("Photo")
                 .accessibilityAddTraits(.isButton)
         }
+    }
+
+    /// A file-backed item whose sealed file is missing or cannot be opened.
+    private var storedMediaMissing: Bool {
+        if message.videoFile != nil { return model.videoData(for: message) == nil }
+        if message.imageFile != nil { return model.imageData(for: message) == nil }
+        if message.voice?.audioFile != nil { return model.voiceAudio(for: message) == nil }
+        return false
+    }
+
+    /// The voice note with its sound, which may come from the sealed pool.
+    private var playableVoice: VoiceNote? {
+        guard var voice = message.voice else { return nil }
+        if voice.audio.isEmpty, let audio = model.voiceAudio(for: message) { voice.audio = audio }
+        return voice
+    }
+
+    private var mediaUnavailable: some View {
+        Label("Media unavailable", systemImage: "exclamationmark.triangle")
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(message.isMine ? Ink.onAccent.opacity(0.8) : Ink.dim)
     }
 
     @ViewBuilder private var droppedMedia: some View {
@@ -1422,7 +1444,9 @@ fileprivate struct Bubble: View, Equatable {
             header
             if message.mediaDropped == true {
                 droppedMedia
-            } else if let voice = message.voice {
+            } else if storedMediaMissing {
+                mediaUnavailable
+            } else if let voice = playableVoice {
                 VoiceBubble(note: voice, id: message.id, mine: mine, loading: message.awaiting == .voice)
             }
             if message.attachment?.kind == .file {
@@ -1458,7 +1482,8 @@ fileprivate struct Bubble: View, Equatable {
 
     /// Emoji-only messages float without a bubble, big.
     private var bare: Bool {
-        message.image == nil && message.voice == nil && message.reply == nil && message.text.isOnlyEmoji
+        message.image == nil && message.imageFile == nil && !message.isVideo && message.voice == nil && message.reply == nil
+            && message.text.isOnlyEmoji
     }
 
     /// The bubble's outline: rounder on the outside, tighter where it joins the one above or below.
