@@ -1564,6 +1564,14 @@ struct AppData: Codable {
     /// still waiting to go), kept after the group itself is gone and tried with the rest of the outbox until they're on
     /// the relay, for a week at most. Without them one failed try (Tor still connecting, say) meant nobody was told.
     var partingPosts: [PartingPost] = []
+    /// Pieces of saved data this build couldn't read (one chat, one contact, one message...), kept exactly as they were
+    /// saved instead of locking the whole account out (`AppData.rescue`). Inside the sealed vault only: never in the
+    /// backup and never sent anywhere. A later build that reads them can bring them back. Keyed by where they came from.
+    /// Not a format bump on purpose: a build before this drops them, which loses nothing it could have read anyway, while
+    /// a bump would lock out anyone who ends up on the build before (a TestFlight copy and an App Store copy, say).
+    var setAside: [String: [Data]]?
+    /// How many pieces the last unlock set aside that haven't been mentioned yet.
+    var setAsideUnseen: Int?
     init() {}
 
     /// The relay new identities use. A build can set `PulshadeRelay` in its Info.plist (the iPhone
@@ -1666,6 +1674,8 @@ struct AppData: Codable {
         groupSecret = try c.decodeIfPresent(Data.self, forKey: .groupSecret)
         groupRenewAfter = try? c.decodeIfPresent(Date.self, forKey: .groupRenewAfter)
         partingPosts = (try? c.decodeIfPresent([PartingPost].self, forKey: .partingPosts)) ?? []
+        setAside = try? c.decodeIfPresent([String: [Data]].self, forKey: .setAside)
+        setAsideUnseen = try? c.decodeIfPresent(Int.self, forKey: .setAsideUnseen)
     }
 }
 
@@ -1721,5 +1731,93 @@ enum SeenPool {
         case .contact: return !key.contains(":")
         case .stranger, .ratchet: return key.hasPrefix(prefix)
         }
+    }
+}
+
+// MARK: - Opening saved data that won't read in one go
+
+extension AppData {
+    /// Opens saved data that didn't decode as a whole: everything that still reads is kept, and each piece that doesn't
+    /// (a contact, a chat, a message, a setting) is set aside exactly as it was saved (`setAside`) instead of the whole
+    /// account staying locked. Nil when the data was saved by a newer build (that stays refused, so nothing it wrote is
+    /// lost) or isn't account data at all. Only ever tried after the ordinary decode has failed.
+    static func rescue(_ json: Data) -> AppData? {
+        guard var top = (try? JSONSerialization.jsonObject(with: json)) as? [String: Any] else { return nil }
+        let written = (top["format"] as? NSNumber)?.intValue ?? 0
+        guard written <= currentFormat else { return nil }
+        let decoder = JSONDecoder.pulshade
+        var aside: [String: [Data]] = [:]
+        // Whatever an earlier rescue set aside stays set aside.
+        if let earlier = top["setAside"],
+           let bytes = fragment(earlier), let kept = try? decoder.decode([String: [Data]].self, from: bytes) {
+            aside = kept
+        }
+        top["setAside"] = nil
+        top["setAsideUnseen"] = nil
+        var newlyAside = 0
+        func setAside(_ value: Any, as key: String) {
+            guard let bytes = fragment(value) else { return }
+            aside[key, default: []].append(bytes)
+            newlyAside += 1
+        }
+        func reads<T: Decodable>(_ value: Any, as type: T.Type) -> Bool {
+            guard let bytes = fragment(value) else { return false }
+            return (try? decoder.decode(type, from: bytes)) != nil
+        }
+
+        // Lists, one entry at a time. `rescuing` may give a repaired entry and the parts it left out to set aside.
+        func filter<T: Decodable>(_ key: String, _ type: T.Type,
+                                  rescuing: ((Any) -> (fixed: Any, left: [(Any, String)])?)? = nil) {
+            guard let items = top[key] as? [Any] else { return }
+            var kept: [Any] = []
+            for item in items {
+                if reads(item, as: type) {
+                    kept.append(item)
+                } else if let repair = rescuing?(item), reads(repair.fixed, as: type) {
+                    kept.append(repair.fixed)
+                    for (part, partKey) in repair.left { setAside(part, as: partKey) }
+                } else {
+                    setAside(item, as: key)
+                }
+            }
+            top[key] = kept
+        }
+        filter("contacts", Contact.self)
+        filter("invites", OpenInvite.self)
+        filter("stories", Story.self)
+        filter("outbox", Outgoing.self)
+        filter("personas", Persona.self)
+        // A chat that won't read often has one message that won't: keep the chat and set that message aside.
+        filter("conversations", Conversation.self) { item in
+            guard var convo = item as? [String: Any], let messages = convo["messages"] as? [Any] else { return nil }
+            var good: [Any] = [], bad: [(Any, String)] = []
+            for message in messages {
+                if reads(message, as: Message.self) { good.append(message) } else { bad.append((message, "messages")) }
+            }
+            guard !bad.isEmpty else { return nil }
+            convo["messages"] = good
+            return (convo, bad)
+        }
+
+        // Then every other field on its own: one that won't read goes aside, and the account starts with its default.
+        for key in top.keys.sorted() where key != "format" {
+            guard let value = top[key] else { continue }
+            let alone: [String: Any] = ["format": written, key: value]
+            guard let bytes = try? JSONSerialization.data(withJSONObject: alone),
+                  (try? decoder.decode(AppData.self, from: bytes)) == nil else { continue }
+            setAside(value, as: key)
+            top[key] = nil
+        }
+
+        guard let bytes = try? JSONSerialization.data(withJSONObject: top),
+              var data = try? decoder.decode(AppData.self, from: bytes) else { return nil }
+        data.setAside = aside.isEmpty ? nil : aside
+        data.setAsideUnseen = newlyAside > 0 ? newlyAside : nil
+        return data
+    }
+
+    private static func fragment(_ value: Any) -> Data? {
+        guard JSONSerialization.isValidJSONObject([value]) else { return nil }
+        return try? JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed])
     }
 }

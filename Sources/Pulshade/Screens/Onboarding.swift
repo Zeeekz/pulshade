@@ -661,6 +661,14 @@ struct UnlockView: View {
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.top, 14)
+                if let reason = model.unreadableReason {
+                    Text(reason)
+                        .font(.system(size: 12))
+                        .foregroundStyle(Ink.dim)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 4)
+                }
             }
             Spacer()
             VStack(spacing: 12) {

@@ -69,6 +69,21 @@ final class AppModel {
     }
     /// The passcode was right but the account's data wouldn't open, so nothing was opened (or touched).
     private(set) var dataUnreadable = false
+    /// Why, in a few words, for the lock screen (`dataUnreadable`): never anything from inside the data.
+    private(set) var unreadableReason: String?
+    /// How many saved pieces this unlock had to set aside (`AppData.setAside`), until the notice is dismissed.
+    var setAsideNotice: Int?
+
+    /// A few words on why the account's data didn't open, from the kind of error alone.
+    static func unreadableReason(_ error: Error) -> String {
+        if let decoding = error as? DecodingError, case let .dataCorrupted(context) = decoding,
+           context.debugDescription.contains("newer version") {
+            return "It was saved by a newer version of Pulshade. Updating the app opens it."
+        }
+        if error is CryptoKitError { return "The file couldn't be decrypted." }
+        if error is DecodingError { return "Part of it is in a shape this version doesn't know." }
+        return "The file couldn't be read."
+    }
     /// Another of your devices has a newer profile than this version can read. Set until PULSHADE is updated.
     private(set) var profileNeedsUpdate = false
     /// The format this build saves profiles in. Only tests change it, to stand in for an older or newer version.
@@ -949,9 +964,11 @@ final class AppModel {
     /// the unlock: opening an empty account instead would save over it at the first change.
     private func storedData(_ identity: Identity) throws -> AppData {
         do {
+            unreadableReason = nil
             return try vault.load(with: identity) ?? AppData()
         } catch {
             dataUnreadable = true
+            unreadableReason = Self.unreadableReason(error)
             throw error
         }
     }
@@ -980,6 +997,12 @@ final class AppModel {
 
     private func didUnlock() {
         rebuildReceivedMedia()
+        // Some saved pieces wouldn't read and were set aside: say so once, then keep them quietly.
+        if let unseen = data.setAsideUnseen, unseen > 0 {
+            setAsideNotice = unseen
+            data.setAsideUnseen = nil
+            save()
+        }
         // Data a build before device keys saved (format 22 or older): its sessions are restarted once, below.
         let fromBeforeDeviceKeys = data.format < 23
         unlockedAt = Date()
@@ -9397,6 +9420,9 @@ extension AppModel {
             return c
         }
         kept.stories = []
+        // Pieces set aside because they wouldn't read stay on this device only: never in a backup or a detached copy.
+        kept.setAside = nil
+        kept.setAsideUnseen = nil
         kept.requests = []
         kept.outbox = []
         kept.chatCodes = []
@@ -9417,8 +9443,14 @@ extension AppModel {
         do { sealed = try await client.backup(key: key, sig: sig, ts: ts) } catch { return .unreachable }
         guard let sealed else { return .none }
         guard let box = try? AES.GCM.SealedBox(combined: sealed),
-              let plain = try? AES.GCM.open(box, using: identity.backupKey),
-              let restored = try? JSONDecoder.pulshade.decode(AppData.self, from: Self.unpadded(plain)) else { return .unreadable }
+              let plain = try? AES.GCM.open(box, using: identity.backupKey) else { return .unreadable }
+        let json = Self.unpadded(plain)
+        // A backup with one piece that won't read still brings back everything else.
+        guard var restored = (try? JSONDecoder.pulshade.decode(AppData.self, from: json)) ?? AppData.rescue(json)
+        else { return .unreadable }
+        // What a backup couldn't give back isn't kept: a backup never holds anything set aside on the device it came from.
+        restored.setAside = nil
+        restored.setAsideUnseen = nil
         return .found(restored)
     }
 

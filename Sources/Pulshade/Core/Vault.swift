@@ -547,7 +547,15 @@ struct Vault {
         let raw = try Data(contentsOf: url)
         let box = try AES.GCM.SealedBox(combined: raw)
         let plain = try AES.GCM.open(box, using: identity.storageKey)
-        return try JSONDecoder.pulshade.decode(AppData.self, from: Self.unpad(plain))
+        let json = try Self.unpad(plain)
+        do {
+            return try JSONDecoder.pulshade.decode(AppData.self, from: json)
+        } catch {
+            // One piece that won't read mustn't lock the whole account: open the rest and set that piece aside, sealed
+            // in the vault as it was. Data from a newer build is still refused, so nothing it saved is lost.
+            guard let rescued = AppData.rescue(json) else { throw error }
+            return rescued
+        }
     }
 
     func save(_ data: AppData, with identity: Identity) throws {

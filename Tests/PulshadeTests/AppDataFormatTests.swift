@@ -48,9 +48,11 @@ struct AppDataFormatTests {
         #expect(contact == Self.contactKeys, "Contact's saved fields changed: raise AppData.currentFormat, then update this list")
     }
 
+    /// `setAside` and `setAsideUnseen` came without a format bump on purpose (see `AppData.setAside`): a build before
+    /// them only drops pieces it couldn't read anyway, and a bump would lock out anyone who ends up back on that build.
     static let appKeys = ["activePersona", "announcementsSeen", "backupDigest", "backupSavedAt", "blobWipes", "blocked", "blockedNames", "bornAt", "chatBackground", "chatCodes", "clipParts", "contacts", "conversations", "decoySeed", "deviceID", "deviceKey",
                           "facade", "format", "friendInvites", "groupRenewAfter", "groupSecret", "handlesTidied", "inviteRelay", "invites", "joinAsks", "linkOffers", "outbox", "panicSeed", "partingPosts", "pendingBackupForget", "personas", "profile",
-                          "profileShared", "relay", "requests", "security", "seenEnvelopes", "sentDigests", "stories", "storyChoices", "theme"]
+                          "profileShared", "relay", "requests", "security", "seenEnvelopes", "sentDigests", "setAside", "setAsideUnseen", "stories", "storyChoices", "theme"]
     static let profileKeys = ["avatar", "badge", "banner", "bio", "collectibleCodes", "collectibles", "collectionCode", "color", "format", "handle", "links",
                               "moreHandles", "name", "notes", "updatedAt"]
     static let contactKeys = ["addedAt", "agreementKey", "avatar", "awaitingAcceptance", "badge", "banner", "bio", "collectibles", "color", "contested", "departing", "devices",

@@ -35,6 +35,13 @@ struct MainView: View {
         .sheet(item: Binding(get: { model.openedGroupLink }, set: { model.openedGroupLink = $0 })) { JoinGroupSheet(code: $0.code) }
         // The backup code now covers something new: save it, or know it's covered.
         .sheet(item: Binding(get: { model.codeAlert }, set: { model.codeAlert = $0 })) { BackupCodeSheet(alert: $0) }
+        .alert("Some saved items couldn't be opened",
+               isPresented: Binding(get: { model.setAsideNotice != nil }, set: { if !$0 { model.setAsideNotice = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            let count = model.setAsideNotice ?? 0
+            Text("\(count == 1 ? "One saved item" : "\(count) saved items") (a chat, contact or message, say) couldn't be read by this version, so \(count == 1 ? "it was" : "they were") kept aside, sealed on this device. Everything else is here, and an update may bring \(count == 1 ? "it" : "them") back.")
+        }
         .overlay { CallView() }
         .overlay { PersonaSwitchOverlay() }
         .animation(.smooth(duration: 0.3), value: model.call == nil)
