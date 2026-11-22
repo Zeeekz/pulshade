@@ -36,6 +36,46 @@ struct AppDataFormatTests {
         #expect(opened.contacts.count == 1 && opened.contacts[0].devices.isEmpty && opened.contacts[0].hidden)
     }
 
+    /// What a build from before collectibles were removed saved, at the same format: a worn one and a list on the profile
+    /// (and a persona's), the backup code, a contact's, and one shown in a chat. It opens as it is, not through the rescue
+    /// (`AppData.rescue`), with nothing set aside and everything else there.
+    @Test func dataSavedWithCollectiblesStillOpens() throws {
+        let worn: [String: Any] = ["item": "bonfire", "serial": 12, "owner": Data(repeating: 1, count: 32).base64EncodedString(),
+                                   "sig": Data(repeating: 2, count: 64).base64EncodedString(), "edition": 100]
+        let collected: [String: Any] = ["badge": worn, "collectibles": [worn], "collectionCode": "ABCD-EFGH-JKMN-PQRS",
+                                        "collectibleCodes": ["bonfire#12": "ABCD-EFGH-JKMN-PQRS"]]
+        var data = AppData()
+        data.profile = Profile(name: "Me", handle: "me")
+        data.personas = [Persona(seed: Data(repeating: 3, count: 32), profile: Profile(name: "Other"))]
+        data.contacts = [Contact(fingerprint: "a", name: "Ann", signingKey: Data([1]), agreementKey: Data([2]), sendID: Data([3]))]
+        data.conversations = [Conversation(kind: .direct, title: "", members: ["a"],
+                                           messages: [Message(sender: "a", text: "Bonfire #12"), Message(sender: "me", text: "nice")])]
+        var json = try #require(try JSONSerialization.jsonObject(with: JSONEncoder.pulshade.encode(data)) as? [String: Any])
+        #expect(json["format"] as? Int == AppData.currentFormat)
+        json["profile"] = try #require(json["profile"] as? [String: Any]).merging(collected) { $1 }
+        var persona = try #require((json["personas"] as? [[String: Any]])?.first)
+        persona["profile"] = try #require(persona["profile"] as? [String: Any]).merging(collected) { $1 }
+        json["personas"] = [persona]
+        var contact = try #require((json["contacts"] as? [[String: Any]])?.first)
+        contact["badge"] = worn
+        contact["collectibles"] = [worn]
+        json["contacts"] = [contact]
+        var chat = try #require((json["conversations"] as? [[String: Any]])?.first)
+        var messages = try #require(chat["messages"] as? [[String: Any]])
+        messages[0]["collectible"] = worn
+        chat["messages"] = messages
+        json["conversations"] = [chat]
+
+        let opened = try JSONDecoder.pulshade.decode(AppData.self, from: JSONSerialization.data(withJSONObject: json))
+        #expect(opened.setAside == nil && opened.setAsideUnseen == nil, "nothing was set aside")
+        #expect(opened.profile.name == "Me" && opened.profile.handle == "me" && opened.personas.map(\.profile.name) == ["Other"])
+        #expect(opened.contacts.map(\.name) == ["Ann"] && opened.contacts[0].sendID == Data([3]))
+        #expect(opened.conversations.count == 1 && opened.conversations[0].messages.map(\.text) == ["Bonfire #12", "nice"])
+        // Saved again, the old keys are gone.
+        let saved = String(decoding: try JSONEncoder.pulshade.encode(opened), as: UTF8.self)
+        #expect(!saved.contains("\"badge\"") && !saved.contains("collectible") && !saved.contains("collectionCode"))
+    }
+
     /// Fails when a field is added to what's saved without raising `AppData.currentFormat`. Change the lists below
     /// together with it.
     @Test func changingWhatIsSavedMeansRaisingTheFormat() throws {
@@ -53,9 +93,11 @@ struct AppDataFormatTests {
     static let appKeys = ["activePersona", "announcementsSeen", "backupDigest", "backupSavedAt", "blobWipes", "blocked", "blockedNames", "bornAt", "chatBackground", "chatCodes", "clipParts", "contacts", "conversations", "decoySeed", "deviceID", "deviceKey",
                           "facade", "format", "friendInvites", "groupRenewAfter", "groupSecret", "handlesTidied", "inviteRelay", "invites", "joinAsks", "linkOffers", "outbox", "panicSeed", "partingPosts", "pendingBackupForget", "personas", "profile",
                           "profileShared", "relay", "requests", "security", "seenEnvelopes", "sentDigests", "setAside", "setAsideUnseen", "stories", "storyChoices", "theme"]
-    static let profileKeys = ["avatar", "badge", "banner", "bio", "collectibleCodes", "collectibles", "collectionCode", "color", "format", "handle", "links",
+    /// The collectible fields (`badge`, `collectibles`, `collectionCode`, `collectibleCodes`) were removed without a bump on
+    /// purpose: data that still has them opens, the keys are just ignored (see `dataSavedWithCollectiblesStillOpens`).
+    static let profileKeys = ["avatar", "banner", "bio", "color", "format", "handle", "links",
                               "moreHandles", "name", "notes", "updatedAt"]
-    static let contactKeys = ["addedAt", "agreementKey", "avatar", "awaitingAcceptance", "badge", "banner", "bio", "collectibles", "color", "contested", "departing", "devices",
+    static let contactKeys = ["addedAt", "agreementKey", "avatar", "awaitingAcceptance", "banner", "bio", "color", "contested", "departing", "devices",
                               "fingerprint", "handle", "hidden", "isSelf", "links", "name", "nickname", "notes", "oldSpares", "persona", "pq", "pqCardSent", "pqCommit", "receiveKey", "relay", "revoked",
                               "signingKey", "spare", "toldPresence", "tooOld", "verified", "walletChangedAt", "wantsMyPresence"]
 }

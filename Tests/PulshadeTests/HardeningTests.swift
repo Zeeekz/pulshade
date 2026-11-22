@@ -111,14 +111,6 @@ import PulshadeShared
         #expect(before.contains("\"rk\""), "the check above can tell a ratchet when one is there")
     }
 
-    @Test func onlyTheAdminKeyMakesAGuardian() throws {
-        let admin = Curve25519.Signing.PrivateKey(), relay = Curve25519.Signing.PrivateKey(), owner = Data(repeating: 1, count: 32)
-        let forged = try Collectible.make(item: "guardian", serial: 1, owner: owner, signedBy: relay)
-        #expect(!forged.isGenuine(for: owner, adminKey: admin.publicKey.rawRepresentation, petKey: relay.publicKey.rawRepresentation))
-        let real = try Collectible.make(item: "guardian", serial: 1, owner: owner, signedBy: admin)
-        #expect(real.isGenuine(for: owner, adminKey: admin.publicKey.rawRepresentation, petKey: relay.publicKey.rawRepresentation))
-    }
-
     @Test func aCallPacketNumberedAtTheLimitIsRefusedNotFatal() {
         var crypto = CallCrypto(key: Data(repeating: 9, count: 32), caller: false)
         let packet = Data([0]) + Data(repeating: 0xFF, count: 8) + Data(repeating: 0, count: 32)

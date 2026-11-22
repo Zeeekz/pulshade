@@ -126,4 +126,37 @@ import Foundation
         let old = Data(#"{"profile":{"name":"Ann","color":2}}"#.utf8)
         #expect(try JSONDecoder.pulshade.decode(Payload.self, from: old) == .profile(name: "Ann", avatar: nil, color: 2, banner: nil))
     }
+
+    /// Friends on builds from before collectibles were removed still send a worn `badge` and their `collectibles` with
+    /// their profile, and a `collectible` with a message that shows one. Those keys are skipped and everything else
+    /// arrives as before: the profile, and the words of the message (which say what the collectible was).
+    @Test func profilesAndMessagesFromBuildsWithCollectiblesStillRead() throws {
+        let worn: [String: Any] = ["item": "bonfire", "serial": 12, "owner": Data(repeating: 1, count: 32).base64EncodedString(),
+                                   "sig": Data(repeating: 2, count: 64).base64EncodedString(), "edition": 100]
+        let profile: [String: Any] = ["profile": ["name": "Ann", "color": 2, "bio": "hi", "handle": "ann", "badge": worn,
+                                                  "collectibles": [worn, worn],
+                                                  "links": [["kind": "github", "value": "https://github.com/octocat"]]]]
+        let readProfile = try Payload.fromWire(JSONSerialization.data(withJSONObject: profile))
+        guard case let .profile(name, avatar, color, banner, bio, handle, links, notes) = readProfile else {
+            Issue.record("not read as a profile: \(readProfile)")
+            return
+        }
+        #expect(name == "Ann" && avatar == nil && color == 2 && banner == nil && bio == "hi" && handle == "ann" && notes == nil)
+        #expect(links?.map(\.value) == ["https://github.com/octocat"])
+
+        let id = UUID()
+        let sent = WireMessage(id: id, conversation: nil, kind: .direct, text: "Bonfire #12", image: nil,
+                               date: Date(timeIntervalSince1970: 1_800_000_000), mentions: nil, noForward: true)
+        var json = try #require(try JSONSerialization.jsonObject(with: JSONEncoder.pulshade.encode(Payload.message(sent))) as? [String: Any])
+        // A case's one unnamed value is keyed "_0".
+        var body = try #require((json["message"] as? [String: Any])?["_0"] as? [String: Any])
+        #expect(body["text"] as? String == "Bonfire #12", "found the message itself")
+        body["collectible"] = worn
+        json["message"] = ["_0": body]
+        let old = try JSONSerialization.data(withJSONObject: json)
+        #expect(try Payload.fromWire(old) == .message(sent), "the rest of the message, its words included, is all there")
+        // The same as it comes from another of your own devices, which passes on what you sent.
+        let synced = try JSONSerialization.data(withJSONObject: ["sync": ["_0": ["sent": ["_0": ["peer": "fp"], "_1": body]]]])
+        #expect(try JSONDecoder.pulshade.decode(Payload.self, from: synced) == .sync(.sent(ConvoRef(peer: "fp"), sent)))
+    }
 }

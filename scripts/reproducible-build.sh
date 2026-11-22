@@ -3,7 +3,7 @@
 # own machine and a release they built to check that it matches.
 #
 #   ./scripts/reproducible-build.sh            debug build (works without a relay)
-#   ./scripts/reproducible-build.sh release    needs relay/, admin-key.pub, pet-key.pub and relay-pin
+#   ./scripts/reproducible-build.sh release    needs relay/, admin-key.pub and relay-pin
 #
 # What is compared: the executable (with its signature removed, since an ad-hoc signature is not part of the
 # code) and the generated Info.plist. The signed bundle and the Tor xcframework are built separately.

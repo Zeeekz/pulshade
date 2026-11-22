@@ -24,12 +24,12 @@ struct MemberProfileSheet: View {
                 VStack(spacing: 16) {
                     SheetHeader(symbol: "person.crop.circle", title: "Profile")
                     ProfileHero(avatar: person.avatar, seed: fingerprint,
-                                name: person.displayName, subtitle: role, badge: person.badge, handle: person.handle,
+                                name: person.displayName, subtitle: role, handle: person.handle,
                                 bio: person.hidden ? nil : person.bio, verified: person.verified) {
                         VStack(spacing: 10) { action(person, convo) }
                     }
                     if !person.hidden {
-                        ProfileTabs(links: person.links ?? [], collectibles: person.collectibles ?? [], notes: person.notes ?? [],
+                        ProfileTabs(links: person.links ?? [], notes: person.notes ?? [],
                                     messages: convo.messages.filter { $0.sender == fingerprint },
                                     walletChangedAt: person.walletChangedAt, isMine: person.isSelf)
                     }

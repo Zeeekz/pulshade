@@ -4,13 +4,12 @@ import PulshadeShared
 #endif
 
 enum Section: String, CaseIterable, Identifiable {
-    case chats, contacts, collectibles, burn, people, settings
+    case chats, contacts, burn, people, settings
     var id: String { rawValue }
     var symbol: String {
         switch self {
         case .chats: "bubble.left.and.bubble.right.fill"
         case .contacts: "person.2.fill"
-        case .collectibles: "crown.fill"
         case .burn: "flame.fill"
         case .people: "qrcode"
         case .settings: "gearshape.fill"
@@ -33,8 +32,6 @@ struct MainView: View {
             ScanSheet(initial: model.openedCode)
         }
         .sheet(item: Binding(get: { model.openedGroupLink }, set: { model.openedGroupLink = $0 })) { JoinGroupSheet(code: $0.code) }
-        // The backup code now covers something new: save it, or know it's covered.
-        .sheet(item: Binding(get: { model.codeAlert }, set: { model.codeAlert = $0 })) { BackupCodeSheet(alert: $0) }
         .alert("Some saved items couldn't be opened",
                isPresented: Binding(get: { model.setAsideNotice != nil }, set: { if !$0 { model.setAsideNotice = nil } })) {
             Button("OK", role: .cancel) {}
@@ -367,7 +364,6 @@ private struct DesktopMainView: View {
                     selection = id
                     withAnimation(.smooth) { section = .chats }
                 })
-                case .collectibles: CollectiblesView()
                 case .burn: LeaveView()
                 case .people: PeopleView(openChat: { id in
                     selection = id
@@ -429,7 +425,7 @@ private struct Rail: View {
     var body: some View {
         VStack(spacing: 6) {
             PulseMark(size: 30).padding(.top, 36).padding(.bottom, 16)
-            ForEach([Section.chats, .contacts, .collectibles, .burn, .people], id: \.self) { s in item(s) }
+            ForEach([Section.chats, .contacts, .burn, .people], id: \.self) { s in item(s) }
             Spacer()
             item(.settings)
             Button { model.lock() } label: { Image(systemName: "lock") }
@@ -1247,7 +1243,6 @@ struct ChatRow: View {
                         .font(.system(size: titleSize, weight: .semibold))
                         .foregroundStyle(Ink.text)
                         .lineLimit(1)
-                    if c.kind == .direct { BadgeMark(badge: model.contact(c.members.first ?? "")?.badge, size: titleSize) }
                     if stories.contains(where: { !$0.seen }) {
                         Text("New story")
                             .font(.system(size: stampSize - 1.5, weight: .semibold))

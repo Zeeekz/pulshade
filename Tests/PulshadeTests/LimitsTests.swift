@@ -48,7 +48,7 @@ struct LimitsTests {
     /// The table of how much work each route asks for is the relay's too, and stays inside what a phone can do.
     @Test func workIsAskedForByRouteAndCapped() {
         for bound in ["lookup|someone", "announcements", "mine", "held", "update", "backup-read|k"] { #expect(Work.baseBits(for: bound) == Work.light) }
-        for bound in ["claim|someone", "retire", "backup|k", "burn", "push", "group|id", "giveaway-claim", "collectible-claim"] {
+        for bound in ["claim|someone", "retire", "backup|k", "burn", "push", "group|id"] {
             #expect(Work.baseBits(for: bound) == Work.heavy)
         }
         Work.learn(Work.ceiling + 5, for: "lookup|a")

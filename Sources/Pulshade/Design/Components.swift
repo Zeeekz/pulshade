@@ -192,24 +192,3 @@ struct OnlineDot: View {
             .accessibilityLabel("Online")
     }
 }
-
-/// Marks someone who keeps Pulshade safe: they wear a Guardian, which only the creator's key can give out, and the
-/// app has already checked it before it gets here. Shown on profiles beside (or in place of) the Creator tag.
-struct ModeratorTag: View {
-    @Environment(\.theme) private var theme
-
-    var body: some View {
-        Label("Moderator", systemImage: "shield.lefthalf.filled")
-            .font(.system(size: 10, weight: .semibold))
-            .foregroundStyle(theme.accent)
-            .padding(.horizontal, 7).padding(.vertical, 3)
-            .background(theme.wash, in: .capsule)
-            .overlay(Capsule().strokeBorder(theme.accent.opacity(0.5)))
-            .help("Keeps Pulshade safe. Awarded by PULSHADE's creator.")
-    }
-}
-
-extension Collectible? {
-    /// Whether this is a Guardian, the badge of a moderator.
-    var isModerator: Bool { self?.item == Collectible.guardian }
-}

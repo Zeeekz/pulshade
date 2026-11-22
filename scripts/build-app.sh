@@ -73,7 +73,6 @@ cat > "$app/Contents/Info.plist" <<PLIST
     <key>PulshadeRelayDirect</key><string>${PULSHADE_RELAY_DIRECT:-$(cat relay/direct-address 2>/dev/null)}</string>
     <key>PulshadeRelayPin</key><string>${PULSHADE_RELAY_PIN:-$(cat relay/relay-pin 2>/dev/null)}</string>
     <key>PulshadeAdminKey</key><string>$(cat relay/admin-key.pub 2>/dev/null)</string>
-    <key>PulshadePetKey</key><string>$(cat relay/pet-key.pub 2>/dev/null)</string>
     <key>PulshadeReleaseKey</key><string>$(cat relay/release.pub 2>/dev/null)</string>
     <key>NSAppTransportSecurity</key>
     <dict>

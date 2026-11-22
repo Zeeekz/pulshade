@@ -7,7 +7,7 @@ see the [Privacy Policy](privacy-policy.md).
 [Friends and chats](#friends-and-chats) · [Groups, channels and stories](#groups-channels-and-stories) ·
 [Files and media](#files-and-media) · [Passcodes, Lock, Detach and Burn](#passcodes-lock-detach-and-burn) ·
 [Recovery and devices](#recovery-and-devices) · [Network](#network) ·
-[Notifications](#notifications) · [Handles, collectibles and extras](#handles-collectibles-and-extras) ·
+[Notifications](#notifications) · [Handles and extras](#handles-and-extras) ·
 [Reporting and safety](#reporting-and-safety)
 
 ## General
@@ -231,17 +231,11 @@ need the strongest anonymity.
 Only "New message" unless you choose otherwise, because the system stores notification text outside Pulshade's
 encryption.
 
-## Handles, collectibles and extras
+## Handles and extras
 
 **What is a username (@handle)?**
 An optional public name you can claim per persona, so people can look you up. Its name and picture are public by
 your choice. A username you let go of is held for a while so nobody takes it straight away.
-
-**What are collectibles and pets?**
-Numbered items that the operator gives to an account or that hatch from an egg. Each gets a random free number from its
-run, so a low or special number is luck; the app marks the wanted ones. You can gift them or let them go; pets have their
-own group in the Collectibles tab. They aren't secret: the item, its number and a hash of its code are kept so the
-owner can claim it again with a backup code.
 
 **What are announcements?**
 Notes from the operator, delivered to a read-only chat from Pulshade. Nobody can reply to them.

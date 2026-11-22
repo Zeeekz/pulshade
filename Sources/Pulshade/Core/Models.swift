@@ -28,15 +28,6 @@ struct Profile: Codable, Equatable {
     var links: [ProfileLink]?
     /// Text notes on your profile, public or locked with a password.
     var notes: [ProfileNote]?
-    /// The collectibles given to this identity, and the one shown after its name.
-    var collectibles: [Collectible]?
-    var badge: Collectible?
-    /// The backup code for all of this persona's collectibles. Only ever on your own devices: entered in another
-    /// account, it brings every one of them back, even after this one burns.
-    var collectionCode: String?
-    /// Which code each collectible is set to on the relay, by its id ("item#serial"). One that isn't the collection
-    /// code yet gets added to it.
-    var collectibleCodes: [String: String]?
     /// When any of this last changed, so your devices can agree on the newest version.
     var updatedAt: Date?
     /// The `AppData.currentFormat` of the build that last saved this profile. Devices of one account pass profiles
@@ -185,10 +176,6 @@ struct Contact: Codable, Identifiable {
     var handle: String?
     /// You checked their safety code in person.
     var verified = false
-    /// The collectible they show after their name, checked against the creator key when it arrived.
-    var badge: Collectible?
-    /// Everything they own, each checked against the creator key and their account when it arrived.
-    var collectibles: [Collectible]?
     var signingKey: Data
     var agreementKey: Data
     /// Their devices. The first one is where a new contact starts.
@@ -256,7 +243,7 @@ struct Contact: Codable, Identifiable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case fingerprint, name, nickname, avatar, banner, color, bio, links, walletChangedAt, notes, handle, verified, badge, collectibles, signingKey, agreementKey, devices, receiveKey, relay
+        case fingerprint, name, nickname, avatar, banner, color, bio, links, walletChangedAt, notes, handle, verified, signingKey, agreementKey, devices, receiveKey, relay
         case hidden, isSelf, awaitingAcceptance, addedAt, persona, wantsMyPresence, toldPresence, spare, oldSpares, departing, pq, pqCommit, pqCardSent, tooOld, revoked, contested
         // Single-device fields from before linked devices.
         case sendID, session, handshake, pending
@@ -279,8 +266,6 @@ struct Contact: Codable, Identifiable {
         notes = try? c.decodeIfPresent([ProfileNote].self, forKey: .notes)
         handle = try c.decodeIfPresent(String.self, forKey: .handle)
         verified = try c.decodeIfPresent(Bool.self, forKey: .verified) ?? false
-        badge = try? c.decodeIfPresent(Collectible.self, forKey: .badge)
-        collectibles = try? c.decodeIfPresent([Collectible].self, forKey: .collectibles)
         receiveKey = try c.decodeIfPresent(Data.self, forKey: .receiveKey)
         relay = try c.decodeIfPresent(String.self, forKey: .relay)
         hidden = try c.decodeIfPresent(Bool.self, forKey: .hidden) ?? false
@@ -329,8 +314,6 @@ struct Contact: Codable, Identifiable {
         try c.encodeIfPresent(notes, forKey: .notes)
         try c.encodeIfPresent(handle, forKey: .handle)
         try c.encode(verified, forKey: .verified)
-        try c.encodeIfPresent(badge, forKey: .badge)
-        try c.encodeIfPresent(collectibles, forKey: .collectibles)
         try c.encode(signingKey, forKey: .signingKey)
         try c.encode(agreementKey, forKey: .agreementKey)
         try c.encode(devices, forKey: .devices)
@@ -630,8 +613,6 @@ struct Message: Codable, Identifiable, Equatable {
     var video: Data?
     /// How long the video runs.
     var clipSeconds: Double?
-    /// A collectible the sender showed in the chat: checked against their key before it's kept, so it's theirs.
-    var collectible: Collectible?
     /// A note of the sender's profile, shown as a card: only its title travels. Opening it reads the note from their
     /// profile, behind its password or the access they gave.
     var note: NoteCard?
@@ -689,7 +670,6 @@ struct Message: Codable, Identifiable, Equatable {
         preview = try? c.decodeIfPresent(LinkPreview.self, forKey: .preview)
         video = try? c.decodeIfPresent(Data.self, forKey: .video)
         clipSeconds = try? c.decodeIfPresent(Double.self, forKey: .clipSeconds)
-        collectible = try? c.decodeIfPresent(Collectible.self, forKey: .collectible)
         note = try? c.decodeIfPresent(NoteCard.self, forKey: .note)
         mentions = (try? c.decodeIfPresent([Mention].self, forKey: .mentions)) ?? []
         attachment = try? c.decodeIfPresent(Attachment.self, forKey: .attachment)
@@ -1682,33 +1662,6 @@ struct AppData: Codable {
 extension Announcement {
     /// Signed by the Pulshade Admin key this build carries.
     @MainActor var isGenuine: Bool { isGenuine(adminKey: AppModel.adminKey) }
-}
-
-extension Collectible {
-    /// Letters and digits nobody misreads: no I, L, O or U.
-    private static let codeAlphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
-
-    /// A fresh backup code: 80 random bits, as XXXX-XXXX-XXXX-XXXX.
-    static func newBackupCode() -> String {
-        let chars = (0..<16).map { _ in codeAlphabet[Int.random(in: 0..<codeAlphabet.count)] }
-        return stride(from: 0, to: 16, by: 4).map { String(chars[$0..<$0 + 4]) }.joined(separator: "-")
-    }
-
-    /// A code as typed: capitals, no spaces or dashes, and O, I and L read as the digits they look like. The relay
-    /// does the same.
-    static func normalisedCode(_ code: String) -> String {
-        String(code.uppercased().filter { $0.isASCII && ($0.isLetter || $0.isNumber) }.map { c -> Character in
-            switch c { case "O": "0"; case "I", "L": "1"; default: c }
-        })
-    }
-
-    static func codeHash(_ code: String) -> Data { Data(SHA256.hash(data: Data(normalisedCode(code).utf8))) }
-
-    /// Signed by the Pulshade Admin key this build carries, for the account with `owner`'s key.
-    @MainActor func isGenuine(for owner: Data) -> Bool {
-        isGenuine(for: owner, adminKey: AppModel.adminKey, petKey: AppModel.petKey,
-                  transferable: CollectibleLibrary.shared.item(item)?.transferable)
-    }
 }
 
 /// The replay table (`AppData.seenEnvelopes`) in three parts, each full on its own, so whoever can write to one can't

@@ -135,7 +135,6 @@ struct ConversationView: View {
                             .font(.system(size: 16, weight: .semibold))
                             .foregroundStyle(Ink.text)
                             .lineLimit(1)
-                        if c.kind == .direct { BadgeMark(badge: model.contact(c.members.first ?? "")?.badge, size: 14) }
                         if c.isAnnouncements { Image(systemName: "checkmark.seal.fill").font(.system(size: 11)).foregroundStyle(theme.accent) }
                         if c.kind == .direct, model.contact(c.members.first ?? "")?.verified == true {
                             Image(systemName: "checkmark.seal.fill").font(.system(size: 11)).foregroundStyle(theme.accent)
@@ -1148,7 +1147,7 @@ fileprivate struct Bubble: View, Equatable {
     private var wallet: WalletMessage? { Self.wallet(in: message) }
 
     static func wallet(in message: Message) -> WalletMessage? {
-        guard message.collectible == nil, message.note == nil, message.voice == nil, !message.isVideo else { return nil }
+        guard message.note == nil, message.voice == nil, !message.isVideo else { return nil }
         return WalletMessage(text: message.text)
     }
 
@@ -1427,13 +1426,10 @@ fileprivate struct Bubble: View, Equatable {
             if message.attachment?.kind == .file {
                 FileBubble(message: message, mine: mine)
             }
-            if let collectible = message.collectible, CollectibleCatalog.validID(collectible.item) {
-                CollectibleCard(collectible: collectible, mine: mine)
-            }
             if let card = message.note {
                 NoteCardView(card: card, message: message, mine: mine)
             }
-            if message.collectible.map({ CollectibleCatalog.validID($0.item) }) == true || message.note != nil {
+            if message.note != nil {
                 // The card says it all; the words are only for apps that don't know cards.
             } else if bare {
                 BigEmoji(text: message.text, fresh: Date().timeIntervalSince(message.date) < 6)
@@ -1572,28 +1568,6 @@ private struct BigEmoji: View {
     }
 }
 
-/// A collectible someone showed in the chat, drawn at a good size with its name and number.
-private struct CollectibleCard: View {
-    @Environment(\.theme) private var theme
-    var collectible: Collectible
-    var mine: Bool
-
-    var body: some View {
-        let info = collectible.info
-        do {
-            VStack(spacing: 4) {
-                CollectibleArtwork(item: collectible.item, size: 132)
-                Text(branded: info.name).font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(mine ? Ink.onAccent : Ink.text).lineLimit(1)
-                Text("#\(collectible.serial)").font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(mine ? Ink.onAccent.opacity(0.7) : Ink.dim)
-            }
-            .padding(.vertical, 6).padding(.horizontal, 10)
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel("\(info.name), number \(collectible.serial)")
-        }
-    }
-}
 
 /// A note sent as a card. Only its title travelled: tapping reads it from the sender's profile, so a locked one asks
 /// for its password, one made for you says "Access Granted", and one that isn't yours to read says so.
@@ -2106,7 +2080,7 @@ private struct ConversationInfo: View {
             ProfileHero(avatar: c.avatar ?? peer.avatar, seed: peer.fingerprint,
                         name: peer.nickname.isEmpty ? theirName : peer.nickname,
                         subtitle: peer.nickname.isEmpty ? nil : "Calls themselves \(theirName)",
-                        badge: peer.badge, handle: peer.handle, bio: peer.bio, verified: peer.verified) {
+                        handle: peer.handle, bio: peer.bio, verified: peer.verified) {
                 HStack(spacing: 8) {
                     ProfileActionTile(title: "Message", symbol: "bubble.left.fill") { dismiss() }
                     if !peer.isSelf {
@@ -2120,7 +2094,7 @@ private struct ConversationInfo: View {
                     }
                 }
             }
-            ProfileTabs(info: info, links: peer.links ?? [], collectibles: peer.collectibles ?? [], notes: peer.notes ?? [],
+            ProfileTabs(info: info, links: peer.links ?? [], notes: peer.notes ?? [],
                         groups: shared, messages: c.messages, walletChangedAt: peer.walletChangedAt, isMine: peer.isSelf)
         }
         .padding(.horizontal, 16).padding(.top, 16)

@@ -20,11 +20,9 @@ pin="${PULSHADE_RELAY_PIN:-$(cat relay/relay-pin 2>/dev/null)}"
 direct="${PULSHADE_RELAY_DIRECT:-$(cat relay/direct-address 2>/dev/null)}"
 [[ -n "$pin" ]] || { echo "No relay pin (relay/relay-pin or PULSHADE_RELAY_PIN): refusing to upload a release without it."; exit 1; }
 [[ -n "$direct" ]] || { echo "No direct address (relay/direct-address or PULSHADE_RELAY_DIRECT): refusing to upload a release without it."; exit 1; }
-# A release with no admin/pet key would ship with collectible and report authenticity checks silently off.
+# A release with no admin key would ship with announcement and report authenticity checks silently off.
 admin_key="${PULSHADE_ADMIN_KEY:-$(cat relay/admin-key.pub 2>/dev/null)}"
-pet_key="${PULSHADE_PET_KEY:-$(cat relay/pet-key.pub 2>/dev/null)}"
 [[ -n "$admin_key" ]] || { echo "No admin key (relay/admin-key.pub or PULSHADE_ADMIN_KEY): refusing to ship without it."; exit 1; }
-[[ -n "$pet_key" ]] || { echo "No pet key (relay/pet-key.pub or PULSHADE_PET_KEY): refusing to ship without it."; exit 1; }
 
 out=build/testflight
 rm -rf "$out"; mkdir -p "$out"
@@ -38,7 +36,7 @@ xcodebuild -project Pulshade.xcodeproj -scheme PulshadeiOS -configuration Releas
   -allowProvisioningUpdates CURRENT_PROJECT_VERSION="$build" \
   PULSHADE_RELAY="$relay" PULSHADE_RELAY_DIRECT="$direct" \
   PULSHADE_RELAY_PIN="$pin" \
-  PULSHADE_ADMIN_KEY="$admin_key" PULSHADE_PET_KEY="$pet_key" \
+  PULSHADE_ADMIN_KEY="$admin_key" \
   archive | tee "$out/archive.log" | grep -E "error:|ARCHIVE (SUCCEEDED|FAILED)"
 
 # Nothing that names you may leave this Mac: check the app before it goes up. It looks for your home folder, your

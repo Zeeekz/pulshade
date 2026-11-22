@@ -123,7 +123,6 @@ final class DemoContact {
             return "Thanks, the photo arrived safely."
         }
         if message.attachment != nil { return "Thanks, the file arrived safely." }
-        if message.collectible != nil { return "Thanks, the collectible arrived safely." }
         if message.note != nil { return "Thanks, the note arrived safely." }
         let text = message.text.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "\n", with: " ")
         guard !text.isEmpty else { return "Got it, thanks!" }

@@ -32,8 +32,7 @@ is never written to its disk. Here is every kind of thing, in plain words:
 | **Spare keys** (one per friend, so a friend who logs back in can write to you straight away) | The server's disk, in the sealed-backup store | Erased by your friend when they use it, or by you when you remove them; otherwise replaced every 5 to 10 days, and 180 days without an update at most | No. Only you and that friend can work out where it is or open it, and it holds no message. |
 | **Group link previews** (one per join link an admin makes) | The server's disk, in the sealed-backup store | Rewritten while the link is in use; erased when the link is reset or deleted; 180 days without an update at most | No. Only people who have the link can find or open it. It holds the group's name, picture, description and size, which anyone with the link can see. |
 | **Public @handle and profile** (only if you choose one) | The server's disk | Until you let it go | Yes, it is public by your choice. |
-| **Collectibles you own** | The server's disk | While they exist | They're not secret: the item, its number and a hash of its code. |
-| **The server's own records and keys** (handle directory, held handles, moderation lists, collectible records, announcements; its push, pet-signing and onion keys) | The server's disk | While the service runs | Only the server, which needs them to work. Sealed with its storage key, which is held in memory only and never written to the disk; after a reboot the server stays locked until we unlock it. The admin password is kept only as a hash. |
+| **The server's own records and keys** (handle directory, held handles, moderation lists, announcements; its push and onion keys) | The server's disk | While the service runs | Only the server, which needs them to work. Sealed with its storage key, which is held in memory only and never written to the disk; after a reboot the server stays locked until we unlock it. The admin password is kept only as a hash. |
 | **Wake-up token** (on iPhone while notifications are on, which is the default) | The server's memory, and a sealed file on its disk | While notifications are on (gone within seconds of turning them off; dropped after 7 days without a renewal) | It is a device token and nothing else. |
 
 Photos, voice notes and text travel inside the encrypted message itself, so they wait like any message: sealed on the server's disk, until collected.
@@ -97,9 +96,6 @@ you connect without Tor, your IP address during that request. A spare is used on
 it. Removing a friend erases yours for them. Otherwise each is replaced every 5 to 10 days, and one nobody updates
 (after a Burn, say) is erased after 180 days; it is no use to anyone without your keys.
 
-**Collectibles.** If you are given a collectible, the server keeps what it needs to show it and let its owner claim it
-again with a backup code: the item, its number and a hash of the code.
-
 **Reports.** If you report something, the report is sealed so that only Pulshade Admin can read it. It is sent from a
 throwaway key and carries your handle only if you add it.
 
@@ -128,7 +124,7 @@ it goes.
 ## Why we handle this information
 
 We handle only what is needed to carry your sealed messages and files, keep the backup you switch on and show the
-public handles and collectibles people choose to publish, and to keep the service safe from abuse (the hourly-salted
+public handles people choose to publish, and to keep the service safe from abuse (the hourly-salted
 request counts above). We have no other purpose for it, and no use for it in advertising or profiling.
 [Lawyer: where the law requires a stated legal basis, this is most likely legitimate interests; confirm and
 word it for each region.]
@@ -188,16 +184,16 @@ word it for each region.]
   every hour while Pulshade is open, until the server confirms, and then deletes it; a message tells you when it is done.
   The order can erase things but can't read anything. Messages already collected by a friend's phone can't be taken
   back, though an up-to-date Pulshade on their side forgets you and everything you sent.
-- Because we hold no account details about you, we usually can't tell which data is yours. For a public handle or a
-  collectible, contact us at [contact address] and we'll act on what we can verify.
+- Because we hold no account details about you, we usually can't tell which data is yours. For a public handle, contact
+  us at [contact address] and we'll act on what we can verify.
 - **If you live in the EU, UK or a similar region**, you may have rights to access, correct and delete your data,
   to move it, to restrict or object to how it is used, and to complain to your data-protection authority. We can't
   look up what we can't link to you, and the above is what we hold. The tools that answer most of these are already in
   the app: you can see and edit your own profile, turn the backup off, and Burn erases everything we hold for you. For a
-  public handle or collectible, ask us as above. [Lawyer: confirm controller details and any representative needed
+  public handle, ask us as above. [Lawyer: confirm controller details and any representative needed
   in the EU or UK.]
 - **How long things are kept**, in one place: messages up to 30 days, sealed on the server's disk; files up to 30 days (7 in groups); the sealed backup
-  until you switch it off or Burn, or 180 days after its last update; handles and collectibles until you let them go;
+  until you switch it off or Burn, or 180 days after its last update; handles until you let them go;
   the wake-up token while notifications are on; and request counts for an hour. Nothing is kept "just in case".
 
 ## Children

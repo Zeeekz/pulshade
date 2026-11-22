@@ -69,8 +69,6 @@
 	<string>$(PULSHADE_ADMIN_KEY)</string>
 	<key>PulshadeKeychainGroup</key>
 	<string>$(AppIdentifierPrefix)app.pulshade.shared</string>
-	<key>PulshadePetKey</key>
-	<string>$(PULSHADE_PET_KEY)</string>
 	<key>PulshadeRelay</key>
 	<string>$(PULSHADE_RELAY)</string>
 	<key>PulshadeRelayDirect</key>

@@ -108,7 +108,7 @@ enum Work {
     static let ceiling = 27
 
     /// Routes that cost the relay more (a claim, a backup, a burn, a push registration, a new group mailbox).
-    private static let heavyRoutes: Set<Substring> = ["claim", "retire", "backup", "burn", "push", "group", "giveaway-claim", "collectible-claim"]
+    private static let heavyRoutes: Set<Substring> = ["claim", "retire", "backup", "burn", "push", "group"]
 
     static func baseBits(for bound: String) -> Int {
         heavyRoutes.contains(bound.split(separator: "|", maxSplits: 1).first ?? "") ? heavy : light
@@ -799,32 +799,6 @@ struct RelayClient {
         return (try JSONDecoder().decode([Announcement].self, from: data), http.value(forHTTPHeaderField: "X-Pulshade-Version"))
     }
 
-    /// The signed collectibles list, or nil when the relay's is still `version`, the one this app has. The same for every
-    /// app, so asking says nothing about who asks.
-    func catalog(since version: UInt64?) async throws -> CollectibleCatalog.Signed? {
-        var request = URLRequest(url: base.appending(path: "v1/catalog"))
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        if let version { request.setValue(String(version), forHTTPHeaderField: "X-Pulshade-Version") }
-        await prove(&request, "catalog")
-        guard let (data, response) = try? await load(request, limit: 128 * 1024), let http = response as? HTTPURLResponse else {
-            throw DirectoryError.unreachable
-        }
-        if http.statusCode == 304 || http.statusCode == 404 { return nil }
-        guard http.statusCode == 200 else { throw DirectoryError.unreachable }
-        return try JSONDecoder().decode(CollectibleCatalog.Signed.self, from: data)
-    }
-
-    /// One picture of the collectibles list, by its SHA-256. The caller checks it against the signed list.
-    func catalogArt(_ sha256: String, bytes: Int) async throws -> Data {
-        guard CollectibleCatalog.validHash(sha256) else { throw DirectoryError.invalid }
-        var request = URLRequest(url: base.appending(path: "v1/catalog/art/\(sha256)"))
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        await prove(&request, "catalog")
-        guard let (data, response) = try? await load(request, limit: min(bytes, CollectibleCatalog.Limits.artBytes)),
-              (response as? HTTPURLResponse)?.statusCode == 200 else { throw DirectoryError.unreachable }
-        return data
-    }
-
     /// Every handle this key owns. The relay only answers with a fresh signature from the key.
     func owned(key: String, sig: String, ts: UInt64) async throws -> [(handle: String, entry: DirectoryEntry)] {
         struct Proof: Encodable { var key: String; var sig: String; var ts: UInt64 }
@@ -845,134 +819,6 @@ struct RelayClient {
         struct Held: Decodable { var handle: String; var until: UInt64 }
         let (data, _) = try await post("v1/held", JSONEncoder().encode(Proof(key: key, sig: sig, ts: ts)), work: "held")
         return try JSONDecoder().decode([Held].self, from: data).map { ($0.handle, Date(timeIntervalSince1970: TimeInterval($0.until))) }
-    }
-
-    /// The collectibles the creator gave this key, and whether each has a backup code set.
-    func collectibles(key: String, sig: String, ts: UInt64) async throws -> [(collectible: Collectible, coded: Bool)] {
-        struct Proof: Encodable { var key: String; var sig: String; var ts: UInt64 }
-        struct Mine: Decodable { var item: String; var serial: UInt32; var owner: Data; var sig: Data; var coded: Bool?; var limit: UInt32? }
-        let (data, _) = try await post("v1/collectibles", JSONEncoder().encode(Proof(key: key, sig: sig, ts: ts)), work: "collectibles")
-        return try JSONDecoder().decode([Mine].self, from: data).map {
-            (Collectible(item: $0.item, serial: $0.serial, owner: $0.owner, sig: $0.sig, edition: $0.limit), $0.coded ?? false)
-        }
-    }
-
-    /// Sets the backup code (only its hash travels) for one of this key's collectibles.
-    func setCollectibleCode(key: String, sig: String, ts: UInt64, item: String, serial: UInt32, hash: Data) async throws {
-        struct Set: Encodable { var key: String; var sig: String; var ts: UInt64; var item: String; var serial: UInt32; var hash: String }
-        _ = try await post("v1/collectibles/code", JSONEncoder().encode(Set(key: key, sig: sig, ts: ts, item: item, serial: serial,
-                                                                              hash: hash.base64EncodedString())))
-    }
-
-    enum ClaimError: Error { case unknownCode, unreachable }
-
-    /// Brings back what a backup code belongs to, for this key. Returns the item and number of each.
-    func claimCollectibles(key: String, sig: String, ts: UInt64, code: String) async throws -> [(item: String, serial: UInt32)] {
-        struct Claim: Encodable { var key: String; var sig: String; var ts: UInt64; var code: String }
-        struct Claimed: Decodable { var item: String; var serial: UInt32 }
-        var request = URLRequest(url: base.appending(path: "v1/collectibles/claim"))
-        await prove(&request, "collectible-claim")
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        guard let (data, response) = try? await load(request, body: JSONEncoder().encode(Claim(key: key, sig: sig, ts: ts, code: code))),
-              let status = (response as? HTTPURLResponse)?.statusCode else { throw ClaimError.unreachable }
-        if status == 404 { throw ClaimError.unknownCode }
-        guard status == 200 else { throw ClaimError.unreachable }
-        return try JSONDecoder().decode([Claimed].self, from: data).map { ($0.item, $0.serial) }
-    }
-
-    enum GiveawayError: Error { case unknownCode, full, unreachable }
-
-    /// Enters a giveaway code for this key: which collectible it's for, and the place in line. The admin app then signs
-    /// it over, in that order.
-    func claimGiveaway(key: String, sig: String, ts: UInt64, code: String) async throws -> (item: String, place: Int) {
-        struct Entry: Encodable { var key: String; var sig: String; var ts: UInt64; var code: String }
-        struct Place: Decodable { var item: String; var place: Int }
-        var request = URLRequest(url: base.appending(path: "v1/collectibles/giveaway"))
-        await prove(&request, "giveaway-claim")
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        guard let (data, response) = try? await load(request, body: JSONEncoder().encode(Entry(key: key, sig: sig, ts: ts, code: code))),
-              let status = (response as? HTTPURLResponse)?.statusCode else { throw GiveawayError.unreachable }
-        if status == 404 || status == 403 { throw GiveawayError.unknownCode }
-        if status == 410 { throw GiveawayError.full }
-        guard status == 200 else { throw GiveawayError.unreachable }
-        let place = try JSONDecoder().decode(Place.self, from: data)
-        return (place.item, place.place)
-    }
-
-    /// An egg the creator gave this key, as the relay reports it. It never says what's inside.
-    struct EggInfo: Decodable, Identifiable, Equatable {
-        var id: String
-        var kind: String
-        /// When it will be ready, on the relay's clock (seconds since 1970), once it has been started.
-        var hatches_at: UInt64?
-        var seconds: UInt64
-        /// The relay's clock when this was said.
-        var now: UInt64
-        /// What it's called, its shell colours (hex, light then dark) and how rare it is. A relay from before these
-        /// were sent leaves them out, and the egg is drawn the old way.
-        var name: String?
-        var colors: [String]?
-        var rarity: String?
-
-        var title: String { name.flatMap { $0.isEmpty ? nil : String($0.prefix(40)) } ?? EggNames.name(kind) }
-        var palette: EggPalette? { EggPalette(hex: colors) }
-
-        /// One entry per id, at most 200: a relay answer may repeat an egg, and two sharing an identity are duplicate IDs,
-        /// which SwiftUI draws unreliably (a display glitch and a runtime warning).
-        static func unique(_ list: [EggInfo]) -> [EggInfo] {
-            var seen = Set<String>()
-            return Array(list.prefix(200).filter { seen.insert($0.id).inserted })
-        }
-    }
-
-    enum HatchError: Error { case notStarted, notReady, soldOut, unreachable }
-
-    /// The eggs this key holds.
-    func eggs(key: String, sig: String, ts: UInt64) async throws -> [EggInfo] {
-        struct Proof: Encodable { var key: String; var sig: String; var ts: UInt64 }
-        let (data, _) = try await post("v1/eggs", JSONEncoder().encode(Proof(key: key, sig: sig, ts: ts)), work: "eggs")
-        return try JSONDecoder().decode([EggInfo].self, from: data)
-    }
-
-    private struct EggAction: Encodable { var key: String; var sig: String; var ts: UInt64; var id: String }
-
-    /// Puts an egg to hatch.
-    func startEgg(key: String, sig: String, ts: UInt64, id: String) async throws -> EggInfo {
-        let (data, _) = try await post("v1/eggs/start", JSONEncoder().encode(EggAction(key: key, sig: sig, ts: ts, id: id)))
-        return try JSONDecoder().decode(EggInfo.self, from: data)
-    }
-
-    /// Opens an egg that's ready, and returns the pet inside (checked by the caller against the relay's key).
-    func hatchEgg(key: String, sig: String, ts: UInt64, id: String) async throws -> Collectible {
-        struct Mine: Decodable { var item: String; var serial: UInt32; var owner: Data; var sig: Data; var limit: UInt32? }
-        var request = URLRequest(url: base.appending(path: "v1/eggs/hatch"))
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        guard let (data, response) = try? await load(request, body: JSONEncoder().encode(EggAction(key: key, sig: sig, ts: ts, id: id))),
-              let status = (response as? HTTPURLResponse)?.statusCode else { throw HatchError.unreachable }
-        switch status {
-        case 200:
-            let m = try JSONDecoder().decode(Mine.self, from: data)
-            return Collectible(item: m.item, serial: m.serial, owner: m.owner, sig: m.sig, edition: m.limit)
-        case 409: throw HatchError.notStarted
-        case 425: throw HatchError.notReady
-        case 410: throw HatchError.soldOut
-        default: throw HatchError.unreachable
-        }
-    }
-
-    /// Gives one of this key's collectibles to another account.
-    func giftCollectible(key: String, sig: String, ts: UInt64, item: String, serial: UInt32, to: String) async throws {
-        struct Gift: Encodable { var key: String; var sig: String; var ts: UInt64; var item: String; var serial: UInt32; var to: String }
-        _ = try await post("v1/collectibles/gift", JSONEncoder().encode(Gift(key: key, sig: sig, ts: ts, item: item, serial: serial, to: to)))
-    }
-
-    /// Lets one of this key's collectibles go for good.
-    func releaseCollectible(key: String, sig: String, ts: UInt64, item: String, serial: UInt32) async throws {
-        struct Release: Encodable { var key: String; var sig: String; var ts: UInt64; var item: String; var serial: UInt32 }
-        _ = try await post("v1/collectibles/release", JSONEncoder().encode(Release(key: key, sig: sig, ts: ts, item: item, serial: serial)))
     }
 
     /// Lets go of a handle held for this key before its three months are up.

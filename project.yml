@@ -49,10 +49,9 @@ targets:
             *) echo "error: PULSHADE_RELAY must be an http(s) URL: $PULSHADE_RELAY"; exit 1 ;;
           esac
           if [ "$CONFIGURATION" = "Release" ]; then
-            # Without these a release ships unpinned, or with collectible/report authenticity checks silently off.
+            # Without these a release ships unpinned, or with report and announcement authenticity checks silently off.
             [ -n "$PULSHADE_RELAY_PIN" ] || { echo "error: PULSHADE_RELAY_PIN is empty; a release build must pin its relay."; exit 1; }
             [ -n "$PULSHADE_ADMIN_KEY" ] || { echo "error: PULSHADE_ADMIN_KEY is empty; a release build must carry it."; exit 1; }
-            [ -n "$PULSHADE_PET_KEY" ] || { echo "error: PULSHADE_PET_KEY is empty; a release build must carry it."; exit 1; }
           fi
     # Push: Xcode swaps "development" for "production" when it signs a build for TestFlight or the App Store.
     entitlements:
@@ -73,7 +72,6 @@ targets:
         PulshadeRelayPin: $(PULSHADE_RELAY_PIN)
         PulshadeKeychainGroup: $(AppIdentifierPrefix)app.pulshade.shared
         PulshadeAdminKey: $(PULSHADE_ADMIN_KEY)
-        PulshadePetKey: $(PULSHADE_PET_KEY)
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen:
@@ -115,11 +113,9 @@ targets:
         "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
         # Set when building, e.g. PULSHADE_RELAY=http://192.168.1.20:7878, to point the phone at your Mac's relay.
         PULSHADE_RELAY: ""
-        # The Pulshade Admin app's public key (relay/admin-key.pub): collectibles and the reports mailbox count only if
+        # The Pulshade Admin app's public key (relay/admin-key.pub): announcements and the reports mailbox count only if
         # it signed them.
         PULSHADE_ADMIN_KEY: ""
-        # The relay's pet-signing public key (relay/pet-key.pub), for hatched and gifted collectibles.
-        PULSHADE_PET_KEY: ""
 
   # Pulshade's notification helper: iOS runs it when a message push arrives, even while the phone is locked, so a
   # friend's message can get its second tick (LockedDelivery). Only what it needs: no Tor, no vault, no chats.

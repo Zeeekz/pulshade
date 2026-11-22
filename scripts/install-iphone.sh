@@ -20,6 +20,6 @@ xcodegen generate >/dev/null
 [[ -n "${PULSHADE_RELAY_DIRECT:-$(cat relay/direct-address 2>/dev/null)}" ]] \
   || echo "Warning: no direct address (relay/direct-address or PULSHADE_RELAY_DIRECT): this build has no direct (non-Tor) address for the relay."
 xcodebuild -project Pulshade.xcodeproj -scheme PulshadeiOS -destination "id=$device" -derivedDataPath ios/build \
-  -allowProvisioningUpdates PULSHADE_RELAY="$relay" PULSHADE_RELAY_DIRECT="${PULSHADE_RELAY_DIRECT:-$(cat relay/direct-address 2>/dev/null)}" PULSHADE_RELAY_PIN="${PULSHADE_RELAY_PIN:-$(cat relay/relay-pin 2>/dev/null)}" PULSHADE_ADMIN_KEY="$(cat relay/admin-key.pub 2>/dev/null)" PULSHADE_PET_KEY="$(cat relay/pet-key.pub 2>/dev/null)" build | grep -E "error:|BUILD (SUCCEEDED|FAILED)"
+  -allowProvisioningUpdates PULSHADE_RELAY="$relay" PULSHADE_RELAY_DIRECT="${PULSHADE_RELAY_DIRECT:-$(cat relay/direct-address 2>/dev/null)}" PULSHADE_RELAY_PIN="${PULSHADE_RELAY_PIN:-$(cat relay/relay-pin 2>/dev/null)}" PULSHADE_ADMIN_KEY="$(cat relay/admin-key.pub 2>/dev/null)" build | grep -E "error:|BUILD (SUCCEEDED|FAILED)"
 xcrun devicectl device install app --device "$device" ios/build/Build/Products/Debug-iphoneos/Pulshade.app >/dev/null
 echo "Installed on $device, using the relay at $relay"

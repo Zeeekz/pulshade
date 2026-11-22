@@ -61,6 +61,7 @@ struct Vault {
     private var biometricKeys: FileKeys { FileKeys(directory: directory, file: "identity.bio") }
     /// Seals the seed of this device's own keys (`DeviceKey`) inside the data file.
     private var deviceKeyKeys: FileKeys { FileKeys(directory: directory, file: "device.key") }
+    /// The sealed collectibles list builds before this kept. Nothing writes or reads it any more; it's only removed.
     private var catalogKeys: FileKeys { FileKeys(directory: directory, file: "catalog.cache") }
     private var catalogURL: URL { directory.appendingPathComponent("catalog.cache") }
 
@@ -511,20 +512,16 @@ struct Vault {
         return nil
     }
 
-    // MARK: Collectibles list
+    // MARK: Left by older builds
 
-    /// The collectibles list and its pictures, kept for the next unlock so they needn't be fetched again. They're the
-    /// same for everyone and say nothing about any account, so there is one file for the device, not one per identity
-    /// (a file per identity would count the real ones). Sealed with a Keychain key like the lock file, and shredded with
-    /// everything else on Burn and Detach.
-    func saveCatalog(_ plain: Data) throws {
-        try writeSealed(plain, to: catalogURL, keys: catalogKeys)
-    }
-
-    func loadCatalog() -> Data? {
-        // Never read a copy that isn't sealed: this file has always been.
-        guard catalogKeys.inUse else { return nil }
-        return try? readSealed(catalogURL, keys: catalogKeys)
+    /// Shreds the collectibles list an older build kept, and forgets its key, so nothing of the removed feature stays
+    /// on the device. Burn and Detach would wipe it too; this doesn't wait for them.
+    func dropOldCatalog() {
+        Self.mutation.lock()
+        defer { Self.mutation.unlock() }
+        guard catalogKeys.inUse || FileManager.default.fileExists(atPath: catalogURL.path) else { return }
+        shred(catalogURL)
+        catalogKeys.forget()
     }
 
     // MARK: Data

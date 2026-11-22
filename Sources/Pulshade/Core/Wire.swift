@@ -53,8 +53,6 @@ struct WireMessage: Codable, Equatable {
     /// Set on a video: its clip follows in pieces (`storyPart`, under this message's id), and `image` is a still
     /// from it. Apps from before chat videos leave this out and show the still as a photo.
     var clip: ClipInfo?
-    /// A collectible the sender shows. Older apps see only `text`, which says what it is.
-    var collectible: Collectible?
     /// A note of the sender's profile, as a card (no words in it). Older apps see only `text`.
     var note: NoteCard?
     /// People @-mentioned in a group message. Older apps ignore it and just show the "@Name" text.
@@ -129,10 +127,10 @@ enum Payload: Codable, Equatable {
     case ratchet(RatchetMessage)
 
     /// `handle` is only a claim: the receiver checks it against the directory before showing it.
-    /// `badge` too: the receiver checks it against the creator key.
+    /// Apps from before collectibles were removed also send `badge` and `collectibles`: the decoder skips keys it
+    /// doesn't know, so the rest of their profile still arrives.
     case profile(name: String, avatar: Data?, color: Int?, banner: Data? = nil, bio: String? = nil, handle: String? = nil,
-                 badge: Collectible? = nil, links: [ProfileLink]? = nil, collectibles: [Collectible]? = nil,
-                 notes: [ProfileNote]? = nil)
+                 links: [ProfileLink]? = nil, notes: [ProfileNote]? = nil)
     case message(WireMessage)
     /// The messages reached the device (`read` nil or false), or were seen in the open chat. Older apps ignore
     /// `read`, so a read receipt still counts as delivered there.
@@ -353,8 +351,6 @@ struct DirectoryProfile: Codable, Equatable {
     var links: [ProfileLink]? = nil
     /// Text notes this profile shows, public or locked with a password. Checked again by whoever reads them.
     var notes: [ProfileNote]? = nil
-    /// Shown after the name once it checks out against the creator key and this profile's key.
-    var badge: Collectible? = nil
 
     var fingerprint: String { Identity.fingerprint(of: signingKey) }
 

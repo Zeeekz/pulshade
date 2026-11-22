@@ -3,9 +3,9 @@ import SwiftUI
 import PulshadeShared
 #endif
 
-/// What you've pinned to your profile (links, wallets, notes) and your collectibles, one tap from sending in the chat
+/// What you've pinned to your profile (links, wallets, notes), one tap from sending in the chat
 /// you're in. Links go as ordinary messages, wallets as a card with their QR code. A note goes as a card with no words in it: they open it from
-/// your profile, behind its password or the access you gave. A collectible goes as a card with its picture.
+/// your profile, behind its password or the access you gave.
 struct QuickSendSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
@@ -14,9 +14,6 @@ struct QuickSendSheet: View {
 
     private var links: [ProfileLink] { ProfileLink.cleaned(model.activeProfile.links ?? []) }
     private var notes: [ProfileNote] { ProfileNote.cleaned(model.activeProfile.notes ?? []) }
-    private var collectibles: [Collectible] {
-        Collectible.unique((model.activeProfile.collectibles ?? []).filter { CollectibleCatalog.validID($0.item) })
-    }
     /// A note for chosen contacts, about to be sent to someone who can't read it yet: asks first.
     @State private var sharing: (note: ProfileNote, fingerprint: String, name: String)?
 
@@ -40,11 +37,11 @@ struct QuickSendSheet: View {
             Rectangle().fill(Ink.line).frame(height: 1)
             ScrollView {
                 VStack(spacing: 18) {
-                    if links.isEmpty && notes.isEmpty && collectibles.isEmpty {
+                    if links.isEmpty && notes.isEmpty {
                         VStack(spacing: 8) {
                             Image(systemName: "pin").font(.system(size: 26)).foregroundStyle(Ink.faint)
                             Text("Nothing pinned yet").font(.system(size: 15, weight: .semibold)).foregroundStyle(Ink.text)
-                            Text("Pin links, wallets, notes or collectibles to send them in one tap.")
+                            Text("Pin links, wallets or notes to send them in one tap.")
                                 .font(.system(size: 13)).foregroundStyle(Ink.dim).multilineTextAlignment(.center)
                         }
                         .padding(.vertical, 40).padding(.horizontal, 24)
@@ -59,9 +56,6 @@ struct QuickSendSheet: View {
                     section("Notes", notes.map { note in
                         Item(id: "n" + note.id, symbol: note.isLocked ? "lock.fill" : note.isRestricted ? "person.fill.checkmark" : "doc.text",
                              title: note.title, detail: note.subtitle, send: { sendNote(note) })
-                    })
-                    section("Collectibles", collectibles.map { c in
-                        Item(id: "c" + c.id, symbol: "", collectible: c.item, title: c.info.name, detail: "#\(c.serial)", send: { sendCollectible(c) })
                     })
                 }
                 .padding(20)
@@ -84,8 +78,6 @@ struct QuickSendSheet: View {
     private struct Item: Identifiable {
         var id: String
         var symbol: String
-        /// A collectible's drawing, shown instead of the symbol.
-        var collectible: String?
         var title: String
         var detail: String
         var send: () -> Void
@@ -109,10 +101,6 @@ struct QuickSendSheet: View {
         finish()
     }
 
-    private func sendCollectible(_ collectible: Collectible) {
-        model.send("\(collectible.info.name) #\(collectible.serial)", collectible: collectible, in: conversation)
-        finish()
-    }
 
     /// A note goes as a card. One made for chosen contacts goes only in a chat with one of them, or with your say-so.
     private func sendNote(_ note: ProfileNote) {
@@ -166,14 +154,10 @@ struct QuickSendSheet: View {
             item.send()
         } label: {
             HStack(spacing: 12) {
-                if let collectible = item.collectible {
-                    CollectibleArtwork(item: collectible, size: 34).frame(width: 34, height: 34)
-                } else {
-                    Image(systemName: item.symbol)
-                        .font(.system(size: 14, weight: .semibold)).foregroundStyle(theme.accent)
-                        .frame(width: 30, height: 30)
-                        .background(theme.accent.opacity(0.14), in: .rect(cornerRadius: 8))
-                }
+                Image(systemName: item.symbol)
+                    .font(.system(size: 14, weight: .semibold)).foregroundStyle(theme.accent)
+                    .frame(width: 30, height: 30)
+                    .background(theme.accent.opacity(0.14), in: .rect(cornerRadius: 8))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(item.title).font(.system(size: 14, weight: .semibold)).foregroundStyle(Ink.text).lineLimit(1)
                     Text(item.detail).font(.system(size: 12)).foregroundStyle(Ink.dim).lineLimit(1).truncationMode(.middle)

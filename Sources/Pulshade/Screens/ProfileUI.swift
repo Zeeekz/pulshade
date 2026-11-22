@@ -13,7 +13,6 @@ struct ProfileHero<Actions: View>: View {
     var name: String
     /// A line under the name, such as what they call themselves when you've given them a nickname.
     var subtitle: String?
-    var badge: Collectible?
     var handle: String?
     var bio: String?
     var verified = false
@@ -36,7 +35,6 @@ struct ProfileHero<Actions: View>: View {
                                 .font(.system(size: 22, weight: .bold))
                                 .foregroundStyle(Ink.text)
                                 .lineLimit(2).minimumScaleFactor(0.7)
-                            BadgeMark(badge: badge, size: 22)
                             if verified {
                                 Image(systemName: "checkmark.seal.fill").font(.system(size: 15)).foregroundStyle(theme.accent)
                                     .accessibilityLabel("Verified in person")
@@ -73,7 +71,6 @@ struct ProfileHero<Actions: View>: View {
                                 }
                             }
                         }
-                        if badge.isModerator { ModeratorTag() }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -191,13 +188,12 @@ private struct ProfileInfoCard: View {
     }
 }
 
-/// What's on a profile under its card, in tabs: About (the facts and links), Collectibles, Notes, and the groups you
+/// What's on a profile under its card, in tabs: About (the facts and links), Media, Files, Links, Notes, and the groups you
 /// share. Only the tabs that have something in them.
 struct ProfileTabs: View {
     @Environment(\.theme) private var theme
     var info: [ProfileInfoRow] = []
     var links: [ProfileLink] = []
-    var collectibles: [Collectible] = []
     var notes: [ProfileNote] = []
     var groups: [ProfileGroupRef] = []
     /// What this person sent in the chat you share, for the Media, Files and Links tabs.
@@ -207,7 +203,7 @@ struct ProfileTabs: View {
     @State private var picked: Kind?
 
     enum Kind: String, Identifiable {
-        case about = "About", media = "Media", files = "Files", links = "Links", collectibles = "Collectibles", notes = "Notes",
+        case about = "About", media = "Media", files = "Files", links = "Links", notes = "Notes",
              groups = "In common"
         var id: String { rawValue }
     }
@@ -228,7 +224,6 @@ struct ProfileTabs: View {
         if !media.isEmpty { out.append(.media) }
         if !files.isEmpty { out.append(.files) }
         if !linkMessages.isEmpty { out.append(.links) }
-        if !collectibles.isEmpty { out.append(.collectibles) }
         if !ProfileNote.cleaned(notes).isEmpty { out.append(.notes) }
         if !groups.isEmpty { out.append(.groups) }
         return out
@@ -279,7 +274,6 @@ struct ProfileTabs: View {
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 case .links: ProfileSharedLinks(messages: linkMessages)
-                case .collectibles: ContactCollectibles(items: collectibles, tint: theme.accent)
                 case .notes: ProfileNoteList(notes: notes, tint: theme.accent)
                 case .groups:
                     VStack(spacing: 0) {
@@ -447,7 +441,7 @@ struct FoundProfileView: View {
             VStack(spacing: 16) {
                 ProfileHero(avatar: profile.avatar, seed: profile.fingerprint,
                             name: profile.name.isEmpty ? "Anonymous" : profile.name,
-                            subtitle: model.isMine(profile.fingerprint) ? "This is you" : nil, badge: profile.badge,
+                            subtitle: model.isMine(profile.fingerprint) ? "This is you" : nil,
                             handle: profile.handle, bio: profile.bio) { actions }
                 if let earlier = model.earlierOwner(of: profile) {
                     Label("@\(profile.handle) used to be \(earlier.displayName). This is a different account.",

@@ -5,7 +5,7 @@ import PulshadeShared
 
 /// The pages Settings opens, each from a row on the main list.
 enum SettingsPage: String, Hashable {
-    case profile, invite, handles, pinned, collectibles, pets, privacy, privacyLock, privacyMessages, privacyPasscodes, privacyBackup, blocked, notifications, appearance, devices, network, networkWaiting, anonymity, account, updates
+    case profile, invite, handles, pinned, privacy, privacyLock, privacyMessages, privacyPasscodes, privacyBackup, blocked, notifications, appearance, devices, network, networkWaiting, anonymity, account, updates
 }
 
 /// Settings, laid out like a phone's own: your profile on top, then a short list of rows,
@@ -33,11 +33,6 @@ struct SettingsView: View {
                             RowDivider(inset: 54)
                             MenuRow(page: .invite, symbol: "person.badge.plus", color: .hex(0x30D158), title: "Add a friend",
                                     value: "Code, link or @username")
-                            RowDivider(inset: 54)
-                            MenuRow(page: .collectibles, symbol: "crown.fill", color: .hex(0xE5383B), title: "Collectibles",
-                                    value: model.activeProfile.badge?.info.name)
-                            RowDivider(inset: 54)
-                            MenuRow(page: .pets, symbol: "pawprint.fill", color: .hex(0xFF9F0A), title: "Pets")
                         }
                     }
                     SettingsGroup {
@@ -90,8 +85,6 @@ struct SettingsView: View {
                     case .invite: PeopleView(openChat: { model.requestedConversation = $0 }, inSettings: true)
                     case .handles: HandleSettings()
                     case .pinned: PinnedSettings()
-                    case .collectibles: CollectiblesView(inSettings: true, pets: false)
-                    case .pets: CollectiblesView(inSettings: true, pets: true)
                     case .privacy: PrivacySettings()
                     case .privacyLock: LockSettings()
                     case .privacyMessages: MessagePrivacySettings()
@@ -151,7 +144,6 @@ struct SettingsView: View {
                 Text(model.activeProfile.displayName)
                     .font(.system(size: 22, weight: .semibold))
                     .foregroundStyle(Ink.text)
-                BadgeMark(badge: model.activeProfile.badge, size: 22)
             }
             // Tap the @handle to copy it.
             Button {
@@ -552,12 +544,10 @@ private struct ProfileSettings: View {
     @ViewBuilder private var addPrompts: some View {
         let hasLinks = !ProfileLink.cleaned(model.activeProfile.links ?? []).isEmpty
         let hasNotes = !ProfileNote.cleaned(model.activeProfile.notes ?? []).isEmpty
-        let hasCollectibles = !(model.activeProfile.collectibles ?? []).filter { CollectibleCatalog.validID($0.item) }.isEmpty
-        if !hasLinks || !hasNotes || !hasCollectibles {
+        if !hasLinks || !hasNotes {
             VStack(spacing: 8) {
                 if !hasLinks { addPrompt(.pinned, "link", "Add links and wallets", "Show your socials and wallets on your profile.") }
                 if !hasNotes { addPrompt(.pinned, "doc.text", "Pin a note", "Public, or locked with a password.") }
-                if !hasCollectibles { addPrompt(.collectibles, "sparkles", "Show collectibles", "Wear one next to your name.") }
             }
         }
     }
@@ -596,15 +586,14 @@ private struct ProfileSettings: View {
             }
             VStack(spacing: 6) {
                 ProfileHero(avatar: model.activeProfile.avatar, seed: model.fingerprint,
-                            name: model.activeProfile.displayName, badge: model.activeProfile.badge, handle: model.activeProfile.handle,
+                            name: model.activeProfile.displayName, handle: model.activeProfile.handle,
                             bio: model.activeProfile.bio,
                             avatarEditor: AnyView(AvatarPicker(image: Binding(get: { model.activeProfile.avatar },
                                                                               set: { v in model.updateProfile { $0.avatar = v } }),
                                                                seed: model.fingerprint, size: 84))) { EmptyView() }
                 sectionNote("This is how people see you. Tap your picture to change it.")
             }
-            ProfileTabs(links: model.activeProfile.links ?? [], collectibles: model.activeProfile.collectibles ?? [],
-                        notes: model.activeProfile.notes ?? [], isMine: true)
+            ProfileTabs(links: model.activeProfile.links ?? [], notes: model.activeProfile.notes ?? [], isMine: true)
             addPrompts
             SettingsGroup("About you", footer: "Only people you chat with see these.") {
                 fieldRow("Name") {

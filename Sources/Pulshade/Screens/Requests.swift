@@ -308,7 +308,6 @@ private struct ContactRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 5) {
                     Text(contact.displayName).font(.system(size: 15)).foregroundStyle(Ink.text).lineLimit(1)
-                    BadgeMark(badge: contact.badge, size: 15)
                     if contact.verified {
                         Image(systemName: "checkmark.seal.fill").font(.system(size: 11)).foregroundStyle(theme.accent)
                     }

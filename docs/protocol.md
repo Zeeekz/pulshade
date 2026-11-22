@@ -678,7 +678,7 @@ key that is never written to its disk, or public because someone chose to publis
 | Big files, chat videos, story videos | Disk, sealed twice, in pieces | Erased when collected or deleted, **30 days at most**, 7 in groups (an unfinished upload: 1 hour; one announced that sends no piece: 2 minutes, and unsent uploads together may hold at most a quarter of the store). When the store is full, finished files older than a week make way, oldest first, only for room really taken (not for uploads announced and not sent), no more than a quarter of the store an hour. Someone who keeps the store full of fresh files can still crowd out new ones; nothing younger than a week ever goes |
 | Sealed backups and spare keys | Disk, in the backup store | Until switched off or Burn; **180 days** after the last save. Spares: also erased when used |
 | Wake-up registrations (Apple push tokens) | Memory, and a sealed file | While the setting is on; dropped after 7 days without renewal |
-| Public @handles and profiles, collectibles, announcements | Disk | Public by choice. A let-go handle is held for its owner 90 days, then free (a 30-day cool-off if the owner gives up the hold early) |
+| Public @handles and profiles, announcements | Disk | Public by choice. A let-go handle is held for its owner 90 days, then free (a 30-day cool-off if the owner gives up the hold early) |
 | Rate-limit counters | Memory | An hour. Only a salted hash of an address, never the address |
 | Mailboxes closed by a Burn | Memory | 30 days (as long as mail can wait) |
 
@@ -800,7 +800,7 @@ the apps.
 | Message content | **Still safe.** The handshake mixes ML-KEM-768, and the sparse post-quantum ratchet adds a fresh ML-KEM-768 secret about every 6 to 10 short messages of a back-and-forth chat. |
 | The sealed-sender layer (version 3 envelopes) | **Still safe.** ML-KEM-768 is mixed into both layers. Exceptions: the first, introducing envelope each way (hello, request or introduction), and group-member envelopes, which are classical. |
 | Any TLS/Tor layers (X25519-based) | **Could be opened** (outside what Pulshade controls). That would reveal the mailbox read keys sent in requests and timing, not message content or, for version 3 envelopes, the sender. |
-| Identity authentication | **Hybrid.** Control messages need an Ed25519 and an ML-DSA-65 signature, and a pinned contact can't be downgraded. Pinning is trust on first use; the pulse code covers both signing keys and both agreement keys (Ed25519 and X25519), not the post-quantum keys, and public directory entries, collectibles and admin signatures are still Ed25519 only. |
+| Identity authentication | **Hybrid.** Control messages need an Ed25519 and an ML-DSA-65 signature, and a pinned contact can't be downgraded. Pinning is trust on first use; the pulse code covers both signing keys and both agreement keys (Ed25519 and X25519), not the post-quantum keys, and public directory entries and admin signatures are still Ed25519 only. |
 | Files, backups, the vault | Symmetric (256-bit) and hash-based: **still safe** at current estimates. |
 
 ## Honest limits

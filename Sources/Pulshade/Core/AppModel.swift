@@ -135,12 +135,9 @@ final class AppModel {
     private var pathMonitor: NWPathMonitor?
     private var lastPath: String?
     private var unlockedAt = Date()
-    /// The Pulshade Admin app's key, built into the app: collectibles and the reports mailbox count only if it signed
+    /// The Pulshade Admin app's key, built into the app: announcements and the reports mailbox count only if it signed
     /// them.
     static var adminKey: Data? = (Bundle.main.object(forInfoDictionaryKey: "PulshadeAdminKey") as? String)
-        .flatMap { Data(base64Encoded: $0.trimmingCharacters(in: .whitespacesAndNewlines)) }
-    /// The relay's own key, built into the app: the pets it hatches and the collectibles people gift count if it signed them.
-    static var petKey: Data? = (Bundle.main.object(forInfoDictionaryKey: "PulshadePetKey") as? String)
         .flatMap { Data(base64Encoded: $0.trimmingCharacters(in: .whitespacesAndNewlines)) }
     private var openAfterUnlock: Conversation.ID?
     /// Reopens the main window if it was closed. Set by the window itself.
@@ -1056,10 +1053,7 @@ final class AppModel {
         restartsHandled = relayRestartTotal()
         resendPendingRequests()
         nextAnnouncementCheck = Date().addingTimeInterval(trafficShaping ? 5 : 0)
-        nextCollectibleCheck = Date().addingTimeInterval(trafficShaping ? 40 : 3600)
-        loadCatalog()
-        nextCatalogCheck = checksCatalog ? Date().addingTimeInterval(trafficShaping ? 25 : 3) : .distantFuture
-        catalogFailures = 0
+        vault.dropOldCatalog()
         announcementsVersion = nil
         announceProfiles()
         relistStrandedProfiles()
@@ -1244,8 +1238,6 @@ final class AppModel {
         openConversation = nil
         Platform.setBadge(0)
         withAnimation(.smooth(duration: 0.5)) { phase = .locked }
-        CollectibleLibrary.shared.clear(by: self)
-        nextCatalogCheck = .distantFuture
         tendStoryUpload()
     }
 
@@ -1277,7 +1269,6 @@ final class AppModel {
         backupTask = nil
         discardSaves()
         vault.destroy(leavingNoTrace: leavingNoTrace)
-        CollectibleLibrary.shared.clear(by: self)
         // A Burn keeps its order so the server side can still be finished; every other wipe leaves nothing behind.
         if !keepingBurnOrder {
             burnStore.delete()
@@ -1303,7 +1294,7 @@ final class AppModel {
         withAnimation(.smooth(duration: 0.6)) { phase = .welcome }
     }
 
-    /// What's held in memory only, for the account that was open: persona keys and its eggs. Whoever unlocks
+    /// What's held in memory only, for the account that was open: persona keys and the like. Whoever unlocks
     /// next, a decoy included, must not find them.
     private func forgetSession() {
         readyTask?.cancel()
@@ -1327,7 +1318,6 @@ final class AppModel {
         unsentMessages = []
         retriedAt = [:]
         keysAnsweredAt = [:]
-        eggs = []
         // Per-contact state derived from the account that was open, including text typed into requests.
         removedStories = [:]
         clipActivity = [:]
@@ -1764,19 +1754,12 @@ final class AppModel {
         return links.isEmpty ? nil : links
     }
 
-    /// What a profile shows contacts of its collectibles: the genuine ones, never the backup code or anything else.
-    static func sharedCollectibles(_ profile: Profile) -> [Collectible]? {
-        // Each was checked against this account's key when it was fetched, and the receiver checks again.
-        let mine = Collectible.unique(profile.collectibles ?? [])
-        return mine.isEmpty ? nil : mine
-    }
 
     private func profilePayload(_ persona: UUID?, for contact: String) -> Payload {
         let profile = profile(for: persona)
         return .profile(name: profile.name, avatar: profile.avatar, color: profile.color, banner: profile.banner,
-                        bio: profile.bio.flatMap { $0.isEmpty ? nil : $0 }, handle: profile.handle, badge: profile.badge,
-                        links: Self.sharedLinks(profile), collectibles: Self.sharedCollectibles(profile),
-                        notes: Self.sharedNotes(profile, for: contact))
+                        bio: profile.bio.flatMap { $0.isEmpty ? nil : $0 }, handle: profile.handle,
+                        links: Self.sharedLinks(profile), notes: Self.sharedNotes(profile, for: contact))
     }
 
     /// Someone's signature colour: what they chose, or one picked from their fingerprint.
@@ -1831,10 +1814,10 @@ final class AppModel {
 
     @discardableResult
     func send(_ text: String, image: Data? = nil, voice: VoiceNote? = nil, replyTo: Message? = nil,
-              quote: ReplyRef? = nil, preview: LinkPreview? = nil, collectible: Collectible? = nil, note: NoteCard? = nil,
+              quote: ReplyRef? = nil, preview: LinkPreview? = nil, note: NoteCard? = nil,
               mentioning picks: [(fingerprint: String, name: String)] = [], forwarded: Bool = false, in id: Conversation.ID) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty || image != nil || voice != nil || collectible != nil || note != nil, let i = index(of: id) else { return false }
+        guard !trimmed.isEmpty || image != nil || voice != nil || note != nil, let i = index(of: id) else { return false }
         let convo = data.conversations[i]
         guard canPost(in: convo) else { return false }
 
@@ -1844,7 +1827,6 @@ final class AppModel {
         var message = Message(sender: "me", text: trimmed, image: image, voice: voice, date: now,
                               expiresAt: convo.disappearAfter.map { now.addingTimeInterval($0) }, reply: reply,
                               preview: preview)
-        message.collectible = collectible
         message.note = note
         message.noForward = noForwardFlag
         message.forwarded = forwarded ? true : nil
@@ -1857,7 +1839,7 @@ final class AppModel {
                                text: trimmed, image: image, voice: voice, date: RelayClock.relay(now), expiresIn: convo.disappearAfter,
                                reply: reply.map { ReplyRef(id: $0.id, author: $0.author == "me" ? (myFingerprint(in: convo) ?? "") : $0.author,
                                                            snippet: $0.snippet, picture: $0.picture) },
-                               preview: preview, collectible: collectible, note: note,
+                               preview: preview, note: note,
                                mentions: message.mentions.isEmpty ? nil : message.mentions)
         wire.noForward = message.noForward
         wire.forwarded = message.forwarded
@@ -1901,11 +1883,11 @@ final class AppModel {
     private var noForwardFlag: Bool? { data.security.allowForwarding ? nil : true }
 
     /// Whether a message can be forwarded from its chat. Not one its sender asked to keep where it is, not in a chat
-    /// with a timer (a copy would outlive it), and not what only means something from its sender (a collectible checked
-    /// against their key, a note of their profile) or a file kept on the relay that its sender can erase.
+    /// with a timer (a copy would outlive it), and not what only means something from its sender (a note of their
+    /// profile) or a file kept on the relay that its sender can erase.
     func canForward(_ message: Message, in convo: Conversation) -> Bool {
         guard !message.isSystem, convo.disappearAfter == nil, message.expiresAt == nil,
-              message.collectible == nil, message.note == nil else { return false }
+              message.note == nil else { return false }
         if !message.isMine, message.noForward == true { return false }
         if message.isVideo { return message.video?.isEmpty == false }
         guard message.awaiting == nil, message.attachment == nil || message.attachment?.kind == .photo
@@ -3887,7 +3869,6 @@ final class AppModel {
         if data.security.onlineStatus, id != data.activePersona { sendPresence(false) }
         presenceDue = [:]
         openConversation = nil
-        if id != data.activePersona { eggs = [] }
         let changed = id != data.activePersona
         withAnimation(.smooth(duration: 0.4)) { data.activePersona = id }
         if changed {
@@ -4008,7 +3989,7 @@ final class AppModel {
         let profile = profile(for: persona)
         var card = DirectoryProfile(handle: handle, name: profile.name, bio: profile.bio ?? "", avatar: profile.avatar,
                                     banner: profile.banner, color: profile.color, signingKey: me.card.signing, agreementKey: me.card.agreement,
-                                    sendID: Mailbox.sendID(for: invite.receiveKey), relay: invite.relay, badge: profile.badge)
+                                    sendID: Mailbox.sendID(for: invite.receiveKey), relay: invite.relay)
         card.links = Self.sharedLinks(profile)
         card.notes = Self.sharedNotes(profile)
         let blob = try JSONEncoder.pulshade.encode(card)
@@ -4144,8 +4125,7 @@ final class AppModel {
         let found: RelayClient.DirectoryEntry?
         do { found = try await client.lookup(handle) } catch { throw DirectoryError.unreachable }
         guard let entry = found else { return nil }
-        guard var profile = verified(entry, handle: handle) else { throw DirectoryError.invalid }
-        if profile.badge?.isGenuine(for: profile.signingKey) != true { profile.badge = nil }
+        guard let profile = verified(entry, handle: handle) else { throw DirectoryError.invalid }
         return profile
     }
 
@@ -4213,220 +4193,6 @@ final class AppModel {
         let (key, sig, ts) = try ownerProof("pulshade.dir.unhold.v1", about: Data(handle.utf8), by: me)
         do { try await client.unhold(handle, key: key, sig: sig, ts: ts) } catch { throw DirectoryError.unreachable }
     }
-
-    // MARK: Collectibles
-
-    /// What the backup code alert shows: collectibles the code now covers, and whether the code itself is new.
-    struct CodeAlert: Identifiable, Equatable {
-        var id = UUID()
-        var items: [Collectible]
-        var newCode: Bool
-    }
-    /// Set when the backup code starts covering something, so an alert can say so. Memory only.
-    var codeAlert: CodeAlert?
-    /// The next time to look for new collectibles: soon after unlocking, then every half hour.
-    var nextCollectibleCheck = Date.distantFuture
-    /// After entering a giveaway code, looking for the new collectible more often until this time.
-    private var collectibleWatchUntil = Date.distantPast
-
-    /// The most collectibles one profile message may put through signature checks. A profile can be megabytes, and a
-    /// signature check per entry would let a hostile contact make the app check tens of thousands of them.
-    static let maxProfileCollectibles = 400
-
-    /// The entries of a profile message worth checking, cut *before* any signature is verified.
-    static func profileCollectibleCandidates(_ list: [Collectible]?) -> ArraySlice<Collectible> {
-        (list ?? []).prefix(Self.maxProfileCollectibles)
-    }
-
-    /// What one profile message's collectibles may add to a contact: the first few hundred, verified, one per item and
-    /// number. Only what's shared with contacts is capped at 40 (`sharedCollectibles`); this is someone else's list.
-    @MainActor
-    static func profileCollectibles(_ list: [Collectible]?, for owner: Data) -> [Collectible] {
-        Collectible.unique(profileCollectibleCandidates(list).filter { $0.isGenuine(for: owner) })
-    }
-
-    /// Asks the relay which collectibles the active persona has been given, keeping only ones that check out.
-    /// If the one shown after its name is no longer among them, it stops being shown. A new one joins the backup code
-    /// (made the first time), and an alert asks you to keep the code safe.
-    func refreshCollectibles() async throws {
-        let persona = activePersona
-        guard let me = me(persona), let client = client(nil, lane: Self.directoryLane(persona)) else { throw DirectoryError.unreachable }
-        let (key, sig, ts) = try ownerProof("pulshade.collect.mine.v1", about: me.card.signing, by: me)
-        let given: [(collectible: Collectible, coded: Bool)]
-        do { given = try await client.collectibles(key: key, sig: sig, ts: ts) } catch { throw DirectoryError.unreachable }
-        guard activePersona == persona else { return }
-        // A relay answer may repeat an entry, or sign the same number twice: one of each number is kept. This is the
-        // account's own collection, so it isn't capped: the 40 limit belongs only on what's shared with contacts.
-        var seen = Set<String>()
-        let genuine = given
-            .filter { $0.collectible.isGenuine(for: me.card.signing) && seen.insert($0.collectible.id).inserted }
-            .sorted { ($0.collectible.item, $0.collectible.serial) < ($1.collectible.item, $1.collectible.serial) }
-        updateProfile { profile in
-            profile.collectibles = genuine.map(\.collectible)
-            if let badge = profile.badge, !genuine.contains(where: { $0.collectible == badge }) { profile.badge = nil }
-        }
-        let known = activeProfile.collectibleCodes ?? [:]
-        // A code on the relay this device doesn't know was set by another of your devices: wait for its profile to
-        // arrive rather than make a second code that would break that one.
-        if activeProfile.collectionCode == nil, genuine.contains(where: { $0.coded && known[$0.collectible.id] == nil }) { return }
-        let code = activeProfile.collectionCode
-        let uncovered = genuine.map(\.collectible).filter { $0.info.transferable && (code == nil || known[$0.id] != code) }
-        guard !uncovered.isEmpty else { return }
-        let fresh = code == nil
-        let covered = (try? await cover(uncovered, with: code ?? Collectible.newBackupCode())) ?? []
-        if !covered.isEmpty {
-            codeAlert = CodeAlert(items: fresh ? genuine.map(\.collectible) : (codeAlert?.items ?? []) + covered, newCode: fresh || codeAlert?.newCode == true)
-        }
-    }
-
-    // MARK: Eggs
-
-    /// The eggs the active persona holds, and when they were last asked about (for counting down). Memory only.
-    private(set) var eggs: [RelayClient.EggInfo] = []
-    private var eggsAsked = Date()
-
-    func refreshEggs() async {
-        let persona = activePersona
-        guard let me = me(persona), let client = client(nil, lane: Self.directoryLane(persona)),
-              let (key, sig, ts) = try? ownerProof("pulshade.eggs.mine.v1", about: me.card.signing, by: me),
-              let list = try? await client.eggs(key: key, sig: sig, ts: ts), activePersona == persona else { return }
-        eggsAsked = Date()
-        withAnimation(.smooth) { eggs = RelayClient.EggInfo.unique(list) }
-    }
-
-    /// Seconds until an egg is ready, by the relay's clock: nil if it hasn't been started, 0 when it's ready.
-    func secondsLeft(_ egg: RelayClient.EggInfo, at date: Date = Date()) -> TimeInterval? {
-        guard let at = egg.hatches_at else { return nil }
-        let relayNow = Double(egg.now) + date.timeIntervalSince(eggsAsked)
-        return max(0, Double(at) - relayNow)
-    }
-
-    /// Starts an egg's clock.
-    func startEgg(_ id: String) async throws {
-        guard let me = me(activePersona), let client = client(nil, lane: Self.directoryLane(activePersona)) else { throw DirectoryError.unreachable }
-        let (key, sig, ts) = try ownerProof("pulshade.eggs.start.v1", about: Data(id.utf8), by: me)
-        let started: RelayClient.EggInfo
-        do { started = try await client.startEgg(key: key, sig: sig, ts: ts, id: id) } catch { throw DirectoryError.unreachable }
-        eggsAsked = Date()
-        withAnimation(.smooth) { eggs = eggs.map { $0.id == id ? started : $0 } }
-    }
-
-    /// Opens an egg that's ready. The pet inside is the relay's roll, signed by its key, so this checks that before
-    /// showing it.
-    func hatchEgg(_ id: String) async throws -> Collectible {
-        let persona = activePersona
-        guard let me = me(persona), let client = client(nil, lane: Self.directoryLane(persona)) else { throw RelayClient.HatchError.unreachable }
-        let (key, sig, ts) = try ownerProof("pulshade.eggs.hatch.v1", about: Data(id.utf8), by: me)
-        let pet = try await client.hatchEgg(key: key, sig: sig, ts: ts, id: id)
-        guard pet.isGenuine(for: me.card.signing) else { throw RelayClient.HatchError.unreachable }
-        withAnimation(.smooth) { eggs.removeAll { $0.id == id } }
-        try? await refreshCollectibles()
-        return pet
-    }
-
-    /// Gives a collectible to a contact. They see it the next time their app checks.
-    func gift(_ item: Collectible, to contact: Contact) async throws {
-        guard let me = me(activePersona), let client = client(nil, lane: Self.directoryLane(activePersona)) else { throw DirectoryError.unreachable }
-        let to = contact.signingKey
-        let about = Data(item.item.utf8) + Data([0]) + withUnsafeBytes(of: item.serial.bigEndian) { Data($0) } + to
-        let (key, sig, ts) = try ownerProof("pulshade.collect.gift.v1", about: about, by: me)
-        do { try await client.giftCollectible(key: key, sig: sig, ts: ts, item: item.item, serial: item.serial, to: to.base64EncodedString()) }
-        catch { throw DirectoryError.unreachable }
-        try? await refreshCollectibles()
-    }
-
-    /// Lets a collectible go. It goes back into circulation, and its number can hatch again for someone else.
-    func release(_ item: Collectible) async throws {
-        guard let me = me(activePersona), let client = client(nil, lane: Self.directoryLane(activePersona)) else { throw DirectoryError.unreachable }
-        let about = Data(item.item.utf8) + Data([0]) + withUnsafeBytes(of: item.serial.bigEndian) { Data($0) }
-        let (key, sig, ts) = try ownerProof("pulshade.collect.release.v1", about: about, by: me)
-        do { try await client.releaseCollectible(key: key, sig: sig, ts: ts, item: item.item, serial: item.serial) }
-        catch { throw DirectoryError.unreachable }
-        try? await refreshCollectibles()
-    }
-
-    /// The backup code for all of the active persona's collectibles, if this device has it.
-    var collectionCode: String? { activeProfile.collectionCode }
-
-    /// Replaces the backup code with a new one for every collectible. The old code stops working.
-    @discardableResult
-    func makeNewCollectionCode() async throws -> String {
-        let code = Collectible.newBackupCode()
-        let all = (activeProfile.collectibles ?? []).filter { $0.info.transferable }
-        let covered = try await cover(all, with: code)
-        if covered.count < all.count { throw DirectoryError.unreachable }
-        return code
-    }
-
-    /// Sets `code` on the relay for each collectible (only its hash travels) and keeps it as the collection code.
-    /// Returns the ones it reached.
-    private func cover(_ items: [Collectible], with code: String) async throws -> [Collectible] {
-        let persona = activePersona
-        guard let me = me(persona), let client = client(nil, lane: Self.directoryLane(persona)) else { throw DirectoryError.unreachable }
-        let hash = Collectible.codeHash(code)
-        var covered: [Collectible] = []
-        for item in items {
-            let about = Data(item.item.utf8) + Data([0]) + withUnsafeBytes(of: item.serial.bigEndian) { Data($0) } + hash
-            let (key, sig, ts) = try ownerProof("pulshade.collect.code.v1", about: about, by: me)
-            guard (try? await client.setCollectibleCode(key: key, sig: sig, ts: ts, item: item.item, serial: item.serial, hash: hash)) != nil
-            else { continue }
-            covered.append(item)
-        }
-        guard !covered.isEmpty || items.isEmpty else { throw DirectoryError.unreachable }
-        // Kept like the rest of your profile, and passed to your other devices, but never to contacts.
-        var profile = self.profile(for: persona)
-        profile.collectionCode = code
-        profile.collectibleCodes = (profile.collectibleCodes ?? [:]).merging(covered.map { ($0.id, code) }) { $1 }
-        profile.updatedAt = Date()
-        setProfile(profile, for: persona)
-        sync(.profile(persona: persona, profile))
-        save()
-        return covered
-    }
-
-    /// Brings collectibles back with a backup code from another account (one that burned, say). PULSHADE then signs
-    /// them over to this account, numbers unchanged; they show up here once it has. Returns what the code was for.
-    func claimCollectibles(code: String) async throws -> [(item: String, serial: UInt32)] {
-        guard let me = me(activePersona), let client = client(nil, lane: Self.directoryLane(activePersona)) else { throw RelayClient.ClaimError.unreachable }
-        let (key, sig, ts) = try ownerProof("pulshade.collect.claim.v1", about: Collectible.codeHash(code), by: me)
-        return try await client.claimCollectibles(key: key, sig: sig, ts: ts, code: code)
-    }
-
-    /// What entering a code did: brought collectibles back, or won a place in a giveaway.
-    enum CodeResult {
-        case restored([(item: String, serial: UInt32)])
-        case giveaway(item: String, place: Int)
-    }
-
-    /// A code typed into the Collectibles tab: a backup code, or one for a giveaway. Tries the backup code first.
-    func enterCollectibleCode(_ code: String) async throws -> CodeResult {
-        do {
-            return .restored(try await claimCollectibles(code: code))
-        } catch RelayClient.ClaimError.unknownCode {
-            guard let me = me(activePersona), let client = client(nil, lane: Self.directoryLane(activePersona)) else { throw RelayClient.GiveawayError.unreachable }
-            let (key, sig, ts) = try ownerProof("pulshade.collect.giveaway.v1", about: Collectible.codeHash(code), by: me)
-            let place = try await client.claimGiveaway(key: key, sig: sig, ts: ts, code: code)
-            // Look for it every 45 seconds for a quarter of an hour, so it shows up soon after the operator signs it.
-            collectibleWatchUntil = Date().addingTimeInterval(15 * 60)
-            nextCollectibleCheck = Date().addingTimeInterval(45)
-            return .giveaway(item: place.item, place: place.place)
-        }
-    }
-
-    // MARK: Collectibles list
-
-    /// The next time to ask the relay for the collectibles list: just after unlocking, then every half hour (a relay
-    /// that has nothing new answers with a bare 304), and five minutes after a try that didn't get through.
-    var nextCatalogCheck = Date.distantFuture
-    /// One fetch at a time.
-    var checkingCatalog = false
-    /// Why the last check for a new collectibles list failed, in words for the Collectibles screen. Nil once one works.
-    var catalogProblem: String?
-    /// Failed list checks in a row: the first few are tried again after 30 seconds, later ones after five minutes.
-    var catalogFailures = 0
-    /// Whether the list is checked by itself after unlocking and every half hour. Not under tests (which keep their keys
-    /// in memory): hundreds of test accounts in one process would all ask at once. They ask when they want it.
-    var checksCatalog = !FileKeys.inMemory
 
     // MARK: Announcements
 
@@ -4508,10 +4274,6 @@ final class AppModel {
         if changed { save() }
     }
 
-    /// Shows a collectible after the active persona's name, or none. Contacts and the public profile hear of it.
-    func wear(_ collectible: Collectible?) {
-        updateProfile { $0.badge = collectible }
-    }
 
     /// `label | about | ts`, signed with the identity's key, as the relay asks for to act on its handles.
     private func ownerProof(_ label: String, about: Data, by me: Identity) throws -> (key: String, sig: String, ts: UInt64) {
@@ -5865,7 +5627,7 @@ final class AppModel {
                            text: message.text, image: message.image, voice: message.voice,
                            date: RelayClock.relay(message.date),
                            expiresIn: message.expiresAt == nil ? nil : convo.disappearAfter,
-                           reply: reply, preview: message.preview, collectible: message.collectible, note: message.note,
+                           reply: reply, preview: message.preview, note: message.note,
                            mentions: message.mentions.isEmpty ? nil : message.mentions,
                            attachment: message.attachment?.kind == .file ? message.attachment : nil,
                            noForward: message.noForward, forwarded: message.forwarded)
@@ -6336,17 +6098,9 @@ final class AppModel {
             typing = typing.mapValues { $0.filter { $0.value >= cutoff } }.filter { !$0.value.isEmpty }
         }
         checkAutoLock()
-        if Date() >= nextCollectibleCheck {
-            nextCollectibleCheck = Date().addingTimeInterval(Date() < collectibleWatchUntil ? 45 : 30 * 60)
-            Task { try? await refreshCollectibles(); await refreshEggs() }
-        }
         if Date() >= nextAnnouncementCheck {
             nextAnnouncementCheck = Date().addingTimeInterval(60)
             Task { await refreshAnnouncements(waiting: false) }
-        }
-        if Date() >= nextCatalogCheck {
-            nextCatalogCheck = Date().addingTimeInterval(30 * 60)
-            Task { await refreshCatalog(waiting: false) }
         }
         #if os(macOS)
         if Date() >= nextUpdateCheck, Updater.enabled, let client = client(nil, lane: "update") {
@@ -6944,7 +6698,7 @@ final class AppModel {
         #endif
     }
 
-    /// The connection for proving a profile's handles, collectibles and eggs are its own. Never the one its mail
+    /// The connection for proving a profile's handles are its own. Never the one its mail
     /// is fetched on, so the relay can't tie a handle to a mailbox, or two personas to one account.
     static func directoryLane(_ persona: UUID?) -> String { "dir|" + (persona?.uuidString ?? "main") }
 
@@ -7792,13 +7546,8 @@ final class AppModel {
         case let .callEnd(id):
             guard call?.invite.id == id, call?.peer == fp, call?.persona == persona else { break }
             endCall(note: call?.phase == .ringing && call?.outgoing == false ? "Missed call" : nil, tell: false)
-        case let .profile(name, avatar, color, banner, bio, handle, badge, links, collectibles, notes):
+        case let .profile(name, avatar, color, banner, bio, handle, links, notes):
             sender.name = String(name.prefix(64))
-            sender.badge = badge.flatMap { $0.isGenuine(for: sender.signingKey) ? $0 : nil }
-            // Never trust what arrives: genuine entries only, one per item and number (a profile may repeat one). The
-            // list is cut before any signature is checked, so a megabyte profile can't make the app do thousands of them.
-            let genuine = Self.profileCollectibles(collectibles, for: sender.signingKey)
-            sender.collectibles = genuine.isEmpty ? nil : genuine
             sender.bio = bio.map { String($0.prefix(160)) }
             // Never trust what arrives: keep only entries that pass the same checks as ours.
             let newLinks = Optional(ProfileLink.cleaned(links)).flatMap { $0.isEmpty ? nil : $0 }
@@ -8204,8 +7953,7 @@ final class AppModel {
         var message = Message(id: wire.id, sender: sender.fingerprint, text: String(wire.text.prefix(20_000)),
                               image: picture, voice: wire.voice?.checked, date: date, status: .delivered, expiresAt: expires,
                               reply: reply, preview: preview)
-        // Shown only if it's really theirs: a collectible is checked against their key, a note card is just a title.
-        message.collectible = wire.collectible.flatMap { $0.isGenuine(for: sender.signingKey) ? $0 : nil }
+        // A note card is just a title: opening it reads the note from their profile.
         message.note = wire.note.flatMap(NoteCard.cleaned)
         message.noForward = wire.noForward == true ? true : nil
         message.forwarded = wire.forwarded == true ? true : nil
@@ -9353,7 +9101,7 @@ extension AppModel {
 
     /// Burns one persona for good, leaving your main identity and other personas as they are: its @handles are
     /// retired, its chats deleted for both sides, its contacts told to forget it, and once that's sent, its keys and
-    /// everything else of it go from all your devices. Its collectibles stay claimable with its backup code.
+    /// everything else of it go from all your devices.
     func burnPersona(_ id: UUID) async throws {
         guard data.personas.contains(where: { $0.id == id }), let client = client(nil), await client.health() else {
             throw LeaveError.offline

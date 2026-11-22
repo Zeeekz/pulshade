@@ -74,7 +74,7 @@ struct ChatSearchResults: View {
                 header("Contacts")
                 ForEach(contacts) { c in
                     Button { message(c) } label: {
-                        PersonRow(avatar: c.avatar, seed: c.fingerprint, name: c.displayName, badge: c.badge,
+                        PersonRow(avatar: c.avatar, seed: c.fingerprint, name: c.displayName,
                                   detail: c.handle.map { "@\($0)" })
                     }
                     .buttonStyle(.plain)
@@ -110,7 +110,7 @@ struct ChatSearchResults: View {
         if let found, lookedUp == handle {
             Button { openProfile(found) } label: {
                 PersonRow(avatar: found.avatar, seed: found.fingerprint,
-                          name: found.name.isEmpty ? "Anonymous" : found.name, badge: found.badge,
+                          name: found.name.isEmpty ? "Anonymous" : found.name,
                           detail: model.isMine(found.fingerprint) ? "@\(found.handle) · you" : "@\(found.handle)")
             }
             .buttonStyle(.plain)
@@ -206,7 +206,6 @@ private struct PersonRow: View {
     var avatar: Data?
     var seed: String
     var name: String
-    var badge: Collectible?
     var detail: String?
 
     var body: some View {
@@ -215,7 +214,6 @@ private struct PersonRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 5) {
                     Text(name).font(.system(size: rowTitle, weight: .semibold)).foregroundStyle(Ink.text).lineLimit(1)
-                    BadgeMark(badge: badge, size: 14)
                 }
                 if let detail {
                     Text(detail).font(.system(size: rowLine)).foregroundStyle(Ink.faint).lineLimit(1)
