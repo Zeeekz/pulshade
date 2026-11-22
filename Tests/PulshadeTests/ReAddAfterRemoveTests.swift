@@ -19,7 +19,10 @@ struct ReAddAfterRemoveTests {
 
     private func until(_ models: AppModel..., seconds: Double = 30, _ done: () -> Bool) async {
         let end = Date().addingTimeInterval(seconds)
-        while !done(), Date() < end { for m in models { await m.syncOnce() } }
+        while !done(), Date() < end {
+            for m in models { await m.syncOnce() }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
     }
 
     private func backupOf(_ model: AppModel) throws -> AppData {
@@ -30,19 +33,25 @@ struct ReAddAfterRemoveTests {
     /// removes him then. Returns her restored copy, with the removal notice still waiting inside his hidden record.
     private func removedWhileKeysPending(_ zee: AppModel, _ bob: AppModel, tag: String) async throws -> AppModel {
         _ = try #require(bob.addContact(code: zee.makeInviteCode(), nickname: ""))
-        await settle(zee, bob)
         let bobFP = try #require(bob.identity?.fingerprint)
+        // Friends on both sides first: under load a few sync rounds may not be enough, and a backup without Bob in it
+        // would leave nothing to remove.
+        await until(zee, bob, seconds: 60) { zee.contact(bobFP, in: nil)?.devices.first?.session?.canSend == true }
+        try #require(zee.contact(bobFP, in: nil)?.devices.first?.session?.canSend == true, "Zee and Bob became friends")
         let seed = try #require(zee.identity?.seed)
         var backup = try backupOf(zee)
         // No spare key from Bob: whether one is up yet depends on timing, and taking it would ready the keys without him.
         for i in backup.contacts.indices { for d in backup.contacts[i].devices.indices { backup.contacts[i].devices[d].takesSpares = nil } }
-        zee.destroyEverything()
+        // Her old copy is only locked, not burned: a Burn closes every relay connection in the process, which would cut off
+        // tests running alongside this one.
+        zee.lock()
         bob.lock()
         let restored = testModel("pulshade-readd-\(tag)")
         try await Task.sleep(for: .seconds(1.1))
         try await restored.restore(seed: seed, passcode: "new-device", from: backup)
         await settle(restored, rounds: 3)
         #expect(restored.contact(bobFP)?.devices.first?.session?.canSend != true, "keys still being set up")
+        try #require(restored.contact(bobFP, in: nil)?.devices.isEmpty == false, "Bob came back with the backup")
         restored.removeContact(bobFP, persona: nil)
         #expect(restored.contact(bobFP)?.departing != nil, "kept, hidden, with the notice waiting")
         return restored
