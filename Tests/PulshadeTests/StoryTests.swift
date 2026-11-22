@@ -77,6 +77,27 @@ struct StoryTests {
         #expect(bob.data.stories.first { $0.id == id }?.isReady != true)
     }
 
+    /// One limit for the editor and for what is kept: a 5,000-character paste is 2,000 wherever it goes.
+    @MainActor @Test func storyWordsAreCutToTheSharedLimit() throws {
+        let long = String(repeating: "a", count: 5_000)
+        #expect(StoryText.clipped(long).count == StoryText.maxLength)
+        guard case let .text(text, _) = AppModel.cleanedStoryStyle(.text(long, palette: 0)) else {
+            Issue.record("not a text story"); return
+        }
+        #expect(text.count == StoryText.maxLength)
+        guard case let .image(_, caption) = AppModel.cleanedStoryStyle(.image(Data([1]), caption: long)) else {
+            Issue.record("not a photo story"); return
+        }
+        #expect(caption.count == StoryText.maxLength)
+
+        let id = UUID()
+        let payload = Payload.story(id: id, style: .text(StoryText.clipped(long), palette: 0), date: Date())
+        let decoded = try JSONDecoder.pulshade.decode(Payload.self, from: JSONEncoder.pulshade.encode(payload))
+        guard case let .story(_, style, _, _, _) = decoded else { Issue.record("not a story"); return }
+        guard case let .text(arrived, _) = style else { Issue.record("not text"); return }
+        #expect(arrived.count == StoryText.maxLength, "what is sent is what arrives")
+    }
+
     @Test func aStoryFromAnOlderAppStillDecodes() throws {
         let payload = Payload.story(id: UUID(), style: .text("hi", palette: 0), date: Date())
         let decoded = try JSONDecoder.pulshade.decode(Payload.self, from: JSONEncoder.pulshade.encode(payload))

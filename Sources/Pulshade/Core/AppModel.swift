@@ -1930,9 +1930,9 @@ final class AppModel {
     /// A story may say only so much: its words and caption are short, whatever a payload claims.
     static func cleanedStoryStyle(_ style: StoryStyle) -> StoryStyle {
         switch style {
-        case let .text(text, palette): .text(String(text.prefix(2_000)), palette: palette)
-        case let .image(data, caption): .image(data, caption: String(caption.prefix(2_000)))
-        case let .video(data, caption): .video(data, caption: String(caption.prefix(2_000)))
+        case let .text(text, palette): .text(StoryText.clipped(text), palette: palette)
+        case let .image(data, caption): .image(data, caption: StoryText.clipped(caption))
+        case let .video(data, caption): .video(data, caption: StoryText.clipped(caption))
         }
     }
     /// The most stories one sender's account may have live here at once, for one persona.

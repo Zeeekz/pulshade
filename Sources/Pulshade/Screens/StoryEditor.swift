@@ -379,6 +379,12 @@ struct StoryTypingOverlay: View {
                 set: { new in if let i = index { items[i][keyPath: keyPath] = new } })
     }
 
+    /// The words, kept to the same limit the receiver applies.
+    private var textBinding: Binding<String> {
+        Binding(get: { index.map { items[$0].text } ?? "" },
+                set: { new in if let i = index { items[i].text = StoryText.clipped(new) } })
+    }
+
     private func finish() {
         // Text with nothing in it goes away rather than lingering as a hint.
         if let i = index, items[i].isEmpty { items.remove(at: i) }
@@ -414,6 +420,15 @@ struct StoryTypingOverlay: View {
                     .padding(.horizontal, 18).padding(.vertical, 10)
                     .keyboardShortcut(.return, modifiers: .command)
             }
+            .overlay(alignment: .topLeading) {
+                if item.text.count > 1_800 {
+                    Text("\(item.text.count)/\(StoryText.maxLength)")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.7))
+                        .padding(.horizontal, 18).padding(.vertical, 10)
+                        .allowsHitTesting(false)
+                }
+            }
             .overlay(alignment: .leading) {
                 VerticalSlider(value: binding(\.size, fallback: 0.08), range: 0.04...0.2)
                     .frame(width: 34, height: 220)
@@ -443,7 +458,7 @@ struct StoryTypingOverlay: View {
         }
         .hidden()
         .overlay {
-            TextField("", text: binding(\.text, fallback: ""),
+            TextField("", text: textBinding,
                       prompt: Text("Type here").foregroundStyle(.white.opacity(0.45)), axis: .vertical)
                 .textFieldStyle(.plain)
                 .font(item.face.font(size: size))

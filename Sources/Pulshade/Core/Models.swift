@@ -1034,6 +1034,12 @@ enum StoryStyle: Codable, Equatable {
     case video(Data, caption: String)
 }
 
+/// A story's words, whether a text story or a caption. One limit for what is typed and what is kept.
+enum StoryText {
+    static let maxLength = 2_000
+    static func clipped(_ text: String) -> String { String(text.prefix(maxLength)) }
+}
+
 /// Who sees a story you post. Fingerprints of the persona's contacts.
 enum StoryAudience: Codable, Equatable, Hashable {
     case everyone

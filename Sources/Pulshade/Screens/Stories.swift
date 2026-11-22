@@ -336,13 +336,13 @@ struct StoryComposer: View {
         editing = story
         switch story.style {
         case let .text(text, palette):
-            _text = State(initialValue: text)
+            _text = State(initialValue: StoryText.clipped(text))
             _palette = State(initialValue: palette)
         case let .image(data, caption):
             _image = State(initialValue: data)
-            _text = State(initialValue: caption)
+            _text = State(initialValue: StoryText.clipped(caption))
         case let .video(_, caption):
-            _text = State(initialValue: caption)
+            _text = State(initialValue: StoryText.clipped(caption))
         }
         _audience = State(initialValue: story.shownTo)
         _lifetime = State(initialValue: story.lifetime ?? StoryLifetime.day.rawValue)
@@ -440,6 +440,15 @@ struct StoryComposer: View {
 
                 TextField(image == nil && clip == nil && !isVideoEdit ? "Say something" : "Caption", text: $text)
                     .textFieldStyle(PulseFieldStyle())
+                    .onChange(of: text) { _, new in
+                        if new.count > StoryText.maxLength { text = StoryText.clipped(new) }
+                    }
+                if text.count > 1_800 {
+                    Text("\(text.count)/\(StoryText.maxLength)")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Ink.faint)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
 
                 SettingsGroup {
                     Button { choosingAudience = true } label: {
