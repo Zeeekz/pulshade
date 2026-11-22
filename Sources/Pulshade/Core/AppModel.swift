@@ -558,6 +558,28 @@ final class AppModel {
         // Keep the keys this chat was using, in memory only, so a message that was sealed under them and arrives
         // while the new session is being set up can still be read. Dropped at lock with the other recovery keys.
         if let old = data.contacts[i].devices[d].session { keepRecovered(old, key) }
+        openKeys(contact: i, device: d)
+    }
+
+    /// Opens new keys with a device. On the spare it left for this account (see `SpareSlot`) where there is one, so
+    /// the chat goes on at once instead of saying "Setting up new keys" until their app next runs; asked the ordinary
+    /// way when there's none, or it can't be fetched (`takeSpares` falls back to asking).
+    private func openKeys(contact i: Int, device d: Int) {
+        let key = sessionKey(contact: i, device: d)
+        if sparesFetching.contains(key) { return }
+        if data.contacts[i].devices[d].handshake == nil, let target = spareTarget(contact: i, device: d) {
+            // `takeSpares` only answers a spare for a device with no session and nothing asked, so the keys being
+            // replaced are set aside while it looks: put back if no spare is waiting, so a repair that wasn't needed
+            // doesn't leave the chat with no keys at all. `needsKeys` picks the fetch up again if the app closes
+            // before it's done (`resumeKeyFetch`).
+            if let old = data.contacts[i].devices[d].session { keptWhileFetching[key] = old }
+            data.contacts[i].devices[d].session = nil
+            data.contacts[i].devices[d].needsKeys = true
+            sparesFetching.insert(key)
+            save()
+            Task { await takeSpares([target]) }
+            return
+        }
         startHandshake(contact: i, device: d)
     }
 
@@ -628,6 +650,9 @@ final class AppModel {
 
     /// Devices whose spare key is being fetched, by `sessionKey`. Memory only: the chat says keys are on their way.
     @ObservationIgnored private var sparesFetching: Set<String> = []
+    /// The keys a chat was on when its friend's spare began to be fetched (`openKeys`), by `sessionKey`: back in place
+    /// if there turns out to be no spare. Memory only.
+    @ObservationIgnored private var keptWhileFetching: [String: Ratchet] = [:]
     /// When this device next looks after the spares it leaves for friends. One at a time, minutes apart, so the
     /// relay never sees a run of them come from one place together.
     @ObservationIgnored private var nextSpareWork = Date().addingTimeInterval(.random(in: 20...120))
@@ -684,10 +709,6 @@ final class AppModel {
                     let (key, sig, ts) = SpareSlot.proof("pulshade.backup.get.v1", target.keys)
                     guard let blob = try? await client.backup(key: key, sig: sig, ts: ts),
                           let card = SpareSlot.open(blob, with: target.keys) else { return (index, nil) }
-                    // Taken: it's erased from the relay (both sides hold the slot's key), so it can't be taken twice
-                    // and doesn't sit in the backup store. Its maker leaves a new one when their app next runs.
-                    let (dkey, dsig, dts) = SpareSlot.proof("pulshade.backup.del.v1", target.keys)
-                    try? await client.deleteBackup(key: dkey, sig: dsig, ts: dts)
                     return (index, card)
                 }
             }
@@ -697,15 +718,27 @@ final class AppModel {
                 add()
             }
         }
+        // Taken: it's erased from the relay (both sides hold the slot's key), so it can't be taken twice and doesn't
+        // sit in the backup store. Its maker leaves a new one when their app next runs. Only once it has been dealt
+        // with: one left unanswered (keys opened another way meanwhile) stays up for next time, instead of leaving
+        // the friend's slot empty for days while their app thinks it's there.
+        func erase(_ index: Int) {
+            guard found[index] != nil, let client = clients[index] else { return }
+            let (dkey, dsig, dts) = SpareSlot.proof("pulshade.backup.del.v1", targets[index].keys)
+            Task { try? await client.deleteBackup(key: dkey, sig: dsig, ts: dts) }
+        }
         for (index, target) in targets.enumerated() {
             guard let i = contactIndex(target.fingerprint, target.persona),
                   let d = data.contacts[i].devices.firstIndex(where: { $0.id == target.device }) else { continue }
-            sparesFetching.remove(sessionKey(contact: i, device: d))
+            let key = sessionKey(contact: i, device: d)
+            sparesFetching.remove(key)
+            let kept = keptWhileFetching.removeValue(forKey: key)
             // Something else opened keys with them meanwhile (their own ask arrived): that's kept.
             guard data.contacts[i].devices[d].session == nil, data.contacts[i].devices[d].handshake == nil else {
                 data.contacts[i].devices[d].needsKeys = nil
                 continue
             }
+            erase(index)
             if let card = found[index], Date().timeIntervalSince(card.madeAt) < Self.spareMaxAge,
                !answeredSpares.contains(card.request.ephemeral),
                acceptSession(card.request, contact: i, device: d, spare: true, context: .spare) {
@@ -713,6 +746,8 @@ final class AppModel {
                 // A hello of theirs sent before now crossed this answer: it isn't taken (see `.deviceHello`).
                 data.contacts[i].devices[d].spareTakenAt = RelayClock.now
             } else {
+                // No spare waiting: the keys the chat was on stay while it asks, as a repair always did before spares.
+                if let kept { data.contacts[i].devices[d].session = kept }
                 startHandshake(contact: i, device: d)
             }
         }
@@ -4938,7 +4973,7 @@ final class AppModel {
             // A device whose spare key is being fetched gets its keys from that, and what waits goes then.
             if data.contacts[i].devices[d].session == nil && data.contacts[i].devices[d].handshake == nil
                 && data.contacts[i].devices[d].awaitingHello != true && !sparesFetching.contains(sessionKey(contact: i, device: d)) {
-                startHandshake(contact: i, device: d)
+                openKeys(contact: i, device: d)
             }
         }
         sendPending(contact: i)
@@ -7380,6 +7415,15 @@ final class AppModel {
             guard let plain else {
                 // Written on a spare this device no longer had: expected, and new keys are already on their way.
                 if let since = deadSpareFrom[keptKey], Date().timeIntervalSince(since) < 600 { return .handled }
+                // Sent before the keys this chat is on now were set up, or longer ago than the relay keeps mail: an old
+                // envelope (sent again by the relay, say), not keys out of step. New keys over it would throw away a
+                // working session (and use up the friend's spare) on nothing.
+                let link = data.contacts[i].devices[d]
+                let since = [link.answeredAt, link.acceptedHelloAt, link.spareTakenAt].compactMap { $0 }.max()
+                if link.session != nil,
+                   RelayClock.now.timeIntervalSince(opened.sentAt) > Self.replayWindow || since.map({ opened.sentAt < $0 }) == true {
+                    return .handled
+                }
                 // Signed by their account, yet this device's keys can't open it: the two are out of step (a backup that
                 // was a little behind, say). Said once in a while, so a new session is opened with them, which they
                 // accept; until then what they sent can't be read, and what's sent to them can't be either.
