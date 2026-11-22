@@ -1670,6 +1670,7 @@ final class AppModel {
         contact.receiveKey = mailbox.receiveKey
         // Following a channel doesn't make its owner one of your contacts.
         contact.hidden = invite.kind == .channel ? (known?.hidden ?? true) : false
+        if !contact.hidden { Self.takeBack(&contact) }
         guard let (handshake, request) = signedHandshake(persona: owner, to: invite.signingKey, context: .hello) else { return nil }
         // The invite names one of their devices' mailboxes; its id arrives with their answer.
         var link = DeviceLink(sendID: invite.sendID)
@@ -4378,6 +4379,7 @@ final class AppModel {
             }
             peer.devices = devices
         }
+        Self.takeBack(&peer)
         peer.pq = request.card.pq?.verified(signer: request.card.signingKey, agreement: request.card.agreementKey)
         if let pin = peer.pq, !pinMatchesInvite(pin, contact: peer) { peer.pq = nil }
         peer.relay = Invite.allowedRelay(request.card.relay)
@@ -4584,6 +4586,16 @@ final class AppModel {
         guard let i = contactIndex(contact.fingerprint, contact.persona) else { return false }
         return data.contacts[i].devices.contains { device in
             device.pending.contains { if case .burn = $0.payload { true } else { false } }
+        }
+    }
+
+    /// Someone you removed is a friend again: the removal is called off. Removed before the chat keys were ready, their
+    /// record was kept, hidden, with the notice still waiting inside it; left there, it would go out once the new keys
+    /// were ready and their app would forget you again, and the record would be forgotten here too.
+    static func takeBack(_ contact: inout Contact) {
+        contact.departing = nil
+        for d in contact.devices.indices {
+            contact.devices[d].pending.removeAll { if case .burn = $0.payload { true } else { false } }
         }
     }
 
@@ -7849,6 +7861,7 @@ final class AppModel {
             save()
         } else {
             peer.hidden = false
+            Self.takeBack(&peer)
             peer.receiveKey = invite.receiveKey
             upsert(peer)
             data.invites.removeAll { $0.receiveKey == invite.receiveKey }
