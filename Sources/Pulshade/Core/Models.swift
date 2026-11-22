@@ -68,6 +68,8 @@ struct Persona: Codable, Identifiable, Equatable {
 struct HeldMail: Codable, Equatable {
     var receiveKey: Data
     var blob: Data
+    /// When it arrived, so the oldest can go first across a contact's devices. Nil in vaults from before this.
+    var at: Date?
 }
 
 struct DeviceLink: Codable {

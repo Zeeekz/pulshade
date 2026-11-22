@@ -1309,6 +1309,7 @@ final class AppModel {
         clipActivity = [:]
         clipAsks = [:]
         clipResent = [:]
+        heldMailNoted = []
         // An upload for the account that was open must not carry on behind the lock for whoever opens next.
         for task in clipUploads.values { task.cancel() }
         clipUploads = [:]
@@ -1359,6 +1360,8 @@ final class AppModel {
     /// it again in case the device was wiped before it could.
     /// When each friend last asked for the stories you have up again, so one can't make you send a video over and over.
     @ObservationIgnored private var storiesWantedAt: [String: Date] = [:]
+    /// Contacts already told that held mail was discarded, so the note is said once per session.
+    @ObservationIgnored private var heldMailNoted: Set<String> = []
 
     private func clearChatsForContacts() {
         for c in data.contacts where !c.isSelf && !c.hidden && !c.awaitingAcceptance {
@@ -5907,6 +5910,66 @@ final class AppModel {
     /// The most kept waiting for a friend's device you haven't allowed, and the most kept from it.
     static let maxHeldPending = 500
     static let maxHeldMail = 200
+    /// The most held from a contact's unconfirmed devices, across all of them.
+    static let maxHeldMailBytes = 16 * 1024 * 1024
+
+    /// Keeps one sealed envelope from an unconfirmed device, dropping the oldest across this contact's devices to
+    /// stay within `maxHeldMailBytes`. Confirmed devices hold nothing here and are never touched.
+    func holdDeviceMail(_ mail: HeldMail, contact i: Int, device d: Int) {
+        var held = data.contacts[i].devices[d].heldMail ?? []
+        // The relay may hand the same one over twice.
+        if !held.contains(where: { $0.blob == mail.blob }) { held.append(mail) }
+        var dropped = false
+        if held.count > Self.maxHeldMail {
+            held.removeFirst(held.count - Self.maxHeldMail)
+            dropped = true
+        }
+        data.contacts[i].devices[d].heldMail = held.isEmpty ? nil : held
+        if trimHeldMail(contact: i) { dropped = true }
+        if dropped { noteHeldMailDropped(contact: i) }
+    }
+
+    /// Drops the oldest sealed envelopes from a contact's unconfirmed devices until the total fits.
+    private func trimHeldMail(contact i: Int) -> Bool {
+        func total() -> Int {
+            data.contacts[i].devices.reduce(0) { sum, device in
+                sum + (device.heldMail ?? []).reduce(0) { $0 + $1.blob.count }
+            }
+        }
+        var dropped = false
+        while total() > Self.maxHeldMailBytes {
+            var oldest: (device: Int, index: Int, at: Date)?
+            for d in data.contacts[i].devices.indices {
+                for (index, mail) in (data.contacts[i].devices[d].heldMail ?? []).enumerated() {
+                    let at = mail.at ?? .distantPast
+                    if oldest == nil || at < oldest!.at { oldest = (d, index, at) }
+                }
+            }
+            guard let oldest else { break }
+            data.contacts[i].devices[oldest.device].heldMail?.remove(at: oldest.index)
+            if data.contacts[i].devices[oldest.device].heldMail?.isEmpty == true {
+                data.contacts[i].devices[oldest.device].heldMail = nil
+            }
+            dropped = true
+        }
+        return dropped
+    }
+
+    /// Tells you once per contact that held mail was discarded; not once per envelope.
+    private func noteHeldMailDropped(contact i: Int) {
+        let c = data.contacts[i]
+        let key = "\(c.fingerprint)|\(c.persona?.uuidString ?? "main")"
+        guard !c.hidden, !c.awaitingAcceptance, !heldMailNoted.contains(key) else { return }
+        heldMailNoted.insert(key)
+        let convo = startConversation(kind: .direct, title: "", members: [c.fingerprint], persona: .some(c.persona))
+        guard let j = index(of: convo.id) else { return }
+        withAnimation(.snappy) {
+            data.conversations[j].messages.append(Message(
+                sender: "system",
+                text: "Some messages from \(c.displayName)'s new device were discarded to free space.",
+                date: Date()))
+        }
+    }
 
     /// A friend's devices that their account added while "ask before new devices" was on, not allowed yet.
     func heldDevices(of fingerprint: String, persona: UUID?) -> Int {
@@ -7324,13 +7387,8 @@ final class AppModel {
             // From a friend's device you haven't allowed: kept sealed and unread until you do, so it can't put words in
             // their mouth next to the Allow button. Opened in order then, as if it had just come.
             if !data.contacts[i].isSelf, data.contacts[i].devices[d].unconfirmed == true {
-                var held = data.contacts[i].devices[d].heldMail ?? []
-                // The relay may hand the same one over twice.
-                if !held.contains(where: { $0.blob == envelope.blob }) {
-                    held.append(HeldMail(receiveKey: envelope.receiveKey, blob: envelope.blob))
-                }
-                if held.count > Self.maxHeldMail { held.removeFirst(held.count - Self.maxHeldMail) }
-                data.contacts[i].devices[d].heldMail = held
+                holdDeviceMail(HeldMail(receiveKey: envelope.receiveKey, blob: envelope.blob, at: Date()),
+                               contact: i, device: d)
                 return .handled
             }
             // A build from before the sparse post-quantum ratchet: its messages aren't read, and the chat tells whose app
