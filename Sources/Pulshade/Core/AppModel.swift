@@ -979,6 +979,7 @@ final class AppModel {
     #endif
 
     private func didUnlock() {
+        rebuildReceivedMedia()
         // Data a build before device keys saved (format 22 or older): its sessions are restarted once, below.
         let fromBeforeDeviceKeys = data.format < 23
         unlockedAt = Date()
@@ -1310,6 +1311,8 @@ final class AppModel {
         clipAsks = [:]
         clipResent = [:]
         heldMailNoted = []
+        receivedMediaBytes = 0
+        mediaRequested = []
         // An upload for the account that was open must not carry on behind the lock for whoever opens next.
         for task in clipUploads.values { task.cancel() }
         clipUploads = [:]
@@ -1362,6 +1365,10 @@ final class AppModel {
     @ObservationIgnored private var storiesWantedAt: [String: Date] = [:]
     /// Contacts already told that held mail was discarded, so the note is said once per session.
     @ObservationIgnored private var heldMailNoted: Set<String> = []
+    /// Received media in messages and stories, kept in memory only and rebuilt when the account is opened.
+    @ObservationIgnored private(set) var receivedMediaBytes = 0
+    /// Items the user asked for again, which may use the hard ceiling.
+    @ObservationIgnored private var mediaRequested: Set<UUID> = []
 
     private func clearChatsForContacts() {
         for c in data.contacts where !c.isSelf && !c.hidden && !c.awaitingAcceptance {
@@ -1926,6 +1933,32 @@ final class AppModel {
     static let mediaInline = 48_000
     /// The biggest photo or voice note taken from the relay or in pieces.
     static let maxMediaBytes = 8_000_000
+    /// Received media kept on this device before new media stops being stored, and the hard ceiling the user may
+    /// reach by explicitly asking for one item. Memory only; rebuilt on unlock.
+    static let receivedMediaSoftLimit = 96 * 1024 * 1024
+    static let receivedMediaHardLimit = 128 * 1024 * 1024
+
+    /// The bytes in a received message that count against the media limit.
+    static func mediaBytes(_ message: Message) -> Int {
+        (message.image?.count ?? 0) + (message.video?.count ?? 0) + (message.voice?.audio.count ?? 0)
+            + (message.preview?.image?.count ?? 0) + (message.reply?.picture?.count ?? 0)
+    }
+
+    static func mediaBytes(_ style: StoryStyle) -> Int {
+        switch style {
+        case .text: 0
+        case let .image(data, _), let .video(data, _): data.count
+        }
+    }
+
+    /// A story's style with its media removed but its words and palette kept.
+    static func withoutMedia(_ style: StoryStyle) -> StoryStyle {
+        switch style {
+        case .text: style
+        case let .image(_, caption): .image(Data(), caption: caption)
+        case let .video(_, caption): .video(Data(), caption: caption)
+        }
+    }
     /// The most bytes one story's clip (or a chat video's pieces) may hold while it is still arriving.
     static func storyClipFits(_ parts: [Int: Data]) -> Bool {
         parts.values.reduce(0) { $0 + $1.count } <= maxMediaBytes
@@ -2450,48 +2483,131 @@ final class AppModel {
         return nil
     }
 
+    /// What is stored right now, counted from the data rather than trusted from an old total, so deletions of
+    /// messages, stories or whole chats are reflected the moment the next item is considered.
+    private func receivedMediaNow() -> Int {
+        var total = 0
+        for convo in data.conversations {
+            for message in convo.messages where !message.isMine && !message.isSystem {
+                total += Self.mediaBytes(message)
+            }
+        }
+        for story in data.stories where story.author != "me" {
+            total += Self.mediaBytes(story.style)
+        }
+        return total
+    }
+
+    /// Rebuilds the memory-only count of received media from what is stored. Own and synced items never count.
+    func rebuildReceivedMedia() {
+        receivedMediaBytes = receivedMediaNow()
+    }
+
+    /// Whether another item fits under the soft limit, or the hard limit after the user asked for it. Counts afresh,
+    /// so media removed by any path (unsend, delete, clear, contact removal, stories) is no longer counted against it.
+    private func fitsReceivedMedia(_ bytes: Int, force: Bool = false) -> Bool {
+        receivedMediaBytes = receivedMediaNow()
+        return receivedMediaBytes + bytes <= (force ? Self.receivedMediaHardLimit : Self.receivedMediaSoftLimit)
+    }
+
     /// Puts a video, photo or voice note that came on its own into the message waiting for it.
     private func fillMessage(_ at: (convo: Int, message: Int), with bytes: Data) -> Bool {
-        let message = data.conversations[at.convo].messages[at.message]
+        var message = data.conversations[at.convo].messages[at.message]
+        guard !bytes.isEmpty else { return false }
+        let kind: Attachment.Kind
         if message.video?.isEmpty == true {
-            guard !bytes.isEmpty, bytes.count <= ChatVideo.maxBytes + 500_000 else { return false }
-            withAnimation(.snappy) { data.conversations[at.convo].messages[at.message].video = bytes }
+            kind = .video
+        } else if let awaiting = message.awaiting {
+            kind = awaiting
+        } else {
+            return false
+        }
+        guard kind == .video || kind == .photo || kind == .voice else { return false }
+        if kind == .voice, message.voice == nil { return false }
+        if kind == .video {
+            guard bytes.count <= ChatVideo.maxBytes + 500_000 else { return false }
+        } else {
+            guard bytes.count <= Self.maxMediaBytes else { return false }
+        }
+        if kind == .photo, PlatformImage.checked(bytes) == nil { return false }
+
+        let forced = mediaRequested.contains(message.id)
+        guard fitsReceivedMedia(bytes.count, force: forced) else {
+            mediaRequested.remove(message.id)
+            message.mediaDropped = true
+            message.mediaGone = forced ? true : nil
+            message.awaiting = nil
+            if kind == .video { message.video = nil }
+            withAnimation(.snappy) { data.conversations[at.convo].messages[at.message] = message }
+            clipActivity[ClipKey(message.id, data.conversations[at.convo].persona)] = nil
             return true
         }
-        guard !bytes.isEmpty, bytes.count <= Self.maxMediaBytes else { return false }
-        switch message.awaiting {
+
+        switch kind {
+        case .video:
+            message.video = bytes
         case .photo:
-            guard PlatformImage.checked(bytes) != nil else { return false }
-            withAnimation(.snappy) {
-                data.conversations[at.convo].messages[at.message].image = bytes
-                data.conversations[at.convo].messages[at.message].awaiting = nil
-            }
+            message.image = bytes
+            message.awaiting = nil
         case .voice:
-            guard var voice = message.voice else { return false }
-            voice.audio = bytes
-            withAnimation(.snappy) {
-                data.conversations[at.convo].messages[at.message].voice = voice
-                data.conversations[at.convo].messages[at.message].awaiting = nil
-            }
+            message.voice?.audio = bytes
+            message.awaiting = nil
         default:
             return false
         }
+        message.mediaDropped = nil
+        message.mediaGone = nil
+        mediaRequested.remove(message.id)
+        withAnimation(.snappy) { data.conversations[at.convo].messages[at.message] = message }
+        receivedMediaBytes += bytes.count
         return true
     }
 
     /// Puts a clip or photo that came on its own into the story waiting for it.
     private func fillStory(_ i: Int, with bytes: Data) -> Bool {
         guard !bytes.isEmpty else { return false }
-        switch data.stories[i].style {
+        let story = data.stories[i]
+        let forced = mediaRequested.contains(story.id)
+        switch story.style {
         case let .video(have, caption) where have.isEmpty:
             guard bytes.count <= Self.maxMediaBytes else { return false }
-            withAnimation(.snappy) { data.stories[i].style = .video(bytes, caption: caption) }
+            guard fitsReceivedMedia(bytes.count, force: forced) else {
+                mediaRequested.remove(story.id)
+                withAnimation(.snappy) {
+                    data.stories[i].style = .video(Data(), caption: caption)
+                    data.stories[i].mediaDropped = true
+                    data.stories[i].mediaGone = forced ? true : nil
+                }
+                clipActivity[ClipKey(story.id, story.persona)] = nil
+                return true
+            }
+            withAnimation(.snappy) {
+                data.stories[i].style = .video(bytes, caption: caption)
+                data.stories[i].mediaDropped = nil
+                data.stories[i].mediaGone = nil
+            }
         case let .image(have, caption) where have.isEmpty:
             guard bytes.count <= Self.maxMediaBytes, PlatformImage.checked(bytes) != nil else { return false }
-            withAnimation(.snappy) { data.stories[i].style = .image(bytes, caption: caption) }
+            guard fitsReceivedMedia(bytes.count, force: forced) else {
+                mediaRequested.remove(story.id)
+                withAnimation(.snappy) {
+                    data.stories[i].style = .image(Data(), caption: caption)
+                    data.stories[i].mediaDropped = true
+                    data.stories[i].mediaGone = forced ? true : nil
+                }
+                clipActivity[ClipKey(story.id, story.persona)] = nil
+                return true
+            }
+            withAnimation(.snappy) {
+                data.stories[i].style = .image(bytes, caption: caption)
+                data.stories[i].mediaDropped = nil
+                data.stories[i].mediaGone = nil
+            }
         default:
             return false
         }
+        mediaRequested.remove(story.id)
+        receivedMediaBytes += bytes.count
         return true
     }
 
@@ -2759,7 +2875,10 @@ final class AppModel {
             removedStories = removedStories.filter { $0.value >= stale }
             changed = true
         }
-        if changed { save() }
+        if changed {
+            rebuildReceivedMedia()
+            save()
+        }
     }
 
     /// One-to-one chats (and burners) in the current list, which "Clear all chats" removes.
@@ -3034,7 +3153,7 @@ final class AppModel {
         let now = Date()
         // Keyed by story and persona: two of your personas can be sent the same story by one friend.
         var stalled = Set(data.clipParts.values.compactMap { p in p.id.map { ClipKey($0, p.persona) } })
-        for story in data.stories where story.author != "me" && story.isLive && !story.isReady {
+        for story in data.stories where story.author != "me" && story.isLive && !story.isReady && story.mediaDropped != true {
             stalled.insert(ClipKey(story.id, story.persona))
         }
         // Chat videos whose message has come but whose pieces haven't all.
@@ -3046,7 +3165,7 @@ final class AppModel {
             if story == nil, let at = mediaMessage(id, persona: .some(key.persona)), data.conversations[at.convo].persona == key.persona {
                 // A chat video, photo or voice note: asked of whoever sent it, in that chat's persona, while it's still unfinished.
                 let message = data.conversations[at.convo].messages[at.message]
-                guard Self.isPending(message), !message.isMine else { clipActivity[key] = nil; continue }
+                guard Self.isPending(message), !message.isMine, message.mediaDropped != true else { clipActivity[key] = nil; continue }
                 guard let last = clipActivity[key] else { clipActivity[key] = now; continue }
                 let asked = clipAsks[key], tries = asked?.count ?? 0
                 guard tries < Self.clipAskLimit, now.timeIntervalSince(last) >= clipQuiet,
@@ -3057,7 +3176,7 @@ final class AppModel {
                 continue
             }
             guard let author = story?.author ?? parts?.author, author != "me",
-                  removedStories["\(author)|\(id)"] == nil else { continue }
+                  story?.mediaDropped != true, removedStories["\(author)|\(id)"] == nil else { continue }
             if story.map({ $0.isLive && !$0.isReady }) == false { continue }
             // Seen for the first time since launch: the wait starts now.
             guard let last = clipActivity[key] else { clipActivity[key] = now; continue }
@@ -3099,6 +3218,60 @@ final class AppModel {
         clipActivity[key] = Date()
         let parts = data.clipParts[key.stored]
         enqueue(.storyWant(id: story.id, parts: parts.map { p in (0..<p.of).filter { p.parts[$0] == nil } }), to: author)
+    }
+
+    /// The user asked for one received item that was not saved. Ask its sender once through the existing resend path;
+    /// it is stored only if the hard ceiling has room when it arrives.
+    func getMediaAnyway(messageID: UUID, in conversationID: UUID) {
+        guard let ci = index(of: conversationID),
+              let mi = data.conversations[ci].messages.firstIndex(where: { $0.id == messageID }) else { return }
+        var message = data.conversations[ci].messages[mi]
+        guard !message.isMine, !message.isSystem, message.mediaDropped == true else { return }
+        guard fitsReceivedMedia(0, force: true),
+              let from = contact(message.sender, in: data.conversations[ci].persona) else {
+            message.mediaGone = true
+            data.conversations[ci].messages[mi] = message
+            save()
+            return
+        }
+        let kind: Attachment.Kind
+        if message.clipSeconds != nil || message.video != nil {
+            kind = .video
+        } else if message.voice != nil {
+            kind = .voice
+        } else {
+            kind = .photo
+        }
+        mediaRequested.insert(message.id)
+        switch kind {
+        case .video: message.video = Data()
+        case .voice: message.awaiting = .voice
+        case .photo: message.awaiting = .photo
+        default: break
+        }
+        message.mediaGone = nil
+        data.conversations[ci].messages[mi] = message
+        enqueue(.storyWant(id: message.id, parts: nil), to: from)
+        save()
+    }
+
+    /// The same for a story. If it has expired or there is no longer room, the UI says it is no longer available.
+    func getStoryAnyway(_ story: Story) {
+        guard let i = data.stories.firstIndex(where: { $0.id == story.id && $0.persona == story.persona }) else { return }
+        var saved = data.stories[i]
+        guard saved.author != "me", saved.mediaDropped == true else { return }
+        guard saved.isLive, fitsReceivedMedia(0, force: true),
+              let from = contact(saved.author, in: saved.persona) else {
+            saved.mediaGone = true
+            data.stories[i] = saved
+            save()
+            return
+        }
+        mediaRequested.insert(saved.id)
+        saved.mediaGone = nil
+        data.stories[i] = saved
+        enqueue(.storyWant(id: saved.id, parts: nil), to: from)
+        save()
     }
 
     /// The same for a video in a chat: it is in the persona that chat belongs to.
@@ -7638,7 +7811,13 @@ final class AppModel {
             // only the copy for this persona counts as "sent before". The id is never taken from someone else.
             guard !data.stories.contains(where: { $0.id == id && $0.author != fp }) else { break }
             if let i = data.stories.firstIndex(where: { $0.id == id && $0.author == fp && $0.persona == persona }) {
-                // A new version of one they sent before.
+                // A new version of one they sent before. New media that would push this device over is ignored, so
+                // the media already stored is never deleted.
+                let oldBytes = Self.mediaBytes(data.stories[i].style)
+                let newBytes = Self.mediaBytes(cleanedStyle)
+                // Recount first: a story update after something was deleted must not be refused for a total that
+                // no longer reflects what is stored.
+                if newBytes > 0, !fitsReceivedMedia(newBytes - oldBytes) { break }
                 var style = cleanedStyle
                 // A new caption on a clip they already sent comes without the clip.
                 if case let .video(bytes, caption) = style, bytes.isEmpty, case let .video(have, _) = data.stories[i].style, !have.isEmpty {
@@ -7650,17 +7829,45 @@ final class AppModel {
                 data.stories[i].style = style
                 data.stories[i].lifetime = lifetime
                 data.stories[i].loops = loops == true ? true : nil
-                if !data.stories[i].isLive { data.stories.remove(at: i); break }
+                receivedMediaBytes += Self.mediaBytes(style) - oldBytes
+                if newBytes > 0 {
+                    data.stories[i].mediaDropped = nil
+                    data.stories[i].mediaGone = nil
+                }
+                if !data.stories[i].isLive {
+                    receivedMediaBytes -= Self.mediaBytes(style)
+                    data.stories.remove(at: i)
+                    break
+                }
                 acknowledgeStory(id, author: fp, persona: persona)
                 // Sent again because pieces went missing: what's here now may complete it. The story arriving again
                 // is not progress (only a piece is), or a sender that keeps repeating it would keep this from
                 // ever asking for the clip.
-                if clipActivity[ClipKey(id, persona)] == nil { clipActivity[ClipKey(id, persona)] = Date() }
+                if data.stories[i].isReady || data.stories[i].mediaDropped == true {
+                    clipActivity[ClipKey(id, persona)] = nil
+                } else if clipActivity[ClipKey(id, persona)] == nil {
+                    clipActivity[ClipKey(id, persona)] = Date()
+                }
                 assembleClip(id, persona: persona)
                 break
             }
-            var story = Story(id: id, author: fp, style: cleanedStyle, date: dated(date))
-            if !story.isReady { clipActivity[ClipKey(id, persona)] = Date() }
+            let styleBytes = Self.mediaBytes(cleanedStyle)
+            var style = cleanedStyle
+            var dropped = false
+            if styleBytes > 0, !fitsReceivedMedia(styleBytes) {
+                style = Self.withoutMedia(style)
+                dropped = true
+            }
+            var story = Story(id: id, author: fp, style: style, date: dated(date))
+            story.mediaDropped = dropped ? true : nil
+            if !story.isReady {
+                if dropped || !fitsReceivedMedia(0) {
+                    story.mediaDropped = true
+                    clipActivity[ClipKey(id, persona)] = nil
+                } else {
+                    clipActivity[ClipKey(id, persona)] = Date()
+                }
+            }
             story.persona = persona
             story.lifetime = lifetime
             story.loops = loops == true ? true : nil
@@ -7672,6 +7879,7 @@ final class AppModel {
                     let keep = Set(theirs.sorted { $0.date > $1.date }.prefix(Self.maxStoriesPerAuthor - 1).map(\.id))
                     data.stories.removeAll { $0.author == fp && $0.persona == persona && !keep.contains($0.id) }
                 }
+                receivedMediaBytes += Self.mediaBytes(style)
                 withAnimation(.snappy) { data.stories.append(story) }
             }
             assembleClip(id, persona: persona)
@@ -7679,10 +7887,13 @@ final class AppModel {
         case let .storyPart(id, index, of, bytes):
             let key = ClipKey(id, persona)
             guard removedStories["\(fp)|\(id)"] == nil else { break }
-            // A piece sent again after the clip came together: nothing to do with it.
-            if data.stories.contains(where: { $0.id == id && $0.author == fp && $0.persona == persona && $0.isReady }) { break }
+            // A piece sent again after the clip came together, or for a story whose media was not saved: nothing to do,
+            // unless the user has just asked for that item again.
+            if !mediaRequested.contains(id), data.stories.contains(where: { $0.id == id && $0.author == fp && $0.persona == persona
+                && ($0.isReady || $0.mediaDropped == true) }) { break }
             if let at = mediaMessage(id, persona: .some(persona)), data.conversations[at.convo].persona == persona,
-               !Self.isPending(data.conversations[at.convo].messages[at.message]) { break }
+               (data.conversations[at.convo].messages[at.message].mediaDropped == true
+                || !Self.isPending(data.conversations[at.convo].messages[at.message])), !mediaRequested.contains(id) { break }
             guard (1...StoryClipPieces.maxPieces).contains(of), (0..<of).contains(index), bytes.count <= StoryClipPieces.framedSize,
                   data.clipParts[key.stored] != nil
                     || (data.clipParts.count < 32 && data.clipParts.values.filter { $0.author == fp }.count < Self.maxClipsPerSender)
@@ -7990,25 +8201,57 @@ final class AppModel {
             message.attachment = a
             message.text = ""
         }
+        let roomForNewMedia = fitsReceivedMedia(0)
+        let clipKey = ClipKey(wire.id, data.conversations[i].persona)
         if let clip = wire.clip {
             // A video: its clip comes in pieces after this (some may be here already).
-            message.video = Data()
             message.clipSeconds = min(max(clip.seconds, 0), ChatVideo.maxSeconds)
-            clipActivity[ClipKey(wire.id, data.conversations[i].persona)] = Date()
+            if roomForNewMedia {
+                message.video = Data()
+                clipActivity[clipKey] = Date()
+            } else {
+                message.mediaDropped = true
+                message.image = nil
+            }
         } else if message.attachment == nil, let follows = wire.mediaFollows {
             // A photo or voice note that follows on its own: until then the message holds a tiny preview, or the voice
             // note's length and waveform.
-            switch follows {
-            case .photo where wire.voice == nil:
-                message.awaiting = .photo
-                if let preview = message.image, preview.count > ReplyRef.maxPicture { message.image = nil }
-            case .voice where wire.voice != nil && wire.image == nil:
-                message.awaiting = .voice
+            if roomForNewMedia {
+                switch follows {
+                case .photo where wire.voice == nil:
+                    message.awaiting = .photo
+                    if let preview = message.image, preview.count > ReplyRef.maxPicture { message.image = nil }
+                case .voice where wire.voice != nil && wire.image == nil:
+                    message.awaiting = .voice
+                    message.voice?.audio = Data()
+                default:
+                    break
+                }
+                if message.awaiting != nil { clipActivity[clipKey] = Date() }
+            } else {
+                message.mediaDropped = true
+                message.image = nil
                 message.voice?.audio = Data()
-            default:
-                break
             }
-            if message.awaiting != nil { clipActivity[ClipKey(wire.id, data.conversations[i].persona)] = Date() }
+        }
+        let incomingMedia = Self.mediaBytes(message)
+        if incomingMedia > 0 {
+            if fitsReceivedMedia(incomingMedia) {
+                receivedMediaBytes += incomingMedia
+            } else {
+                // Too much here already: keep the words, time and reactions, and let the UI offer to fetch the main
+                // media anyway. Small quote and link-preview pictures are simply left off.
+                let hadPrimary = message.image != nil || message.video != nil || message.voice != nil
+                message.image = nil
+                message.video = nil
+                message.voice?.audio = Data()
+                message.reply?.picture = nil
+                message.preview?.image = nil
+                message.awaiting = nil
+                if hadPrimary { message.mediaDropped = true }
+                message.mediaGone = nil
+                clipActivity[clipKey] = nil
+            }
         }
         typing[data.conversations[i].id]?[sender.fingerprint] = nil
         withAnimation(.snappy(duration: 0.4)) { data.conversations[i].messages.append(message) }

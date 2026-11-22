@@ -180,6 +180,24 @@ struct StoryFace: View {
         return "\(what) · \(got.have) of \(got.of)"
     }
 
+    /// Media that was not stored because this device is holding too much already.
+    private var mediaMissing: some View {
+        VStack(spacing: 10) {
+            Text(story.mediaGone == true ? "No longer available" : "Not saved - storage full")
+                .font(.system(size: 13, weight: .semibold))
+                .multilineTextAlignment(.center)
+            if story.mediaGone != true, !compact, let model {
+                Button("Get it anyway") { model.getStoryAnyway(story) }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 13, weight: .semibold))
+                    .padding(.horizontal, 16).padding(.vertical, 8)
+                    .background(.white.opacity(0.18), in: .capsule)
+            }
+        }
+        .foregroundStyle(.white.opacity(0.85))
+        .padding(.horizontal, 28)
+    }
+
     /// A video still on its way: how far it has got, and once it has been asked for, who it is waiting on, with a
     /// way to ask again. Read again every few seconds, since the asking happens out of sight.
     private var waiting: some View {
@@ -217,7 +235,9 @@ struct StoryFace: View {
                     .padding(compact ? 16 : 40)
             case let .image(data, caption):
                 Color.black
-                if data.isEmpty {
+                if story.mediaDropped == true {
+                    mediaMissing
+                } else if data.isEmpty {
                     // Still arriving: it shows as soon as the picture is in.
                     VStack(spacing: 10) {
                         ProgressView().tint(.white)
@@ -231,7 +251,9 @@ struct StoryFace: View {
                 if !caption.isEmpty { StoryCaption(text: caption, compact: compact) }
             case let .video(data, caption):
                 Color.black
-                if data.isEmpty {
+                if story.mediaDropped == true {
+                    mediaMissing
+                } else if data.isEmpty {
                     // Still arriving: it plays as soon as the last piece is in.
                     VStack(spacing: 10) {
                         ProgressView().tint(.white)

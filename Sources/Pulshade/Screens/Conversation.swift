@@ -294,6 +294,7 @@ struct ConversationView: View {
                swipe: !copy && swipe?.id == m.id ? swipe?.dx ?? 0 : 0,
                react: { model.react($0, to: m.id, in: id) },
                reply: { startReply(m) },
+               getMedia: { model.getMediaAnyway(messageID: m.id, in: id) },
                unsend: { model.unsend(m.id, in: id) },
                jump: { target in if let proxy { jump(to: target, proxy: proxy) } },
                hover: { inside in if inside { hovered = m.id } else if hovered == m.id { hovered = nil } },
@@ -967,6 +968,8 @@ fileprivate struct Bubble: View, Equatable {
     var swipe: CGFloat
     var react: (String) -> Void
     var reply: () -> Void
+    /// Asks the sender for media that was not saved because this device is holding too much already.
+    var getMedia: () -> Void = {}
     var unsend: () -> Void
     var jump: (UUID) -> Void
     var hover: (Bool) -> Void
@@ -1397,11 +1400,28 @@ fileprivate struct Bubble: View, Equatable {
         }
     }
 
+    @ViewBuilder private var droppedMedia: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Label(message.mediaGone == true ? "No longer available" : "Not saved - storage full",
+                  systemImage: "exclamationmark.triangle")
+                .font(.system(size: 12, weight: .semibold))
+            if message.mediaGone != true {
+                Button("Get it anyway", action: getMedia)
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12, weight: .semibold))
+            }
+        }
+        .foregroundStyle(message.isMine ? Ink.onAccent.opacity(0.8) : Ink.dim)
+        .padding(.vertical, 2)
+    }
+
     private var textBubble: some View {
         let mine = message.isMine
         return VStack(alignment: mine ? .trailing : .leading, spacing: 6) {
             header
-            if let voice = message.voice {
+            if message.mediaDropped == true {
+                droppedMedia
+            } else if let voice = message.voice {
                 VoiceBubble(note: voice, id: message.id, mine: mine, loading: message.awaiting == .voice)
             }
             if message.attachment?.kind == .file {

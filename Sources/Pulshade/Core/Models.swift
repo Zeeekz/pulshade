@@ -69,7 +69,7 @@ struct HeldMail: Codable, Equatable {
     var receiveKey: Data
     var blob: Data
     /// When it arrived, so the oldest can go first across a contact's devices. Nil in vaults from before this.
-    var at: Date?
+    var at: Date? = nil
 }
 
 struct DeviceLink: Codable {
@@ -649,6 +649,10 @@ struct Message: Codable, Identifiable, Equatable {
     /// A photo or voice note whose bytes are still on their way (from the relay, or in pieces): what's here until then
     /// is a tiny preview, or a voice note's length and waveform without its sound.
     var awaiting: Attachment.Kind?
+    /// Received media that was not stored because this device is holding too much already. The words remain.
+    var mediaDropped: Bool? = nil
+    /// A dropped item that can no longer be fetched: the sender no longer has it, or it would not fit even on request.
+    var mediaGone: Bool? = nil
 
     var isVideo: Bool { video != nil }
     /// Whether this message @-mentions you.
@@ -693,6 +697,8 @@ struct Message: Codable, Identifiable, Equatable {
         noForward = try? c.decodeIfPresent(Bool.self, forKey: .noForward)
         forwarded = try? c.decodeIfPresent(Bool.self, forKey: .forwarded)
         awaiting = try? c.decodeIfPresent(Attachment.Kind.self, forKey: .awaiting)
+        mediaDropped = try? c.decodeIfPresent(Bool.self, forKey: .mediaDropped)
+        mediaGone = try? c.decodeIfPresent(Bool.self, forKey: .mediaGone)
     }
 }
 
@@ -1144,6 +1150,10 @@ struct Story: Codable, Identifiable, Equatable {
     var clipBlob: Attachment?
     /// A video story only: when it ends it plays again from the start, until the viewer moves on. Nil is no.
     var loops: Bool?
+    /// Received media that was not stored because this device is holding too much already.
+    var mediaDropped: Bool? = nil
+    /// A dropped story that can no longer be fetched.
+    var mediaGone: Bool? = nil
 
     /// Whether it can ride along in a device sync, which fits a story only as small as a photo.
     var isSyncable: Bool {
