@@ -96,7 +96,7 @@ private struct PhoneMainView: View {
             Tab("Contacts", systemImage: "person.2", value: Section.contacts) {
                 ContactsView(openChat: open).background(Ink.base)
             }
-            .badge(model.requests.count)
+            .badge(model.requests.count + model.groupOffers.count)
             Tab("Burn", systemImage: "flame", value: Section.burn) {
                 LeaveView().background(Ink.base)
             }
@@ -464,8 +464,8 @@ private struct Rail: View {
                 Image(systemName: s.symbol)
                     .font(.system(size: 16, weight: .medium))
                     .foregroundStyle(section == s ? theme.accent : Ink.faint)
-                if s == .contacts, !model.requests.isEmpty {
-                    Text("\(model.requests.count)")
+                if s == .contacts, !model.requests.isEmpty || !model.groupOffers.isEmpty {
+                    Text("\(model.requests.count + model.groupOffers.count)")
                         .font(.system(size: 9, weight: .bold))
                         .foregroundStyle(Ink.onAccent)
                         .padding(.horizontal, 4).frame(minWidth: 15, minHeight: 15)

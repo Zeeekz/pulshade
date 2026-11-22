@@ -1,4 +1,5 @@
 import SwiftUI
+import LocalAuthentication
 
 /// The camera on the chat list. It reads a new device's code to link it, or a friend's invite to add them.
 /// Also opens with a code the system Camera handed over through a pulshade:// link.
@@ -175,6 +176,8 @@ struct LinkApproval: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
+    @State private var checkingOwner = false
+    @State private var askNoPasscode = false
 
     var body: some View {
         if let digits = model.linkConfirmation, model.pendingLink == nil {
@@ -220,9 +223,33 @@ struct LinkApproval: View {
                     }
                     .buttonStyle(.plain).foregroundStyle(Ink.dim)
                     Button {
-                        model.approveLink()
+                        // The whole account goes to whoever made this code, so the person holding this device proves it's
+                        // theirs first (Face ID, Touch ID or the device passcode): a code someone talked them into
+                        // scanning, or a phone left unlocked, isn't enough on its own. A device with no passcode at all
+                        // gets a second, plain question instead.
+                        guard !checkingOwner else { return }
+                        let context = LAContext()
+                        var problem: NSError?
+                        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &problem) else {
+                            // Only a device with no passcode at all gets the plain question; any other failure is a no.
+                            if problem?.code == LAError.passcodeNotSet.rawValue { askNoPasscode = true }
+                            return
+                        }
+                        checkingOwner = true
+                        context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "Give a new device your whole account") { ok, _ in
+                            Task { @MainActor in
+                                checkingOwner = false
+                                if ok { model.approveLink() }
+                            }
+                        }
                     } label: {
                         Text("Link").font(.system(size: 13, weight: .semibold)).padding(.horizontal, 16)
+                    }
+                    .disabled(checkingOwner)
+                    .confirmationDialog("This device has no passcode, so anyone holding it could do this. Give the new device your whole account?",
+                                        isPresented: $askNoPasscode, titleVisibility: .visible) {
+                        Button("Link", role: .destructive) { model.approveLink() }
+                        Button("Cancel", role: .cancel) {}
                     }
                     .buttonStyle(GlowButtonStyle(size: 34))
                 }

@@ -97,7 +97,9 @@ struct Identity {
 }
 
 /// An invite carries only public keys and the send id of a brand-new mailbox.
-/// Each contact invite works once, so two contacts can't compare invites to link you.
+/// Each contact invite opens its own mailbox and works once, so the relay can't tie your mailboxes together. Every invite
+/// from one persona carries that persona's identity key, so two invites from it can be matched: personas are what keep
+/// identities apart.
 struct Invite: Equatable {
     enum Kind: UInt8 { case contact = 1, channel = 2 }
 

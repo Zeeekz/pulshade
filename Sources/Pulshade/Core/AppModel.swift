@@ -1694,6 +1694,27 @@ final class AppModel {
         if let known, !known.hidden, invite.kind == .contact { return known }
         // Keys already pinned for this signing key must be the ones the invite commits to: they come from the same seed.
         if let pinned = known?.pq, pinned.commitment != invite.pqHash { return nil }
+        // A friend's channel code used again within a few days sends nothing more: their phone already has the hello, and
+        // each one keeps an ask on every one of their devices (see below), which would push out real ones.
+        let followedLately = known.map { !$0.hidden } == true && invite.kind == .channel
+            && data.followsAsked[Self.followKey(invite.fingerprint, owner)].map { Date().timeIntervalSince($0) < 3 * 86_400 } == true
+        if invite.kind == .channel { noteFollowAsked(invite.fingerprint, persona: owner) }
+        if followedLately, let known { save(); return known }
+        // A friend's own channel: the friend stays exactly as they are (devices, sessions, mailboxes, nickname). The hello
+        // goes to the channel's code mailbox and names the mailbox they already write to, so their phone only lets this
+        // account into the channel and changes nothing about the chat.
+        if let known, !known.hidden, invite.kind == .channel {
+            guard let i = contactIndex(known.fingerprint, owner), !known.devices.isEmpty, let receiveKey = known.receiveKey,
+                  let (pending, request) = signedHandshake(persona: owner, to: invite.signingKey, context: .hello),
+                  let meCard = card(sendID: Mailbox.sendID(for: receiveKey), persona: owner) else { return nil }
+            // Their app from before this answers such a hello with new keys for the chat, from whichever of their devices
+            // read the code: the ask is kept on each, so that answer completes here instead of leaving the two sides on
+            // different keys. A newer app doesn't answer, and the ask is let go with the other old ones.
+            for d in data.contacts[i].devices.indices { keepEarlierAsk(pending, contact: i, device: d) }
+            seal(.hello(meCard, request), contact: i, device: 0, toSendID: invite.sendID, toRelay: .some(invite.relay))
+            save()
+            return known
+        }
 
         let mailbox = Mailbox.make()
         var contact = known ?? Contact(fingerprint: invite.fingerprint, signingKey: invite.signingKey,
@@ -1701,6 +1722,8 @@ final class AppModel {
         contact.persona = owner
         contact.pqCommit = invite.pqHash
         contact.relay = invite.relay
+        // Someone whose code you used yourself is never let go as a stranger who said hello on yours.
+        contact.viaCode = nil
         contact.nickname = nickname
         contact.receiveKey = mailbox.receiveKey
         // Following a channel doesn't make its owner one of your contacts.
@@ -4629,6 +4652,8 @@ final class AppModel {
     /// were ready and their app would forget you again, and the record would be forgotten here too.
     static func takeBack(_ contact: inout Contact) {
         contact.departing = nil
+        // A friend now, not a stranger from a channel's code: never let go with those.
+        contact.viaCode = nil
         for d in contact.devices.indices {
             contact.devices[d].pending.removeAll { if case .burn = $0.payload { true } else { false } }
         }
@@ -5202,7 +5227,7 @@ final class AppModel {
     /// Seals a payload to one of a contact's devices, as the persona that knows them, and queues it.
     private func seal(_ payload: Payload, contact i: Int, device d: Int, message: UUID? = nil, ephemeral: Bool = false,
                       collapse: String? = nil, resendOf: UUID? = nil, story: UUID? = nil, viewReport: UUID? = nil, rings: Bool = false, framed: Bool = false,
-                      wakes: Bool = false) {
+                      wakes: Bool = false, toSendID: Data? = nil, toRelay: String?? = nil) {
         let c = data.contacts[i]
         guard c.devices.indices.contains(d), let me = me(c.persona) else { return }
         let blob: Data
@@ -5231,14 +5256,14 @@ final class AppModel {
             sendPQIntro(contact: i)
             return
         }
-        let sendID = c.devices[d].sendID
+        let sendID = toSendID ?? c.devices[d].sendID
         // Only the newest of these waits for a mailbox.
         if ephemeral { data.outbox.removeAll { $0.ephemeral == true && $0.sendID == sendID } }
         // A friend request is the one thing besides a message that should wake a locked phone: it's how you hear that
         // someone wants to talk to you. The relay is only asked to wake for mail that says so.
         var asksToWake = wakes
         if case .request = payload { asksToWake = true }
-        var outgoing = Outgoing(sendID: sendID, blob: blob, relay: c.relay, message: message, ephemeral: ephemeral ? true : nil,
+        var outgoing = Outgoing(sendID: sendID, blob: blob, relay: toRelay ?? c.relay, message: message, ephemeral: ephemeral ? true : nil,
                                 story: story, viewReport: viewReport, lane: c.persona == nil ? nil : Outgoing.lane(for: c.persona), rings: rings ? true : nil,
                                 wakes: asksToWake ? true : nil)
         if introduces { outgoing.introduces = true }
@@ -5347,6 +5372,15 @@ final class AppModel {
     /// When each of your messages was last sent again, and how many times, while the app is open.
     @ObservationIgnored private var resentAt: [UUID: (at: Date, count: Int)] = [:]
     @ObservationIgnored private var lastDueCheck = Date.distantPast
+    /// When invites to groups were last told about, so a flood of them makes a few banners an hour at most.
+    @ObservationIgnored private var offerNotices: [Date] = []
+    static let offerNoticesPerHour = 5
+    #if DEBUG
+    /// For tests about other things: invites to groups and channels are taken as if you'd said yes at once.
+    @ObservationIgnored var acceptsInvitesForTests = false
+    #else
+    let acceptsInvitesForTests = false
+    #endif
 
     private func resendIsDue(_ message: Message) -> Bool {
         if resentAt[message.id] == nil {
@@ -7139,7 +7173,9 @@ final class AppModel {
             noteReads(opened, from: fp, persona: invite.persona)
             // Following through a channel's code: invited into its mailbox now that their app's abilities are known (when
             // their app can take part), up to the hourly limit.
-            if let channelID = invite.channel, let c = index(of: channelID), data.conversations[c].shared != nil {
+            // Only someone actually kept (there was room): one turned away uses none of the hour's places.
+            if let channelID = invite.channel, let c = index(of: channelID), data.conversations[c].shared != nil,
+               contact(fp, in: invite.persona) != nil {
                 admitFromCode([fp], at: c)
                 save()
             }
@@ -7854,6 +7890,59 @@ final class AppModel {
         }
     }
 
+    /// Most people kept for one channel who said hello on its code and haven't got in yet.
+    static var maxCodeStrangers = 1_000
+    /// How long someone who said hello on a channel's code and never got in is kept: as long as their invite lasts.
+    static let codeStrangerLife: TimeInterval = inviteLife
+
+    /// Makes room for one more person saying hello on a channel's code. Whoever said hello longer ago than an invite
+    /// lasts and never got in is let go; past the limit, the one who said hello first and hasn't got in (and isn't
+    /// waiting their turn) makes way, so a flood of throwaway accounts that never answer can't keep newcomers out.
+    /// False only if everyone held is waiting their turn.
+    private func roomForCodeHello(_ channel: UUID, persona: UUID?) -> Bool {
+        let now = Date()
+        func shared(_ c: Contact) -> SharedGroup? { c.viaCode.flatMap { index(of: $0) }.flatMap { data.conversations[$0].shared } }
+        func admitted(_ c: Contact) -> Bool { shared(c)?.knownAs[c.fingerprint] != nil }
+        func queued(_ c: Contact) -> Bool { shared(c)?.joinWaiting?.contains(c.fingerprint) == true }
+        func invitedLately(_ c: Contact) -> Bool {
+            shared(c)?.invited[c.fingerprint].map { now.timeIntervalSince($0) < Self.inviteLife } == true
+        }
+        func inAGroup(_ c: Contact) -> Bool {
+            data.conversations.contains { $0.persona == c.persona && ($0.members.contains(c.fingerprint) || $0.owner == c.fingerprint) }
+        }
+        // Anyone this account depends on, whatever channel code they first came through: the one a channel is followed
+        // through, someone known in any channel, someone invited to (or asked to staff) a channel other than the one whose
+        // code they said hello on, or someone asked to be a friend. An unanswered invite to that same channel doesn't count:
+        // that's the stranger the limit is for.
+        let convos = data.conversations
+        let inviters = Set(convos.compactMap { $0.shared?.ownerAccount })
+        let known = Set(convos.flatMap { $0.shared?.knownAs.keys.map { $0 } ?? [] })
+        func neededElsewhere(_ c: Contact) -> Bool {
+            inviters.contains(c.fingerprint) || known.contains(c.fingerprint)
+                || convos.contains { $0.id != c.viaCode && ($0.shared?.invited[c.fingerprint] != nil || $0.shared?.staffInvited?[c.fingerprint] != nil) }
+        }
+        func stranger(_ c: Contact) -> Bool {
+            c.viaCode != nil && c.hidden && !c.isSelf && !c.awaitingAcceptance && !admitted(c) && !inAGroup(c) && !neededElsewhere(c)
+        }
+        // Worked out first and taken out after: the checks read the vault's data, which can't be read while it's changed.
+        let contacts = data.contacts
+        var gone = Set(contacts.indices.filter { i in
+            let c = contacts[i]
+            return stranger(c) && now.timeIntervalSince(c.addedAt) > Self.codeStrangerLife && !queued(c) && !invitedLately(c)
+        })
+        var held = contacts.indices.filter { !gone.contains($0) && contacts[$0].viaCode == channel && contacts[$0].persona == persona && stranger(contacts[$0]) }
+        while held.count >= Self.maxCodeStrangers {
+            guard let oldest = held.filter({ !queued(contacts[$0]) }).min(by: { contacts[$0].addedAt < contacts[$1].addedAt }) else { break }
+            gone.insert(oldest)
+            held.removeAll { $0 == oldest }
+        }
+        if !gone.isEmpty {
+            data.contacts = contacts.indices.filter { !gone.contains($0) }.map { contacts[$0] }
+            save()
+        }
+        return held.count < Self.maxCodeStrangers
+    }
+
     private func acceptHello(_ card: PeerCard, _ request: SessionInit, fingerprint fp: String, device: Data,
                              via invite: OpenInvite, pq: PQPin, sentAt: Date? = nil) {
         let persona = invite.persona
@@ -7898,6 +7987,19 @@ final class AppModel {
         }
 
         if let channelID = invite.channel {
+            // A friend following this channel from an app that leaves the chat as it is: the hello names the mailbox this
+            // device already writes to them at. Nothing about the friend changes (no new session, nothing replaced); the
+            // caller lets them into the channel.
+            if let known, !known.hidden, known.devices.contains(where: { $0.sendID == card.sendID }) {
+                _ = channelID
+                return
+            }
+            if known == nil {
+                // A stranger on the code: no picture kept (staff never show one), and only while there's room.
+                guard roomForCodeHello(channelID, persona: persona) else { return }
+                peer.viaCode = channelID
+                peer.avatar = nil
+            }
             peer.hidden = known?.hidden ?? true
             upsert(peer)
             answer()
@@ -9990,8 +10092,11 @@ extension AppModel {
 
     // MARK: Being invited
 
-    /// An invite over a chat with someone you know. The group is joined straight away, and the card goes back to whoever invited.
-    func acceptGroupInvite(_ invite: GroupInvite, from sender: Contact) {
+    /// An invite over a chat with someone you know. A group or channel this account isn't in yet waits for you to say yes
+    /// (`groupOffers`), unless it's the channel of someone whose channel code you followed: nobody puts you in a group,
+    /// gets your card, or makes themselves the one a channel listens to on this account without you choosing them. Once
+    /// you're in, the card goes back to whoever invited.
+    func acceptGroupInvite(_ invite: GroupInvite, from sender: Contact, consented: Bool = false) {
         let s = invite.settings
         guard s.kind == .group || s.kind == .channel, s.signatureIsValid, s.wellFormed(),
               s.isAdmin(s.signer), s.epoch == invite.epoch.number, invite.epoch.isValid, s.epochCheck == invite.epoch.check, !sender.isSelf,
@@ -10038,6 +10143,16 @@ extension AppModel {
             // A new group comes from a friend. Someone known only through another group or a channel can't put this
             // account in one (and so get its name and picture card back); a channel's own invite is how it is followed.
             if s.kind == .group, sender.hidden { return }
+            let followed = s.kind == .channel && takeFollowAsked(sender.fingerprint, persona: sender.persona)
+            // Nor a channel, unless it's the one whose code you followed: anyone who said hello on a channel's code, or
+            // the staff of a channel you follow, would otherwise have a way to send you invites (and notifications) of
+            // their own making.
+            if s.kind == .channel, sender.hidden, !followed, !consented { return }
+            if !consented, !acceptsInvitesForTests, !followed {
+                noteGroupOffer(invite, from: sender)
+                return
+            }
+            data.groupOffers.removeAll { $0.invite.settings.group == s.group && $0.persona == sender.persona }
             let place = newGroupPlace(s.group, persona: sender.persona)
             var convo = Conversation(id: place.id, kind: s.kind, title: String(s.title.prefix(80)), avatar: s.avatar, members: [])
             convo.groupID = place.groupID
@@ -11467,6 +11582,7 @@ extension AppModel {
             keys = renewed
         }
         let joining = !settings.isMember(keys.publicKey)
+        data.groupOffers.removeAll { $0.invite.settings.group == settings.group && $0.persona == persona }
         if let i = groupIndex(settings.group, persona: persona) {
             var shared = data.conversations[i].shared ?? SharedGroup(settings: settings, epochs: [], joining: joining)
             if settings.version >= shared.settings.version || shared.epochs.isEmpty {
@@ -12061,7 +12177,13 @@ extension AppModel {
     private func takeChainKeysFromInviter(_ group: UUID, keys: [GroupChainKey], from sender: Contact) {
         guard let i = groupIndex(group, persona: sender.persona), let shared = data.conversations[i].shared,
               isFollower(data.conversations[i]), shared.ownerAccount == sender.fingerprint else { return }
-        let staff = keys.filter { $0.epoch != 0 && shared.settings.isAdmin($0.sender) }
+        // Never a jump far past a chain already followed: that would replace the real chain with one of the inviter's
+        // choosing, and the staff member's posts would stop opening here.
+        let staff = keys.filter { k in
+            guard k.epoch != 0, shared.settings.isAdmin(k.sender) else { return false }
+            guard let held = shared.reader.chains[GroupReader.id(epoch: k.epoch, sender: k.sender, device: k.device)] else { return true }
+            return !(k.index > held.index && k.index - held.index > GroupReader.maxSkip)
+        }
         if takeChainKeys(staff, from: nil, at: i) { rereadHeldMail(at: i) }
         save()
     }
@@ -12384,12 +12506,14 @@ extension AppModel {
                                    expires: link.expires.map(wholeSecond), requestKey: link.requestPublic, mailbox: link.mailboxSendID,
                                    owner: s.owner, admins: Array(s.admins.prefix(200)), made: wholeSecond(Date()))
         if (preview.avatar?.count ?? 0) > 32 * 1024 { preview.avatar = nil }
+        preview.slot = JoinSlot.tag(link.secret)
         preview.sign(with: keys)
         return preview
     }
 
     /// The owner's phone writes every link's preview whose content changed (a new name, size, or set of admins), or that
-    /// hasn't been written for a few days (so one a link holder overwrote doesn't stay broken). Only the owner signs
+    /// hasn't been written for a day (so one a link holder deleted or overwrote doesn't stay broken, and openers, who take
+    /// a preview only for two weeks after it was made, always find a fresh one). Only the owner signs
     /// previews, and the link names the owner, so nobody who stops being an admin can put out one of their own.
     func writePreviews(at i: Int) {
         guard let keys = amGroupOwner(at: i), isLeadDevice(data.conversations[i].persona),
@@ -12399,7 +12523,7 @@ extension AppModel {
             guard let preview = preview(of: link, at: i, keys: keys), let slot = JoinSlot.keys(link.secret),
                   let sealed = JoinSlot.seal(preview, with: slot) else { continue }
             let mark = data.conversations[i].shared?.previews?[link.id.uuidString]
-            if let mark, mark.hash == preview.contentHash, now.timeIntervalSince(mark.at) < 3 * 86_400 { continue }
+            if let mark, mark.hash == preview.contentHash, now.timeIntervalSince(mark.at) < 86_400 { continue }
             guard let client = client(nil, lane: "join-\(link.id.uuidString.prefix(8))") else { continue }
             let group = data.conversations[i].id, hash = preview.contentHash, id = link.id.uuidString
             // Marked before it goes, so a slow write isn't started again; put back if it fails.
@@ -12436,6 +12560,7 @@ extension AppModel {
     /// go are sent and old ones dropped; and every join and answer mailbox this device looks after is read, each group's
     /// and each ask's on a connection of its own.
     func tendJoinLinks(force: Bool = false) {
+        dropStaleOffers()
         let now = Date()
         for i in data.conversations.indices {
             guard let keys = amGroupAdmin(at: i), let shared = data.conversations[i].shared, let links = shared.links else { continue }
@@ -12741,7 +12866,7 @@ extension AppModel {
     func previewGroup(_ code: GroupLinkCode) async -> GroupPreview? {
         guard let slot = JoinSlot.keys(code.secret), let client = client(nil, lane: "join-preview|\(UUID().uuidString)") else { return nil }
         let (key, sig, ts) = SpareSlot.proof("pulshade.backup.get.v1", slot)
-        guard let blob = try? await client.backup(key: key, sig: sig, ts: ts), let preview = JoinSlot.open(blob, with: slot),
+        guard let blob = try? await client.backup(key: key, sig: sig, ts: ts, limit: JoinSlot.maxBlob), let preview = JoinSlot.open(blob, with: slot),
               preview.verified(by: code) else { return nil }
         return preview
     }
@@ -12922,6 +13047,76 @@ extension AppModel {
                 : "\(sender?.displayName ?? "Someone") from \(title) wants to be friends"
             Notifier.shared.post(("PULSHADE", words), conversation: group ?? UUID(), sound: data.security.notificationSound)
         }
+    }
+
+    // MARK: Group and channel invites waiting for a yes
+
+    /// Invites past their time are let go (housekeeping), with the group keys they hold.
+    private func dropStaleOffers() {
+        let before = data.groupOffers.count
+        data.groupOffers.removeAll { Date().timeIntervalSince($0.at) >= GroupOffer.life }
+        if data.groupOffers.count != before { save() }
+    }
+
+    var groupOffers: [GroupOffer] {
+        data.groupOffers.filter { $0.persona == activePersona && Date().timeIntervalSince($0.at) < GroupOffer.life }
+    }
+
+    private static func followKey(_ fp: String, _ persona: UUID?) -> String { "\(persona?.uuidString ?? "")|\(fp)" }
+    private static let followAskLife: TimeInterval = 14 * 86_400
+
+    /// You followed this person's channel code: their channel's invite is taken without asking again.
+    private func noteFollowAsked(_ fp: String, persona: UUID?) {
+        data.followsAsked = data.followsAsked.filter { Date().timeIntervalSince($0.value) < Self.followAskLife }
+        data.followsAsked[Self.followKey(fp, persona)] = Date()
+    }
+
+    /// Whether you followed this person's channel code lately; used up by the invite it brings.
+    private func takeFollowAsked(_ fp: String, persona: UUID?) -> Bool {
+        let key = Self.followKey(fp, persona)
+        guard let at = data.followsAsked[key] else { return false }
+        data.followsAsked[key] = nil
+        return Date().timeIntervalSince(at) < Self.followAskLife
+    }
+
+    /// An invite to a group or channel you aren't in: kept, without joining anything, until you answer.
+    private func noteGroupOffer(_ invite: GroupInvite, from sender: Contact) {
+        guard !data.blocked.contains(sender.fingerprint), !sender.hidden else { return }
+        let s = invite.settings
+        data.groupOffers.removeAll {
+            Date().timeIntervalSince($0.at) >= GroupOffer.life
+                || ($0.invite.settings.group == s.group && $0.persona == sender.persona && $0.from == sender.fingerprint)
+        }
+        // A few from any one person at a time: one friend can't push everyone else's out.
+        let theirs = data.groupOffers.filter { $0.from == sender.fingerprint && $0.persona == sender.persona }
+        if theirs.count >= GroupOffer.perSender, let oldest = theirs.last { data.groupOffers.removeAll { $0.id == oldest.id } }
+        let isNew = !data.groupOffers.contains { $0.invite.settings.group == s.group && $0.persona == sender.persona }
+        data.groupOffers.insert(GroupOffer(persona: sender.persona, from: sender.fingerprint,
+                                               name: String(sender.displayName.prefix(64)), avatar: sender.avatar,
+                                               title: String(s.title.prefix(80)), invite: invite), at: 0)
+        if data.groupOffers.count > GroupOffer.max { data.groupOffers.removeLast(data.groupOffers.count - GroupOffer.max) }
+        save()
+        let now = Date()
+        offerNotices = offerNotices.filter { now.timeIntervalSince($0) < 3600 }
+        if isNew, data.security.notifications, offerNotices.count < Self.offerNoticesPerHour {
+            offerNotices.append(now)
+            let words = data.security.notificationContent == .hidden ? "New invite"
+                : "\(sender.displayName) invites you to \(s.kind == .channel ? "follow" : "join") \(s.title)"
+            Notifier.shared.post(("PULSHADE", String(words.prefix(160))), conversation: s.group, sound: data.security.notificationSound)
+        }
+    }
+
+    /// Says yes to one invite: the group is joined, or the channel followed, through the person who sent it and nobody else.
+    func acceptGroupOffer(_ id: UUID) {
+        guard let offer = data.groupOffers.first(where: { $0.id == id }) else { return }
+        data.groupOffers.removeAll { $0.invite.settings.group == offer.invite.settings.group && $0.persona == offer.persona }
+        if let sender = contact(offer.from, in: offer.persona) { acceptGroupInvite(offer.invite, from: sender, consented: true) }
+        save()
+    }
+
+    func declineGroupOffer(_ id: UUID) {
+        data.groupOffers.removeAll { $0.id == id }
+        save()
     }
 
     /// Says yes: their invite code is used, as if scanned, under the persona they asked.

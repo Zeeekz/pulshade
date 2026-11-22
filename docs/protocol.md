@@ -504,8 +504,12 @@ An admin of a group that shares one mailbox can make links that let people join 
 
 What this means: anyone who has a link can read the preview, so they learn the group's name, picture, description, size
 and the member keys of its owner and admins (keys used only in this group); they can also overwrite or delete the
-preview (the admin's phone puts it back within three days, or at once on any change; a reset gives the link new
-secrets). Only admins can see who asked through a link that needs approval. The relay sees a small backup-sized slot
+preview (the owner's phone puts it back within a day, or at once on any change; a reset gives the link new
+secrets). A preview is taken for 14 days after it was made and names the link secret it was made for (a tag signed with
+a second signature that older apps ignore), so an old copy put back by someone who once held the link stops working,
+and one can't be moved into another link's slot. A preview without the tag (from an owner on an older app) is taken
+only for four days after it was made, and not at all from 1 March 2027, so taking the tag off doesn't get round it.
+Openers read at most 256 KB from the slot. Only admins can see who asked through a link that needs approval. The relay sees a small backup-sized slot
 read now and then, and envelopes going into and out of two ordinary mailboxes. If the owner's phone is away when an
 admin is removed, that admin can still read requests until it's back; previews aren't refreshed while it's away. Two admins changing the links at the same moment
 can let a use limit be passed by one or two; a ban or use count lost that way is put back by the phone that holds it.

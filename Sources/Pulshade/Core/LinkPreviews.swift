@@ -34,6 +34,15 @@ enum LinkPreviews {
         return detector?.matches(in: text, range: range).compactMap(\.url).first { isWebLink($0.absoluteString) }
     }
 
+    /// Whether the first link in the text is followed by a space or a new line: typing has moved past it. (A full stop or
+    /// question mark straight after isn't enough: the link found leaves it off, so "https://example." would count.)
+    static func linkIsFinished(in text: String) -> Bool {
+        let range = NSRange(text.startIndex..., in: text)
+        guard let match = detector?.matches(in: text, range: range).first(where: { $0.url.map { isWebLink($0.absoluteString) } == true }),
+              let end = Range(match.range, in: text)?.upperBound else { return false }
+        return end < text.endIndex && text[end].isWhitespace
+    }
+
     /// Finding links is slow next to drawing, and a chat redraws its bubbles often, so each text is looked at once.
     /// In memory only, and emptied on lock and Burn with the decoded pictures.
     private final class Linked {

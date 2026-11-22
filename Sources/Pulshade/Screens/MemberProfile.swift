@@ -123,3 +123,45 @@ struct GroupFriendInvitesSection: View {
         }
     }
 }
+
+/// Invites to groups and channels, in Contacts beside the other requests. Nothing is joined until you say yes, and the
+/// one you say yes to is the only person a channel is followed through.
+struct GroupOffersSection: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("GROUP INVITES")
+                .font(.system(size: 10, weight: .semibold)).tracking(0.6).foregroundStyle(Ink.faint).padding(.leading, 4)
+            ForEach(model.groupOffers) { offer in
+                HStack(alignment: .top, spacing: 14) {
+                    Avatar(image: offer.avatar, seed: offer.from, size: 48)
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(offer.name).font(.system(size: 14, weight: .bold)).foregroundStyle(Ink.text)
+                            Spacer()
+                            Text(offer.at.chatStamp).font(.system(size: 11)).foregroundStyle(Ink.faint)
+                        }
+                        Text("Invites you to \(offer.invite.settings.kind == .channel ? "follow" : "join") \(offer.title)").font(.system(size: 12)).foregroundStyle(Ink.dim)
+                        HStack(spacing: 8) {
+                            Button { model.acceptGroupOffer(offer.id) } label: {
+                                Label(offer.invite.settings.kind == .channel ? "Follow" : "Join", systemImage: "checkmark")
+                                    .font(.system(size: 12, weight: .bold))
+                                    .foregroundStyle(Ink.onAccent.opacity(0.85))
+                                    .padding(.horizontal, 14).frame(height: 30)
+                                    .background(theme.gradient, in: .capsule)
+                            }
+                            .buttonStyle(.plain)
+                            Button { model.declineGroupOffer(offer.id) } label: { Image(systemName: "xmark") }
+                                .buttonStyle(IconButtonStyle(size: 30))
+                                .accessibilityLabel("Decline")
+                        }
+                    }
+                }
+                .padding(12)
+                .background(Ink.surface, in: .rect(cornerRadius: 12))
+            }
+        }
+    }
+}

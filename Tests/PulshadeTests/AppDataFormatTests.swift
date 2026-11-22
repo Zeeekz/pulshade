@@ -79,7 +79,7 @@ struct AppDataFormatTests {
     /// Fails when a field is added to what's saved without raising `AppData.currentFormat`. Change the lists below
     /// together with it.
     @Test func changingWhatIsSavedMeansRaisingTheFormat() throws {
-        #expect(AppData.currentFormat == 27)
+        #expect(AppData.currentFormat == 28)
         let app = keys(AppData())
         let profile = keys(Profile())
         #expect(app == Self.appKeys, "AppData's saved fields changed: raise AppData.currentFormat, then update this list")
@@ -91,7 +91,7 @@ struct AppDataFormatTests {
     /// `setAside` and `setAsideUnseen` came without a format bump on purpose (see `AppData.setAside`): a build before
     /// them only drops pieces it couldn't read anyway, and a bump would lock out anyone who ends up back on that build.
     static let appKeys = ["activePersona", "announcementsSeen", "backupDigest", "backupSavedAt", "blobWipes", "blocked", "blockedNames", "bornAt", "chatBackground", "chatCodes", "clipParts", "contacts", "conversations", "decoySeed", "deviceID", "deviceKey",
-                          "facade", "format", "friendInvites", "groupRenewAfter", "groupSecret", "handlesTidied", "inviteRelay", "invites", "joinAsks", "linkOffers", "outbox", "panicSeed", "partingPosts", "pendingBackupForget", "personas", "profile",
+                          "facade", "followsAsked", "format", "friendInvites", "groupOffers", "groupRenewAfter", "groupSecret", "handlesTidied", "inviteRelay", "invites", "joinAsks", "linkOffers", "outbox", "panicSeed", "partingPosts", "pendingBackupForget", "personas", "profile",
                           "profileShared", "relay", "requests", "security", "seenEnvelopes", "sentDigests", "setAside", "setAsideUnseen", "stories", "storyChoices", "theme"]
     /// The collectible fields (`badge`, `collectibles`, `collectionCode`, `collectibleCodes`) were removed without a bump on
     /// purpose: data that still has them opens, the keys are just ignored (see `dataSavedWithCollectiblesStillOpens`).
@@ -99,5 +99,5 @@ struct AppDataFormatTests {
                               "moreHandles", "name", "notes", "updatedAt"]
     static let contactKeys = ["addedAt", "agreementKey", "avatar", "awaitingAcceptance", "banner", "bio", "color", "contested", "departing", "devices",
                               "fingerprint", "handle", "hidden", "isSelf", "links", "name", "nickname", "notes", "oldSpares", "persona", "pq", "pqCardSent", "pqCommit", "receiveKey", "relay", "revoked",
-                              "signingKey", "spare", "toldPresence", "tooOld", "verified", "walletChangedAt", "wantsMyPresence"]
+                              "signingKey", "spare", "toldPresence", "tooOld", "verified", "viaCode", "walletChangedAt", "wantsMyPresence"]
 }

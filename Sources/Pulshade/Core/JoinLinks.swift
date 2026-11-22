@@ -252,18 +252,45 @@ struct GroupPreview: Codable, Equatable {
     var owner: Data
     var admins: [Data]
     var made: Date
+    /// Which link secret this preview is for (`JoinSlot.tag`): a preview copied into another link's slot, or into the
+    /// slot of the same link before its keys were renewed, doesn't pass. Previews from before have none.
+    var slot: Data?
     var signer = Data()
+    /// Over everything but `slot` and `slotSignature`, exactly as apps from before sign and check it: they drop the
+    /// fields they don't know, so a signature over them as well would fail there and every link would look dead.
     var signature = Data()
+    /// Over everything, `slot` included, so the tag can't be swapped for another; apps from before ignore it.
+    var slotSignature: Data?
+
+    /// The longest a preview is taken after it was made. The owner's phone writes each one again every day, so an old
+    /// copy put back by someone who held the link (an admin since taken out, say) stops working after this, and a phone
+    /// away for a week or so doesn't leave its links dead.
+    static let life: TimeInterval = 14 * 86_400
+    /// A preview without the tag (from an owner whose app is from before it) is taken only while such apps may still be
+    /// around, and only for a few days after it was made: those apps write it again every three days. Without these, the
+    /// tag could simply be taken off a preview to get round it.
+    static let untaggedLife: TimeInterval = 4 * 86_400
+    static let untaggedUntil = Date(timeIntervalSince1970: 1_803_859_200) // 2027-03-01
 
     func signable() -> Data {
         var copy = self
         copy.signature = Data()
+        copy.slot = nil
+        copy.slotSignature = nil
         return canonical(copy, "pulshade.group.preview.v2")
+    }
+
+    func slotSignable() -> Data {
+        var copy = self
+        copy.signature = Data()
+        copy.slotSignature = nil
+        return canonical(copy, "pulshade.group.preview.slot.v1")
     }
 
     mutating func sign(with keys: GroupMemberKeys) {
         signer = keys.publicKey
         signature = (try? keys.signing.signature(for: signable())) ?? Data()
+        slotSignature = slot == nil ? nil : try? keys.signing.signature(for: slotSignable())
     }
 
     /// Who can let someone in, by this preview: the owner and the admins.
@@ -277,6 +304,9 @@ struct GroupPreview: Codable, Equatable {
         return requestKey.count == 32 && mailbox.count == 32 && owner.count == 32 && admins.count <= 200 && admins.allSatisfy { $0.count == 32 }
             && title.count <= 100 && (about?.count ?? 0) <= 500
             && (avatar?.count ?? 0) <= 32 * 1024 && (0...GroupSettings.maxMembers).contains(members) && (expires.map { $0 > now } ?? true)
+            && now.timeIntervalSince(made) < (slot == nil ? Self.untaggedLife : Self.life) && made.timeIntervalSince(now) < 86_400
+            && (slot != nil || now < Self.untaggedUntil)
+            && (slot.map { $0 == JoinSlot.tag(code.secret) && slotSignature.map { key.isValidSignature($0, for: slotSignable()) } == true } ?? true)
     }
 
     /// What changes the preview (everything but when it was made and the signature), to tell when it needs writing again.
@@ -285,6 +315,7 @@ struct GroupPreview: Codable, Equatable {
         copy.made = Date(timeIntervalSince1970: 0)
         copy.signer = Data()
         copy.signature = Data()
+        copy.slotSignature = nil
         return Data(SHA256.hash(data: canonical(copy, "")))
     }
 }
@@ -360,6 +391,12 @@ struct JoinAsk: Codable, Equatable, Identifiable {
 
 /// The slot a link's preview lives in: a slot in the relay's sealed-backup store whose keys come from the link's secret.
 enum JoinSlot {
+    /// The largest slot read: a preview is padded to 32 KB, so anything far past that is someone filling the slot.
+    static let maxBlob = 256 * 1024
+
+    /// Names a link secret inside its preview, without giving it away.
+    static func tag(_ secret: Data) -> Data { Data(SHA256.hash(data: derive(secret, "slot.tag")).prefix(16)) }
+
     static func keys(_ secret: Data) -> SpareSlot.Keys? {
         guard secret.count == 32, let signer = try? Curve25519.Signing.PrivateKey(rawRepresentation: derive(secret, "slot.signing"))
         else { return nil }
@@ -379,7 +416,7 @@ enum JoinSlot {
     }
 
     static func open(_ blob: Data, with keys: SpareSlot.Keys) -> GroupPreview? {
-        guard blob.count <= 256 * 1024, let box = try? AES.GCM.SealedBox(combined: blob),
+        guard blob.count <= maxBlob, let box = try? AES.GCM.SealedBox(combined: blob),
               let plain = try? AES.GCM.open(box, using: keys.sealing, authenticating: keys.name),
               plain.first == 0x01, plain.count >= 5 else { return nil }
         let length = plain.dropFirst().prefix(4).reduce(0) { $0 << 8 | Int($1) }

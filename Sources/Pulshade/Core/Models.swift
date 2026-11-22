@@ -220,6 +220,10 @@ struct Contact: Codable, Identifiable {
     /// Two of their devices unlinked each other (a phone that was taken, say, against the one it was taken from): both
     /// were dropped, the safety code counts as unchecked, and any new device of theirs is held until you allow it.
     var contested: Date?
+    /// The channel whose code they said hello on, when that's all this device knows them by. Someone who never got in is
+    /// let go once their invite has run out (three days), and only so many such strangers are kept for each channel (a flood of throwaway accounts
+    /// can't fill the vault).
+    var viaCode: UUID?
 
     /// Where a new contact starts: their first device's mailbox.
     var sendID: Data {
@@ -245,6 +249,7 @@ struct Contact: Codable, Identifiable {
     private enum CodingKeys: String, CodingKey {
         case fingerprint, name, nickname, avatar, banner, color, bio, links, walletChangedAt, notes, handle, verified, signingKey, agreementKey, devices, receiveKey, relay
         case hidden, isSelf, awaitingAcceptance, addedAt, persona, wantsMyPresence, toldPresence, spare, oldSpares, departing, pq, pqCommit, pqCardSent, tooOld, revoked, contested
+        case viaCode
         // Single-device fields from before linked devices.
         case sendID, session, handshake, pending
     }
@@ -283,6 +288,7 @@ struct Contact: Codable, Identifiable {
         tooOld = try? c.decodeIfPresent(Date.self, forKey: .tooOld)
         revoked = try? c.decodeIfPresent([RevokedDevice].self, forKey: .revoked)
         contested = try? c.decodeIfPresent(Date.self, forKey: .contested)
+        viaCode = try? c.decodeIfPresent(UUID.self, forKey: .viaCode)
         addedAt = try c.decodeIfPresent(Date.self, forKey: .addedAt) ?? Date()
         // A saved list of devices is taken as it is, even an empty one: your own entry once the last linked device leaves,
         // and the members of a group that shares one mailbox, who are never written to directly. (An empty list used to
@@ -335,6 +341,7 @@ struct Contact: Codable, Identifiable {
         try c.encodeIfPresent(tooOld, forKey: .tooOld)
         try c.encodeIfPresent(revoked, forKey: .revoked)
         try c.encodeIfPresent(contested, forKey: .contested)
+        try c.encodeIfPresent(viaCode, forKey: .viaCode)
     }
 
     var displayName: String {
@@ -432,6 +439,26 @@ struct GroupFriendInvite: Codable, Identifiable, Equatable {
     var at = Date()
 
     static let max = 50
+}
+
+/// Someone invited you to a group or channel you aren't in. Nothing is joined, no card goes back, and nobody becomes the
+/// one a channel is followed through, until you say yes.
+struct GroupOffer: Codable, Identifiable, Equatable {
+    var id = UUID()
+    var persona: UUID?
+    var from: String
+    var name: String
+    var avatar: Data?
+    var title: String
+    var invite: GroupInvite
+    var at = Date()
+
+    /// Most kept, and most from one person.
+    static let max = 20
+    static let perSender = 3
+    /// A little under the three days an invite lasts on the inviter's side (`AppModel.inviteLife`), so a yes near the
+    /// end (to one that took a while to arrive) still reaches them in time to be let in.
+    static let life: TimeInterval = 2 * 86_400
 }
 
 struct FriendRequest: Codable, Identifiable, Equatable {
@@ -1458,7 +1485,9 @@ struct AppData: Codable {
     /// archived (`Conversation.archived`); whether to warn before saving a photo or video out of Pulshade
     /// (`SecuritySettings.warnBeforeSaving`). Waking a locked iPhone, friend request wake-ups and receiving while
     /// auto-locked stop being saved: they're always on.
-    static let currentFormat = 27
+    /// 28: invites to groups and channels wait for a yes (`groupOffers`), channel codes followed (`followsAsked`), and
+    /// the channel a stranger said hello on (`Contact.viaCode`).
+    static let currentFormat = 28
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []
@@ -1533,6 +1562,11 @@ struct AppData: Codable {
     var joinAsks: [JoinAsk] = []
     /// Invites to be friends from people you share a group with, until you answer.
     var friendInvites: [GroupFriendInvite] = []
+    /// Invites to groups and channels you aren't in, until you answer (`GroupOffer`).
+    var groupOffers: [GroupOffer] = []
+    /// "persona|fingerprint" → when you followed that person's channel code: their channel's invite is taken without
+    /// asking again, for two weeks.
+    var followsAsked: [String: Date] = [:]
     /// Random bytes every linked device of the account holds, which group keys are made from with the seed
     /// (`GroupMemberKeys`). Replaced when a device is unlinked, and every group then moves to keys made with the new one.
     /// Nil: the seed alone (an account from before; its lead device makes one at unlock).
@@ -1633,6 +1667,8 @@ struct AppData: Codable {
         blobWipes = (try? c.decodeIfPresent([BlobWipe].self, forKey: .blobWipes)) ?? []
         joinAsks = (try? c.decodeIfPresent([JoinAsk].self, forKey: .joinAsks)) ?? []
         friendInvites = (try? c.decodeIfPresent([GroupFriendInvite].self, forKey: .friendInvites)) ?? []
+        groupOffers = (try? c.decodeIfPresent([GroupOffer].self, forKey: .groupOffers)) ?? []
+        followsAsked = (try? c.decodeIfPresent([String: Date].self, forKey: .followsAsked)) ?? [:]
         personas = try c.decodeIfPresent([Persona].self, forKey: .personas) ?? []
         requests = (try? c.decodeIfPresent([FriendRequest].self, forKey: .requests)) ?? []
         blocked = try c.decodeIfPresent([String].self, forKey: .blocked) ?? []

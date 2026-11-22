@@ -1054,7 +1054,7 @@ private struct MessagePrivacySettings: View {
                 SecurityToggle(title: "Ask before a friend's new device gets my messages", key: \.holdNewDevices)
             }
             LearnMore(title: "Link previews",
-                      text: "Fetched over Tor, so the site never sees your IP (with Tor off, it does).")
+                      text: "Fetched once a link is pasted or finished, before you send it, whether or not you then send it. Over Tor, so the site never sees your IP (with Tor off, it does).")
         }
     }
 }

@@ -692,9 +692,9 @@ struct ConversationView: View {
                         // Pasted text keeps its paragraphs and lists (PastedText).
                         .onChange(of: focused, initial: true) { _, now in if now { ShapedPaste.attachToFocusedField() } }
                         #endif
-                        .onChange(of: draft) { _, new in
+                        .onChange(of: draft) { old, new in
                             if !new.isEmpty { model.noteTyping(in: id) }
-                            refreshPreview(for: new)
+                            refreshPreview(for: new, pasted: new.count - old.count >= 8)
                         }
                         .overlay(alignment: .bottomTrailing) {
                             if !Platform.isPhone {
@@ -765,14 +765,16 @@ struct ConversationView: View {
         }
     }
 
-    /// Builds a preview for the first link in the draft, after typing pauses.
-    private func refreshPreview(for text: String) {
+    /// Builds a preview for the first link in the draft once it's whole: pasted in (eight or more characters at once, so a
+    /// suggested word or the ".com" key doesn't count), or typed and followed by a space or a new line. A link still being typed is never fetched (each half-typed address would be visited along the way).
+    private func refreshPreview(for text: String, pasted: Bool) {
         previewTask?.cancel()
         guard model.data.security.linkPreviews, let url = LinkPreviews.firstLink(in: text) else {
             if draftPreview != nil { draftPreview = nil }
             return
         }
         guard url.absoluteString != draftPreview?.url, url.absoluteString != dismissedPreview else { return }
+        guard pasted || LinkPreviews.linkIsFinished(in: text) else { return }
         previewTask = Task {
             try? await Task.sleep(for: .milliseconds(700))
             guard !Task.isCancelled, let preview = await LinkPreviews.fetch(url), !Task.isCancelled,
@@ -2370,7 +2372,12 @@ private struct ConversationInfo: View {
                     }
                     if c.canRemove(fp, by: "me") {
                         Button("Remove from \(c.kind == .channel ? "channel" : "group")", role: .destructive) {
-                            pending = Pending(title: "Remove \(name) from the \(c.kind == .channel ? "channel" : "group")?", confirm: "Remove") {
+                            // A removed member still knows every open link, so they're told they can come back that way
+                            // unless banned.
+                            let openLinks = c.kind == .group && c.shared?.links?.links.contains(where: { $0.isOpen() }) == true
+                            let title = "Remove \(name) from the \(c.kind == .channel ? "channel" : "group")?"
+                                + (openLinks ? " They can still ask to join again through your open links. Use Remove and ban to stop that." : "")
+                            pending = Pending(title: title, confirm: "Remove") {
                                 model.removeMember(c.id, fp)
                             }
                         }

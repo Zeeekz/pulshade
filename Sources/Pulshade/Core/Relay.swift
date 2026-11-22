@@ -868,10 +868,12 @@ struct RelayClient {
     }
 
     /// Nil when there's no backup under this key.
-    func backup(key: Data, sig: Data, ts: UInt64) async throws -> Data? {
-        let (data, status) = try await backupRequest("get", key: key, sig: sig, ts: ts)
+    /// `limit`: the most read before giving up, for slots whose contents anyone with the slot's keys can replace (a
+    /// link's preview), so nobody can make each reader download megabytes.
+    func backup(key: Data, sig: Data, ts: UInt64, limit: Int = RelayClient.maxResponse) async throws -> Data? {
+        let (data, status) = try await backupRequest("get", key: key, sig: sig, ts: ts, limit: min(limit, Self.maxResponse))
         if status == 404 { return nil }
-        guard status == 200, data.count <= Self.maxResponse else { throw BackupError.refused }
+        guard status == 200, data.count <= min(limit, Self.maxResponse) else { throw BackupError.refused }
         return data
     }
 
@@ -880,7 +882,7 @@ struct RelayClient {
         guard (200..<300).contains(status) || status == 404 else { throw BackupError.refused }
     }
 
-    private func backupRequest(_ action: String, key: Data, sig: Data, ts: UInt64) async throws -> (Data, Int) {
+    private func backupRequest(_ action: String, key: Data, sig: Data, ts: UInt64, limit: Int = RelayClient.maxResponse) async throws -> (Data, Int) {
         struct Proof: Encodable { var sig: String; var ts: UInt64 }
         var request = URLRequest(url: base.appending(path: "v1/backup/\(key.hex)/\(action)"))
         request.httpMethod = "POST"
@@ -888,7 +890,7 @@ struct RelayClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if action == "get" { await prove(&request, "backup-read|\(key.hex)") }
         let body = try JSONEncoder().encode(Proof(sig: sig.base64EncodedString(), ts: ts))
-        guard let (data, response) = try? await load(request, body: body),
+        guard let (data, response) = try? await load(request, body: body, limit: limit),
               let status = (response as? HTTPURLResponse)?.statusCode else { throw BackupError.unreachable }
         return (data, status)
     }

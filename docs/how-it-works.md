@@ -87,8 +87,10 @@ file unreadable is that its key is gone.
 ## Messages
 
 **Mailboxes.** A mailbox is a secret *receive key* and its SHA-256 hash, the *send id*. You give out the send id;
-only the receive key can read. Each contact invite opens a new mailbox and works once, so two contacts can't compare
-invites to link you. Each persona's mailboxes, each public profile's request mailbox and the reports mailbox are
+only the receive key can read. Each contact invite opens a new mailbox and works once, so the relay can't tell which
+mailboxes belong to one person. Every code a persona gives out carries the same public identity key, though, so two
+codes posted in different places can be matched to one persona: use a separate persona for each place you want kept
+apart. Each persona's mailboxes, each public profile's request mailbox and the reports mailbox are
 fetched separately, on separate connections, each on its own clock. A fetch asks the server to wait up to 25
 seconds for mail, and the server answers the moment something lands, so messages arrive in about a second even
 over Tor. Sending uses connections of its own too. Delivery receipts wait a random few seconds and go out together,

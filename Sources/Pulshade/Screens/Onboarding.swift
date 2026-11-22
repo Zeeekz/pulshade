@@ -1072,7 +1072,7 @@ struct PrivacyChoice: View {
                 toggle("Online status", $s.onlineStatus, "Shows accepted contacts when PULSHADE is open.")
             }
             group("Links & backup") {
-                toggle("Link previews", $s.linkPreviews, "Builds a preview when you send a link, which visits the website from your connection.")
+                toggle("Link previews", $s.linkPreviews, "Builds a preview of a link you paste or finish typing, before you send it, which visits the website from your connection (over Tor when Tor is on).")
                 toggle("Sealed backup", $s.keepBackup, "A sealed copy of your profile, contacts, groups and chat keys (never messages) that only your recovery code opens.")
             }
             group("Notifications") {
