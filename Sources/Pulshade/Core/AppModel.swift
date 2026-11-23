@@ -1722,10 +1722,20 @@ final class AppModel {
             && data.followsAsked[followKey]?.contains { $0.tag == invite.codeTag && Date().timeIntervalSince($0.at) < 3 * 86_400 } == true
         if invite.kind == .channel { noteFollowAsked(invite.fingerprint, persona: owner, tag: invite.codeTag) }
         if followedLately, let known { save(); return known }
-        // A friend's own channel: the friend stays exactly as they are (devices, sessions, mailboxes, nickname). The hello
-        // goes to the channel's code mailbox and names the mailbox they already write to, so their phone only lets this
-        // account into the channel and changes nothing about the chat.
-        if let known, !known.hidden, invite.kind == .channel {
+        // Another of their channels before they've answered the first: the hello would have to go classical again, and
+        // their app turns that away once it has read the first. It goes once their keys are known (`sendFollowsLater`).
+        if let known, known.hidden, known.pq == nil, invite.kind == .channel, !known.devices.isEmpty, known.receiveKey != nil,
+           let i = contactIndex(known.fingerprint, owner) {
+            let held = (data.contacts[i].followLater ?? []).filter { $0 != invite.code }
+            data.contacts[i].followLater = Array((held + [invite.code]).suffix(4))
+            save()
+            return data.contacts[i]
+        }
+        // A friend's own channel, or another channel of someone whose code you already followed: they stay exactly as they
+        // are (devices, sessions, mailboxes, nickname). The hello goes to the channel's code mailbox and names the mailbox
+        // they already write to, so their phone only lets this account into the channel and changes nothing else. Starting
+        // over instead would leave the first channel's invite sealed to keys and a mailbox given up here.
+        if let known, invite.kind == .channel, !known.hidden || (!known.devices.isEmpty && known.receiveKey != nil) {
             guard let i = contactIndex(known.fingerprint, owner), !known.devices.isEmpty, let receiveKey = known.receiveKey,
                   let (pending, request) = signedHandshake(persona: owner, to: invite.signingKey, context: .hello),
                   let meCard = card(sendID: Mailbox.sendID(for: receiveKey), persona: owner) else { return nil }
@@ -6821,6 +6831,8 @@ final class AppModel {
         retryUnreadable()
         nudgeStuckDevices()
         tendSpares()
+        // Held follows whose person's keys came some other way (another of your devices, say).
+        for c in data.contacts where c.followLater != nil && c.pq != nil { sendFollowsLater(c.fingerprint, persona: c.persona) }
         // An app left open for days would otherwise keep every envelope digest it ever saw. Only assign when
         // something has actually aged out: writing redraws every view that reads the data.
         let stale = Date().addingTimeInterval(-Self.replayWindow)
@@ -7542,6 +7554,7 @@ final class AppModel {
                 // What was waiting for their keys goes now, and your other devices are told them.
                 sendPending(contact: known)
                 syncContact(fp, persona)
+                sendFollowsLater(fp, persona: persona)
             }
             if opened.postQuantum, data.contacts[known].pqCardSent != true { data.contacts[known].pqCardSent = true }
             if data.contacts[known].tooOld != nil { data.contacts[known].tooOld = nil }
@@ -8458,10 +8471,10 @@ final class AppModel {
         }
 
         if let channelID = invite.channel {
-            // A friend following this channel from an app that leaves the chat as it is: the hello names the mailbox this
-            // device already writes to them at. Nothing about the friend changes (no new session, nothing replaced); the
-            // caller lets them into the channel.
-            if let known, !known.hidden, known.devices.contains(where: { $0.sendID == card.sendID }) {
+            // A friend, or someone already following another of these channels, from an app that leaves things as they are:
+            // the hello names the mailbox this device already writes to them at. Nothing about them changes (no new
+            // session, nothing replaced); the caller lets them into the channel.
+            if let known, known.devices.contains(where: { $0.sendID == card.sendID }) {
                 _ = channelID
                 return
             }
@@ -9036,6 +9049,7 @@ extension AppModel {
             if learned {
                 for d in data.contacts[i].devices.indices where data.contacts[i].devices[d].session == nil && data.contacts[i].devices[d].handshake == nil
                     && !card.awaitingAcceptance { startHandshake(contact: i, device: d) }
+                sendFollowsLater(data.contacts[i].fingerprint, persona: data.contacts[i].persona)
             }
             // Devices their account unlinked, as another of yours heard: dropped here too, before the list below.
             for gone in card.revoked ?? [] { revoke(gone.id, pin: gone.key, by: nil, contact: i) }
@@ -13609,6 +13623,16 @@ extension AppModel {
 
     private static func followKey(_ fp: String, _ persona: UUID?) -> String { "\(persona?.uuidString ?? "")|\(fp)" }
     private static let followAskLife: TimeInterval = 14 * 86_400
+
+    /// The hellos for more of someone's channel codes, held until their post-quantum keys were known (`Contact.followLater`).
+    private func sendFollowsLater(_ fp: String, persona: UUID?) {
+        // Only onto the contact as it is (devices and a mailbox to name): otherwise a held code would start them over.
+        guard let i = contactIndex(fp, persona), let codes = data.contacts[i].followLater, data.contacts[i].pq != nil,
+              !data.contacts[i].devices.isEmpty, data.contacts[i].receiveKey != nil else { return }
+        data.contacts[i].followLater = nil
+        for code in codes { addContact(code: code, nickname: "", persona: .some(persona)) }
+        save()
+    }
 
     /// You followed this person's channel code: the invite for that code's channel is taken without asking again.
     private func noteFollowAsked(_ fp: String, persona: UUID?, tag: Data) {

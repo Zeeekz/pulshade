@@ -209,6 +209,9 @@ struct Contact: Codable, Identifiable {
     /// What the invite you used to add them committed their post-quantum keys to (`PQPin.commitment`). Until `pq` is set,
     /// the first card is accepted only if its keys match this; nil for someone who didn't come by an invite.
     var pqCommit: Data?
+    /// Codes of more of their channels you followed before they answered the first: each hello waits until their
+    /// post-quantum keys are known, since a second classical hello would be turned away once the first is read.
+    var followLater: [String]?
     /// They have this account's post-quantum card (sent in a hello, a request or an introduction, or they've sealed an
     /// envelope to us, which they can only do with it), so envelopes to them needn't carry it.
     var pqCardSent: Bool?

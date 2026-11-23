@@ -339,6 +339,43 @@ struct LinkAuditFixFlowTests {
         #expect(bob.conversation(b.id)?.shared != nil, "B's own invite still comes in without asking")
     }
 
+    /// Two channels of the same stranger followed through their codes, one after the other: both let you in, and
+    /// both keep working.
+    @Test func followingTwoCodesOfOneStrangerLetsBothIn() async throws {
+        AppModel.channelAdmitsPerHour = 60
+        let alice = try await makeUser("Alice"), bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        let a = alice.startConversation(kind: .channel, title: "A", members: [])
+        let b = alice.startConversation(kind: .channel, title: "B", members: [])
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(channel: a.id), nickname: ""))
+        await until([alice, bob], seconds: 30) { bob.conversation(a.id)?.shared != nil }
+        #expect(bob.conversation(a.id)?.shared != nil, "follows A")
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(channel: b.id), nickname: ""))
+        await until([alice, bob], seconds: 30) { bob.conversation(b.id)?.shared != nil }
+        #expect(bob.conversation(b.id)?.shared != nil, "follows B too")
+        alice.send("in A", in: a.id)
+        alice.send("in B", in: b.id)
+        await until([alice, bob], seconds: 30) {
+            bob.conversation(a.id)?.messages.last?.text == "in A" && bob.conversation(b.id)?.messages.last?.text == "in B"
+        }
+        #expect(bob.conversation(a.id)?.messages.last?.text == "in A", "A still works")
+        #expect(bob.conversation(b.id)?.messages.last?.text == "in B", "B works")
+    }
+
+    /// The same, with both codes followed before Alice's app has read either hello.
+    @Test func followingTwoCodesOfOneStrangerAtOnceLetsBothIn() async throws {
+        AppModel.channelAdmitsPerHour = 60
+        let alice = try await makeUser("Alice"), bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        let a = alice.startConversation(kind: .channel, title: "A", members: [])
+        let b = alice.startConversation(kind: .channel, title: "B", members: [])
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(channel: a.id), nickname: ""))
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(channel: b.id), nickname: ""))
+        await until([alice, bob], seconds: 30) { bob.conversation(a.id)?.shared != nil && bob.conversation(b.id)?.shared != nil }
+        #expect(bob.conversation(a.id)?.shared != nil, "follows A")
+        #expect(bob.conversation(b.id)?.shared != nil, "follows B")
+    }
+
     /// A new channel from someone known only through a channel's code is dropped: no channel, no invite, no banner.
     @Test func aHiddenContactCantSendChannelInvites() async throws {
         AppModel.channelAdmitsPerHour = 60
