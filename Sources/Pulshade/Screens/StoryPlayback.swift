@@ -16,6 +16,8 @@ final class StoryClip {
     @ObservationIgnored private let clip: MemoryClip
     @ObservationIgnored private var ticker: Any?
     @ObservationIgnored private var end: NSObjectProtocol?
+    @ObservationIgnored private var failed: NSObjectProtocol?
+    @ObservationIgnored private var status: NSKeyValueObservation?
     /// How long it plays, in seconds; 0 until the file has been read.
     private(set) var duration: Double = 0
     /// 0 to 1.
@@ -44,6 +46,15 @@ final class StoryClip {
         end = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.finished = true; self?.progress = 1 }
         }
+        // A clip that can't be played (it won't decode, or stops part way) counts as watched, so the viewer moves on
+        // instead of sitting on an empty bar.
+        failed = NotificationCenter.default.addObserver(forName: .AVPlayerItemFailedToPlayToEndTime, object: item, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.finished = true; self?.progress = 1 }
+        }
+        status = item.observe(\.status) { [weak self] item, _ in
+            guard item.status == .failed else { return }
+            Task { @MainActor in self?.finished = true; self?.progress = 1 }
+        }
     }
 
     func play() { if !finished { player.play() } }
@@ -63,6 +74,10 @@ final class StoryClip {
         ticker = nil
         if let end { NotificationCenter.default.removeObserver(end) }
         end = nil
+        if let failed { NotificationCenter.default.removeObserver(failed) }
+        failed = nil
+        status?.invalidate()
+        status = nil
         player.replaceCurrentItem(with: nil)
     }
 }

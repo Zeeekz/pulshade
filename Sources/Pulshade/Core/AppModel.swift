@@ -13252,9 +13252,12 @@ extension AppModel {
                 _ = publishLinks(at: i) { _ in }
             }
         }
-        let before = data.joinAsks.count
-        data.joinAsks.removeAll { now.timeIntervalSince($0.asked) > JoinAsk.life }
-        if data.joinAsks.count != before { save() }
+        // Only written when something goes: any write to `data`, even one that changes nothing, redraws every screen
+        // that shows it, and this runs on every sync.
+        if data.joinAsks.contains(where: { now.timeIntervalSince($0.asked) > JoinAsk.life }) {
+            data.joinAsks.removeAll { now.timeIntervalSince($0.asked) > JoinAsk.life }
+            save()
+        }
         for ask in data.joinAsks where !ask.sent { sendAsk(ask.id) }
         guard force || now.timeIntervalSince(lastJoinPoll) >= Self.joinPoll else { return }
         lastJoinPoll = now
@@ -13709,9 +13712,11 @@ extension AppModel {
 
     /// Invites past their time are let go (housekeeping), with the group keys they hold.
     private func dropStaleOffers() {
-        let before = data.groupOffers.count
-        data.groupOffers.removeAll { Date().timeIntervalSince($0.at) >= GroupOffer.life }
-        if data.groupOffers.count != before { save() }
+        // Only written when one goes (see `tendJoinLinks`): this runs on every sync.
+        let now = Date()
+        guard data.groupOffers.contains(where: { now.timeIntervalSince($0.at) >= GroupOffer.life }) else { return }
+        data.groupOffers.removeAll { now.timeIntervalSince($0.at) >= GroupOffer.life }
+        save()
     }
 
     var groupOffers: [GroupOffer] {

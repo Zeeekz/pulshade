@@ -28,6 +28,10 @@ final class Camera: NSObject {
     /// Whether the camera in use has a flash.
     private(set) var hasFlash = false
     @ObservationIgnored private var micAllowed = false
+    /// Whether the screen showing the camera still wants it. A `stop()` that comes while `start()` is still waiting
+    /// (for permission, or a stop before it) has nothing running to stop yet: `start()` checks this after each wait.
+    @ObservationIgnored private var wanted = false
+    @ObservationIgnored nonisolated(unsafe) private var interruption: NSObjectProtocol?
     @ObservationIgnored private var taken: ((PlatformImage?) -> Void)?
     @ObservationIgnored private var recorded: ((MemoryClip?, ZoomTrack) -> Void)?
     @ObservationIgnored private var device: AVCaptureDevice?
@@ -54,6 +58,16 @@ final class Camera: NSObject {
         // The capture session would otherwise take over the sound and stop music playing in the background.
         session.automaticallyConfiguresApplicationAudioSession = false
         #endif
+        // The camera taken away part way through a clip (the app going to the background, a call, another app taking
+        // it): the clip ends there. Left recording, the gap was written as a frozen picture and the clip filled up at once.
+        interruption = NotificationCenter.default.addObserver(forName: AVCaptureSession.wasInterruptedNotification,
+                                                              object: session, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.finishRecording() }
+        }
+    }
+
+    deinit {
+        if let interruption { NotificationCenter.default.removeObserver(interruption) }
     }
 
     /// Lets music or a podcast from another app carry on while the camera is open and while a clip is recorded, the
@@ -69,11 +83,15 @@ final class Camera: NSObject {
 
     /// False when there's no camera, or Pulshade isn't allowed to use it.
     func start() async -> Bool {
+        wanted = true
         guard !running, await AVCaptureDevice.requestAccess(for: .video) else { return running }
+        // Closed while permission was being asked: it doesn't start behind nothing.
+        guard wanted else { return false }
         // A microphone already allowed goes in with the first setup, so nothing has to be set up again.
         if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized { micAllowed = true }
         // A stop still under way finishes first.
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in queue.async { done.resume() } }
+        guard wanted else { return false }
         mixWithOtherAudio()
         guard !running, configure() else { return running }
         running = true
@@ -83,10 +101,19 @@ final class Camera: NSObject {
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
             queue.async { session.startRunning(); done.resume() }
         }
+        // Closed while it was starting: stopped now it can be.
+        if !wanted { stop(); return false }
         return true
     }
 
+    /// Whether the camera can't be used because Pulshade was refused it (as opposed to there being none).
+    var refused: Bool {
+        let status = AVCaptureDevice.authorizationStatus(for: .video)
+        return status == .denied || status == .restricted
+    }
+
     func stop() {
+        wanted = false
         if recording { framer.endClip() }
         guard running else { return }
         running = false
@@ -274,8 +301,10 @@ final class Camera: NSObject {
         maxZoom = ZoomMath.ceiling
         #endif
         #if os(iOS)
-        // Photos come at the camera's best size whatever the video preset is.
-        if let best = device.activeFormat.supportedMaxPhotoDimensions.last { output.maxPhotoDimensions = best }
+        // Photos come big enough for anything they're used for (a story, a chat photo, a crop of either), but not at
+        // the camera's very largest: 48 megapixels took longer to take and to shrink than the photo is ever shown at.
+        let sizes = device.activeFormat.supportedMaxPhotoDimensions
+        if let enough = sizes.first(where: { max($0.width, $0.height) >= 4000 }) ?? sizes.last { output.maxPhotoDimensions = enough }
         // The app is portrait only: take photos and clips the right way up, and mirror the selfie camera.
         for connection in [output.connection(with: .video), frames.connection(with: .video)].compactMap({ $0 }) {
             if connection.isVideoRotationAngleSupported(90) { connection.videoRotationAngle = 90 }

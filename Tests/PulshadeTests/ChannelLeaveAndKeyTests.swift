@@ -543,7 +543,8 @@ struct ChannelLeaveAndKeyTests {
         #expect(shared(alice, id)?.rekeyDue != nil)
         AppModel.leaveRekeyWindow = 0
         alice.data.conversations[try #require(alice.data.conversations.firstIndex { $0.id == id })].shared?.rekeyDue = Date()
-        await alice.syncOnce()
+        // The next housekeeping starts it (a sync already under way skips it, so this waits for one that runs).
+        await until([alice], seconds: 10) { shared(alice, id)?.settings.epoch == epoch + 2 }
         #expect(shared(alice, id)?.settings.epoch == epoch + 2)
     }
 

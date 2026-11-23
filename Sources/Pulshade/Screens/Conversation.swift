@@ -21,6 +21,8 @@ struct ConversationView: View {
     @State private var videoDraft: VideoDraft?
     @State private var videoTask: Task<Void, Never>?
     @State private var takingPhoto = false
+    /// What was left out of a pick from the library (a second video, one that wouldn't load), said once.
+    @State private var mediaNote: String?
     @State private var choosingFile = false
     @State private var quickSending = false
     @State private var showInfo = false
@@ -677,6 +679,7 @@ struct ConversationView: View {
                     // Pinned only shows when there's something pinned to send.
                     AttachMenu(hasPinned: !(model.activeProfile.links ?? []).isEmpty || !(model.activeProfile.notes ?? []).isEmpty,
                                camera: { takingPhoto = true },
+                               library: chooseMedia,
                                file: { choosingFile = true },
                                pinned: { quickSending = true })
 
@@ -755,6 +758,9 @@ struct ConversationView: View {
         .fileImporter(isPresented: $choosingFile, allowedContentTypes: [.item]) { result in
             if case let .success(url) = result { model.sendFile(url, replyTo: replyingTo, in: id); replyingTo = nil }
         }
+        .alert("Some of it wasn't added", isPresented: Binding(get: { mediaNote != nil }, set: { if !$0 { mediaNote = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: { Text(mediaNote ?? "") }
         .alert("Can't send that file", isPresented: Binding(get: { model.fileProblem != nil }, set: { if !$0 { model.fileProblem = nil } })) {
             Button("OK", role: .cancel) {}
         } message: { Text(model.fileProblem ?? "") }
@@ -791,6 +797,18 @@ struct ConversationView: View {
             guard !Task.isCancelled, let preview = await LinkPreviews.fetch(url), !Task.isCancelled,
                   LinkPreviews.firstLink(in: draft)?.absoluteString == preview.url else { return }
             draftPreview = preview
+        }
+    }
+
+    /// Photos and a video from the library, picked together, go into the message being written like ones from the camera.
+    private func chooseMedia() {
+        let room = max(1, 10 - attachments.count)
+        ChatMediaPicker.present(limit: room + (videoDraft == nil ? 1 : 0), maxSide: 1600) { picked in
+            if !picked.photos.isEmpty {
+                withAnimation(.snappy) { attachments = Array((attachments + picked.photos).prefix(10)) }
+            }
+            if let clip = picked.clip { prepareVideo(clip, .none) }
+            mediaNote = picked.note
         }
     }
 
@@ -860,17 +878,24 @@ struct ConversationView: View {
     }
 }
 
-/// The pulse button left of the text box. It opens a short menu: camera, file, and pinned when there is any.
+/// The pulse button left of the text box. It opens a short menu: take a photo or video, upload photos and videos from
+/// the library, a file, and pinned when there is any.
 private struct AttachMenu: View {
     @Environment(\.theme) private var theme
     var hasPinned: Bool
     var camera: () -> Void
+    var library: () -> Void
     var file: () -> Void
     var pinned: () -> Void
 
     var body: some View {
         Menu {
-            Button(action: camera) { Label("Photo or video", systemImage: "camera") }
+            Button(action: camera) {
+                Label { Text("Take photo"); Text("Hold the button for a video") } icon: { Image(systemName: "camera") }
+            }
+            Button(action: library) {
+                Label { Text("Upload media"); Text("Photos and videos") } icon: { Image(systemName: "photo.on.rectangle") }
+            }
             Button(action: file) { Label("File", systemImage: "paperclip") }
             if hasPinned { Button(action: pinned) { Label("Pinned", systemImage: "pin") } }
         } label: {

@@ -326,6 +326,8 @@ struct StoryComposer: View {
     /// The photo with the look applied, for the preview.
     @State private var looked: Data?
     @State private var exporting = false
+    /// The parts of a video being made and posted. Closing the editor stops it after the part under way.
+    @State private var exportTask: Task<Void, Never>?
     /// How long the picked clip is, up to five minutes, and which part is being made when it is cut into several.
     @State private var clipSeconds = 0.0
     @State private var partMaking = 0
@@ -586,7 +588,7 @@ struct StoryComposer: View {
                 if typing == nil && !interacting {
                     VStack {
                         HStack {
-                            floating("xmark", label: "Close") { dismiss() }
+                            floating("xmark", label: "Close") { stopExport(); dismiss() }
                             Spacer()
                             if clip != nil, sourceSize != nil {
                                 floating(isFilled ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right",
@@ -927,7 +929,7 @@ struct StoryComposer: View {
             settling?.cancel()
             let look = filter, track = clipZoom, placed = framing, kept = trim
             let words = StoryOverlayRender.text(overlays)
-            Task {
+            exportTask = Task {
                 // The kept part goes up as several stories, in order, each 15 seconds. The parts share a size budget,
                 // since every contact receives every one of them.
                 let total = await StoryVideo.fullDuration(of: clip)
@@ -937,9 +939,12 @@ struct StoryComposer: View {
                 var posted = 0
                 do {
                     for (part, piece) in pieces.enumerated() {
+                        // Closed while it was being made: what's posted stays, nothing more goes, and the camera stays.
+                        if Task.isCancelled { exporting = false; return }
                         partMaking = part + 1
                         let data = try await StoryVideo.export(from: clip, filter: look, zoom: track, maxBytes: budget,
                                                                maxSeconds: piece.seconds, text: words, from: piece.start, framing: placed)
+                        if Task.isCancelled { exporting = false; return }
                         model.postStory(.video(data, caption: ""), audience: audience, lifetime: lifetime, loops: loops)
                         posted += 1
                     }
@@ -971,6 +976,12 @@ struct StoryComposer: View {
     private func finish() {
         dismiss()
         posted()
+    }
+
+    /// The editor closed (its X, or swiped away): a video still being made stops.
+    private func stopExport() {
+        exportTask?.cancel()
+        exportTask = nil
     }
 }
 
@@ -1240,6 +1251,13 @@ struct StoryCamera: View {
         }
     }
     @State private var cover: Cover?
+    /// A photo framed in the cropper, waiting for the cropper to finish leaving before the editor opens over the
+    /// camera: UIKit refuses to present over a screen still being dismissed, and the editor then never appeared.
+    @State private var cropped: StoryPick?
+    /// The shutter is held down. Unlike the drag's end, this is reset when the touch is cancelled (a call, Control
+    /// Center), so a press that never ended can't go on to record with no finger on the button.
+    @GestureState private var shutterDown = false
+    @Environment(\.scenePhase) private var scenePhase
     @State private var filter = StoryFilter.none
     // The shutter: a press that lasts becomes a clip.
     @State private var pressStart: Date?
@@ -1392,6 +1410,17 @@ struct StoryCamera: View {
             if ready == true { await camera.allowSound() }
         }
         .onDisappear { camera.stop() }
+        // Nothing to look at behind the editor or the cropper: the camera (and the microphone, and the green and orange
+        // dots) are off while they're open, and come back when they close.
+        .onChange(of: cover == nil && pending == nil && cropped == nil) { _, free in
+            if free { Task { ready = await camera.start() } } else { camera.stop() }
+        }
+        .onChange(of: shutterDown) { _, down in
+            guard !down else { return }
+            // After the drag's own end has had its turn: only a press it never heard about is left.
+            DispatchQueue.main.async { if pressStart != nil { shutterCancelled() } }
+        }
+        .onChange(of: scenePhase) { _, phase in if phase != .active, pressStart != nil { shutterCancelled() } }
         .onChange(of: filter) { _, new in camera.filter = new }
         .onChange(of: camera.zoom) { _, _ in
             withAnimation(.easeOut(duration: 0.15)) { zoomShown = true }
@@ -1409,7 +1438,9 @@ struct StoryCamera: View {
             guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.3)) { zoomShown = false }
         }
-        .cropper($pending, frame: .story) { data in cover = .framed(StoryPick(kind: .photo(data), filter: filter)) }
+        .cropper($pending, frame: .story, onDismiss: {
+            if let cropped { self.cropped = nil; cover = .framed(cropped) }
+        }) { data in cropped = StoryPick(kind: .photo(data), filter: filter) }
         .composerCover(item: $cover) { cover in
             switch cover {
             case let .framed(pick):
@@ -1501,6 +1532,16 @@ struct StoryCamera: View {
         }
     }
 
+    /// A press whose end never came (the touch was cancelled): whatever it started stops, and nothing is taken.
+    private func shutterCancelled() {
+        holdTask?.cancel()
+        pressStart = nil
+        if holdRecording {
+            holdRecording = false
+            camera.finishRecording()
+        }
+    }
+
     private func startClip() {
         guard !holdRecording, !camera.recording else { return }
         holdRecording = true
@@ -1531,7 +1572,8 @@ struct StoryCamera: View {
         }
         .frame(width: 90, height: 90)
         .contentShape(Circle())
-        .gesture(DragGesture(minimumDistance: 0).onChanged(shutterMoved).onEnded(shutterLifted))
+        .gesture(DragGesture(minimumDistance: 0).updating($shutterDown) { _, down, _ in down = true }
+            .onChanged(shutterMoved).onEnded(shutterLifted))
         .opacity(ready == true ? 1 : 0.35)
         .accessibilityElement()
         .accessibilityLabel(camera.recording ? "Stop recording" : "Take photo")
@@ -1628,6 +1670,13 @@ struct StoryViewer: View {
     @State private var gone: Set<Story.ID> = []
     /// The video of the story on screen, if it is one.
     @State private var clip: StoryClip?
+    /// Sound off, kept from one video to the next while the viewer is open.
+    @State private var muted = false
+    /// A like or reply on its way, so a second tap doesn't send it twice.
+    @State private var answering = false
+    /// A finger is on the story. Reset when the touch is cancelled, which the drag's end never hears about.
+    @GestureState private var pressing = false
+    @Environment(\.scenePhase) private var scenePhase
     /// A finger is held down: the story waits.
     @State private var holding = false
     @State private var touching = false
@@ -1655,6 +1704,7 @@ struct StoryViewer: View {
 
     private var paused: Bool {
         editing != nil || showingViewers != nil || confirmDelete || holding || replying || !replyText.isEmpty || loading
+            || scenePhase != .active
     }
 
     /// The story on screen is a video still arriving: it waits, unwatched, until it can play.
@@ -1684,6 +1734,7 @@ struct StoryViewer: View {
                 Color.clear.contentShape(Rectangle())
                     .ignoresSafeArea()
                     .gesture(DragGesture(minimumDistance: 0)
+                        .updating($pressing) { _, down, _ in down = true }
                         .onChanged { drag in touchBegan(); dragMoved(drag) }
                         .onEnded { drag in touchEnded(drag, width: geo.size.width) })
                     .accessibilityElement()
@@ -1697,7 +1748,7 @@ struct StoryViewer: View {
             if clip != nil, !holding {
                 HStack {
                     Spacer()
-                    Button { clip?.muted.toggle() } label: {
+                    Button { muted.toggle(); clip?.muted = muted } label: {
                         Image(systemName: clip?.muted == true ? "speaker.slash.fill" : "speaker.wave.2.fill")
                             .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
                             .frame(width: 32, height: 32)
@@ -1763,7 +1814,23 @@ struct StoryViewer: View {
             markSeenIfReady()
         }
         .onChange(of: currentID, initial: true) { openClip() }
-        .onChange(of: currentID) { replyText = ""; replying = false }
+        .onChange(of: currentID) {
+            replyText = ""
+            replying = false
+            // A new person's page can start at the same index as the last one, which `index` alone never notices.
+            markSeenIfReady()
+            prefetchAround(index)
+        }
+        // A story before the one on screen went (expired, or deleted elsewhere): stay on the same story.
+        .onChange(of: current.map(\.id)) { old, new in
+            guard old.indices.contains(index) else { index = min(index, max(new.count - 1, 0)); return }
+            if let moved = new.firstIndex(of: old[index]) { index = moved } else { index = min(index, max(new.count - 1, 0)) }
+        }
+        // A touch the system took away (a call, Control Center): the story doesn't stay held with its bars hidden.
+        .onChange(of: pressing) { _, down in
+            guard !down else { return }
+            DispatchQueue.main.async { if touching { touchCancelled() } }
+        }
         .onChange(of: paused) { _, now in
             if now { clip?.pause() } else { clip?.play() }
         }
@@ -1821,6 +1888,7 @@ struct StoryViewer: View {
         guard current.indices.contains(index), case .video = current[index].style,
               let data = model.storyData(for: current[index]), !data.isEmpty else { return }
         clip = StoryClip(data: data)
+        clip?.muted = muted
         if !paused { clip?.play() }
     }
 
@@ -1842,6 +1910,15 @@ struct StoryViewer: View {
             swipingAway = SwipeAway.starts(drag.translation) && !(own && drag.translation.height < 0)
         }
         if swipingAway == true { dragOffset = drag.translation }
+    }
+
+    /// A touch that ended without the drag hearing of it.
+    private func touchCancelled() {
+        holdTask?.cancel()
+        touching = false
+        holding = false
+        if swipingAway == true { withAnimation(.smooth(duration: 0.25)) { dragOffset = .zero } }
+        swipingAway = nil
     }
 
     private func touchEnded(_ drag: DragGesture.Value, width: Double) {
@@ -1912,9 +1989,11 @@ struct StoryViewer: View {
     }
 
     private func like(_ story: Story) {
-        guard story.liked != true else { return }
+        guard story.liked != true, !answering else { return }
+        answering = true
         Task {
             let sent = await model.answerStory(story, like: true)
+            answering = false
             guard sent else { return }
             await MainActor.run {
                 model.playSendSound()
@@ -1925,17 +2004,21 @@ struct StoryViewer: View {
 
     private func sendReply(to story: Story) {
         let words = replyText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !words.isEmpty else { return }
+        guard !words.isEmpty, !answering else { return }
+        // Cleared at once, so Return and the send button together can't send it twice.
+        answering = true
+        replyText = ""
+        replying = false
         Task {
             let sent = await model.answerStory(story, text: words)
             await MainActor.run {
+                answering = false
                 if sent {
                     model.playSendSound()
-                    replyText = ""
-                    replying = false
                     flash("Reply sent")
                 } else {
-                    // Keep the words so they can try again.
+                    // The words come back so they can try again.
+                    if replyText.isEmpty { replyText = words }
                     flash("Couldn't send")
                 }
             }
@@ -2021,6 +2104,10 @@ struct StoryViewer: View {
     /// To the next person (1) or the one before (-1), the page turning like a cube. Past either end it closes (if
     /// asked to, going forward) or does nothing.
     private func goPerson(_ d: Int, closeAtEnd: Bool = false) {
+        // People whose stories have all gone (expired, or taken down) since the viewer opened are passed over.
+        func up(_ stories: [Story]) -> Bool { stories.contains { s in model.data.stories.contains { $0.id == s.id } } }
+        while let first = upcoming.first, !up(first) { upcoming.removeFirst() }
+        while let last = previousReels.last, !up(last) { previousReels.removeLast() }
         guard d > 0 ? !upcoming.isEmpty : !previousReels.isEmpty else {
             if d > 0, closeAtEnd { dismiss() }
             return
@@ -2045,7 +2132,8 @@ struct StoryViewer: View {
                     reel = next
                 }
                 gone = []
-                index = reel.firstIndex { !$0.seen } ?? 0
+                // Counted among the stories still up, as they are now, which is what the page shows.
+                index = current.firstIndex { !$0.seen } ?? 0
             }
             clock.progress = 0
         }

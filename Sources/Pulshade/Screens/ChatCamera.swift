@@ -1,4 +1,5 @@
 import SwiftUI
+import AVFoundation
 
 extension View {
     /// The chat camera: full screen on iPhone, a sheet on the Mac. `taken` gets cleaned JPEGs ready to attach.
@@ -25,6 +26,11 @@ struct ChatCamera: View {
     @State private var holdTask: Task<Void, Never>?
     @State private var holding = false
     @State private var zoomAtPress: CGFloat = 1
+    /// The camera is closing: a clip that ends because of it (the camera stopping) is thrown away, not attached.
+    @State private var closing = false
+    /// The shutter is held. Reset when the touch is cancelled (a call, Control Center), which the drag's end never hears.
+    @GestureState private var shutterDown = false
+    @Environment(\.scenePhase) private var scenePhase
     var taken: ([Data]) -> Void
     var filmed: (MemoryClip, ZoomTrack) -> Void = { _, _ in }
 
@@ -39,13 +45,27 @@ struct ChatCamera: View {
             } else if ready == false {
                 VStack(spacing: 10) {
                     Image(systemName: "camera.fill").font(.system(size: 34)).foregroundStyle(Ink.faint)
-                    Text("No camera available").font(.system(size: 15, weight: .semibold)).foregroundStyle(Ink.text)
-                    Text("Choose a photo from your library instead.").font(.system(size: 13)).foregroundStyle(Ink.dim)
+                    if camera.refused {
+                        Text("Pulshade isn't allowed to use the camera").font(.system(size: 15, weight: .semibold)).foregroundStyle(Ink.text)
+                        Text("Allow it in Settings, or choose a photo from your library instead.")
+                            .font(.system(size: 13)).foregroundStyle(Ink.dim).multilineTextAlignment(.center)
+                        #if os(iOS)
+                        Button("Open Settings") {
+                            if let url = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(url) }
+                        }
+                        .font(.system(size: 14, weight: .semibold))
+                        .padding(.top, 4)
+                        #endif
+                    } else {
+                        Text("No camera available").font(.system(size: 15, weight: .semibold)).foregroundStyle(Ink.text)
+                        Text("Choose a photo from your library instead.").font(.system(size: 13)).foregroundStyle(Ink.dim)
+                    }
                 }
+                .padding(.horizontal, 32)
             }
             VStack {
                 HStack {
-                    Button { dismiss() } label: { face("xmark") }
+                    Button { closing = true; dismiss() } label: { face("xmark") }
                         .buttonStyle(.plain)
                         .accessibilityLabel("Close")
                     Spacer()
@@ -92,7 +112,13 @@ struct ChatCamera: View {
             camera.clipLimit = ChatVideo.maxSeconds
             ready = await camera.start()
         }
-        .onDisappear { holdTask?.cancel(); camera.stop() }
+        .onDisappear { closing = true; holdTask?.cancel(); camera.stop() }
+        .onChange(of: shutterDown) { _, down in
+            guard !down else { return }
+            // After the drag's own end has had its turn: only a press it never heard about is left.
+            DispatchQueue.main.async { if pressStart != nil { shutterCancelled() } }
+        }
+        .onChange(of: scenePhase) { _, phase in if phase != .active, pressStart != nil { shutterCancelled() } }
         .overlay(alignment: .top) {
             if camera.recording, let start = camera.recordingStart {
                 TimelineView(.periodic(from: start, by: 0.5)) { context in
@@ -127,7 +153,8 @@ struct ChatCamera: View {
         }
         .frame(width: 90, height: 90)
         .contentShape(Circle())
-        .gesture(DragGesture(minimumDistance: 0).onChanged(shutterMoved).onEnded(shutterLifted))
+        .gesture(DragGesture(minimumDistance: 0).updating($shutterDown) { _, down, _ in down = true }
+            .onChanged(shutterMoved).onEnded(shutterLifted))
         .opacity(ready == true && !taking ? 1 : 0.35)
         .accessibilityElement()
         .accessibilityLabel(camera.recording ? "Stop recording" : "Take photo")
@@ -168,13 +195,32 @@ struct ChatCamera: View {
         }
     }
 
+    /// A press whose end never came: whatever it started stops, and the clip it made is kept as if let go.
+    private func shutterCancelled() {
+        holdTask?.cancel()
+        pressStart = nil
+        if holding {
+            holding = false
+            camera.finishRecording()
+        }
+    }
+
     private func startClip() {
         guard ready == true, !holding, !camera.recording else { return }
+        // The first video asks for the microphone (photos never do). The press that asked doesn't record: one without
+        // sound would have gone out silently. The next one does, with sound if it was allowed.
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+            holdTask?.cancel()
+            pressStart = nil
+            Task { await camera.allowSound() }
+            return
+        }
         holding = true
         Haptics.tick()
         camera.record { made, track in
             holding = false
-            guard let made else { return }
+            // Closed part way through: the camera stopping ended the clip, and it isn't wanted.
+            guard let made, !closing else { return }
             filmed(made, track)
             dismiss()
         }
@@ -205,8 +251,14 @@ struct ChatCamera: View {
         taking = true
         Haptics.tick()
         camera.capture { image in
-            if let image, let data = cleanJPEG(image, maxSide: Self.maxSide) { taken([data]) }
-            dismiss()
+            guard let image else { taking = false; dismiss(); return }
+            // Shrunk and cleaned off the main thread, so the camera doesn't freeze while it's done.
+            let maxSide = Self.maxSide
+            Task {
+                let data = await Task.detached(priority: .userInitiated) { cleanJPEG(image, maxSide: maxSide) }.value
+                if let data { taken([data]) }
+                dismiss()
+            }
         }
     }
 

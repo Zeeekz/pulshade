@@ -300,8 +300,10 @@ extension ImageCropper {
 
 extension View {
     /// Shows the cropper for a picked picture, as a sheet (or full screen on iPhone).
-    func cropper(_ pending: Binding<PendingCrop?>, frame: CropFrame, done: @escaping (Data) -> Void) -> some View {
-        sheet(item: pending) { item in
+    /// `onDismiss` runs once the cropper has finished leaving the screen: anything to be shown after it goes there.
+    func cropper(_ pending: Binding<PendingCrop?>, frame: CropFrame, onDismiss: (() -> Void)? = nil,
+                 done: @escaping (Data) -> Void) -> some View {
+        sheet(item: pending, onDismiss: onDismiss) { item in
             ImageCropper(image: item.image, frame: frame) { data in
                 pending.wrappedValue = nil
                 if let data { done(data) }
