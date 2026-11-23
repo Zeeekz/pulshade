@@ -1120,6 +1120,7 @@ final class AppModel {
         forgetUnusableRelays()
         purgeExpired()
         migrateInlineMedia()
+        wrapDataFilesTogether()
         pruneLinkOffers()
         data.seenEnvelopes = data.seenEnvelopes.filter { $0.value > Date().addingTimeInterval(-Self.seenRetention) }
         // Unused contact invites die with the relay's 7-day retention.
@@ -2758,11 +2759,37 @@ final class AppModel {
     private func storeReceivedMedia(_ plain: Data) -> MediaFileRef? {
         guard !plain.isEmpty else { return nil }
         let pool = mediaPool()
-        guard let ref = try? pool.store(plain) else { return nil }
+        guard let ref = try? pool.store(plain, growLater: true) else { return nil }
         keepFillers(of: pool)
+        if pool.wantsGrowth { growMediaSoon(after: ref) }
         pendingMediaNames.insert(ref.name)
         Self.mediaCache.setObject(plain as NSData, forKey: ref.name as NSString, cost: plain.count)
         return ref
+    }
+
+    /// A media pool grown in the background: anyone can send a photo, and doubling a big pool on the main thread froze
+    /// the app (and on iPhone risked it being stopped). The new filler is this account's once it's made, if the account
+    /// is still the one open; one wiped meanwhile stops the growth (`MediaPool.grow`).
+    @ObservationIgnored private var growingMedia = false
+    private func growMediaSoon(after stored: MediaFileRef) {
+        guard !growingMedia, let identity else { return }
+        growingMedia = true
+        let pool = mediaPool()
+        let directory = pool.directory, real = pool.realNames.union([stored.name]), own = pool.ownFillers
+        let sizes = pool.realSizes, account = identity.fingerprint
+        // Counted now, not when the task gets to run: a Burn in between must stop it.
+        let wipes = pool.wipes
+        Task.detached(priority: .utility) { [weak self] in
+            let worker = MediaPool(directory: directory, realNames: real, ownFillers: own, realSizes: sizes)
+            let made = (try? worker.topUp(since: wipes)) ?? []
+            await MainActor.run {
+                guard let self else { return }
+                self.growingMedia = false
+                guard !made.isEmpty, self.phase == .unlocked, self.identity?.fingerprint == account else { return }
+                self.data.mediaFillers = Set(self.data.mediaFillers ?? []).union(made).sorted()
+                self.save()
+            }
+        }
     }
 
     private func deleteStoredMedia(_ ref: MediaFileRef?) {
@@ -5417,6 +5444,15 @@ final class AppModel {
         vault.refreshFillers(real: real)
     }
 
+    /// After updating from a build whose data files had no Keychain keys: the main account gives every one (its own, the
+    /// decoy's and panic's, the fillers) its key in one go, so the Keychain's creation dates don't single out the real one.
+    private func wrapDataFilesTogether() {
+        guard isPrimary, vault.hasUnwrappedDataFiles else { return }
+        save()
+        settleSaves()
+        refreshDisguises()
+    }
+
     private func rebalanceFiles() {
         settleSaves()
         guard let identity else { return }
@@ -7316,6 +7352,8 @@ final class AppModel {
 
     /// One fetch at a time: two overlapping ones could both collect, and handle, the same envelope.
     private var syncing = false
+    /// Tests: a sync is under way (one asked for now returns at once without doing anything).
+    var isSyncing: Bool { syncing }
 
     /// Whether what's about to be sent may go: whatever sealing it moved on (a ratchet, a group's chain) has to be on the
     /// disk before it leaves, and the nonces follow from that state alone, so a state rolled back to one already used

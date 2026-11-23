@@ -15,10 +15,10 @@ struct PresenceTests {
 
     private func settle(_ models: AppModel..., seconds: Int = 4) async {
         for _ in 0..<seconds {
-            for m in models { await m.syncOnce() }
+            for m in models { await m.syncOnceFully() }
             try? await Task.sleep(for: .seconds(1))
         }
-        for m in models { await m.syncOnce() }
+        for m in models { await m.syncOnceFully() }
     }
 
     @Test func statusShowsOnlyWhenBothSidesShowTheirs() async throws {

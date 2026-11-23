@@ -442,5 +442,22 @@ memory). A code comment in the relay says deposits are refused (507) at the cap,
   shows when the pool last changed: after every write, every file's is moved to that moment, so it doesn't say which file
   changed. Items are written into their filler's own file (same inode, same blocks where the system allows), never a new
   one, so inode numbers don't single them out either. Files made in one growth step still have neighbouring inode numbers,
-  which says the pool grew then, not what it holds. A deleted item's key can survive in an old copy of the data file left
-  in free space or a snapshot (the data file's key doesn't change yet; see the key wrapper in stage 1).
+  which says the pool grew then, not what it holds.
+- **Deleting really deletes (stage 1, built in build 21).** Every `data-*.vault` is sealed with a key derived (HKDF) from
+  the identity's storage key and a Keychain key of its own (`FileKeys`, named by the file), which is replaced on every
+  save: the new key is added, the file written and read back under it, then the old keys dropped (a failed drop is
+  retried by the next save). An old copy of the data file in free space or a snapshot, still holding a deleted item's
+  key, then opens with nothing, passcode included. Filler data files have Keychain keys too, refreshed with them by the
+  main account, so the Keychain's item count doesn't say how many accounts are real. A file from before opens once with
+  the storage key alone, only while no Keychain key was ever made for it, and is wrapped by its next save. On the Mac the
+  keys go in the data protection Keychain (this device only) when the build may use it, else the login Keychain, whose
+  deleted rows may survive in snapshots: the Mac's guarantee is weaker than the iPhone's. A build that can't use the data
+  protection Keychain still finds a key the other kind of build left there, and the other way round. Only the key that
+  opens the file now is kept beside the new one during a save (at most two more if the file can't be read to tell, as on
+  a locked iPhone), so the list never collects keys that open old copies. When a device moves from a build without these
+  keys, the main account gives every data file its key in one pass (`wrapDataFilesTogether`); filler items are made anew
+  whenever fillers are refreshed. **Still open:** the iPhone's Keychain is a database, and whether a replaced row's old
+  value can survive in its free pages is not known (unverified; a forensic test would settle it). Copies of data files
+  written before the update open with the storage key alone, as they always did.
+- Growing the pool for a received item happens in the background (a doubling can be hundreds of megabytes); at most one
+  file is written for the item itself.

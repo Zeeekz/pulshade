@@ -187,4 +187,37 @@ struct MediaPoolTests {
         }
         #expect(try FileManager.default.contentsOfDirectory(atPath: pool.directory.path).filter { $0.hasPrefix(".media-gone-") }.isEmpty)
     }
+
+    /// Storing into a pool that already exists never grows it there and then (the app does that on the main thread, for
+    /// anything anyone sends): it says the pool wants growing, and a copy grows it in the background.
+    @Test func aBigGrowthIsLeftForTheBackground() throws {
+        let pool = makePool("pulshade-media-later")
+        let item = Data([1, 2, 3])
+        for _ in 0..<8 { _ = try pool.store(item, growLater: true) }
+        #expect(pool.fileCount == 16, "the very first pool is still made at once: it's small")
+        _ = try pool.store(item, growLater: true)
+        #expect(pool.fileCount == 16, "nine items want thirty-two files, but not now")
+        #expect(pool.wantsGrowth)
+        let worker = MediaPool(directory: pool.directory, realNames: pool.realNames, ownFillers: pool.ownFillers)
+        let made = try worker.topUp(since: worker.wipes)
+        #expect(worker.fileCount == 32 && made.count == 16)
+
+        // An account with no filler of its own beside a big pool (a decoy) makes one file for its item, nothing more.
+        let decoy = MediaPool(directory: pool.directory)
+        let ref = try decoy.store(Data([9]), growLater: true)
+        #expect(decoy.fileCount == 33)
+        #expect(decoy.wantsGrowth)
+        #expect(try decoy.load(ref) == Data([9]))
+    }
+
+    /// A growth asked for before Burn, Detach or a panic wiped the pool makes nothing, and never brings the pool back.
+    @Test func aGrowthAskedForBeforeAWipeMakesNothing() throws {
+        let pool = makePool("pulshade-media-burngrow")
+        _ = try pool.store(Data([1]))
+        let asked = pool.wipes
+        let worker = MediaPool(directory: pool.directory, realNames: pool.realNames, ownFillers: pool.ownFillers)
+        pool.wipe()
+        #expect(throws: (any Error).self) { _ = try worker.topUp(since: asked) }
+        #expect(!FileManager.default.fileExists(atPath: pool.mediaDirectory.path), "the pool stays gone")
+    }
 }

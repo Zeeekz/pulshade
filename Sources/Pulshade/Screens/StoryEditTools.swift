@@ -214,6 +214,26 @@ struct StoryCropTool: View {
                 shade(box: box, size: geo.size)
                 frame(box: box)
                     .contentShape(Rectangle())
+                // For VoiceOver: the box as one thing to grow, shrink and move, keeping its shape.
+                Color.clear
+                    .frame(width: box.width, height: box.height)
+                    .offset(x: box.minX, y: box.minY)
+                    .accessibilityElement()
+                    .accessibilityLabel("Crop box")
+                    .accessibilityValue(boxDescription)
+                    .accessibilityHint("Swipe up or down to make it bigger or smaller. Use the actions to move it.")
+                    .accessibilityAdjustableAction { direction in
+                        switch direction {
+                        case .increment: resizeBox(by: 1.1)
+                        case .decrement: resizeBox(by: 1 / 1.1)
+                        @unknown default: break
+                        }
+                    }
+                    .accessibilityAction(named: "Move left") { nudge(dx: -0.05, dy: 0) }
+                    .accessibilityAction(named: "Move right") { nudge(dx: 0.05, dy: 0) }
+                    .accessibilityAction(named: "Move up") { nudge(dx: 0, dy: -0.05) }
+                    .accessibilityAction(named: "Move down") { nudge(dx: 0, dy: 0.05) }
+                    .accessibilityAction(named: "Centre it") { centreBox() }
                 Color.clear.contentShape(Rectangle())
                     .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .local)
                         .onChanged { drag in dragged(drag, box: box, shown: shown) }
@@ -349,6 +369,41 @@ struct StoryCropTool: View {
     }
 
     // MARK: Changing the box
+
+    /// How much of the picture the box keeps, and where, in words.
+    private var boxDescription: String {
+        let r = draft.rect
+        let w = Int((r.width * 100).rounded()), h = Int((r.height * 100).rounded())
+        func place(_ mid: CGFloat, _ low: String, _ high: String) -> String { mid < 0.4 ? low : mid > 0.6 ? high : "" }
+        let across = place(r.midX, "left", "right"), down = place(r.midY, "top", "bottom")
+        let spot = [down, across].filter { !$0.isEmpty }.joined(separator: " ")
+        return "\(w)% wide, \(h)% high, " + (spot.isEmpty ? "in the middle" : "towards the \(spot)")
+    }
+
+    /// The box made bigger or smaller about its middle, keeping its shape and staying on the picture.
+    private func resizeBox(by factor: CGFloat) {
+        let r = draft.rect
+        var w = r.width * factor, h = r.height * factor
+        // No bigger than the picture, no smaller than the least, in proportion.
+        let shrink = min(1, 1 / max(w, h, 0.0001))
+        w *= shrink; h *= shrink
+        let grow = max(1, StoryCrop.smallest / max(min(w, h), 0.0001))
+        w = min(w * grow, 1); h = min(h * grow, 1)
+        let x = min(max(r.midX - w / 2, 0), 1 - w), y = min(max(r.midY - h / 2, 0), 1 - h)
+        withAnimation(.snappy) { draft.rect = CGRect(x: x, y: y, width: w, height: h) }
+    }
+
+    private func nudge(dx: CGFloat, dy: CGFloat) {
+        let r = draft.rect
+        withAnimation(.snappy) {
+            draft.rect.origin = CGPoint(x: min(max(r.minX + dx, 0), 1 - r.width), y: min(max(r.minY + dy, 0), 1 - r.height))
+        }
+    }
+
+    private func centreBox() {
+        let r = draft.rect
+        withAnimation(.snappy) { draft.rect.origin = CGPoint(x: (1 - r.width) / 2, y: (1 - r.height) / 2) }
+    }
 
     /// The box's width over height as a fraction of the picture, for a shape in pixels.
     private func unitRatio(_ shape: CropShape) -> CGFloat? {

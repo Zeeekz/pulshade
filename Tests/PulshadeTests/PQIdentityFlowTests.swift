@@ -14,7 +14,7 @@ struct PQIdentityFlowTests {
     }
 
     private func settle(_ models: AppModel..., rounds: Int = 6) async {
-        for _ in 0..<rounds { for m in models { await m.syncOnce() } }
+        for _ in 0..<rounds { for m in models { await m.syncOnceFully() } }
     }
 
     private func connected() async throws -> (alice: AppModel, bob: AppModel) {

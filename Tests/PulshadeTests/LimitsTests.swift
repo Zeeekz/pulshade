@@ -51,10 +51,12 @@ struct LimitsTests {
         for bound in ["claim|someone", "retire", "backup|k", "burn", "push", "group|id"] {
             #expect(Work.baseBits(for: bound) == Work.heavy)
         }
-        Work.learn(Work.ceiling + 5, for: "lookup|a")
-        #expect(Work.bits(for: "lookup|a") == Work.light, "an absurd ask is not learned")
-        Work.learn(25, for: "lookup|a")
-        #expect(Work.bits(for: "lookup|b") == 25, "what the relay asked of a route is used for that route")
+        // A route of its own: what the test relay asks of real routes while the rest of the suite runs is learned too, and
+        // the table is shared.
+        Work.learn(Work.ceiling + 5, for: "limitstest|a")
+        #expect(Work.bits(for: "limitstest|a") == Work.light, "an absurd ask is not learned")
+        Work.learn(25, for: "limitstest|a")
+        #expect(Work.bits(for: "limitstest|b") == 25, "what the relay asked of a route is used for that route")
         #expect(Work.bits(for: "claim|a") == Work.heavy)
     }
 

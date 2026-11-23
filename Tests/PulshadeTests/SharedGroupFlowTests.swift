@@ -14,13 +14,13 @@ struct SharedGroupFlowTests {
     }
 
     private func settle(_ models: AppModel..., rounds: Int = 6) async {
-        for _ in 0..<rounds { for m in models { await m.syncOnce() } }
+        for _ in 0..<rounds { for m in models { await m.syncOnceFully() } }
     }
 
     private func until(_ models: [AppModel], seconds: Double = 15, _ done: () -> Bool) async {
         let end = Date().addingTimeInterval(seconds)
         while !done() && Date() < end {
-            for m in models { await m.syncOnce() }
+            for m in models { await m.syncOnceFully() }
             try? await Task.sleep(for: .milliseconds(100))
         }
     }
@@ -31,6 +31,10 @@ struct SharedGroupFlowTests {
         _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
         _ = try #require(cara.addContact(code: alice.makeInviteCode(), nickname: ""))
         await settle(alice, bob, cara)
+        // A fixed few syncs were sometimes too few with the whole suite running: until Alice has both.
+        await until([alice, bob, cara]) {
+            alice.visibleContacts.contains { $0.name == "Bob" } && alice.visibleContacts.contains { $0.name == "Cara" }
+        }
         // Everyone has heard from everyone's app (and so knows it takes part) once a message has gone each way.
         let bobFP = try #require(alice.visibleContacts.first { $0.name == "Bob" }).fingerprint
         let caraFP = try #require(alice.visibleContacts.first { $0.name == "Cara" }).fingerprint

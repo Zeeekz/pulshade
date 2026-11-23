@@ -277,7 +277,7 @@ struct Vault {
             try writeLock(slots, device: device, unbound: [])
             let keep = dataURL(for: landing).lastPathComponent
             let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
-            for url in files where url.pathExtension == "vault" && url.lastPathComponent != keep { shred(url) }
+            for url in files where url.pathExtension == "vault" && url.lastPathComponent != keep { shredData(url) }
             disableBiometrics()
             rebalance(real: [landing])
             // The landing account is always new and empty, so every media file is the destroyed accounts' (or their
@@ -294,7 +294,7 @@ struct Vault {
             var (slots, device, unbound) = try readLock()
             slots[index] = Self.filler()
             try writeLock(slots, device: device, unbound: Set(unbound ?? []))
-            if let identity { shred(dataURL(for: identity)) }
+            if let identity { shredData(dataURL(for: identity)) }
         }
     }
 
@@ -542,6 +542,79 @@ struct Vault {
         return directory.appendingPathComponent("data-\(name).vault")
     }
 
+    // A data file is sealed with a key made from two: the identity's storage key (which needs the passcode) and a key
+    // kept in the Keychain (`dataKeys`) that is replaced on every save. Delete a message or a photo, and the next save
+    // replaces the Keychain key, so an older copy of the file left in the disk's free space or a snapshot, still holding
+    // what was deleted (a photo's own key included), no longer opens, even with the passcode. Filler files have
+    // Keychain keys too, rotated with them, so the Keychain doesn't say which files are real.
+
+    /// The Keychain key for one data file, named by the file.
+    private func dataKeys(_ url: URL) -> FileKeys { FileKeys(directory: directory, file: url.lastPathComponent) }
+
+    /// The key a data file is sealed with: the identity's storage key bound to the Keychain key.
+    private static func dataKey(_ identity: Identity, _ wrap: SymmetricKey) -> SymmetricKey {
+        HKDF<SHA256>.deriveKey(inputKeyMaterial: identity.storageKey, salt: wrap.withUnsafeBytes { Data($0) },
+                               info: Data("pulshade.data.wrap.v1".utf8), outputByteCount: 32)
+    }
+
+    /// Opens a data file's bytes: with each Keychain key it has (newest first); written before data files had one, with
+    /// the storage key alone, but only while no Keychain key was ever made for it (after that, such a copy can only be
+    /// an old one); or with a key left under an older name for the file (iOS moved the app's folder).
+    private func openData(_ raw: Data, identity: Identity, url: URL) throws -> Data {
+        let box = try AES.GCM.SealedBox(combined: raw)
+        let keys = dataKeys(url)
+        for wrap in keys.load().reversed() {
+            if let plain = try? AES.GCM.open(box, using: Self.dataKey(identity, wrap)) { return plain }
+        }
+        // On a Mac, a key left in the other Keychain by a build that could (or couldn't) use the data protection one.
+        for wrap in keys.loadEverywhere().reversed() {
+            guard let plain = try? AES.GCM.open(box, using: Self.dataKey(identity, wrap)) else { continue }
+            try? keys.store([wrap])
+            return plain
+        }
+        if !keys.inUse { return try AES.GCM.open(box, using: identity.storageKey) }
+        // A stray key that opens it was this file's under its old name. Another file's key is never taken or removed.
+        let mine = Set(knownKeyAccounts())
+        for stray in keys.others() where !mine.contains(stray.account) {
+            for wrap in stray.load() {
+                guard let plain = try? AES.GCM.open(box, using: Self.dataKey(identity, wrap)) else { continue }
+                try keys.store([wrap])
+                stray.forget()
+                return plain
+            }
+        }
+        throw VaultError.corrupt
+    }
+
+    /// The Keychain accounts of every file in the folder that has one, so a key that belongs to a file still here is
+    /// never mistaken for a stray.
+    private func knownKeyAccounts() -> [String] {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+        return names.filter { $0.hasSuffix(".vault") || ["identity.lock", "identity.bio", "device.key", "catalog.cache"].contains($0) }
+            .map { FileKeys(directory: directory, file: $0).account }
+    }
+
+    /// A fresh Keychain key for a filler file, so it has one like any real file and the count and changes match. The
+    /// item is made anew (not updated), so its creation date moves with the others' rather than marking it.
+    private func refreshFillerKey(_ url: URL) {
+        let keys = dataKeys(url)
+        keys.forget()
+        try? keys.store([SymmetricKey(size: .bits256)])
+    }
+
+    /// Whether any data file has no Keychain key yet (written by an older build): the main account then gives every
+    /// file one in a single pass (`AppModel.wrapDataFilesTogether`), so their creation dates don't single out the real one.
+    var hasUnwrappedDataFiles: Bool {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+        return names.contains { $0.hasPrefix("data-") && $0.hasSuffix(".vault") && !dataKeys(directory.appendingPathComponent($0)).inUse }
+    }
+
+    /// Shreds a data file and removes its Keychain key with it.
+    private func shredData(_ url: URL) {
+        dataKeys(url).forget()
+        shred(url)
+    }
+
     func load(with identity: Identity) throws -> AppData? {
         let url = dataURL(for: identity)
         if !FileManager.default.fileExists(atPath: url.path), FileManager.default.fileExists(atPath: legacyDataURL.path) {
@@ -552,8 +625,7 @@ struct Vault {
         // that would then be saved over it.
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         let raw = try Data(contentsOf: url)
-        let box = try AES.GCM.SealedBox(combined: raw)
-        let plain = try AES.GCM.open(box, using: identity.storageKey)
+        let plain = try openData(raw, identity: identity, url: url)
         let json = try Self.unpad(plain)
         do {
             return try JSONDecoder.pulshade.decode(AppData.self, from: json)
@@ -565,10 +637,36 @@ struct Vault {
         }
     }
 
+    /// Seals under a brand-new Keychain key. The new key is added before the file is written; the old ones are dropped
+    /// only once the new file has been read back and opens, so whatever is on disk always has its key, and a save that
+    /// failed part-way never strands the account. Old keys a failed drop left behind go with the next save.
     func save(_ data: AppData, with identity: Identity) throws {
         let plain = try JSONEncoder.pulshade.encode(data)
-        let sealed = try AES.GCM.seal(Self.pad(plain), using: identity.storageKey).combined!
-        try write(sealed, to: dataURL(for: identity))
+        let url = dataURL(for: identity)
+        let keys = dataKeys(url)
+        Self.mutation.lock()
+        defer { Self.mutation.unlock() }
+        let old = keys.load()
+        let fresh = SymmetricKey(size: .bits256)
+        let sealed = try AES.GCM.seal(Self.pad(plain), using: Self.dataKey(identity, fresh)).combined!
+        // Checked in memory before anything is written.
+        guard (try? AES.GCM.open(AES.GCM.SealedBox(combined: sealed), using: Self.dataKey(identity, fresh))) != nil
+        else { throw VaultError.corrupt }
+        // Only the key that opens the file there now is kept beside the new one, never every key from before: those
+        // open only older copies. If the file can't be read to tell (an iPhone locked), the last two are kept, one of
+        // which is it, so the list never grows past three.
+        let current = (try? Data(contentsOf: url)).flatMap { try? AES.GCM.SealedBox(combined: $0) }
+        let opener = current.flatMap { box in old.last { (try? AES.GCM.open(box, using: Self.dataKey(identity, $0))) != nil } }
+        let keep = opener.map { [$0] } ?? (current == nil ? Array(old.suffix(2)) : [])
+        // Never a file without its Keychain key: failing here beats quietly writing one an old key still opens.
+        try keys.store(keep + [fresh])
+        try write(sealed, to: url)
+        // Read back before the old key goes. A file that can't be read back yet (an iPhone that locked: the file is
+        // written, but can't be opened again until it unlocks) isn't a failure: the old key stays until the next save.
+        guard let back = try? Data(contentsOf: url) else { return }
+        guard let box = try? AES.GCM.SealedBox(combined: back),
+              (try? AES.GCM.open(box, using: Self.dataKey(identity, fresh))) != nil else { throw VaultError.corrupt }
+        try? keys.store([fresh])
     }
 
     /// Data files come in a few sizes only: 64 KB, then doubling. An empty decoy and a filler file look
@@ -607,10 +705,15 @@ struct Vault {
         let files = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
         var fillers = files.filter { $0.hasPrefix("data-") && $0.hasSuffix(".vault") && !realNames.contains($0) }
         let wanted = max(0, Self.dataFileCount - realNames.count)
-        while fillers.count > wanted { shred(directory.appendingPathComponent(fillers.removeLast())) }
+        while fillers.count > wanted { shredData(directory.appendingPathComponent(fillers.removeLast())) }
         for _ in fillers.count..<wanted {
-            try? write(.random(fillerSize(real: real)), to: directory.appendingPathComponent("data-\(Data.random(12).hex).vault"))
+            let url = directory.appendingPathComponent("data-\(Data.random(12).hex).vault")
+            try? write(.random(fillerSize(real: real)), to: url)
+            refreshFillerKey(url)
         }
+        // Fillers from before data files had Keychain keys get theirs from `refreshFillers`, which only the main account
+        // runs: from here (a decoy runs this too) a real file written by an older build would look like filler, and a
+        // random key put on it would lock that account out.
     }
 
     /// Rewrites the filler files with fresh random bytes, so they change size and time together with the
@@ -619,7 +722,9 @@ struct Vault {
         let realNames = Set(real.map { dataURL(for: $0).lastPathComponent })
         let files = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
         for name in files where name.hasPrefix("data-") && name.hasSuffix(".vault") && !realNames.contains(name) {
-            try? write(.random(fillerSize(real: real)), to: directory.appendingPathComponent(name))
+            let url = directory.appendingPathComponent(name)
+            try? write(.random(fillerSize(real: real)), to: url)
+            refreshFillerKey(url)
         }
     }
 
@@ -648,6 +753,9 @@ struct Vault {
             if exists || lockKeys.inUse { lockKeys.revoke() }
             if hasBiometrics || biometricKeys.inUse { biometricKeys.revoke() }
         }
+        // Every data file's key too, real and filler alike.
+        let present = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+        for url in present where url.pathExtension == "vault" { dataKeys(url).forget() }
         // The keys are gone above; only then are the media files and fillers wiped.
         MediaPool(directory: directory).wipe()
         let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
@@ -825,9 +933,16 @@ final class MediaPool {
         return size
     }
 
+    /// Set by `store(_:growLater:)` when the pool should grow and that was left for `topUp`.
+    private(set) var wantsGrowth = false
+
     /// Writes a new sealed item into one of this account's filler files (growing the pool first if it has none) and
     /// returns the reference the vault must keep. Fails rather than writing anything unencrypted.
-    func store(_ plaintext: Data) throws -> MediaFileRef {
+    ///
+    /// `growLater`: a pool that already exists isn't grown here (doubling a big one writes hundreds of megabytes, and the
+    /// app calls this on the main thread, for anything anyone sends). At most one new filler is made, for this item, and
+    /// `wantsGrowth` says the caller should `topUp` a copy of the pool in the background.
+    func store(_ plaintext: Data, growLater: Bool = false) throws -> MediaFileRef {
         try prepare()
         let key = SymmetricKey(size: .bits256)
         let keyData = key.withUnsafeBytes { Data($0) }
@@ -835,12 +950,19 @@ final class MediaPool {
         realSizes.append(sealed.count)
         let existing = Set(allFiles().map(\.lastPathComponent))
         ownFillers.formIntersection(existing)
-        if ownFillers.isEmpty || existing.count < Self.target(forReal: realNames.count + 1, files: existing.count) {
-            try grow(toHold: realNames.count + 1)
+        let short = ownFillers.isEmpty || existing.count < Self.target(forReal: realNames.count + 1, files: existing.count)
+        if short, growLater, existing.count >= Self.smallest {
+            wantsGrowth = true
+            if ownFillers.isEmpty {
+                let url = try makeFiller()
+                ownFillers.insert(url.lastPathComponent)
+            }
+        } else {
+            if short { try grow(toHold: realNames.count + 1) }
+            // Still none of its own (the pool is full of another account's files, which it can't tell from filler): double
+            // the pool with filler of its own rather than ever borrowing a file it doesn't know.
+            if ownFillers.isEmpty { try grow(toHold: realNames.count + 1, doubling: true) }
         }
-        // Still none of its own (the pool is full of another account's files, which it can't tell from filler): double
-        // the pool with filler of its own rather than ever borrowing a file it doesn't know.
-        if ownFillers.isEmpty { try grow(toHold: realNames.count + 1, doubling: true) }
         guard let name = ownFillers.sorted().first else { throw VaultError.corrupt }
         let url = mediaDirectory.appendingPathComponent(name)
         // Into the filler's own file, not a new one put in its place: a new file would get a new inode and its own
@@ -884,13 +1006,22 @@ final class MediaPool {
         stamp([url])
     }
 
-    /// Adds filler (this account's own) until the pool is the size it should be for `real` items. Never removes.
-    func grow(toHold real: Int, doubling: Bool = false) throws {
+    /// Adds filler (this account's own) until the pool is the size it should be for `real` items. Never removes. Stops,
+    /// and removes what it made, if the pool is wiped meanwhile (Burn, Detach or a panic, while it grew in the background).
+    func grow(toHold real: Int, doubling: Bool = false, since: Int? = nil) throws {
+        let started = since ?? wipes
+        // Asked for before a wipe (Burn, Detach, a panic): nothing is made, and a pool that's gone isn't made again.
+        guard wipes == started else { throw VaultError.missing }
+        if since != nil, !FileManager.default.fileExists(atPath: mediaDirectory.path) { throw VaultError.missing }
         try prepare()
         var count = allFiles().count
         let wanted = doubling ? max(Self.smallest, count * 2) : Self.target(forReal: real, files: count)
         var made: [URL] = []
         while count < wanted {
+            guard wipes == started else {
+                for url in made { try? FileManager.default.removeItem(at: url) }
+                throw VaultError.missing
+            }
             let url = try makeFiller()
             made.append(url)
             ownFillers.insert(url.lastPathComponent)
@@ -898,6 +1029,25 @@ final class MediaPool {
         }
         if !made.isEmpty { stamp(made) }
     }
+
+    /// Grows the pool to its size for the items it holds, with filler of this account's own to spare. For a copy of the
+    /// pool, in the background, after a `store(_:growLater:)` that left it short. Returns the new filler's names.
+    /// `since`: the pool's `wipes` when the growth was asked for, so a wipe in between stops it.
+    func topUp(since: Int) throws -> Set<String> {
+        let before = ownFillers
+        try grow(toHold: realNames.count, since: since)
+        if ownFillers.subtracting(before).isEmpty, ownFillers.count < 2 {
+            try grow(toHold: realNames.count, doubling: true, since: since)
+        }
+        return ownFillers.subtracting(before)
+    }
+
+    /// Counts each pool's wipes (by its folder), so a growth running in the background knows the pool it was growing is
+    /// gone.
+    nonisolated(unsafe) private static var wipeCounts: [String: Int] = [:]
+    private static let wipeLock = NSLock()
+    var wipes: Int { Self.wipeLock.withLock { Self.wipeCounts[mediaDirectory.standardizedFileURL.path] ?? 0 } }
+    private func noteWipe() { Self.wipeLock.withLock { Self.wipeCounts[mediaDirectory.standardizedFileURL.path, default: 0] += 1 } }
 
     var fileCount: Int { allFiles().count }
     var fillerCount: Int { allFiles().filter { !realNames.contains($0.lastPathComponent) }.count }
@@ -907,6 +1057,7 @@ final class MediaPool {
     /// straight away) and overwritten in the background. One left part-way (the app was closed) is finished the next time
     /// the pool is used. Its keys must already be gone.
     func wipeSoon() {
+        noteWipe()
         guard FileManager.default.fileExists(atPath: mediaDirectory.path) else { return }
         let aside = directory.appendingPathComponent(Self.asidePrefix + Data.random(8).hex, isDirectory: true)
         guard (try? FileManager.default.moveItem(at: mediaDirectory, to: aside)) != nil else { wipe(); return }
@@ -927,6 +1078,7 @@ final class MediaPool {
 
     /// Keys are destroyed by the vault before this is called; then every real file and filler is overwritten and removed.
     func wipe() {
+        noteWipe()
         guard FileManager.default.fileExists(atPath: mediaDirectory.path) else { return }
         Vault.scrub(item: mediaDirectory)
         try? FileManager.default.removeItem(at: mediaDirectory)

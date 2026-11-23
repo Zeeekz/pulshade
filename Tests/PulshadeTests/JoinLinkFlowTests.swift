@@ -15,7 +15,7 @@ struct JoinLinkFlowTests {
     }
 
     private func settle(_ models: AppModel..., rounds: Int = 6) async {
-        for _ in 0..<rounds { for m in models { await m.syncOnce() } }
+        for _ in 0..<rounds { for m in models { await m.syncOnceFully() } }
     }
 
     /// Syncs and reads join mailboxes until `done`, or for `seconds`.

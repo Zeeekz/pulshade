@@ -41,3 +41,16 @@ func testDirectory(_ prefix: String) -> URL {
     model.acceptsInvitesForTests = true
     return model
 }
+
+extension AppModel {
+    /// A sync that really runs: one asked for while another is under way (the app's own, say) returns at once and does
+    /// nothing, which under a busy test run used up a test's rounds before anything had arrived.
+    func syncOnceFully() async {
+        var waited = 0
+        while isSyncing, waited < 150 {
+            try? await Task.sleep(for: .milliseconds(20))
+            waited += 1
+        }
+        await syncOnce()
+    }
+}

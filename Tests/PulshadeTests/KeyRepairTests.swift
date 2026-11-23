@@ -18,7 +18,7 @@ struct KeyRepairTests {
     private func until(_ models: [AppModel], seconds: Double = 30, _ done: () -> Bool) async {
         let end = Date().addingTimeInterval(seconds)
         while !done() && Date() < end {
-            for m in models { await m.syncOnce() }
+            for m in models { await m.syncOnceFully() }
             try? await Task.sleep(for: .milliseconds(100))
         }
     }

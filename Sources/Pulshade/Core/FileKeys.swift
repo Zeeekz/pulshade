@@ -25,7 +25,9 @@ struct FileKeys {
         let home = URL(fileURLWithPath: NSHomeDirectory()).standardizedFileURL.path + "/"
         if path.hasPrefix(home) { path.removeFirst(home.count) }
         account = Data(SHA256.hash(data: Data(path.utf8)).prefix(16)).hex
-        dataProtection = file == "device.key"
+        // The data files' keys too: an old copy of one must stop opening when its key goes, and the file-based login
+        // Keychain neither deletes rows securely nor stays off another Mac.
+        dataProtection = file == "device.key" || (file.hasPrefix("data-") && file.hasSuffix(".vault"))
     }
 
     private init(account: String) {
@@ -55,6 +57,20 @@ struct FileKeys {
         return stride(from: 0, to: raw.count, by: 32).map {
             SymmetricKey(data: raw[raw.startIndex + $0 ..< raw.startIndex + $0 + 32])
         }
+    }
+
+    /// Keys for this file in either of the Mac's Keychains (on iPhone, the same as `load`): one a build that could use the
+    /// data protection Keychain left there, or one a build that couldn't left in the login Keychain.
+    func loadEverywhere() -> [SymmetricKey] {
+        #if os(macOS)
+        guard dataProtection, !Self.inMemory else { return load() }
+        let raws = [Self.read(account, query: Self.query(account)), Self.read(account, query: Self.query(account, dataProtection: true))]
+        return raws.compactMap { $0 }.filter { $0.count % 32 == 0 }.flatMap { raw in
+            stride(from: 0, to: raw.count, by: 32).map { SymmetricKey(data: raw[raw.startIndex + $0 ..< raw.startIndex + $0 + 32]) }
+        }
+        #else
+        return load()
+        #endif
     }
 
     /// Whether this file has ever been sealed with a Keychain key here. Once it has, an unsealed copy
