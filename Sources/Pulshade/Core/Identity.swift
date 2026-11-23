@@ -247,6 +247,14 @@ struct Invite: Equatable {
         }
     }
 
+    /// What a channel's invites carry to say which code they belong to (`GroupInvite.code`): made from the code's mailbox
+    /// send id under a label of its own, so it names the code without giving it away.
+    static func codeTag(sendID: Data) -> Data {
+        Data(SHA256.hash(data: Data("pulshade.channel.code.v1".utf8) + sendID).prefix(16))
+    }
+
+    var codeTag: Data { Self.codeTag(sendID: sendID) }
+
     /// As a link, so the phone's own Camera app and other apps open it in Pulshade.
     static func link(_ code: String) -> String { "pulshade://invite/" + code }
 

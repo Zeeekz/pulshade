@@ -443,6 +443,12 @@ struct GroupFriendInvite: Codable, Identifiable, Equatable {
 
 /// Someone invited you to a group or channel you aren't in. Nothing is joined, no card goes back, and nobody becomes the
 /// one a channel is followed through, until you say yes.
+/// A channel code you followed: its tag (`Invite.codeTag`), which that channel's invite carries, and when.
+struct FollowedCode: Codable, Equatable {
+    var tag: Data
+    var at: Date
+}
+
 struct GroupOffer: Codable, Identifiable, Equatable {
     var id = UUID()
     var persona: UUID?
@@ -1496,7 +1502,7 @@ struct AppData: Codable {
     /// archived (`Conversation.archived`); whether to warn before saving a photo or video out of Pulshade
     /// (`SecuritySettings.warnBeforeSaving`). Waking a locked iPhone, friend request wake-ups and receiving while
     /// auto-locked stop being saved: they're always on.
-    /// 28: invites to groups and channels wait for a yes (`groupOffers`), channel codes followed (`followsAsked`), and
+    /// 28: invites to groups and channels wait for a yes (`groupOffers`), channel codes followed (`followsAsked`, with the tag channel invites carry), and
     /// the channel a stranger said hello on (`Contact.viaCode`).
     static let currentFormat = 28
     var profile = Profile()
@@ -1575,9 +1581,9 @@ struct AppData: Codable {
     var friendInvites: [GroupFriendInvite] = []
     /// Invites to groups and channels you aren't in, until you answer (`GroupOffer`).
     var groupOffers: [GroupOffer] = []
-    /// "persona|fingerprint" → when you followed that person's channel code: their channel's invite is taken without
-    /// asking again, for two weeks.
-    var followsAsked: [String: Date] = [:]
+    /// "persona|fingerprint" → the codes of that person's channels you followed lately (`FollowedCode`): the invite for
+    /// each code's own channel is taken without asking again, for two weeks after you followed it.
+    var followsAsked: [String: [FollowedCode]] = [:]
     /// Random bytes every linked device of the account holds, which group keys are made from with the seed
     /// (`GroupMemberKeys`). Replaced when a device is unlinked, and every group then moves to keys made with the new one.
     /// Nil: the seed alone (an account from before; its lead device makes one at unlock).
@@ -1683,7 +1689,7 @@ struct AppData: Codable {
         joinAsks = (try? c.decodeIfPresent([JoinAsk].self, forKey: .joinAsks)) ?? []
         friendInvites = (try? c.decodeIfPresent([GroupFriendInvite].self, forKey: .friendInvites)) ?? []
         groupOffers = (try? c.decodeIfPresent([GroupOffer].self, forKey: .groupOffers)) ?? []
-        followsAsked = (try? c.decodeIfPresent([String: Date].self, forKey: .followsAsked)) ?? [:]
+        followsAsked = (try? c.decodeIfPresent([String: [FollowedCode]].self, forKey: .followsAsked)) ?? [:]
         personas = try c.decodeIfPresent([Persona].self, forKey: .personas) ?? []
         requests = (try? c.decodeIfPresent([FriendRequest].self, forKey: .requests)) ?? []
         blocked = try c.decodeIfPresent([String].self, forKey: .blocked) ?? []

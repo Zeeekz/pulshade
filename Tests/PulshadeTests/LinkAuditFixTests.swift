@@ -285,6 +285,60 @@ struct LinkAuditFixFlowTests {
         #expect(alice.contact(stranger.fingerprint, in: nil)?.viaCode == nil, "no longer a stranger from the code")
     }
 
+    /// Following a code lets in only that code's channel without asking. Another channel of the same person's, sent
+    /// while the follow is fresh, isn't taken; one from an older app, which can't say which code it's for, waits for a
+    /// yes under its own name.
+    @Test func aFollowedCodeOnlyLetsItsOwnChannelIn() async throws {
+        AppModel.channelAdmitsPerHour = 60
+        let alice = try await makeUser("Alice"), bob = try await makeUser("Bob"), cara = try await makeUser("Cara")
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let drops = alice.startConversation(kind: .channel, title: "Drops", members: [])
+        let other = alice.startConversation(kind: .channel, title: "Other", members: [])
+        let otherCode = try #require(Invite(code: alice.makeInviteCode(channel: other.id)))
+        let aliceOnBob = try #require(bob.addContact(code: alice.makeInviteCode(channel: drops.id), nickname: ""))
+        #expect(aliceOnBob.hidden)
+
+        // Alice's other channel, before her app has even read Bob's hello: not taken, not even asked about.
+        let held = try #require(alice.conversation(other.id)?.shared)
+        bob.acceptGroupInvite(GroupInvite(settings: held.settings, epoch: try #require(held.current), code: otherCode.codeTag), from: aliceOnBob)
+        #expect(bob.conversation(other.id) == nil && bob.data.groupOffers.isEmpty, "not the channel he followed")
+
+        // An owner on an older app sends no tag: after a follow, its invite is asked about by the channel's name.
+        let third = cara.startConversation(kind: .channel, title: "Third", members: [])
+        let caraOnBob = try #require(bob.addContact(code: cara.makeInviteCode(channel: third.id), nickname: ""))
+        let thirdHeld = try #require(cara.conversation(third.id)?.shared)
+        bob.acceptGroupInvite(GroupInvite(settings: thirdHeld.settings, epoch: try #require(thirdHeld.current)), from: caraOnBob)
+        #expect(bob.conversation(third.id) == nil && bob.groupOffers.first?.title == "Third", "asked, by the channel's name")
+        bob.acceptGroupOffer(try #require(bob.groupOffers.first).id)
+        #expect(bob.conversation(third.id)?.shared != nil, "in, once he said yes")
+
+        // The channel he followed comes in without asking, as Alice's app lets him in.
+        await until([alice, bob, cara], seconds: 30) { bob.conversation(drops.id)?.shared != nil }
+        #expect(bob.conversation(drops.id)?.shared != nil && bob.data.groupOffers.isEmpty, "his follow lets Drops in")
+        #expect(bob.conversation(other.id) == nil, "and only Drops")
+    }
+
+    /// Two of one person's codes followed, and one of their devices on an older app: its untagged invite is asked about
+    /// and uses no follow up, so the other code's channel still comes in without asking. A tag that isn't one is ignored.
+    @Test func anUntaggedInviteDoesntUseUpAnotherCodesFollow() async throws {
+        let alice = try await makeUser("Alice"), bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        let a = alice.startConversation(kind: .channel, title: "A", members: [])
+        let b = alice.startConversation(kind: .channel, title: "B", members: [])
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(channel: a.id), nickname: ""))
+        let codeB = try #require(Invite(code: alice.makeInviteCode(channel: b.id)))
+        let aliceOnBob = try #require(bob.addContact(code: codeB.code, nickname: ""))
+        let heldA = try #require(alice.conversation(a.id)?.shared), heldB = try #require(alice.conversation(b.id)?.shared)
+
+        bob.acceptGroupInvite(GroupInvite(settings: heldA.settings, epoch: try #require(heldA.current)), from: aliceOnBob)
+        #expect(bob.conversation(a.id) == nil && bob.groupOffers.map(\.title) == ["A"], "asked about")
+        bob.acceptGroupInvite(GroupInvite(settings: heldB.settings, epoch: try #require(heldB.current), code: Data(codeB.codeTag.prefix(8))),
+                              from: aliceOnBob)
+        #expect(bob.conversation(b.id) == nil, "a cut-short tag is no tag of B's")
+        bob.acceptGroupInvite(GroupInvite(settings: heldB.settings, epoch: try #require(heldB.current), code: codeB.codeTag), from: aliceOnBob)
+        #expect(bob.conversation(b.id)?.shared != nil, "B's own invite still comes in without asking")
+    }
+
     /// A new channel from someone known only through a channel's code is dropped: no channel, no invite, no banner.
     @Test func aHiddenContactCantSendChannelInvites() async throws {
         AppModel.channelAdmitsPerHour = 60

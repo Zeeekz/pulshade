@@ -1716,9 +1716,11 @@ final class AppModel {
         if let pinned = known?.pq, pinned.commitment != invite.pqHash { return nil }
         // A friend's channel code used again within a few days sends nothing more: their phone already has the hello, and
         // each one keeps an ask on every one of their devices (see below), which would push out real ones.
+        // Only the same code: another of their channels' codes is followed as usual.
+        let followKey = Self.followKey(invite.fingerprint, owner)
         let followedLately = known.map { !$0.hidden } == true && invite.kind == .channel
-            && data.followsAsked[Self.followKey(invite.fingerprint, owner)].map { Date().timeIntervalSince($0) < 3 * 86_400 } == true
-        if invite.kind == .channel { noteFollowAsked(invite.fingerprint, persona: owner) }
+            && data.followsAsked[followKey]?.contains { $0.tag == invite.codeTag && Date().timeIntervalSince($0.at) < 3 * 86_400 } == true
+        if invite.kind == .channel { noteFollowAsked(invite.fingerprint, persona: owner, tag: invite.codeTag) }
         if followedLately, let known { save(); return known }
         // A friend's own channel: the friend stays exactly as they are (devices, sessions, mailboxes, nickname). The hello
         // goes to the channel's code mailbox and names the mailbox they already write to, so their phone only lets this
@@ -10588,10 +10590,14 @@ extension AppModel {
         }
         guard let epoch = shared.current else { return tooOld }
         let added = Array(people.prefix(room))
+        // A channel says which code it's for, so whoever followed that code takes it without asking.
+        let id = data.conversations[i].id
+        let code = kind == .channel
+            ? data.invites.first { $0.channel == id }.map { Invite.codeTag(sendID: Mailbox.sendID(for: $0.receiveKey)) } : nil
         for person in added {
             shared.invited[person.fingerprint] = Date()
             shared.invitedEpoch[person.fingerprint] = epoch.number
-            enqueue(.groupInvite(GroupInvite(settings: shared.settings, epoch: epoch)), to: person)
+            enqueue(.groupInvite(GroupInvite(settings: shared.settings, epoch: epoch, code: code)), to: person)
         }
         data.conversations[i].shared = shared
         if kind == .channel { for person in added { noteAdmitted(person.fingerprint, at: i) } }
@@ -10677,13 +10683,15 @@ extension AppModel {
             // A new group comes from a friend. Someone known only through another group or a channel can't put this
             // account in one (and so get its name and picture card back); a channel's own invite is how it is followed.
             if s.kind == .group, sender.hidden { return }
-            let followed = s.kind == .channel && takeFollowAsked(sender.fingerprint, persona: sender.persona)
+            let match = s.kind == .channel && !consented ? takeFollowAsked(sender.fingerprint, persona: sender.persona, tag: invite.code) : .none
+            let followed = match == .matched
             // Nor a channel, unless it's the one whose code you followed: anyone who said hello on a channel's code, or
             // the staff of a channel you follow, would otherwise have a way to send you invites (and notifications) of
-            // their own making.
-            if s.kind == .channel, sender.hidden, !followed, !consented { return }
+            // their own making. An invite that doesn't say which code it's for (their app is older) comes from someone
+            // whose code you followed, so it is asked about, by the channel's name, rather than dropped or taken.
+            if s.kind == .channel, sender.hidden, match == .none, !consented { return }
             if !consented, !acceptsInvitesForTests, !followed {
-                noteGroupOffer(invite, from: sender)
+                noteGroupOffer(invite, from: sender, followed: match == .untagged)
                 return
             }
             data.groupOffers.removeAll { $0.invite.settings.group == s.group && $0.persona == sender.persona }
@@ -13602,23 +13610,43 @@ extension AppModel {
     private static func followKey(_ fp: String, _ persona: UUID?) -> String { "\(persona?.uuidString ?? "")|\(fp)" }
     private static let followAskLife: TimeInterval = 14 * 86_400
 
-    /// You followed this person's channel code: their channel's invite is taken without asking again.
-    private func noteFollowAsked(_ fp: String, persona: UUID?) {
-        data.followsAsked = data.followsAsked.filter { Date().timeIntervalSince($0.value) < Self.followAskLife }
-        data.followsAsked[Self.followKey(fp, persona)] = Date()
+    /// You followed this person's channel code: the invite for that code's channel is taken without asking again.
+    private func noteFollowAsked(_ fp: String, persona: UUID?, tag: Data) {
+        pruneFollowsAsked()
+        let key = Self.followKey(fp, persona)
+        let held = (data.followsAsked[key] ?? []).filter { $0.tag != tag }
+        data.followsAsked[key] = Array((held + [FollowedCode(tag: tag, at: Date())]).suffix(4))
     }
 
-    /// Whether you followed this person's channel code lately; used up by the invite it brings.
-    private func takeFollowAsked(_ fp: String, persona: UUID?) -> Bool {
+    /// Lets go of codes followed more than two weeks ago, each by its own time.
+    private func pruneFollowsAsked() {
+        let now = Date()
+        data.followsAsked = data.followsAsked
+            .mapValues { $0.filter { now.timeIntervalSince($0.at) < Self.followAskLife } }
+            .filter { !$0.value.isEmpty }
+    }
+
+    enum FollowMatch { case none, matched, untagged }
+
+    /// Whether an invite from this person is for a channel whose code you followed lately. `.matched` when it carries
+    /// that code's tag, which uses that follow up. `.untagged` when it carries none (their app is older, so it can't say
+    /// which channel): asked about, and nothing used up, since there's no telling which follow it answers; the follows
+    /// still wait for their own channels' invites, and the offer limits (`GroupOffer.perSender`) bound what such
+    /// invites can do. An invite naming another code, or a tag that isn't one, uses nothing up and isn't taken.
+    private func takeFollowAsked(_ fp: String, persona: UUID?, tag: Data?) -> FollowMatch {
+        pruneFollowsAsked()
         let key = Self.followKey(fp, persona)
-        guard let at = data.followsAsked[key] else { return false }
-        data.followsAsked[key] = nil
-        return Date().timeIntervalSince(at) < Self.followAskLife
+        guard var held = data.followsAsked[key] else { return .none }
+        guard let tag else { return .untagged }
+        guard tag.count == 16, let n = held.firstIndex(where: { $0.tag == tag }) else { return .none }
+        held.remove(at: n)
+        data.followsAsked[key] = held.isEmpty ? nil : held
+        return .matched
     }
 
     /// An invite to a group or channel you aren't in: kept, without joining anything, until you answer.
-    private func noteGroupOffer(_ invite: GroupInvite, from sender: Contact) {
-        guard !data.blocked.contains(sender.fingerprint), !sender.hidden else { return }
+    private func noteGroupOffer(_ invite: GroupInvite, from sender: Contact, followed: Bool = false) {
+        guard !data.blocked.contains(sender.fingerprint), !sender.hidden || followed else { return }
         let s = invite.settings
         data.groupOffers.removeAll {
             Date().timeIntervalSince($0.at) >= GroupOffer.life

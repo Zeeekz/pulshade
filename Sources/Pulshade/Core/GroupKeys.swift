@@ -984,6 +984,10 @@ struct GroupInvite: Codable, Equatable {
     var staff: Bool?
     /// With `staff`: the key of the staff-only mailbox the follower roster is kept in (see `SharedGroup.staffEpoch`).
     var staffKey: Data?
+    /// In a channel: a tag made from the channel's code mailbox (`Invite.codeTag`), so someone who followed a code knows
+    /// this invite is for the channel that code was for, and not another of the same person's. Nil from apps before it,
+    /// and from staff whose device doesn't hold the code; such an invite waits for a yes. Apps from before ignore it.
+    var code: Data?
 }
 
 /// A post waiting to go into a group's mailbox, already sealed (its chain has moved on, so it must go as it is).
