@@ -489,28 +489,40 @@ struct ChannelLeaveAndKeyTests {
         let fps = (0..<70).map { fakeJoiner(alice, $0) }
         alice.admitFromCodeForTests(fps, in: id)
         #expect(alice.channelAdmits[id]?.count == 60)
-        #expect(Set(shared(alice, id)?.invited.keys.filter { fps.contains($0) } ?? []).count == 60)
-        #expect(shared(alice, id)?.joinWaiting == Array(fps[60...]), "the ten extra wait, in order")
+        let invitedNow = Set(shared(alice, id)?.invited.keys.filter { fps.contains($0) } ?? [])
+        #expect(invitedNow.count == 60)
+        let waitingNow = Set(shared(alice, id)?.joinWaiting ?? [])
+        #expect(waitingNow == Set(fps).subtracting(invitedNow), "the ten extra wait")
         alice.admitFromCodeForTests(fps, in: id)
-        #expect(shared(alice, id)?.joinWaiting == Array(fps[60...]), "asking again changes nothing")
+        #expect(Set(shared(alice, id)?.joinWaiting ?? []) == waitingNow, "asking again changes nothing")
         alice.channelAdmits = [:]
         await alice.syncOnce()
         #expect(shared(alice, id)?.joinWaiting == nil)
         #expect(Set(shared(alice, id)?.invited.keys.filter { fps.contains($0) } ?? []).count == 70)
     }
 
-    @Test func aFloodOfWaitingJoinersKeepsTheEarliest() async throws {
+    /// A waiting list someone keeps full with throwaway accounts still has room for whoever comes after: newcomers take
+    /// places drawn at random, so later arrivals are in it, and a friend of the channel's staff goes ahead of everyone.
+    @Test func aFloodOfWaitingJoinersCantHoldOthersOut() async throws {
         let (alice, bob, cara, dave, _, id) = try await channelWithTwoFollowers()
         defer { for m in [alice, bob, cara, dave] { m.lock() } }
-        AppModel.channelAdmitsPerHour = 0
-        defer { AppModel.channelAdmitsPerHour = 60 }
+        // This hour's places already used, in this channel only (the hourly limit is shared with tests running beside this).
+        let full = Array(repeating: Date(), count: AppModel.channelAdmitsPerHour)
+        alice.channelAdmits[id] = full
         let fps = (0..<1_600).map { "flood-\($0)" }
         alice.admitFromCodeForTests(Array(fps[0..<100]), in: id)
         alice.admitFromCodeForTests(Array(fps[100...]), in: id)
         let waiting = try #require(shared(alice, id)?.joinWaiting)
         let cap = GroupRoster.Body.maxEntries
         #expect(waiting.count == cap)
-        #expect(waiting.first == fps.first && waiting.last == fps[cap - 1], "the newest arrivals are the ones dropped")
+        #expect(waiting.filter { fps.firstIndex(of: $0)! >= cap }.count > 100, "later arrivals have places too")
+        #expect(Set(fps[0..<100]).isSubset(of: Set(waiting)) == false, "the earliest don't hold theirs for good")
+        let daveFP = try aliceKnows(alice, "Dave")
+        alice.admitFromCodeForTests([daveFP], in: id)
+        #expect(shared(alice, id)?.joinWaiting?.first == daveFP, "a friend goes first")
+        alice.channelAdmits[id] = Array(full.dropFirst())
+        alice.admitFromCodeForTests([], in: id)
+        #expect(shared(alice, id)?.invited[daveFP] != nil && shared(alice, id)?.joinWaiting?.contains(daveFP) == false, "and is let in first")
     }
 
     @Test func aLeaveAfterTheEpochMovedOnStillGetsItsOwnRekey() async throws {

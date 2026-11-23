@@ -8506,11 +8506,12 @@ final class AppModel {
     /// so someone with the code can't make staff send an invite and rekey for a crowd of throwaway accounts at once.
     static var channelAdmitsPerHour = 60
 
-    /// Invites people who followed through a channel's code, up to the hourly limit; the rest wait their turn, earliest first.
-    /// Only people who are new count: someone already in the roster, or invited within the hour, or already waiting is
-    /// skipped (one identity saying hello again and again uses no more of the limit and sends nothing more). The waiting list
-    /// keeps its earliest entries when it is full, so a flood of throwaway accounts can't push real joiners out. Called with no
-    /// one new, it lets in whoever is waiting as the hour allows.
+    /// Invites people who followed through a channel's code, up to the hourly limit; the rest wait. Only people who are new
+    /// count: someone already in the roster, or invited within the hour, or already waiting is skipped (one identity saying
+    /// hello again and again uses no more of the limit and sends nothing more). People this account knows otherwise (a
+    /// friend) go first. Strangers are let in by lot, and when the waiting list is full a newcomer takes a place drawn at
+    /// random: whoever keeps the list topped up with throwaway accounts can't hold everyone else out for good, as keeping the
+    /// earliest would let them. Called with no one new, it lets in whoever is waiting as the hour allows.
     private func admitFromCode(_ fingerprints: [String], at i: Int) {
         guard let shared = data.conversations[i].shared else { return }
         let id = data.conversations[i].id
@@ -8520,9 +8521,12 @@ final class AppModel {
         func settled(_ fp: String) -> Bool {
             live.contains(fp) || shared.invited[fp].map { now.timeIntervalSince($0) < 3600 } == true
         }
+        let persona = data.conversations[i].persona
         var seen = Set<String>()
         var queue = (shared.joinWaiting ?? []).filter { !settled($0) && seen.insert($0).inserted }
         for fp in fingerprints where !settled(fp) && seen.insert(fp).inserted { queue.append(fp) }
+        let friends = Set(data.contacts.filter { $0.persona == persona && !$0.hidden }.map(\.fingerprint))
+        queue = queue.filter { friends.contains($0) } + queue.filter { !friends.contains($0) }.shuffled()
         let recent = (channelAdmits[id] ?? []).filter { now.timeIntervalSince($0) < 3600 }
         let room = max(0, Self.channelAdmitsPerHour - recent.count)
         let go = Array(queue.prefix(room))
@@ -8532,7 +8536,6 @@ final class AppModel {
             // Whoever the invite refused for good (an app too old) is dropped; whoever it simply had no room for waits.
             let refused = Set(invite(go, at: i))
             let invited = data.conversations[i].shared?.invited ?? [:]
-            let persona = data.conversations[i].persona
             let unplaced = go.filter { !refused.contains($0) && invited[$0] == nil && contact($0, in: persona) != nil }
             rest = unplaced + rest
         }
