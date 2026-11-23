@@ -34,6 +34,10 @@ struct KeyRepairTests {
         let savedGaps = AppModel.resendGaps
         AppModel.resendGaps = [3600]
         defer { AppModel.resendGaps = savedGaps }
+        // A first ask for new keys lost under a busy test relay is asked again in seconds, not the app's two minutes,
+        // which is longer than this test waits.
+        AppModel.mendWait = 3
+        defer { AppModel.mendWait = 120 }
         let alice = try await makeUser("Alice")
         let bob = try await makeUser("Bob")
         defer { for m in [alice, bob] { m.lock() } }

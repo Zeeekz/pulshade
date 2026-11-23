@@ -139,7 +139,8 @@ struct LinkAuditFixFlowTests {
     private func befriend(_ a: AppModel, _ b: AppModel) async throws -> (aSeesB: String, bSeesA: String) {
         let aName = a.data.profile.name, bName = b.data.profile.name
         _ = try #require(b.addContact(code: a.makeInviteCode(), nickname: ""))
-        await until([a, b]) { a.visibleContacts.contains { $0.name == bName } }
+        // Both sides, not only the first: under load the second can be a sync behind.
+        await until([a, b]) { a.visibleContacts.contains { $0.name == bName } && b.visibleContacts.contains { $0.name == aName } }
         let bFP = try #require(a.visibleContacts.first { $0.name == bName }).fingerprint
         let aFP = try #require(b.visibleContacts.first { $0.name == aName }).fingerprint
         let chat = a.startConversation(kind: .direct, title: "", members: [bFP])

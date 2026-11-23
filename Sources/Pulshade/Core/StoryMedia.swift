@@ -250,9 +250,22 @@ struct StoryFraming: Equatable, Sendable {
     var zoom: CGFloat = 1
     var dx: CGFloat = 0
     var dy: CGFloat = 0
+    /// Turned about its middle, in radians, clockwise as seen.
+    var angle: CGFloat = 0
 
     static let fill = StoryFraming()
     static let mostZoom: CGFloat = 4
+    /// How small the picture can be made in the editor, against filling the frame.
+    static let leastZoom: CGFloat = 0.2
+
+    /// Kept to what the editor allows, Instagram-style: any size from small to four times filling, turned any way, with
+    /// its middle somewhere on the frame.
+    func loose() -> StoryFraming {
+        StoryFraming(zoom: min(max(zoom.isFinite ? zoom : 1, Self.leastZoom), Self.mostZoom),
+                     dx: min(max(dx.isFinite ? dx : 0, -0.5), 0.5),
+                     dy: min(max(dy.isFinite ? dy : 0, -0.5), 0.5),
+                     angle: angle.isFinite ? angle : 0)
+    }
 
     /// The size where the whole picture shows: the zoom (against filling) at which the longer side just fits.
     static func fitZoom(source: CGSize, frame: CGSize) -> CGFloat {
@@ -282,6 +295,7 @@ struct StoryFraming: Equatable, Sendable {
         let room = out.spare(source: source, frame: frame)
         out.dx = min(max(dx.isFinite ? dx : 0, -room.x), room.x)
         out.dy = min(max(dy.isFinite ? dy : 0, -room.y), room.y)
+        out.angle = 0
         return out
     }
 }
@@ -383,38 +397,19 @@ enum StoryVideo {
         var isSet: Bool { lock.withLock { value } }
     }
 
-    /// The look to bake into every frame, scaled to fill the story's 9:16 frame and centred.
+    /// The look to bake into every frame, placed in the story's 9:16 frame (filling it and centred unless `framing` says
+    /// otherwise). `look`, when given, is read for every frame (crop, adjustments, look and backdrop) and overrides `filter`.
     static func composition(for asset: AVAsset, filter: StoryFilter, size: CGSize = StoryVideo.size,
-                            zoom: ZoomTrack = .none, text: CIImage? = nil, framing: FramingBox? = nil) -> AVMutableVideoComposition {
+                            zoom: ZoomTrack = .none, text: CIImage? = nil, framing: FramingBox? = nil,
+                            look: LookBox? = nil) -> AVMutableVideoComposition {
         // The words are drawn once at full HD and fitted to this clip's size, then laid over every frame.
         let words = text.map { $0.transformed(by: CGAffineTransform(scaleX: size.width / $0.extent.width, y: size.width / $0.extent.width)) }
+        let fixed = StoryLook(filter: filter)
         let composition = AVMutableVideoComposition(asset: asset) { request in
-            let source = request.sourceImage
-            let e = source.extent
             let frame = CGRect(origin: .zero, size: size)
-            let fillScale = max(size.width / e.width, size.height / e.height)
-            let placed = framing?.value ?? .fill
-            let scale = fillScale * placed.zoom
-            let w = e.width * scale, h = e.height * scale
-            let moved = CGAffineTransform(translationX: (size.width - w) / 2 + placed.dx * size.width,
-                                          y: (size.height - h) / 2 - placed.dy * size.height)
-            let flat = source.transformed(by: CGAffineTransform(translationX: -e.minX, y: -e.minY))
-            var image = flat.transformed(by: CGAffineTransform(scaleX: scale, y: scale)).transformed(by: moved)
-            // Smaller than the frame, or moved off an edge: a soft, darkened copy of the picture fills what's left.
-            if !image.extent.contains(frame.insetBy(dx: 0.5, dy: 0.5)) {
-                // Blurred at a quarter of the size and scaled back up: it looks the same, and costs a sixteenth,
-                // which keeps the live preview smooth.
-                let q: CGFloat = 0.25
-                let back = flat.transformed(by: CGAffineTransform(scaleX: fillScale * q, y: fillScale * q))
-                    .transformed(by: CGAffineTransform(translationX: (size.width - e.width * fillScale) / 2 * q,
-                                                       y: (size.height - e.height * fillScale) / 2 * q))
-                    .clampedToExtent()
-                    .applyingGaussianBlur(sigma: size.width / 14 * q)
-                    .transformed(by: CGAffineTransform(scaleX: 1 / q, y: 1 / q))
-                    .cropped(to: frame)
-                let dim = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0.3)).cropped(to: frame)
-                image = image.composited(over: dim.composited(over: back))
-            }
+            let current = look?.value ?? fixed
+            let media = current.media(request.sourceImage)
+            var image = StoryCanvas.compose(media, framing: framing?.value ?? .fill, backdrop: current.backdrop, size: size)
             // Digital zoom recorded where the camera couldn't zoom for real (the Mac).
             let z = zoom.value(at: request.compositionTime.seconds)
             if z > 1.001 {
@@ -422,13 +417,23 @@ enum StoryVideo {
                 // Scale about the centre of the frame.
                 image = image.transformed(by: CGAffineTransform(a: z, b: 0, c: 0, d: z, tx: c.x * (1 - z), ty: c.y * (1 - z)))
             }
-            var finished = filter.apply(image.cropped(to: frame)).cropped(to: frame)
+            var finished = image.cropped(to: frame)
             if let words { finished = words.composited(over: finished).cropped(to: frame) }
             request.finish(with: finished, context: StoryFilter.context)
         }
         composition.renderSize = size
         composition.frameDuration = CMTime(value: 1, timescale: fps)
         return composition
+    }
+
+    /// A still of the clip at `seconds`, the right way up, for the crop tool.
+    static func poster(of clip: MemoryClip, at seconds: Double, maxSide: CGFloat = 1400) async -> CGImage? {
+        let generator = AVAssetImageGenerator(asset: clip.makeAsset())
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: maxSide, height: maxSide)
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = CMTime(seconds: 0.5, preferredTimescale: 600)
+        return try? await generator.image(at: CMTime(seconds: max(seconds, 0), preferredTimescale: 600)).image
     }
 
     /// The picture's size as it is shown (rotation applied), or nil if it can't be read.
@@ -451,7 +456,7 @@ enum StoryVideo {
     /// chosen to fit `maxBytes`, no location or device metadata. Returns the file's bytes.
     static func export(from clip: MemoryClip, filter: StoryFilter, zoom: ZoomTrack = .none, maxBytes: Int = StoryVideo.maxBytes,
                        maxSeconds: Double = StoryVideo.maxSeconds, size: CGSize? = nil, text: CIImage? = nil,
-                       from start: Double = 0, framing: StoryFraming = .fill) async throws -> Data {
+                       from start: Double = 0, framing: StoryFraming = .fill, look: StoryLook? = nil) async throws -> Data {
         let asset = clip.makeAsset()
         guard let track = try? await asset.loadTracks(withMediaType: .video).first,
               let total = try? await asset.load(.duration), total.seconds.isFinite, total.seconds > 0 else { throw StoryVideoError.unreadable }
@@ -480,7 +485,8 @@ enum StoryVideo {
                 let ceiling = size.width >= 1_000 || size.height >= 1_000 ? 16_000_000.0 : 8_000_000.0
                 do {
                     data = try await transcode(asset, seconds: seconds, filter: filter, zoom: zoom, size: size, text: text,
-                                               bitsPerSecond: max(Int(min(wanted, ceiling)) - 48_000, 150_000), allowHEVC: hevc, from: start, framing: FramingBox(framing))
+                                               bitsPerSecond: max(Int(min(wanted, ceiling)) - 48_000, 150_000), allowHEVC: hevc, from: start, framing: FramingBox(framing),
+                                               look: look.map { LookBox($0) })
                 } catch StoryVideoError.failed(let why) {
                     config += 1
                     if config >= configs.count { throw StoryVideoError.failed(why) }
@@ -500,7 +506,8 @@ enum StoryVideo {
     }
 
     private static func transcode(_ asset: AVURLAsset, seconds: Double, filter: StoryFilter, zoom: ZoomTrack, size: CGSize,
-                                  text: CIImage? = nil, bitsPerSecond: Int, allowHEVC: Bool = true, from start: Double = 0, framing: FramingBox? = nil) async throws -> Data {
+                                  text: CIImage? = nil, bitsPerSecond: Int, allowHEVC: Bool = true, from start: Double = 0, framing: FramingBox? = nil,
+                                  look: LookBox? = nil) async throws -> Data {
         let begin = CMTime(seconds: start, preferredTimescale: 600)
         let range = CMTimeRange(start: begin, duration: CMTime(seconds: seconds, preferredTimescale: 600))
         let reader = try AVAssetReader(asset: asset)
@@ -509,7 +516,7 @@ enum StoryVideo {
         let readerVideo = AVAssetReaderVideoCompositionOutput(videoTracks: videoTracks, videoSettings: [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
         ])
-        readerVideo.videoComposition = composition(for: asset, filter: filter, size: size, zoom: zoom, text: text, framing: framing)
+        readerVideo.videoComposition = composition(for: asset, filter: filter, size: size, zoom: zoom, text: text, framing: framing, look: look)
         guard reader.canAdd(readerVideo) else { throw StoryVideoError.unreadable }
         reader.add(readerVideo)
 

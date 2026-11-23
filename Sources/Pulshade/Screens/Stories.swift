@@ -353,6 +353,28 @@ struct StoryComposer: View {
     /// The clip's framing settling after a pinch or the fill button, and whether it last clicked onto fill or fit.
     @State private var settling: Task<Void, Never>?
     @State private var zoomSnapped = false
+    @State private var turnSnapped = false
+    /// Light and colour, and the crop, straighten, turn and flip (see `StoryLook`).
+    @State private var adjust = StoryAdjust()
+    @State private var crop = StoryCrop()
+    /// Which backdrop fills the frame around the picture, counted through `backdrops`.
+    @State private var backdropChoice = 0
+    /// Two colours taken from the photo, for its default backdrop.
+    @State private var photoColours: [StoryRGB]?
+    /// The look, read by the video preview for every frame.
+    @State private var lookBox = LookBox()
+    /// The photo's place on the canvas, followed live by the photo alone while a finger moves it.
+    @State private var live = LiveFraming()
+    /// A clip's shape the right way up, before any crop.
+    @State private var clipUpright: CGSize?
+    /// The tool open over the editor, if any.
+    @State private var tool: EditTool?
+    @State private var adjustTool = StoryAdjust.Tool.brightness
+    /// The whole picture for the crop screen, the right way up and uncut.
+    @State private var cropSource: PlatformImage?
+    /// The crop changed: the picture goes back to fitting the frame once its new shape is known.
+    @State private var refit = false
+    private enum EditTool { case crop, adjust }
     /// The story being edited, if this isn't a new one.
     private var editing: Story?
     /// After posting, so the camera behind closes too.
@@ -411,11 +433,14 @@ struct StoryComposer: View {
         .task(id: clip?.id) {
             // How the clip is shaped first, so it opens fitted whole rather than jumping from filled to fitted.
             sourceSize = nil
+            clipUpright = nil
             trim = StoryTrim()
             if let clip, editing == nil, let size = await StoryVideo.uprightSize(of: clip) {
-                sourceSize = size
-                setFraming(.fit(source: size, frame: StoryVideo.size))
-            } else {
+                clipUpright = size
+                let shaped = crop.outputSize(of: size)
+                sourceSize = shaped
+                setFraming(.fit(source: shaped, frame: StoryVideo.size))
+            } else if clip != nil {
                 setFraming(.fill)
             }
             openClip()
@@ -425,8 +450,11 @@ struct StoryComposer: View {
                 clipPreview?.play(trim)
             }
         }
-        .task(id: [filter.rawValue, String(image?.count ?? 0)]) { await look() }
-        .onChange(of: filter) { _, new in clipPreview?.set(new) }
+        .task(id: LookKey(filter: filter, adjust: adjust, crop: crop, image: image?.count ?? 0)) { await look() }
+        .onChange(of: currentLook, initial: true) { _, new in
+            lookBox.value = new
+            clipPreview?.redraw()
+        }
         .onDisappear {
             settling?.cancel()
             clipPreview?.close()
@@ -585,17 +613,32 @@ struct StoryComposer: View {
                 .frame(width: canvas.width, height: canvas.height)
                 .clipShape(.rect(cornerRadius: Platform.isPhone ? 0 : 16))
 
-                if typing == nil && !interacting {
+                if tool == .adjust {
                     VStack {
-                        HStack {
+                        Spacer()
+                        StoryAdjustPanel(adjust: $adjust, tool: $adjustTool) { withAnimation(.snappy) { tool = nil } }
+                    }
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                } else if typing == nil && !interacting {
+                    VStack {
+                        HStack(spacing: 8) {
                             floating("xmark", label: "Close") { stopExport(); dismiss() }
                             Spacer()
-                            if clip != nil, sourceSize != nil {
-                                floating(isFilled ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right",
-                                         label: isFilled ? "Fit the whole video" : "Fill the screen") { toggleFill(canvas: canvas) }
+                            floating("textformat", label: "Add text") { addText() }
+                            if hasMedia {
+                                floating("crop.rotate", label: "Crop and straighten") { openCrop() }
+                                    .disabled(exporting)
+                                floating("slider.horizontal.3", label: "Adjust") { withAnimation(.snappy) { tool = .adjust } }
+                                    .disabled(exporting)
+                                floating("paintpalette", label: "Change the background") { nextBackdrop() }
                                     .disabled(exporting)
                             }
-                            floating("textformat", label: "Add text") { addText() }
+                            if hasMedia, sourceSize != nil {
+                                floating(isFilled ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right",
+                                         label: isFilled ? "Fit the whole picture" : "Fill the screen") { toggleFill(canvas: canvas) }
+                                    .disabled(exporting)
+                            }
                         }
                         .padding(.horizontal, 14).padding(.top, 6)
                         Spacer()
@@ -620,6 +663,68 @@ struct StoryComposer: View {
         .animation(.snappy(duration: 0.2), value: typing)
         .animation(.easeOut(duration: 0.18), value: interacting)
         .sheet(isPresented: $choosingSettings) { settingsSheet }
+        .overlay {
+            if tool == .crop, let cropSource {
+                StoryCropTool(source: cropSource, draft: crop, done: { new in
+                    withAnimation(.snappy) { tool = nil }
+                    guard new != crop else { return }
+                    crop = new
+                    refit = true
+                    if let clipUpright {
+                        // A clip's new shape is known at once.
+                        let shaped = new.outputSize(of: clipUpright)
+                        sourceSize = shaped
+                        refit = false
+                        setFraming(.fit(source: shaped, frame: StoryVideo.size))
+                    }
+                }, cancel: { withAnimation(.snappy) { tool = nil } })
+                .transition(.opacity)
+            }
+        }
+    }
+
+    // MARK: Picture tools
+
+    private var hasMedia: Bool { editing == nil && (image != nil || clip != nil) }
+
+    /// What can go behind the picture, in turn: the photo's own colours first (for a photo), then a blurred copy of
+    /// it, black and white.
+    private var backdrops: [StoryBackdrop] {
+        var all: [StoryBackdrop] = []
+        if image != nil, let c = photoColours, c.count == 2 { all.append(.gradient(c[0], c[1])) }
+        return all + [.blur, .solid(.black), .solid(.white)]
+    }
+
+    private var backdrop: StoryBackdrop { backdrops[backdropChoice % backdrops.count] }
+
+    private var currentLook: StoryLook { StoryLook(filter: filter, adjust: adjust, crop: crop, backdrop: backdrop) }
+
+    private func nextBackdrop() {
+        Haptics.tick()
+        withAnimation(.easeInOut(duration: 0.2)) { backdropChoice = (backdropChoice + 1) % backdrops.count }
+    }
+
+    /// Opens the crop screen on the whole picture: the photo itself, or the clip's first kept frame.
+    private func openCrop() {
+        if let image {
+            let data = image
+            Task {
+                let made: CGImage? = await Task.detached(priority: .userInitiated) {
+                    guard let source = StoryCanvas.source(data, maxSide: 1600) else { return nil }
+                    return StoryFilter.context.createCGImage(source, from: source.extent)
+                }.value
+                guard let made else { return }
+                cropSource = .from(cgImage: made)
+                withAnimation(.snappy) { tool = .crop }
+            }
+        } else if let clip {
+            let at = trim.start
+            Task {
+                guard let poster = await StoryVideo.poster(of: clip, at: at) else { return }
+                cropSource = .from(cgImage: poster)
+                withAnimation(.snappy) { tool = .crop }
+            }
+        }
     }
 
     /// A sideways swipe on empty space: the next look for a photo, the next colours for a text story.
@@ -679,7 +784,10 @@ struct StoryComposer: View {
             HStack(spacing: 10) {
                 if image != nil || clip != nil {
                     floating("textformat.abc", label: "Write a text story instead") {
-                        withAnimation { image = nil; clip = nil; looked = nil; filter = .none }
+                        withAnimation {
+                            image = nil; clip = nil; looked = nil; filter = .none
+                            adjust = StoryAdjust(); crop = StoryCrop(); sourceSize = nil; photoColours = nil; backdropChoice = 0
+                        }
                     }
                     .disabled(exporting)
                 } else {
@@ -775,12 +883,10 @@ struct StoryComposer: View {
             .accessibilityLabel("Video preview")
         } else if clip != nil {
             Color.black.overlay { ProgressView().tint(.white) }
-        } else if let shown = looked ?? image, let img = PlatformImage.checked(shown) {
-            ZStack {
-                Color.black
-                Image(platformImage: img).resizable().scaledToFill()
-            }
-            .clipped()
+        } else if image != nil, let shown = looked, let img = PlatformImage.checked(shown), let size = sourceSize {
+            StoryPhotoStage(image: img, source: size, backdrop: backdrop, live: live, canvas: canvasSize)
+        } else if image != nil {
+            Color.black.overlay { ProgressView().tint(.white) }
         } else {
             StoryTextBackdrop(palette: palette, seed: seed)
         }
@@ -810,23 +916,31 @@ struct StoryComposer: View {
         clipPreview?.close()
         clipPreview = nil
         guard let clip else { clipSeconds = 0; return }
-        clipPreview = ClipPreview(clip: clip, filter: filter, zoom: clipZoom, framing: framingBox, trim: trim.length > 0 ? trim : nil)
+        lookBox.value = currentLook
+        clipPreview = ClipPreview(clip: clip, filter: filter, zoom: clipZoom, framing: framingBox, trim: trim.length > 0 ? trim : nil,
+                                  look: lookBox)
     }
 
     private func setFraming(_ new: StoryFraming) {
         settling?.cancel()
         framing = new
-        framingBox.value = new
+        show(new)
+    }
+
+    /// Where the picture is now, for the video preview (read each frame) and the photo (redrawn alone).
+    private func show(_ value: StoryFraming) {
+        framingBox.value = value
+        if image != nil { live.value = value }
     }
 
     /// Whether a pinch or drag on the picture moves a clip. Touches on text move the text instead.
-    private var canReframe: Bool { clip != nil && editing == nil && typing == nil && !exporting && sourceSize != nil }
+    private var canReframe: Bool { hasMedia && typing == nil && tool == nil && !exporting && sourceSize != nil }
 
     private var isFilled: Bool { framing.zoom >= 0.999 }
 
     private func toggleFill(canvas: CGSize) {
         guard let size = sourceSize else { return }
-        settle(to: isFilled ? .fit(source: size, frame: StoryVideo.size) : .fill)
+        settle(to: isFilled && framing.angle == 0 ? .fit(source: size, frame: StoryVideo.size) : .fill)
     }
 
     /// Pinch and drag on the clip, given to the text layer so the two share one set of touches.
@@ -837,46 +951,54 @@ struct StoryComposer: View {
                 settling?.cancel()
                 framingBase = framingBox.value
                 zoomSnapped = false
+                turnSnapped = false
             },
             changed: { value in reframe(value, canvas: canvas, source: size) },
             ended: {
                 framingBase = nil
-                settle(to: framingBox.value.clamped(source: size, frame: StoryVideo.size))
+                settle(to: framingBox.value.loose())
             })
     }
 
-    /// Follows the fingers: the spot under them stays under them as they pinch. Past the edges and the size limits it
-    /// stretches, and settles back on letting go; near the middle and near fill or fit it clicks into place. Only the
-    /// box the preview reads is changed while moving, so the editor itself isn't redrawn for every touch.
+    /// Follows the fingers, Instagram-style: the spot under them stays under them as they pinch and twist, and the picture
+    /// can be made smaller than the frame, larger, turned, and moved anywhere its middle stays on the frame. Fill, fit,
+    /// upright and the centre lines click into place. Past the size limits and the edges it stretches, and settles back on
+    /// letting go. Only what the preview reads is changed while moving, so the editor itself isn't redrawn for every touch.
     private func reframe(_ value: TransformValue, canvas: CGSize, source: CGSize) -> (x: Bool, y: Bool) {
         let base = framingBase ?? framingBox.value
         let frame = StoryVideo.size
         let w = max(canvas.width, 1), h = max(canvas.height, 1)
-        // The point the fingers started on, as a fraction of the frame from its middle.
-        let px = (value.location.x - value.translation.width) / w - 0.5
-        let py = (value.location.y - value.translation.height) / h - 0.5
         let fit = StoryFraming.fitZoom(source: source, frame: frame)
         var zoom = base.zoom * value.scale
-        // Fill and fit click into place.
         let snapZoom: CGFloat? = abs(zoom - 1) < 0.04 ? 1 : fit < 0.999 && abs(zoom - fit) < 0.03 ? fit : nil
         if let snapZoom, value.fingers > 1 {
             if !zoomSnapped { Haptics.snap() }
             zoom = snapZoom
         }
         zoomSnapped = snapZoom != nil && value.fingers > 1
-        zoom = exp(RubberBand.clamp(log(max(zoom, 0.01)), log(fit)...log(StoryFraming.mostZoom), span: 0.2))
-        let k = zoom / max(base.zoom, 0.001)
-        var next = StoryFraming(zoom: zoom,
-                                dx: px + (base.dx - px) * k + value.translation.width / w,
-                                dy: py + (base.dy - py) * k + value.translation.height / h)
-        let room = next.spare(source: source, frame: frame)
-        let lineX = room.x > 0.001 && abs(next.dx) < 0.012
-        let lineY = room.y > 0.001 && abs(next.dy) < 0.012
+        zoom = exp(RubberBand.clamp(log(max(zoom, 0.01)), log(StoryFraming.leastZoom)...log(StoryFraming.mostZoom), span: 0.2))
+        // The turn, clicking onto upright and the quarters.
+        var angle = base.angle
+        if value.fingers > 1 {
+            let (turned, snapped) = StoryOverlayCanvas.snapTurn(Double(base.angle) + value.rotation)
+            if snapped, !turnSnapped { Haptics.snap() }
+            turnSnapped = snapped
+            angle = CGFloat(turned)
+        }
+        // The picture's middle, carried round the point the fingers started on as it grows and turns.
+        let k = zoom / max(base.zoom, 0.001), turn = angle - base.angle
+        let p = CGPoint(x: value.location.x - value.translation.width, y: value.location.y - value.translation.height)
+        let c = CGPoint(x: w / 2 + base.dx * w, y: h / 2 + base.dy * h)
+        let v = CGPoint(x: (c.x - p.x) * k, y: (c.y - p.y) * k)
+        let moved = CGPoint(x: p.x + v.x * cos(turn) - v.y * sin(turn) + value.translation.width,
+                            y: p.y + v.x * sin(turn) + v.y * cos(turn) + value.translation.height)
+        var next = StoryFraming(zoom: zoom, dx: (moved.x - w / 2) / w, dy: (moved.y - h / 2) / h, angle: angle)
+        let lineX = abs(next.dx) < 0.012, lineY = abs(next.dy) < 0.012
         if lineX { next.dx = 0 }
         if lineY { next.dy = 0 }
-        next.dx = RubberBand.clamp(next.dx, -room.x...room.x, span: 0.08)
-        next.dy = RubberBand.clamp(next.dy, -room.y...room.y, span: 0.08)
-        framingBox.value = next
+        next.dx = RubberBand.clamp(next.dx, -0.5...0.5, span: 0.08)
+        next.dy = RubberBand.clamp(next.dy, -0.5...0.5, span: 0.08)
+        show(next)
         return (lineX, lineY)
     }
 
@@ -885,8 +1007,7 @@ struct StoryComposer: View {
         settling?.cancel()
         let from = framingBox.value
         framing = target
-        guard from != target, !reduceMotion else { framingBox.value = target; return }
-        let box = framingBox
+        guard from != target, !reduceMotion else { show(target); return }
         settling = Task { @MainActor in
             let steps = 16
             for n in 1...steps {
@@ -894,11 +1015,12 @@ struct StoryComposer: View {
                 if Task.isCancelled { return }
                 let t = Double(n) / Double(steps)
                 let e = CGFloat(1 - pow(1 - t, 3))
-                box.value = StoryFraming(zoom: from.zoom + (target.zoom - from.zoom) * e,
-                                         dx: from.dx + (target.dx - from.dx) * e,
-                                         dy: from.dy + (target.dy - from.dy) * e)
+                show(StoryFraming(zoom: from.zoom + (target.zoom - from.zoom) * e,
+                                  dx: from.dx + (target.dx - from.dx) * e,
+                                  dy: from.dy + (target.dy - from.dy) * e,
+                                  angle: from.angle + (target.angle - from.angle) * e))
             }
-            box.value = target
+            show(target)
         }
     }
 
@@ -909,14 +1031,26 @@ struct StoryComposer: View {
         return "Posts as \(partCount) stories of 15 seconds" + (clipSeconds >= StoryVideo.longestSeconds ? " (the first 5 minutes)" : "")
     }
 
-    /// Colours the photo for the preview.
+    /// The photo cut, adjusted and given its look, for the preview, with two of its colours for the backdrop. The first
+    /// time (and after a new crop) it opens fitted whole in the frame, over its colours.
     private func look() async {
         guard let image, editing == nil else { looked = nil; return }
-        if filter == .none { looked = nil; return }
-        let look = filter
-        let made = await Task.detached(priority: .userInitiated) { look.bake(into: image, maxSide: 900) }.value
-        guard look == filter else { return }
-        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.18)) { looked = made }
+        // A slider sends many changes a second: only the last of a quick run is drawn.
+        if looked != nil { try? await Task.sleep(for: .milliseconds(30)) }
+        guard !Task.isCancelled else { return }
+        let wanted = StoryLook(filter: filter, adjust: adjust, crop: crop)
+        let made = await Task.detached(priority: .userInitiated) { StoryCanvas.preview(image, look: wanted, maxSide: 1400) }.value
+        guard !Task.isCancelled, let made, let shown = PlatformImage(data: made.jpeg), let cg = shown.cgImageValue else { return }
+        let first = looked == nil
+        if photoColours == nil, let c = made.colours { photoColours = [c.0, c.1] }
+        let size = CGSize(width: cg.width, height: cg.height)
+        let reshaped = sourceSize.map { abs($0.width / $0.height - size.width / size.height) > 0.001 } ?? true
+        sourceSize = size
+        looked = made.jpeg
+        if first || refit || reshaped {
+            refit = false
+            setFraming(.fit(source: size, frame: StoryVideo.size))
+        }
     }
 
     private func post() {
@@ -927,7 +1061,7 @@ struct StoryComposer: View {
             exporting = true
             failure = nil
             settling?.cancel()
-            let look = filter, track = clipZoom, placed = framing, kept = trim
+            let look = filter, track = clipZoom, placed = framingBox.value.loose(), kept = trim, edit = currentLook
             let words = StoryOverlayRender.text(overlays)
             exportTask = Task {
                 // The kept part goes up as several stories, in order, each 15 seconds. The parts share a size budget,
@@ -943,7 +1077,8 @@ struct StoryComposer: View {
                         if Task.isCancelled { exporting = false; return }
                         partMaking = part + 1
                         let data = try await StoryVideo.export(from: clip, filter: look, zoom: track, maxBytes: budget,
-                                                               maxSeconds: piece.seconds, text: words, from: piece.start, framing: placed)
+                                                               maxSeconds: piece.seconds, text: words, from: piece.start, framing: placed,
+                                                               look: edit)
                         if Task.isCancelled { exporting = false; return }
                         model.postStory(.video(data, caption: ""), audience: audience, lifetime: lifetime, loops: loops)
                         posted += 1
@@ -958,11 +1093,21 @@ struct StoryComposer: View {
                 }
             }
         } else if let image {
-            // The look is baked into the pixels that are sent, not just the preview.
-            let words = StoryOverlayRender.text(overlays)
-            let sent = (filter == .none && words == nil) ? image : (filter.bake(into: image, text: words) ?? image)
-            model.postStory(.image(sent, caption: ""), audience: audience, lifetime: lifetime)
-            finish()
+            // Drawn as it looks in the editor: cut, adjusted, given its look, placed on its backdrop, the words on top.
+            exporting = true
+            failure = nil
+            settling?.cancel()
+            let words = StoryOverlayRender.text(overlays), edit = currentLook, placed = framingBox.value.loose()
+            exportTask = Task {
+                let made = await Task.detached(priority: .userInitiated) {
+                    StoryCanvas.photo(image, look: edit, framing: placed, text: words)
+                }.value
+                exporting = false
+                guard !Task.isCancelled else { return }
+                guard let made else { failure = "The photo couldn't be prepared."; return }
+                model.postStory(.image(made, caption: ""), audience: audience, lifetime: lifetime)
+                finish()
+            }
         } else if let made = StoryOverlayRender.textStory(overlays, palette: palette, seed: seed) {
             // A story of colours and words goes out as a picture, so it looks the same for everyone, however
             // the text was placed.
@@ -1015,6 +1160,14 @@ extension View {
 }
 
 /// Adds the swipe-to-change-look gesture only when there's something to colour.
+/// What the photo preview is drawn from: a change to any of it draws it again.
+private struct LookKey: Equatable {
+    var filter: StoryFilter
+    var adjust: StoryAdjust
+    var crop: StoryCrop
+    var image: Int
+}
+
 private struct OptionalFilterSwipe: ViewModifier {
     @Binding var filter: StoryFilter
     var enabled: Bool
@@ -1528,7 +1681,17 @@ struct StoryCamera: View {
         } else if let start, ready == true,
                   ShutterTiming.isTap(duration: Date().timeIntervalSince(start), travel: hypot(drag.translation.width, drag.translation.height)) {
             Haptics.tick()
-            camera.capture { image in if let image { pending = PendingCrop(image: image) } }
+            camera.capture { image in if let image { useShot(image) } }
+        }
+    }
+
+    /// A photo just taken goes straight into the editor (cleaned of its details off the main thread), where it's cropped,
+    /// placed and turned.
+    private func useShot(_ image: PlatformImage) {
+        let look = filter
+        Task {
+            let data = await Task.detached(priority: .userInitiated) { cleanJPEG(image, maxSide: StoryPick.photoSide) }.value
+            if let data { cover = .framed(StoryPick(kind: .photo(data), filter: look)) }
         }
     }
 
@@ -1580,7 +1743,7 @@ struct StoryCamera: View {
         .accessibilityHint("Hold to record a video")
         .accessibilityAddTraits(.isButton)
         .accessibilityAction {
-            if camera.recording { camera.finishRecording() } else { camera.capture { image in if let image { pending = PendingCrop(image: image) } } }
+            if camera.recording { camera.finishRecording() } else { camera.capture { image in if let image { useShot(image) } } }
         }
         .accessibilityAction(named: camera.recording ? "Stop recording" : "Record video") {
             if camera.recording { camera.finishRecording() } else { startClip() }

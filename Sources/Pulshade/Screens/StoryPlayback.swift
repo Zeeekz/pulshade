@@ -119,6 +119,7 @@ final class ClipPreview {
     @ObservationIgnored private let asset: AVURLAsset
     @ObservationIgnored private let zoom: ZoomTrack
     @ObservationIgnored private let framing: FramingBox?
+    @ObservationIgnored private let look: LookBox?
     @ObservationIgnored private var end: NSObjectProtocol?
     @ObservationIgnored private var ticker: Any?
     @ObservationIgnored private var range: StoryTrim?
@@ -129,12 +130,15 @@ final class ClipPreview {
     /// nothing else.
     private(set) var time: Double = 0
 
-    init(clip: MemoryClip, filter: StoryFilter, zoom: ZoomTrack = .none, framing: FramingBox? = nil, trim: StoryTrim? = nil) {
+    /// `look`, when given, is read for every frame, so crop, adjustments and backdrop show as they're changed.
+    init(clip: MemoryClip, filter: StoryFilter, zoom: ZoomTrack = .none, framing: FramingBox? = nil, trim: StoryTrim? = nil,
+         look: LookBox? = nil) {
         asset = clip.makeAsset()
         self.zoom = zoom
         self.framing = framing
+        self.look = look
         let item = AVPlayerItem(asset: asset)
-        item.videoComposition = StoryVideo.composition(for: asset, filter: filter, zoom: zoom, framing: framing)
+        item.videoComposition = StoryVideo.composition(for: asset, filter: filter, zoom: zoom, framing: framing, look: look)
         // Until the kept part is known, the first 15 seconds.
         item.forwardPlaybackEndTime = CMTime(seconds: trim?.end ?? StoryVideo.maxSeconds, preferredTimescale: 600)
         range = trim
@@ -161,7 +165,13 @@ final class ClipPreview {
     }
 
     func set(_ filter: StoryFilter) {
-        player.currentItem?.videoComposition = StoryVideo.composition(for: asset, filter: filter, zoom: zoom, framing: framing)
+        player.currentItem?.videoComposition = StoryVideo.composition(for: asset, filter: filter, zoom: zoom, framing: framing, look: look)
+    }
+
+    /// Draws the frame on screen again, for a change made while it is paused (playing, the next frame shows it anyway).
+    func redraw() {
+        guard player.rate == 0, let item = player.currentItem else { return }
+        item.videoComposition = StoryVideo.composition(for: asset, filter: .none, zoom: zoom, framing: framing, look: look)
     }
 
     /// Plays only `trim`, from its start.
@@ -354,6 +364,8 @@ struct FilterDots: View {
 /// What a story starts from.
 struct StoryPick: Identifiable {
     enum Kind { case photo(Data), clip(MemoryClip, ZoomTrack) }
+    /// The longest side a photo is kept at on its way into the editor: room to crop and zoom, and no more.
+    static let photoSide: CGFloat = 2600
     let id = UUID()
     let kind: Kind
     var filter = StoryFilter.none
@@ -521,17 +533,22 @@ final class LibraryPicker: NSObject, PHPickerViewControllerDelegate {
 }
 #endif
 
-/// Pick a photo (framed to the story's shape first) or a video (first 15 seconds are used) from the library:
-/// the photo picker on iPhone, a file panel on the Mac.
+/// Pick a photo or a video from the library: the photo picker on iPhone, a file panel on the Mac. A photo goes
+/// straight into the editor, where it's cropped, placed and turned.
 struct StoryMediaPicker<Label: View>: View {
     var picked: (StoryPick.Kind) -> Void
     @ViewBuilder var label: Label
-    @State private var pending: PendingCrop?
 
     var body: some View {
         Button { choose() } label: { label }
-            // Its own anchor: a sheet and the photo picker on one view cancel each other out.
-            .background { Color.clear.cropper($pending, frame: .story) { picked(.photo($0)) } }
+    }
+
+    /// Cleaned (no location or camera details) and kept no bigger than a story can use, off the main thread.
+    private func use(_ image: PlatformImage) {
+        Task {
+            let data = await Task.detached(priority: .userInitiated) { cleanJPEG(image, maxSide: StoryPick.photoSide) }.value
+            if let data { picked(.photo(data)) }
+        }
     }
 
     private func choose() {
@@ -548,11 +565,11 @@ struct StoryMediaPicker<Label: View>: View {
             if let bytes = try? Data(contentsOf: url, options: .mappedIfSafe) { picked(.clip(MemoryClip(bytes), .none)) }
         } else if let bytes = try? Data(contentsOf: url, options: .mappedIfSafe),
                   ImageLimits.isReasonable(bytes), let image = NSImage(data: bytes) {
-            pending = PendingCrop(image: image)
+            use(image)
         }
         #else
         LibraryPicker.present { kind, image in
-            if let kind { picked(kind) } else if let image { pending = PendingCrop(image: image) }
+            if let kind { picked(kind) } else if let image { use(image) }
         }
         #endif
     }
