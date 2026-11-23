@@ -15,15 +15,24 @@ typealias PlatformImage = UIImage
 enum ImageLimits {
     static let maxPixels = 50_000_000
 
-    /// Reads only the picture's header: false when it has no readable size or is over `maxPixels`.
+    /// How many pictures one file may hold. A photo is one (a HEIF can carry a few: depth, a thumbnail); a TIFF, icon or
+    /// HEIF with many more could put a huge one behind a small first one.
+    static let maxFrames = 8
+
+    /// Reads only the pictures' headers: false when there's none, too many, or any of them (not only the first: the
+    /// system may draw the file's primary one, or the largest) has no readable size or is over `maxPixels`.
     static func isReasonable(_ data: Data) -> Bool {
-        guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
-              CGImageSourceGetCount(source) > 0,
-              let info = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
-              let width = (info[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
-              let height = (info[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
-              width > 0, height > 0 else { return false }
-        return width <= maxPixels / height
+        guard let source = CGImageSourceCreateWithData(data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary)
+        else { return false }
+        let count = CGImageSourceGetCount(source)
+        guard count > 0, count <= maxFrames else { return false }
+        for index in 0..<count {
+            guard let info = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any],
+                  let width = (info[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+                  let height = (info[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+                  width > 0, height > 0, width <= maxPixels / height else { return false }
+        }
+        return true
     }
 }
 

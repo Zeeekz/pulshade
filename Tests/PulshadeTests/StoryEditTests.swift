@@ -151,4 +151,45 @@ struct StoryEditTests {
         let left = await StoryFramingTests.colour(of: MemoryClip(exported), x: 0.03, y: 0.5)
         #expect(left.g < 180, "the green stripe was cut away")
     }
+
+    /// Flip is left for right as the picture stands, also after a quarter turn (it used to turn it upside down).
+    @Test func flippingAfterATurnStaysLeftForRight() {
+        var crop = StoryCrop()
+        crop.turns = 1
+        crop.flipped = true
+        let out = crop.apply(Self.halves())
+        // Turned, red is at the top and blue at the bottom; a left-for-right flip keeps it so.
+        #expect(Self.colour(out, x: 0.5, y: 0.1).r > 200)
+        #expect(Self.colour(out, x: 0.5, y: 0.9).b > 200)
+    }
+
+    /// A panorama fits only far below the usual smallest size; it is still allowed that small, so it posts as shown.
+    @Test func aPanoramaKeepsTheSizeItFitsAt() {
+        let fit = StoryFraming.fitZoom(source: CGSize(width: 2600, height: 200), frame: StoryCanvas.photoSize)
+        #expect(fit < StoryFraming.leastZoom)
+        #expect(StoryFraming(zoom: fit).loose(fit: fit).zoom == fit)
+        #expect(StoryFraming(zoom: 0.001).loose(fit: fit).zoom == fit)
+    }
+
+    @Test func aFullTwistReadsAsUpright() {
+        #expect(StoryFraming.wrapped(2 * .pi) == 0)
+        #expect(abs(StoryFraming.wrapped(3 * .pi / 2) + .pi / 2) < 1e-9)
+        #expect(StoryFraming(angle: -2 * .pi).loose().angle == 0)
+    }
+
+    /// A file with many pictures in it isn't decoded: a huge one could hide behind a small first one.
+    @Test func aFileWithManyPicturesIsRefused() throws {
+        func tiff(frames: Int) throws -> Data {
+            let data = NSMutableData()
+            let destination = try #require(CGImageDestinationCreateWithData(data, "public.tiff" as CFString, frames, nil))
+            let space = try #require(CGColorSpace(name: CGColorSpace.sRGB))
+            let image = try #require(StoryFilter.context.createCGImage(CIImage(color: .red).cropped(to: CGRect(x: 0, y: 0, width: 8, height: 8)),
+                                                                   from: CGRect(x: 0, y: 0, width: 8, height: 8), format: .RGBA8, colorSpace: space))
+            for _ in 0..<frames { CGImageDestinationAddImage(destination, image, nil) }
+            #expect(CGImageDestinationFinalize(destination))
+            return data as Data
+        }
+        #expect(ImageLimits.isReasonable(try tiff(frames: 2)))
+        #expect(!ImageLimits.isReasonable(try tiff(frames: ImageLimits.maxFrames + 1)))
+    }
 }

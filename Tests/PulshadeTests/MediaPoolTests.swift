@@ -145,4 +145,46 @@ struct MediaPoolTests {
         vault.destroy(leavingNoTrace: true)
         #expect(!FileManager.default.fileExists(atPath: pool.mediaDirectory.path))
     }
+
+    /// An item goes into its filler's own file (same inode), so real files can't be picked out from filler by being newer
+    /// files, and every file's change time moves together.
+    @Test func anItemIsWrittenIntoItsFillersOwnFile() throws {
+        let pool = makePool("pulshade-media-inode")
+        _ = try pool.store(Data([1]))
+        func inodes() throws -> [String: Int] {
+            var out: [String: Int] = [:]
+            for url in try FileManager.default.contentsOfDirectory(at: pool.mediaDirectory, includingPropertiesForKeys: nil) {
+                out[url.lastPathComponent] = (try FileManager.default.attributesOfItem(atPath: url.path)[.systemFileNumber] as? Int) ?? -1
+            }
+            return out
+        }
+        let before = try inodes()
+        let ref = try pool.store(Data(repeating: 7, count: 5_000))
+        let after = try inodes()
+        #expect(after[ref.name] == before[ref.name], "the same file, not a new one in its place")
+        #expect(try pool.load(ref) == Data(repeating: 7, count: 5_000))
+        // Every file's change time is the same second.
+        var changed = Set<Int>()
+        for url in try FileManager.default.contentsOfDirectory(at: pool.mediaDirectory, includingPropertiesForKeys: nil) {
+            var info = stat()
+            #expect(stat(url.path, &info) == 0)
+            changed.insert(Int(info.st_ctimespec.tv_sec))
+        }
+        #expect(changed.count == 1)
+    }
+
+    /// A panic's wipe returns at once: the pool is gone from its place straight away and overwritten in the background.
+    @Test func wipingSoonMovesThePoolAsideAndFinishesIt() async throws {
+        let pool = makePool("pulshade-media-wipesoon")
+        _ = try pool.store(Data([1, 2, 3]))
+        pool.wipeSoon()
+        #expect(!FileManager.default.fileExists(atPath: pool.mediaDirectory.path))
+        #expect(pool.fileCount == 0)
+        for _ in 0..<50 {
+            let left = try FileManager.default.contentsOfDirectory(atPath: pool.directory.path).filter { $0.hasPrefix(".media-gone-") }
+            if left.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: pool.directory.path).filter { $0.hasPrefix(".media-gone-") }.isEmpty)
+    }
 }

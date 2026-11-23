@@ -802,10 +802,17 @@ struct ConversationView: View {
 
     /// Photos and a video from the library, picked together, go into the message being written like ones from the camera.
     private func chooseMedia() {
-        let room = max(1, 10 - attachments.count)
+        let room = max(0, 10 - attachments.count)
+        guard room > 0 || videoDraft == nil else {
+            mediaNote = "This message already has 10 photos and a video. Send it, or remove some, to add more."
+            return
+        }
         ChatMediaPicker.present(limit: room + (videoDraft == nil ? 1 : 0), maxSide: 1600) { picked in
-            if !picked.photos.isEmpty {
-                withAnimation(.snappy) { attachments = Array((attachments + picked.photos).prefix(10)) }
+            var picked = picked
+            let fits = min(picked.photos.count, max(0, 10 - attachments.count))
+            picked.dropped += picked.photos.count - fits
+            if fits > 0 {
+                withAnimation(.snappy) { attachments += picked.photos.prefix(fits) }
             }
             if let clip = picked.clip { prepareVideo(clip, .none) }
             mediaNote = picked.note
@@ -929,7 +936,7 @@ private struct ComposerContext: View {
     var body: some View {
         HStack(spacing: 10) {
             Rectangle().fill(theme.accent).frame(width: 2).clipShape(.capsule)
-            if let image, let ns = PlatformImage(data: image) {
+            if let image, let ns = PlatformImage.checked(image) {
                 Image(platformImage: ns).resizable().scaledToFill().frame(width: 34, height: 34).clipShape(.rect(cornerRadius: 6))
             } else {
                 Image(systemName: symbol).font(.system(size: 13)).foregroundStyle(theme.accent).frame(width: 20)

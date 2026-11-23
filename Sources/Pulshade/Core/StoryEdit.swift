@@ -143,13 +143,14 @@ struct StoryCrop: Equatable, Sendable {
     /// Flipped and turned, with its corner at the origin.
     func oriented(_ image: CIImage) -> CIImage {
         var out = image.transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY))
-        if flipped {
-            out = out.transformed(by: CGAffineTransform(scaleX: -1, y: 1).translatedBy(x: -out.extent.width, y: 0))
-        }
         for _ in 0..<((turns % 4 + 4) % 4) {
             // A quarter turn clockwise as seen, which is the other way in Core Image's upward y.
             out = out.transformed(by: CGAffineTransform(rotationAngle: -.pi / 2))
             out = out.transformed(by: CGAffineTransform(translationX: -out.extent.minX, y: -out.extent.minY))
+        }
+        // Flipped last, so it's always left for right as the picture now stands, whatever its turns.
+        if flipped {
+            out = out.transformed(by: CGAffineTransform(scaleX: -1, y: 1).translatedBy(x: -out.extent.width, y: 0))
         }
         return out
     }
@@ -311,6 +312,16 @@ enum StoryCanvas {
     static func preview(_ data: Data, look: StoryLook, maxSide: CGFloat) -> (jpeg: Data, colours: (StoryRGB, StoryRGB)?)? {
         guard let source = source(data, maxSide: maxSide) else { return nil }
         let media = look.media(source)
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let jpeg = StoryFilter.context.jpegRepresentation(of: media, colorSpace: space,
+                                                                options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.9])
+        else { return nil }
+        return (jpeg, colours(of: media))
+    }
+
+    /// The same, from a picture already decoded (the editor keeps one, so a slider doesn't decode the file each time).
+    static func preview(base: CGImage, look: StoryLook) -> (jpeg: Data, colours: (StoryRGB, StoryRGB)?)? {
+        let media = look.media(CIImage(cgImage: base))
         guard let space = CGColorSpace(name: CGColorSpace.sRGB),
               let jpeg = StoryFilter.context.jpegRepresentation(of: media, colorSpace: space,
                                                                 options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.9])

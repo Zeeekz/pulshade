@@ -74,7 +74,7 @@ struct StoryPhotoStage: View {
 // MARK: - Adjust
 
 /// Brightness, contrast, saturation, warmth, vignette and sharpen: pick one below, slide it above. A small dot marks
-/// the ones that have been changed; double-tap the slider to put one back.
+/// the ones that have been changed; tap the number to put one back.
 struct StoryAdjustPanel: View {
     @Binding var adjust: StoryAdjust
     @Binding var tool: StoryAdjust.Tool
@@ -93,13 +93,18 @@ struct StoryAdjustPanel: View {
 
     var body: some View {
         VStack(spacing: 14) {
-            Text(label(adjust[tool]))
-                .font(.system(size: 15, weight: .semibold).monospacedDigit())
-                .foregroundStyle(.white)
+            // Tap the number to put this one back.
+            Button { adjust[tool] = 0; Haptics.tick() } label: {
+                Text(label(adjust[tool]))
+                    .font(.system(size: 15, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(.white)
+                    .frame(minWidth: 60, minHeight: 28)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Reset \(tool.label)")
             Slider(value: value, in: tool.range)
                 .tint(.white)
                 .padding(.horizontal, 28)
-                .onTapGesture(count: 2) { adjust[tool] = 0; Haptics.tick() }
                 .accessibilityLabel(tool.label)
                 .accessibilityValue(label(adjust[tool]))
             ScrollView(.horizontal) {
@@ -202,7 +207,8 @@ struct StoryCropTool: View {
                              width: draft.rect.width * shown.width, height: draft.rect.height * shown.height)
             ZStack(alignment: .topLeading) {
                 Color.black.ignoresSafeArea()
-                if let oriented {
+                if let oriented, let cg = oriented.cgImageValue,
+                   abs(CGFloat(cg.width) / CGFloat(max(cg.height, 1)) - o.width / max(o.height, 1)) < 0.01 {
                     picture(oriented, shown: shown, origin: origin)
                 }
                 shade(box: box, size: geo.size)
@@ -220,7 +226,7 @@ struct StoryCropTool: View {
             }
         }
         .preferredColorScheme(.dark)
-        .task(id: [draft.turns, draft.flipped ? 1 : 0]) { orient() }
+        .task(id: [draft.turns, draft.flipped ? 1 : 0]) { await orient() }
     }
 
     /// The picture, straightened about the middle of the box and grown just enough to cover it, as it will be cut.
@@ -331,6 +337,8 @@ struct StoryCropTool: View {
                             .padding(.horizontal, 14).padding(.vertical, 8)
                             .background(aspect == shape ? Color.white : .white.opacity(0.12), in: .capsule)
                             .buttonStyle(.plain)
+                            .accessibilityLabel("Crop to \(shape == .free ? "any shape" : shape.rawValue)")
+                            .accessibilityAddTraits(aspect == shape ? .isSelected : [])
                     }
                 }
                 .padding(.horizontal, 20)
@@ -382,7 +390,11 @@ struct StoryCropTool: View {
             r.origin.x = min(max(start.minX + dx, 0), 1 - start.width)
             r.origin.y = min(max(start.minY + dy, 0), 1 - start.height)
         case let .edge(e):
-            guard unitRatio(aspect) == nil else { return resizeCorner(e == 0 || e == 3 ? 0 : 2, dx: dx, dy: dy, start: start) }
+            // With a shape chosen, the edge's own side leads and the other follows.
+            guard unitRatio(aspect) == nil else {
+                return resizeCorner(e == 0 || e == 3 ? 0 : 2, dx: e % 2 == 1 ? dx : 0, dy: e % 2 == 0 ? dy : 0, start: start,
+                                    lead: e % 2 == 1 ? .width : .height)
+            }
             switch e {
             case 0: let top = min(max(start.minY + dy, 0), start.maxY - least); r = CGRect(x: start.minX, y: top, width: start.width, height: start.maxY - top)
             case 1: let right = min(max(start.maxX + dx, start.minX + least), 1); r.size.width = right - start.minX
@@ -395,8 +407,11 @@ struct StoryCropTool: View {
         draft.rect = r
     }
 
-    /// Moves one corner (0 top left, then clockwise) with the opposite one held, keeping the shape if one is chosen.
-    private func resizeCorner(_ n: Int, dx: CGFloat, dy: CGFloat, start: CGRect) {
+    private enum Lead { case width, height }
+
+    /// Moves one corner (0 top left, then clockwise) with the opposite one held, keeping the shape if one is chosen: the
+    /// side moved further (for its size) leads, so the box shrinks as readily as it grows.
+    private func resizeCorner(_ n: Int, dx: CGFloat, dy: CGFloat, start: CGRect, lead: Lead? = nil) {
         let least = StoryCrop.smallest
         let anchor = [CGPoint(x: start.maxX, y: start.maxY), CGPoint(x: start.minX, y: start.maxY),
                       CGPoint(x: start.minX, y: start.minY), CGPoint(x: start.maxX, y: start.minY)][n]
@@ -408,25 +423,28 @@ struct StoryCropTool: View {
         var w = min(max((moving.x + dx - anchor.x) * sx, least), roomX)
         var h = min(max((moving.y + dy - anchor.y) * sy, least), roomY)
         if let a = unitRatio(aspect) {
-            // The shape is kept: the side moved further leads, and both stay inside.
-            if w / a > h { h = w / a } else { w = h * a }
+            let byWidth = lead.map { $0 == .width }
+                ?? (abs(w - start.width) / max(start.width, 0.001) >= abs(h - start.height) / max(start.height, 0.001))
+            if byWidth { h = w / a } else { w = h * a }
+            if w < least { w = least; h = w / a }
+            if h < least { h = least; w = h * a }
             if h > roomY { h = roomY; w = h * a }
             if w > roomX { w = roomX; h = w / a }
         }
         draft.rect = CGRect(x: sx > 0 ? anchor.x : anchor.x - w, y: sy > 0 ? anchor.y : anchor.y - h, width: w, height: h)
     }
 
-    /// Flips and turns the picture for drawing, off the main thread.
-    private func orient() {
+    /// Flips and turns the picture for drawing, off the main thread. Kept only if the draft still turns and flips that way,
+    /// so quick taps can't leave it showing an older turn squeezed into the new shape.
+    private func orient() async {
         guard let cg = source.cgImageValue else { return }
         let crop = draft
-        Task {
-            let made: CGImage? = await Task.detached(priority: .userInitiated) {
-                let image = crop.oriented(CIImage(cgImage: cg))
-                return StoryFilter.context.createCGImage(image, from: image.extent)
-            }.value
-            if let made { oriented = .from(cgImage: made) }
-        }
+        let made: CGImage? = await Task.detached(priority: .userInitiated) {
+            let image = crop.oriented(CIImage(cgImage: cg))
+            return StoryFilter.context.createCGImage(image, from: image.extent)
+        }.value
+        guard !Task.isCancelled, draft.turns == crop.turns, draft.flipped == crop.flipped, let made else { return }
+        oriented = .from(cgImage: made)
     }
 }
 
@@ -472,7 +490,7 @@ struct StraightenDial: View {
                         angle = next
                     }
                     .onEnded { _ in start = nil })
-                .onTapGesture(count: 2) { withAnimation(.snappy) { angle = 0 } }
+                .simultaneousGesture(TapGesture(count: 2).onEnded { withAnimation(.snappy) { angle = 0 } })
                 .frame(width: geo.size.width)
             }
             .frame(height: 30)

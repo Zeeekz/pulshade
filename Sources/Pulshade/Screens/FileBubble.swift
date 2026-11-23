@@ -150,7 +150,10 @@ private struct FileSheet: View {
         .padding(20)
         .frame(minWidth: 360, minHeight: 360)
         .background(Ink.base)
-        .fileExporter(isPresented: $saving, document: RawFileDocument(data: file.data), contentType: .data, defaultFilename: file.name) { _ in }
+        .fileExporter(isPresented: $saving, document: RawFileDocument(data: file.data), contentType: .data, defaultFilename: file.name) { result in
+            // Someone else's file: marked as downloaded, so the Mac checks it (Gatekeeper) before anything in it can run.
+            if case let .success(url) = result { Quarantine.mark(url) }
+        }
     }
 }
 
@@ -160,4 +163,17 @@ struct RawFileDocument: FileDocument {
     init(data: Data) { self.data = data }
     init(configuration: ReadConfiguration) throws { data = configuration.file.regularFileContents ?? Data() }
     func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper { FileWrapper(regularFileWithContents: data) }
+}
+
+/// The mark macOS puts on downloaded files, so an app or script inside one is checked before it can run.
+enum Quarantine {
+    static func mark(_ url: URL) {
+        #if os(macOS)
+        let value = String(format: "0083;%08x;PULSHADE;", Int(Date().timeIntervalSince1970))
+        _ = url.withUnsafeFileSystemRepresentation { path in
+            guard let path else { return Int32(-1) }
+            return value.withCString { setxattr(path, "com.apple.quarantine", $0, strlen($0), 0, 0) }
+        }
+        #endif
+    }
 }

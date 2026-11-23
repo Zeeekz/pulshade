@@ -260,11 +260,27 @@ struct StoryFraming: Equatable, Sendable {
 
     /// Kept to what the editor allows, Instagram-style: any size from small to four times filling, turned any way, with
     /// its middle somewhere on the frame.
-    func loose() -> StoryFraming {
-        StoryFraming(zoom: min(max(zoom.isFinite ? zoom : 1, Self.leastZoom), Self.mostZoom),
+    /// `fit` is the zoom at which the whole picture shows: a panorama fits only far below `leastZoom`, and is still
+    /// allowed down to that, so it posts as it was shown. The turn is kept between a half turn either way.
+    func loose(fit: CGFloat = 1) -> StoryFraming {
+        StoryFraming(zoom: min(max(zoom.isFinite ? zoom : 1, Self.lowest(fit: fit)), Self.mostZoom),
                      dx: min(max(dx.isFinite ? dx : 0, -0.5), 0.5),
                      dy: min(max(dy.isFinite ? dy : 0, -0.5), 0.5),
-                     angle: angle.isFinite ? angle : 0)
+                     angle: Self.wrapped(angle))
+    }
+
+    /// The smallest the editor lets a picture be: `leastZoom`, or less for one that only fits whole below it.
+    static func lowest(fit: CGFloat) -> CGFloat {
+        min(leastZoom, fit.isFinite && fit > 0 ? fit : leastZoom)
+    }
+
+    /// An angle brought within a half turn either way, so a full twist reads as upright.
+    static func wrapped(_ angle: CGFloat) -> CGFloat {
+        guard angle.isFinite else { return 0 }
+        var a = angle.truncatingRemainder(dividingBy: 2 * .pi)
+        if a > .pi { a -= 2 * .pi }
+        if a <= -.pi { a += 2 * .pi }
+        return abs(a) < 1e-9 ? 0 : a
     }
 
     /// The size where the whole picture shows: the zoom (against filling) at which the longer side just fits.

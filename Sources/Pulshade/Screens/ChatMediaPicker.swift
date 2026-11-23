@@ -18,11 +18,17 @@ enum ChatMediaPicker {
         var extraVideos = 0
         /// Items that couldn't be read (an iCloud video while offline, say, or one too big to hold).
         var failed = 0
+        /// Photos past what the message has room for (ten in all).
+        var dropped = 0
 
         /// What to tell the person about what was left out, if anything.
         var note: String? {
             var parts: [String] = []
             if extraVideos > 0 { parts.append("Only one video can go at a time, so the first one you picked was added.") }
+            if dropped > 0 {
+                parts.append(dropped == 1 ? "A message takes up to 10 photos, so one was left out."
+                                          : "A message takes up to 10 photos, so \(dropped) were left out.")
+            }
             if failed > 0 {
                 parts.append(failed == 1 ? "One item couldn't be loaded. If it's kept in iCloud, check you're online and try again."
                                          : "\(failed) items couldn't be loaded. If they're kept in iCloud, check you're online and try again.")
@@ -42,8 +48,19 @@ enum ChatMediaPicker {
         panel.allowedContentTypes = [.image, .movie]
         panel.allowsMultipleSelection = true
         guard panel.runModal() == .OK else { return }
+        let urls = panel.urls
+        // Read and cleaned off the main thread, so the window doesn't hang over a handful of big photos.
+        Task {
+            let picked = await Task.detached(priority: .userInitiated) { load(urls, limit: limit, maxSide: maxSide) }.value
+            done(picked)
+        }
+        #endif
+    }
+
+    #if os(macOS)
+    private nonisolated static func load(_ urls: [URL], limit: Int, maxSide: CGFloat) -> Picked {
         var picked = Picked()
-        for url in panel.urls {
+        for url in urls {
             let isMovie = (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType?.conforms(to: .movie) == true
             if isMovie {
                 if picked.clip != nil { picked.extraVideos += 1; continue }
@@ -54,16 +71,19 @@ enum ChatMediaPicker {
                     picked.failed += 1
                 }
             } else if picked.photos.count < limit {
-                if let image = NSImage(contentsOf: url), let data = cleanJPEG(image, maxSide: maxSide) {
+                if let bytes = try? Data(contentsOf: url, options: .mappedIfSafe), ImageLimits.isReasonable(bytes),
+                   let image = NSImage(data: bytes), let data = cleanJPEG(image, maxSide: maxSide) {
                     picked.photos.append(data)
                 } else {
                     picked.failed += 1
                 }
+            } else {
+                picked.dropped += 1
             }
         }
-        done(picked)
-        #endif
+        return picked
     }
+    #endif
 }
 
 #if os(iOS)

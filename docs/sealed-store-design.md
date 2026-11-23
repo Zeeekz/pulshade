@@ -434,7 +434,13 @@ memory). A code comment in the relay says deposits are refused (507) at the cap,
   save (`releaseDroppedMedia`).
 - The budget counts each item at its padded size on disk, so tiny items can't grow the pool past it.
 - Burn, Detach and a panic unlock remove the whole pool after its keys are gone. The panic landing account starts empty.
+  A panic unlock moves the pool aside under a random name and overwrites it in the background, so the panic passcode
+  doesn't open slower than the real one; one left part-way is finished the next time the pool is used.
 - A newly linked device gets the bytes inside the sealed history, never file references.
 - **What still shows:** the pool's file count and total size give a rough idea of how much media one account on the
   device keeps. An empty decoy beside a large pool can't explain it. The inode change time can't be set by an app, so it
-  shows when the pool last changed.
+  shows when the pool last changed: after every write, every file's is moved to that moment, so it doesn't say which file
+  changed. Items are written into their filler's own file (same inode, same blocks where the system allows), never a new
+  one, so inode numbers don't single them out either. Files made in one growth step still have neighbouring inode numbers,
+  which says the pool grew then, not what it holds. A deleted item's key can survive in an old copy of the data file left
+  in free space or a snapshot (the data file's key doesn't change yet; see the key wrapper in stage 1).

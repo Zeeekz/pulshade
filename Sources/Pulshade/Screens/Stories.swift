@@ -374,6 +374,12 @@ struct StoryComposer: View {
     @State private var cropSource: PlatformImage?
     /// The crop changed: the picture goes back to fitting the frame once its new shape is known.
     @State private var refit = false
+    /// The photo decoded once, small enough to redraw quickly, and the renders of it, one at a time with the newest next.
+    @State private var previewBase: CGImage?
+    @State private var previewBaseKey = 0
+    @State private var renderer = LatestRender()
+    /// A paused clip redrawn once a run of changes stops, not for every one.
+    @State private var redrawTask: Task<Void, Never>?
     private enum EditTool { case crop, adjust }
     /// The story being edited, if this isn't a new one.
     private var editing: Story?
@@ -453,7 +459,12 @@ struct StoryComposer: View {
         .task(id: LookKey(filter: filter, adjust: adjust, crop: crop, image: image?.count ?? 0)) { await look() }
         .onChange(of: currentLook, initial: true) { _, new in
             lookBox.value = new
-            clipPreview?.redraw()
+            redrawTask?.cancel()
+            redrawTask = Task {
+                try? await Task.sleep(for: .milliseconds(80))
+                guard !Task.isCancelled else { return }
+                clipPreview?.redraw()
+            }
         }
         .onDisappear {
             settling?.cancel()
@@ -669,7 +680,9 @@ struct StoryComposer: View {
                     withAnimation(.snappy) { tool = nil }
                     guard new != crop else { return }
                     crop = new
-                    refit = true
+                    // The backdrop's colours come from what's kept now.
+                    photoColours = nil
+                    refit = image != nil
                     if let clipUpright {
                         // A clip's new shape is known at once.
                         let shaped = new.outputSize(of: clipUpright)
@@ -691,7 +704,11 @@ struct StoryComposer: View {
     /// it, black and white.
     private var backdrops: [StoryBackdrop] {
         var all: [StoryBackdrop] = []
-        if image != nil, let c = photoColours, c.count == 2 { all.append(.gradient(c[0], c[1])) }
+        // A photo's own colours are always first, a plain dark grey until they're known, so a choice made meanwhile
+        // doesn't move when they arrive.
+        if image != nil {
+            all.append(photoColours.flatMap { $0.count == 2 ? .gradient($0[0], $0[1]) : nil } ?? .solid(StoryRGB(r: 0.12, g: 0.12, b: 0.14)))
+        }
         return all + [.blur, .solid(.black), .solid(.white)]
     }
 
@@ -787,6 +804,7 @@ struct StoryComposer: View {
                         withAnimation {
                             image = nil; clip = nil; looked = nil; filter = .none
                             adjust = StoryAdjust(); crop = StoryCrop(); sourceSize = nil; photoColours = nil; backdropChoice = 0
+                            refit = false; previewBase = nil; live.value = .fill
                         }
                     }
                     .disabled(exporting)
@@ -956,7 +974,11 @@ struct StoryComposer: View {
             changed: { value in reframe(value, canvas: canvas, source: size) },
             ended: {
                 framingBase = nil
-                settle(to: framingBox.value.loose())
+                // A full twist is upright: brought round first, so settling doesn't spin it back.
+                var now = framingBox.value
+                now.angle = StoryFraming.wrapped(now.angle)
+                show(now)
+                settle(to: now.loose(fit: fitNow))
             })
     }
 
@@ -976,7 +998,7 @@ struct StoryComposer: View {
             zoom = snapZoom
         }
         zoomSnapped = snapZoom != nil && value.fingers > 1
-        zoom = exp(RubberBand.clamp(log(max(zoom, 0.01)), log(StoryFraming.leastZoom)...log(StoryFraming.mostZoom), span: 0.2))
+        zoom = exp(RubberBand.clamp(log(max(zoom, 0.01)), log(StoryFraming.lowest(fit: fit))...log(StoryFraming.mostZoom), span: 0.2))
         // The turn, clicking onto upright and the quarters.
         var angle = base.angle
         if value.fingers > 1 {
@@ -1035,12 +1057,24 @@ struct StoryComposer: View {
     /// time (and after a new crop) it opens fitted whole in the frame, over its colours.
     private func look() async {
         guard let image, editing == nil else { looked = nil; return }
-        // A slider sends many changes a second: only the last of a quick run is drawn.
-        if looked != nil { try? await Task.sleep(for: .milliseconds(30)) }
-        guard !Task.isCancelled else { return }
         let wanted = StoryLook(filter: filter, adjust: adjust, crop: crop)
-        let made = await Task.detached(priority: .userInitiated) { StoryCanvas.preview(image, look: wanted, maxSide: 1400) }.value
-        guard !Task.isCancelled, let made, let shown = PlatformImage(data: made.jpeg), let cg = shown.cgImageValue else { return }
+        // One render at a time: while one runs, only the newest change waits for it, so a slider never piles them up.
+        renderer.run { await renderPreview(image, wanted) }
+    }
+
+    private func renderPreview(_ image: Data, _ wanted: StoryLook) async {
+        if previewBase == nil || previewBaseKey != image.count {
+            let base = await Task.detached(priority: .userInitiated) { () -> CGImage? in
+                guard let source = StoryCanvas.source(image, maxSide: 1400) else { return nil }
+                return StoryFilter.context.createCGImage(source, from: source.extent)
+            }.value
+            previewBase = base
+            previewBaseKey = image.count
+        }
+        guard let base = previewBase else { return }
+        let made = await Task.detached(priority: .userInitiated) { StoryCanvas.preview(base: base, look: wanted) }.value
+        // The photo was changed meanwhile (a text story instead, say): nothing to show.
+        guard self.image == image, let made, let shown = PlatformImage(data: made.jpeg), let cg = shown.cgImageValue else { return }
         let first = looked == nil
         if photoColours == nil, let c = made.colours { photoColours = [c.0, c.1] }
         let size = CGSize(width: cg.width, height: cg.height)
@@ -1053,6 +1087,9 @@ struct StoryComposer: View {
         }
     }
 
+    /// The zoom at which the whole picture shows, the lower end of what the editor allows for a panorama.
+    private var fitNow: CGFloat { sourceSize.map { StoryFraming.fitZoom(source: $0, frame: StoryVideo.size) } ?? 1 }
+
     private func post() {
         if let editing {
             model.editStory(editing.id, style: preview.style, audience: audience, lifetime: lifetime, loops: loops)
@@ -1061,7 +1098,7 @@ struct StoryComposer: View {
             exporting = true
             failure = nil
             settling?.cancel()
-            let look = filter, track = clipZoom, placed = framingBox.value.loose(), kept = trim, edit = currentLook
+            let look = filter, track = clipZoom, placed = framing.loose(fit: fitNow), kept = trim, edit = currentLook
             let words = StoryOverlayRender.text(overlays)
             exportTask = Task {
                 // The kept part goes up as several stories, in order, each 15 seconds. The parts share a size budget,
@@ -1097,7 +1134,7 @@ struct StoryComposer: View {
             exporting = true
             failure = nil
             settling?.cancel()
-            let words = StoryOverlayRender.text(overlays), edit = currentLook, placed = framingBox.value.loose()
+            let words = StoryOverlayRender.text(overlays), edit = currentLook, placed = framing.loose(fit: fitNow)
             exportTask = Task {
                 let made = await Task.detached(priority: .userInitiated) {
                     StoryCanvas.photo(image, look: edit, framing: placed, text: words)
@@ -1160,6 +1197,23 @@ extension View {
 }
 
 /// Adds the swipe-to-change-look gesture only when there's something to colour.
+/// Runs one piece of work at a time; work asked for while one runs waits, and only the newest of it.
+@MainActor
+final class LatestRender {
+    private var running = false
+    private var queued: (() async -> Void)?
+
+    func run(_ work: @escaping () async -> Void) {
+        if running { queued = work; return }
+        running = true
+        Task { @MainActor in
+            await work()
+            running = false
+            if let next = queued { queued = nil; run(next) }
+        }
+    }
+}
+
 /// What the photo preview is drawn from: a change to any of it draws it again.
 private struct LookKey: Equatable {
     var filter: StoryFilter

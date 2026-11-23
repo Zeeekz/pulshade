@@ -282,8 +282,9 @@ struct Vault {
             rebalance(real: [landing])
             // The landing account is always new and empty, so every media file is the destroyed accounts' (or their
             // filler). Left behind, a pool of hundreds of files beside an account with nothing in it would say there
-            // was another account; its keys are gone with the vault files above, and the files go too.
-            MediaPool(directory: directory).wipe()
+            // was another account; its keys are gone with the vault files above, and the files go too. In the background:
+            // overwriting a big pool took seconds, and a panic passcode that opened slower than the real one gave it away.
+            MediaPool(directory: directory).wipeSoon()
         }
     }
 
@@ -842,7 +843,9 @@ final class MediaPool {
         if ownFillers.isEmpty { try grow(toHold: realNames.count + 1, doubling: true) }
         guard let name = ownFillers.sorted().first else { throw VaultError.corrupt }
         let url = mediaDirectory.appendingPathComponent(name)
-        try write(sealed, to: url)
+        // Into the filler's own file, not a new one put in its place: a new file would get a new inode and its own
+        // change time, telling real files from filler, and when each came.
+        try writeInPlace(sealed, to: url)
         ownFillers.remove(name)
         realNames.insert(name)
         stamp([url])
@@ -900,6 +903,28 @@ final class MediaPool {
     var fillerCount: Int { allFiles().filter { !realNames.contains($0.lastPathComponent) }.count }
     var ownFillerCount: Int { ownFillers.count }
 
+    /// Like `wipe`, but returns at once: the pool is moved aside under a random name (so it's gone from where it was
+    /// straight away) and overwritten in the background. One left part-way (the app was closed) is finished the next time
+    /// the pool is used. Its keys must already be gone.
+    func wipeSoon() {
+        guard FileManager.default.fileExists(atPath: mediaDirectory.path) else { return }
+        let aside = directory.appendingPathComponent(Self.asidePrefix + Data.random(8).hex, isDirectory: true)
+        guard (try? FileManager.default.moveItem(at: mediaDirectory, to: aside)) != nil else { wipe(); return }
+        realNames = []
+        ownFillers = []
+        Task.detached(priority: .utility) { Vault.scrub(item: aside) }
+    }
+
+    private static let asidePrefix = ".media-gone-"
+
+    /// Pools moved aside by `wipeSoon` that weren't finished.
+    private func finishWipes() {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? []
+        let left = names.filter { $0.hasPrefix(Self.asidePrefix) }.map { directory.appendingPathComponent($0, isDirectory: true) }
+        guard !left.isEmpty else { return }
+        Task.detached(priority: .utility) { for url in left { Vault.scrub(item: url) } }
+    }
+
     /// Keys are destroyed by the vault before this is called; then every real file and filler is overwritten and removed.
     func wipe() {
         guard FileManager.default.fileExists(atPath: mediaDirectory.path) else { return }
@@ -912,6 +937,7 @@ final class MediaPool {
     // MARK: Files
 
     private func prepare() throws {
+        finishWipes()
         var url = mediaDirectory
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
@@ -954,6 +980,23 @@ final class MediaPool {
             try? FileManager.default.setAttributes([.modificationDate: when, .creationDate: when],
                                                    ofItemAtPath: url.path)
         }
+        // The change time (ctime) can't be set, only moved to now: every file's is, so they all say only when the pool
+        // last changed, not which file did.
+        for url in allFiles() {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        }
+    }
+
+    /// Writes `data` over a file that is already there, in its own blocks, and cuts it to that length. Falls back to a
+    /// fresh file only if there's none (never an unencrypted one: `data` is already sealed).
+    private func writeInPlace(_ data: Data, to url: URL) throws {
+        guard FileManager.default.fileExists(atPath: url.path) else { return try write(data, to: url) }
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.seek(toOffset: 0)
+        try handle.write(contentsOf: data)
+        try handle.truncate(atOffset: UInt64(data.count))
+        try handle.synchronize()
     }
 
     /// Writes random bytes over the file's own blocks (no new file and rename, which would leave the old bytes where
