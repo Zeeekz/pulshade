@@ -29,7 +29,7 @@ is never written to its disk. Here is every kind of thing, in plain words:
 | **Files and chat videos you send** (files up to 100 MB; videos a few MB) | The server's disk, in pieces | Erased the moment the other person's phone has downloaded it, or when you delete the message, or after 30 days at most (7 days in groups) | No. Sealed on your phone with a key that travels only inside the encrypted message, and sealed a second time by the server with a key of its own. Its name and type are inside the encrypted message, so we don't even know those. |
 | **Video stories** (a few MB) | The server's disk, one copy for everyone | Until the story's timer runs out (then overwritten and erased), or sooner if you delete the story | No. The same two layers of encryption. |
 | **Sealed backup** (profile, contacts, groups and settings; never chats themselves or the keys for any chat, so mail sent while you were logged out can't be opened afterwards) | The server's disk | Until you switch it off, Burn, or 180 days without an update | No. Sealed with a key only your recovery code makes. |
-| **Spare keys** (one per friend, so a friend who logs back in can write to you straight away) | The server's disk, in the sealed-backup store | Erased by your friend when they use it, or by you when you remove them; otherwise replaced every 5 to 10 days, and 180 days without an update at most | No. Only you and that friend can work out where it is or open it, and it holds no message. |
+| **Spare keys** (up to three per friend, so a friend who logs back in or whose keys need mending can write to you straight away) | The server's disk, in the sealed-backup store | One-time ones erased by your friend when they use one, all of them by you when you remove that friend; otherwise replaced every 5 to 10 days, and 180 days without an update at most | No. Only you and that friend can work out where it is or open it, and it holds no message. |
 | **Group link previews** (one per join link an admin makes) | The server's disk, in the sealed-backup store | Rewritten while the link is in use; erased when the link is reset or deleted; 180 days without an update at most | No. Only people who have the link can find or open it. It holds the group's name, picture, description and size, which anyone with the link can see. |
 | **Public @handle and profile** (only if you choose one) | The server's disk | Until you let it go | Yes, it is public by your choice. |
 | **The server's own records and keys** (handle directory, held handles, moderation lists, announcements; its push and onion keys) | The server's disk | While the service runs | Only the server, which needs them to work. Sealed with its storage key, which is held in memory only and never written to the disk; after a reboot the server stays locked until we unlock it. The admin password is kept only as a hash. |
@@ -86,14 +86,15 @@ worked out from the link; anyone who has the link can find and read them, and th
 one sealed message to the group's admins, from a key you use only in that group, with your name and picture as the group
 will see them and an optional note. The admins' answer comes back the same way. Your account is never named.
 
-**Spare keys.** After you log back in (Detach and your recovery code), the app needs new keys with each friend. So
-that you don't have to wait for every friend to open Pulshade, each friend's app leaves a spare key for you on the
-server ahead of time, and yours leaves one for each of them. It's kept in the sealed-backup store, at a place only the
+**Spare keys.** After you log back in (Detach and your recovery code), or when the keys of a chat need mending, the app
+needs new keys with that friend. So that you don't have to wait for them to open Pulshade, each friend's app leaves up
+to three spare keys for you on the server ahead of time, and yours leaves the same for each of them. It's kept in the sealed-backup store, at a place only the
 two of you can work out, sealed with a key only the two of you can make, and every spare is the same size. The server
 can't open it or tell whose it is. Each one is written and read on its own connection, at random times, so the server
 can't easily tie the spares of one person together, but it does see when a spare is written, read or erased, and if
-you connect without Tor, your IP address during that request. A spare is used once: the friend who uses it erases
-it. Removing a friend erases yours for them. Otherwise each is replaced every 5 to 10 days, and one nobody updates
+you connect without Tor, your IP address during that request. Two of the spares are used once: the friend who uses
+one erases it. The third is only used when those are gone, and can be used more than once until it's replaced.
+Removing a friend erases yours for them. Otherwise each is replaced every 5 to 10 days, and one nobody updates
 (after a Burn, say) is erased after 180 days; it is no use to anyone without your keys.
 
 **Reports.** If you report something, the report is sealed so that only Pulshade Admin can read it. It is sent from a

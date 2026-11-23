@@ -31,6 +31,31 @@ struct SpareKeyTests {
                                issuer: bobSigning, device: Data()) == nil)
     }
 
+    /// Each of a device's spares for a friend has its own slot, both sides agree on each, and the first is the slot
+    /// builds before had, so their apps still find it.
+    @Test func eachSpareHasItsOwnSlotAndTheFirstIsTheOldOne() throws {
+        let alice = Identity.generate(), bob = Identity.generate()
+        let device = Data(repeating: 5, count: 16), issuer = bob.signingKey.publicKey.rawRepresentation
+        var names: [Data] = []
+        for slot in SpareSlot.Slot.allCases {
+            let left = try #require(SpareSlot.keys(mine: bob.agreementKey, theirs: alice.agreementKey.publicKey.rawRepresentation,
+                                                   issuer: issuer, device: device, slot: slot))
+            let looked = try #require(SpareSlot.keys(mine: alice.agreementKey, theirs: bob.agreementKey.publicKey.rawRepresentation,
+                                                     issuer: issuer, device: device, slot: slot))
+            #expect(left.name == looked.name)
+            names.append(left.name)
+        }
+        #expect(Set(names).count == SpareSlot.Slot.allCases.count)
+        // The derivation builds before used, written out: the first slot must stay exactly that.
+        let shared = try bob.agreementKey.sharedSecretFromKeyAgreement(with: alice.agreementKey.publicKey)
+        let ikm = SymmetricKey(data: shared.withUnsafeBytes { Data($0) })
+        let context = Data(SHA256.hash(data: Data("pulshade.spare.v1".utf8) + issuer + device))
+        let signing = HKDF<SHA256>.deriveKey(inputKeyMaterial: ikm, salt: context, info: Data("pulshade.spare.signing".utf8), outputByteCount: 32)
+        let old = try Curve25519.Signing.PrivateKey(rawRepresentation: signing.withUnsafeBytes { Data($0) })
+        #expect(names.first == old.publicKey.rawRepresentation)
+        #expect(SpareSlot.Slot.lastResort.reusable && !SpareSlot.Slot.first.reusable && !SpareSlot.Slot.second.reusable)
+    }
+
     /// What goes on the relay is the size of the smallest backup, opens only with the slot's keys, and the session
     /// it starts works both ways.
     @Test func aSpareIsOneSizeAndOpensASession() throws {

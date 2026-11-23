@@ -98,6 +98,6 @@ struct AppDataFormatTests {
     static let profileKeys = ["avatar", "banner", "bio", "color", "format", "handle", "links",
                               "moreHandles", "name", "notes", "updatedAt"]
     static let contactKeys = ["addedAt", "agreementKey", "avatar", "awaitingAcceptance", "banner", "bio", "color", "contested", "departing", "devices",
-                              "fingerprint", "followLater", "handle", "hidden", "isSelf", "links", "name", "nickname", "notes", "oldSpares", "persona", "pq", "pqCardSent", "pqCommit", "receiveKey", "relay", "revoked",
+                              "fingerprint", "followLater", "handle", "hidden", "isSelf", "links", "moreSpares", "name", "nickname", "notes", "oldSpares", "persona", "pq", "pqCardSent", "pqCommit", "receiveKey", "relay", "revoked",
                               "signingKey", "spare", "toldPresence", "tooOld", "verified", "viaCode", "walletChangedAt", "wantsMyPresence"]
 }

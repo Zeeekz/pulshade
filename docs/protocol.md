@@ -268,15 +268,33 @@ and its device id. So:
 - the relay cannot work out the slot or open it, and cannot tell whose it is;
 - every spare is padded to **one size (16 KB)**, whatever is inside (it carries the device's signed card);
 - each slot is read and written on its own connection at random times, so one person's spares are hard to tie together;
-- a spare is **used once**: whoever takes it erases it;
-- an unused spare is replaced every **5 to 10 days**; removing a friend erases yours for them; one nobody updates is
-  erased by the relay after **180 days**.
+- each device leaves each friend up to **three** spares, each in its own slot (the slot number is mixed into the HKDF
+  context; the first slot is derived exactly as before, so older apps still find it): two are **used once**, and whoever
+  takes one erases it; the third is a **last resort**, taken only when both of the others are gone, and not erased;
+- an unused spare, and the last-resort one whether used or not, is replaced every **5 to 10 days**; removing a friend
+  erases yours for them; one nobody updates is erased by the relay after **180 days**.
 - Spares are only made for friends whose app says it takes them.
 
 The relay can still see *that* a spare was written, read or erased, and when, and (in Fast mode) the IP address that did
 it. It cannot see who the friends are. Each spare is signed by the device's own keys. Its secret half lives in your
 encrypted vault, and **not** in the sealed backup: a copy of the backup must not be able to finish a spare in your
 device's name. A friend who takes a spare the device no longer has is asked for new keys instead.
+
+**Why three, and the trade.** Spares now also mend chats whose keys fell out of step in everyday use, not only after a
+recovery, so a friend may need several in a row, or their phone and their Mac may both need one at once, while your app
+stays closed. Two one-time spares cover most of that; the last-resort one (like Signal's signed prekey) means there is
+always something to start from, so a chat only waits for a friend who hasn't opened Pulshade for weeks. The cost: the
+last-resort spare's secret half is kept until it is replaced rather than thrown away when first used, so the first
+messages of a session started on it are only as safe as that secret for those few days; the keys move on with the
+first reply, as always. Each answer to it is remembered (its ephemeral key, the last 64), so the same answer sent again
+can't put a chat back on keys it has moved on from, and the maker finishes none older than a friend would take. A
+device fills or replaces **one slot per run** of its upkeep, minutes apart, so it writes new backup keys no faster than
+before; the last-resort slot is filled before the second and is never left waiting behind refills, so its secret half
+doesn't outlive its 5 to 10 days. A friend reads the slots one at a time, a few random seconds apart: the first; if
+that's gone, the last-resort one (always up where a device leaves more than one, so if it isn't, there's nothing else
+to look for); then the second, which is preferred to it. That keeps a recovery at about one read per friend, inside the
+relay's hourly allowance. If the device's own keys change (its data opened on another device, say), every spare they
+signed is erased and new ones are made; an answer to one signed by keys the device no longer has is refused.
 
 **When both friends log back in at once.** Each may take the other's spare, so for a moment there are two new
 sessions. Both sides settle on the same one, the spare made by the "lower" side by a fixed comparison both make, as

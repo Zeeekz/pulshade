@@ -93,10 +93,11 @@ import Foundation
     }
 
     /// With this Mac's real Secure Enclave: an unbound file is bound, its old slots keep opening, and a slot rewritten
-    /// afterwards is bound too. Skipped where there's no Secure Enclave (or the run switched it off).
+    /// afterwards is bound too. Skipped where there's no Secure Enclave, the run switched it off, or it won't make a key
+    /// right now (the Mac is locked, or the run has no login session).
     @Test func bindingAnOlderFileKeepsItsDecoyAndPanicOpening() throws {
         Vault.bindingOffForTests = false
-        guard Vault.canBindToDevice else { return }
+        guard Vault.canBindToDevice, Vault.enclaveMakesKeysNow else { return }
         Vault.bindingOffForTests = true
         let made = try vaultWithDecoyAndPanic(testDirectory("pulshade-vault-bind-enclave"))
         Vault.bindingOffForTests = false

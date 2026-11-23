@@ -99,7 +99,11 @@ struct GroupDeliveryTests {
         cara.data.conversations[c].shared?.lastFetch = Date().addingTimeInterval(-8 * 86_400)
         #expect(cara.conversation(id)?.messages.contains { $0.text == "while you were gone" } != true)
 
-        await until([alice, bob, cara]) { cara.conversation(id)?.messages.contains { $0.text == "while you were gone" } == true }
+        // The message can come in the same sync that notices she was away, before her ask has gone: both are waited for.
+        await until([alice, bob, cara]) {
+            cara.conversation(id)?.messages.contains { $0.text == "while you were gone" } == true
+                && cara.conversation(id)?.shared?.catchUpSince == nil
+        }
         #expect(cara.conversation(id)?.messages.filter { $0.text == "while you were gone" }.count == 1,
                 "she asked, Bob's phone posted it again, and she has it")
         #expect(cara.conversation(id)?.shared?.catchUpSince == nil)

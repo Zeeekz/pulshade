@@ -496,7 +496,8 @@ struct ChannelLeaveAndKeyTests {
         alice.admitFromCodeForTests(fps, in: id)
         #expect(Set(shared(alice, id)?.joinWaiting ?? []) == waitingNow, "asking again changes nothing")
         alice.channelAdmits = [:]
-        await alice.syncOnce()
+        // The next housekeeping lets them in (a sync already under way skips it, so this waits for one that runs).
+        await until([alice], seconds: 10) { shared(alice, id)?.joinWaiting == nil }
         #expect(shared(alice, id)?.joinWaiting == nil)
         #expect(Set(shared(alice, id)?.invited.keys.filter { fps.contains($0) } ?? []).count == 70)
     }

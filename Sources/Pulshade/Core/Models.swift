@@ -199,6 +199,8 @@ struct Contact: Codable, Identifiable {
     /// still honoured for a while.
     var spare: SpareKey?
     var oldSpares: [SpareKey]?
+    /// Its other spares for them: the second one-time one and the last-resort one (see `SpareSlot.Slot`).
+    var moreSpares: [SpareKey]?
     /// You removed them, but the notice that tells their app is still waiting for chat keys, so the record stays (hidden)
     /// until it has gone, or two weeks have passed.
     var departing: Date?
@@ -251,7 +253,7 @@ struct Contact: Codable, Identifiable {
 
     private enum CodingKeys: String, CodingKey {
         case fingerprint, name, nickname, avatar, banner, color, bio, links, walletChangedAt, notes, handle, verified, signingKey, agreementKey, devices, receiveKey, relay
-        case hidden, isSelf, awaitingAcceptance, addedAt, persona, wantsMyPresence, toldPresence, spare, oldSpares, departing, pq, pqCommit, pqCardSent, tooOld, revoked, contested
+        case hidden, isSelf, awaitingAcceptance, addedAt, persona, wantsMyPresence, toldPresence, spare, oldSpares, moreSpares, departing, pq, pqCommit, pqCardSent, tooOld, revoked, contested
         case viaCode
         // Single-device fields from before linked devices.
         case sendID, session, handshake, pending
@@ -284,6 +286,7 @@ struct Contact: Codable, Identifiable {
         toldPresence = try c.decodeIfPresent(Bool.self, forKey: .toldPresence)
         spare = try? c.decodeIfPresent(SpareKey.self, forKey: .spare)
         oldSpares = try? c.decodeIfPresent([SpareKey].self, forKey: .oldSpares)
+        moreSpares = try? c.decodeIfPresent([SpareKey].self, forKey: .moreSpares)
         departing = try? c.decodeIfPresent(Date.self, forKey: .departing)
         pq = try? c.decodeIfPresent(PQPin.self, forKey: .pq)
         pqCommit = try? c.decodeIfPresent(Data.self, forKey: .pqCommit)
@@ -337,6 +340,7 @@ struct Contact: Codable, Identifiable {
         try c.encodeIfPresent(toldPresence, forKey: .toldPresence)
         try c.encodeIfPresent(spare, forKey: .spare)
         try c.encodeIfPresent(oldSpares, forKey: .oldSpares)
+        try c.encodeIfPresent(moreSpares, forKey: .moreSpares)
         try c.encodeIfPresent(departing, forKey: .departing)
         try c.encodeIfPresent(pq, forKey: .pq)
         try c.encodeIfPresent(pqCommit, forKey: .pqCommit)
@@ -1506,7 +1510,8 @@ struct AppData: Codable {
     /// (`SecuritySettings.warnBeforeSaving`). Waking a locked iPhone, friend request wake-ups and receiving while
     /// auto-locked stop being saved: they're always on.
     /// 28: invites to groups and channels wait for a yes (`groupOffers`), channel codes followed (`followsAsked`, with the tag channel invites carry), and
-    /// the channel a stranger said hello on (`Contact.viaCode`).
+    /// the channel a stranger said hello on (`Contact.viaCode`); up to three spare keys per friend, one of them reusable
+    /// (`Contact.moreSpares`, `SpareKey.slot`, `SpareKey.answers`).
     static let currentFormat = 28
     var profile = Profile()
     var contacts: [Contact] = []

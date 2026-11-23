@@ -141,11 +141,22 @@ struct ConversationView: View {
                         }
                     }
                     let here = c.kind == .direct && c.members.first.map(model.isOnline) == true
-                    let settingUp = c.kind == .direct && c.members.first.map(model.keysPending) == true
-                    Text(settingUp ? "Setting up new keys. Done when they open Pulshade" : here ? "Online" : subtitle(c))
+                    let waitingSince = c.kind == .direct ? c.members.first.flatMap(model.keysPendingSince) : nil
+                    // New keys are on their way: messages queue and go by themselves, so nothing is said for the first
+                    // few minutes, and then only a quiet "Sending soon".
+                    TimelineView(.periodic(from: .now, by: 30)) { timeline in
+                        let slow = waitingSince.map { timeline.date.timeIntervalSince($0) > AppModel.keysQuietFor } ?? false
+                        Group {
+                            if slow {
+                                Label("Sending soon", systemImage: "clock").labelStyle(.titleAndIcon)
+                            } else {
+                                Text(here ? "Online" : subtitle(c))
+                            }
+                        }
                         .font(.system(size: 11))
-                        .foregroundStyle(settingUp ? Color.orange : here ? OnlineDot.color : Ink.faint)
+                        .foregroundStyle(here && !slow ? OnlineDot.color : Ink.faint)
                         .lineLimit(1)
+                    }
                 }
                 .frame(maxWidth: .infinity)
                 .contentShape(Rectangle())

@@ -193,6 +193,9 @@ struct Vault {
     #if DEBUG
     /// Tests only: lock files made while this is set aren't bound, as if written before binding existed.
     nonisolated(unsafe) static var bindingOffForTests = false
+    /// Tests only: whether the Secure Enclave will make a key right now. It won't while the Mac is locked (or the run has
+    /// no login session), though it's there: a test that needs one skips then, as it does on a Mac without one.
+    static var enclaveMakesKeysNow: Bool { makeBinding() != nil }
     #endif
 
     /// Tries every slot, always all of them, so timing doesn't reveal which one matched.

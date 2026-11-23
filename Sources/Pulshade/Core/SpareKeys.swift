@@ -35,15 +35,36 @@ enum SpareSlot {
 
     private static let salt = Data("pulshade.spare.v1".utf8)
 
+    /// Each device leaves a friend up to three spares, each in its own slot:
+    /// - `first` and `second` are used once each: the friend who takes one erases it, and its maker leaves a new one.
+    ///   Two, so a couple of repairs in a row, or a friend's phone and Mac at once, each find one.
+    /// - `lastResort` is only taken when both of those are gone, and isn't erased: it stays until its maker replaces it,
+    ///   a week or so later, so there is always something to start from, even with the friend's app closed for days.
+    ///   The trade (the same one Signal makes with its signed prekey): a session started on it shares that ask with any
+    ///   other started on it, so its very first messages are only as safe as the ask's secret half, which this device
+    ///   keeps until the spare is replaced, rather than throwing it away at once. The keys move on with the first reply,
+    ///   as always.
+    /// Builds before this only know `first`.
+    enum Slot: UInt8, Codable, CaseIterable {
+        case first = 0, second = 1, lastResort = 0xFF
+        var reusable: Bool { self == .lastResort }
+    }
+
     /// The slot for one device's spare, for one friend. `issuer` is the signing key of the account that made the
     /// spare and `device` its device id, so each device of each account has its own slot per friend, and your spare
     /// for them never shares a slot with theirs for you. Both sides work out the same keys: the exchange between
     /// the two identity keys is the same from either end, and the relay can make neither.
-    static func keys(mine: Curve25519.KeyAgreement.PrivateKey, theirs: Data, issuer: Data, device: Data) -> Keys? {
+    ///
+    /// `slot`: which of the device's spares for that friend (see `Slot`). The first keeps the slot builds before had,
+    /// so their apps still find it; the others mix their number in.
+    static func keys(mine: Curve25519.KeyAgreement.PrivateKey, theirs: Data, issuer: Data, device: Data,
+                     slot: Slot = .first) -> Keys? {
         guard !device.isEmpty, let them = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: theirs),
               let shared = try? mine.sharedSecretFromKeyAgreement(with: them) else { return nil }
         let ikm = SymmetricKey(data: shared.withUnsafeBytes { Data($0) })
-        let context = Data(SHA256.hash(data: salt + issuer + device))
+        // Past the first, the device id's length goes in too, so no other id and slot can come out the same.
+        let more = slot == .first ? Data() : Data([UInt8(truncatingIfNeeded: device.count), slot.rawValue])
+        let context = Data(SHA256.hash(data: salt + issuer + device + more))
         let signing = HKDF<SHA256>.deriveKey(inputKeyMaterial: ikm, salt: context, info: Data("pulshade.spare.signing".utf8),
                                              outputByteCount: 32)
         let sealing = HKDF<SHA256>.deriveKey(inputKeyMaterial: ikm, salt: context, info: Data("pulshade.spare.sealing".utf8),
@@ -108,6 +129,14 @@ struct SpareKey: Codable {
     var replaceAt: Date?
     /// When it was replaced. A replaced spare is still honoured for a while, for a friend who took it just before.
     var retiredAt: Date?
+    /// Which slot it's in. Nil is `first`, the only one before.
+    var slot: SpareSlot.Slot?
+    /// For the `lastResort` spare, which can be answered more than once: the answers already taken (their ephemeral
+    /// keys), newest last, so the same answer coming again (a replay) can't put the chat back on keys it has moved on
+    /// from.
+    var answers: [Data]?
+
+    var place: SpareSlot.Slot { slot ?? .first }
 
     var card: SpareSlot.Card? {
         guard let ephemeral = handshake.publicEphemeral,
@@ -116,9 +145,26 @@ struct SpareKey: Codable {
     }
 
     /// `pin`: this device's own keys, which sign the spare when it's left on the relay and go into the session it opens.
-    static func make(pin: Data) -> SpareKey? {
+    static func make(pin: Data, slot: SpareSlot.Slot = .first) -> SpareKey? {
         guard var (handshake, _) = try? Handshake.start() else { return nil }
         handshake.pin = pin
-        return SpareKey(handshake: handshake)
+        return SpareKey(handshake: handshake, slot: slot == .first ? nil : slot)
     }
+}
+
+extension Contact {
+    /// The spare this device has up for them in one slot.
+    func spare(in slot: SpareSlot.Slot) -> SpareKey? {
+        slot == .first ? spare : moreSpares?.first { $0.place == slot }
+    }
+
+    mutating func setSpare(_ key: SpareKey?, in slot: SpareSlot.Slot) {
+        if slot == .first { spare = key; return }
+        var rest = (moreSpares ?? []).filter { $0.place != slot }
+        if var key { key.slot = slot; rest.append(key) }
+        moreSpares = rest.isEmpty ? nil : rest
+    }
+
+    /// Every spare this device has up for them.
+    var liveSpares: [SpareKey] { [spare].compactMap { $0 } + (moreSpares ?? []) }
 }
