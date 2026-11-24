@@ -113,6 +113,8 @@ struct BurnSheet: View {
         Task {
             do {
                 try await model.burn(thisDeviceOnly: deviceOnly)
+            } catch AppModel.LeaveError.burnNotSaved {
+                problem = "Your chats are erased, but this device couldn't keep the steps the server still has to take, so your account is still here. Try Burn again."
             } catch {
                 problem = "Something went wrong, so nothing was burned. Try again."
             }
@@ -218,6 +220,8 @@ struct LockedLeaveSheet: View {
                 try await model.leaveFromLock(burning: burning, recoveryCode: code)
             } catch AppModel.LeaveError.wrongRecoveryCode {
                 problem = "That isn't the recovery code of the account on this device"
+            } catch AppModel.LeaveError.burnNotSaved {
+                problem = "Your chats are erased, but this device couldn't keep the steps the server still has to take, so your account is still here. Try Burn again."
             } catch AppModel.LeaveError.backupNotRemoved {
                 problem = "Your saved backup couldn't be removed from the relay, so nothing was burned. Try again."
             } catch {

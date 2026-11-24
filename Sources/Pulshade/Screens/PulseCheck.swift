@@ -1,7 +1,10 @@
 import SwiftUI
 
-/// Verify someone face to face: same emoji, same colours, same code on both screens.
-/// Scan their screen with the camera, or compare by eye and confirm.
+/// Verify someone face to face: scan their screen with the camera, or compare all 30 digits by eye and confirm.
+/// The emoji and colours are a quick look only. Ten emoji are 60 bits, and since both screens show one code made from
+/// both people's keys, someone in the middle choosing keys for both sides can make them match in about 2^30 tries.
+/// The digits (about 100 bits) would take about 2^50 tries, and the QR code (160 bits) about 2^80, so only they verify,
+/// the QR best. A code made from each person's own keys separately, as Signal does, is the lasting fix.
 struct PulseCheckView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
@@ -66,10 +69,17 @@ struct PulseCheckView: View {
                 }
                 .frame(height: 200)
 
-                Text(code.digits.joined(separator: "  "))
-                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(Ink.faint)
-                    .textSelection(.enabled)
+                VStack(spacing: 6) {
+                    Text(code.digits.prefix(3).joined(separator: "  ") + "\n" + code.digits.suffix(3).joined(separator: "  "))
+                        .font(.system(size: 17, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(Ink.text)
+                        .multilineTextAlignment(.center)
+                        .textSelection(.enabled)
+                    Text("To verify, scan their screen or check all 30 digits match. The emoji are only a quick look.")
+                        .font(.system(size: 12)).foregroundStyle(Ink.dim)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
                 if let result {
                     HStack(spacing: 8) {
@@ -94,8 +104,8 @@ struct PulseCheckView: View {
                     } else {
                         Button { confirm(true) } label: { Image(systemName: "checkmark") }
                             .buttonStyle(GlowButtonStyle(size: 50))
-                            .help("The emoji match")
-                            .accessibilityLabel("The emoji match")
+                            .help("All 30 digits match")
+                            .accessibilityLabel("All 30 digits match")
                     }
                 }
             }

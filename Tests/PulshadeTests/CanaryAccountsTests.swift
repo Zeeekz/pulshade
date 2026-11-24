@@ -172,13 +172,11 @@ struct CanaryAccountsTests {
         await settle(60) { (0..<4).allSatisfy { i in (0..<4).allSatisfy { j in i == j || hasKeys("P\(i)", "P\(j)") } } }
 
         // A Mac linked to P0's account.
-        let code = d("P0").model.makeLinkCode()
         let linker = DeviceLinker()
-        linker.start(code)
-        for _ in 0..<40 where d("P0").model.pendingLink == nil {
-            try await Task.sleep(for: .milliseconds(200))
-            await d("P0").model.syncOnce()
-        }
+        linker.offer()
+        // The logged-in device scans the code the new one shows.
+        let shownCode = try #require(linker.joinCode)
+        #expect(d("P0").model.acceptJoinCode(shownCode))
         d("P0").model.approveLink()
         await d("P0").model.syncOnce()
         for _ in 0..<40 where linker.stage != .confirming { try await Task.sleep(for: .milliseconds(250)) }

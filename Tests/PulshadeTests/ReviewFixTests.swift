@@ -229,16 +229,29 @@ import PulshadeShared
     @Test @MainActor func aLinkCodeStopsWorkingAfterFifteenMinutes() async throws {
         let model = testModel("pulshade-linkexpiry")
         try await model.create(identity: .generate(), profile: Profile(name: "Ada"), passcode: "test-passcode")
-        let code = model.makeLinkCode()
-        #expect(!code.isEmpty)
-        var offer = model.data.linkOffers[0]
-        offer.request = LinkRequest(deviceID: .random(16), name: "Phone", ephemeral: Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation,
-                                    bundleSendID: .random(32), selfSendID: .random(32), keyPin: .random(32))
-        model.data.linkOffers[0] = offer
+        let request = LinkRequest(deviceID: .random(16), name: "Phone", ephemeral: Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation,
+                                  bundleSendID: .random(32), selfSendID: .random(32), keyPin: .random(32))
+        #expect(model.acceptJoinCode(JoinCode(secret: .random(32), request: request, relay: AppData.defaultRelay).text))
         #expect(model.pendingLink != nil)
         model.data.linkOffers[0].createdAt = Date().addingTimeInterval(-AppModel.linkOfferLife - 60)
         #expect(model.pendingLink == nil, "an answered code is not approvable after it has run out")
         model.pruneLinkOffers()
         #expect(model.data.linkOffers.isEmpty)
+    }
+
+    /// A Burn cut short between keeping its order and wiping (the app killed, the battery gone) is wiped at the next
+    /// launch, before the lock screen can open the burned account.
+    @Test @MainActor func aBurnCutShortIsWipedAtTheNextLaunch() async throws {
+        let directory = testDirectory("pulshade-cutshort")
+        let model = AppModel(vault: Vault(directory: directory), watchSystem: false)
+        try await model.create(identity: .generate(), profile: Profile(name: "Ada"), passcode: "test-passcode")
+        model.lock()
+        #expect(model.vault.exists)
+        AppModel.markWipeDue(model.burnStore)
+
+        let relaunched = AppModel(vault: Vault(directory: directory), watchSystem: false)
+        #expect(!relaunched.vault.exists && relaunched.phase == .welcome)
+        #expect(!FileManager.default.fileExists(atPath: AppModel.wipeDueFile(relaunched.burnStore).path), "the mark goes with the wipe")
+        #expect(await relaunched.unlock(passcode: "test-passcode") == false)
     }
 }

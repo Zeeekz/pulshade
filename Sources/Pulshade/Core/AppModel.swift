@@ -205,6 +205,7 @@ final class AppModel {
         }
         #endif
         Ink.source = { [weak self] in self?.theme ?? .dark }
+        finishCutShortWipe()
         guard watchSystem else { return }
         #if os(iOS)
         // Collecting while locked is switched off: the helper's keys (left by an earlier build) go at launch, before the
@@ -1398,6 +1399,8 @@ final class AppModel {
         identity = nil
         data = AppData()
         forgetSession()
+        // Last of all: until here, a wipe cut short is finished at the next launch.
+        try? FileManager.default.removeItem(at: Self.wipeDueFile(burnStore))
         withAnimation(.smooth(duration: 0.6)) { phase = .welcome }
     }
 
@@ -7631,10 +7634,9 @@ final class AppModel {
         if holdMail?(envelope) == true { return .retry }
         envelopeTap?(envelope)
         deposited = envelope.deposited
-        if let offer = data.linkOffers.firstIndex(where: { $0.receiveKey == envelope.receiveKey }) {
-            receiveLinkRequest(envelope.blob, offer: offer)
-            return .handled
-        }
+        // A logged-in device no longer shows a code for new devices to answer (someone filming both screens could
+        // answer it with digits ground to match): it only scans theirs. Nothing that lands on a link mailbox is a request.
+        if data.linkOffers.contains(where: { $0.receiveKey == envelope.receiveKey }) { return .handled }
         guard let persona = persona(forMailbox: envelope.receiveKey), let me = me(persona) else { return .junk }
         let opened: Envelope.Opened
         do {
@@ -9503,16 +9505,7 @@ extension AppModel {
         if data.linkOffers.count != before { save() }
     }
 
-    /// A fresh QR code for linking a new device.
-    func makeLinkCode() -> String {
-        pruneLinkOffers()
-        let offer = LinkOffer(receiveKey: Mailbox.make().receiveKey, secret: .random(32))
-        data.linkOffers.append(offer)
-        save()
-        return LinkCode(secret: offer.secret, sendID: Mailbox.sendID(for: offer.receiveKey), relay: data.relay).text
-    }
-
-    /// A device that scanned the code and is waiting for you to approve it.
+    /// A new device whose code this one scanned, waiting for you to approve it.
     var pendingLink: (offer: LinkOffer, request: LinkRequest)? {
         guard let offer = data.linkOffers.last(where: { $0.request != nil && Date().timeIntervalSince($0.createdAt) <= Self.linkOfferLife }),
               let request = offer.request else { return nil }
@@ -9556,7 +9549,8 @@ extension AppModel {
         return Invite.isOutdated(code) ? .outdated : .unknown
     }
 
-    /// A code shown by a new device: it waits to be approved like any device that scanned yours.
+    /// A code shown by a new device: it waits for you to approve it. The only way a device is linked, since the code
+    /// itself carries the new device's request and keys, so nobody who merely saw it can swap in their own.
     func acceptJoinCode(_ text: String) -> Bool {
         guard let code = JoinCode(text) else { return false }
         // "This machine" on the new device means nothing here; it's then on the same relay as you.
@@ -9568,16 +9562,6 @@ extension AppModel {
         withAnimation(.snappy) { data.linkOffers.append(offer) }
         save()
         return true
-    }
-
-    /// The first device to answer a code is the only one: anyone who saw the code afterwards can't take its place.
-    func receiveLinkRequest(_ blob: Data, offer i: Int) {
-        let offer = data.linkOffers[i]
-        guard offer.request == nil, Date().timeIntervalSince(offer.createdAt) <= Self.linkOfferLife, let box = try? ChaChaPoly.SealedBox(combined: blob),
-              let plain = try? ChaChaPoly.open(box, using: LinkCrypto.requestKey(offer.secret)),
-              let request = try? JSONDecoder().decode(LinkRequest.self, from: plain),
-              request.deviceID.count == 16, request.ephemeral.count == 32, request.keyPin.count == 32 else { return }
-        withAnimation(.snappy) { data.linkOffers[i].request = request }
     }
 
     func cancelLink() {
@@ -9752,7 +9736,7 @@ extension AppModel {
 // MARK: - Detach & burn
 
 extension AppModel {
-    enum LeaveError: Error { case wrongRecoveryCode, offline, backupNotRemoved }
+    enum LeaveError: Error { case wrongRecoveryCode, offline, backupNotRemoved, burnNotSaved }
 
     /// Whether this account also lives on another device, so detaching only this one loses nothing.
     var hasOtherDevices: Bool { !linkedDevices.isEmpty }
@@ -9825,8 +9809,16 @@ extension AppModel {
         sync(.accountErased)
         let order = makeBurnOrder(identity: identity, outboxBefore: outboxBefore)
         burning = false
-        // The order is kept first, so a crash from here on still finishes on the relay. Then one go, briefly.
-        burnStore.save(order)
+        // Marked first, so a wipe cut short (the app killed, the battery gone) is finished at the next launch.
+        // The device is marked as due a wipe and the order is kept before anything is sent: if the app is killed from
+        // here on, the next launch wipes the phone before anything can open it, and the relay side still finishes.
+        // If either can't be written, nothing goes further: a Burn that would silently skip the server is refused.
+        guard Self.markWipeDue(burnStore) else { throw LeaveError.burnNotSaved }
+        guard burnStore.save(order) else {
+            try? FileManager.default.removeItem(at: Self.wipeDueFile(burnStore))
+            throw LeaveError.burnNotSaved
+        }
+        // One go, briefly, while the sync is still running (groups you own are deleted through it).
         let attempt = Task { await self.attemptBurnCleanup() }
         let timer = Task { try? await Task.sleep(for: .seconds(20)); attempt.cancel() }
         let finished = await attempt.value
@@ -9930,6 +9922,23 @@ extension AppModel {
         }
     }
 
+    /// Set just before a Burn wipes this device and gone once the wipe is done. Found at launch, the wipe was cut short.
+    static func wipeDueFile(_ store: BurnOrderStore) -> URL {
+        store.file.deletingPathExtension().appendingPathExtension("wipe-due")
+    }
+
+    @discardableResult
+    static func markWipeDue(_ store: BurnOrderStore) -> Bool {
+        FileManager.default.createFile(atPath: wipeDueFile(store).path, contents: Data())
+    }
+
+    /// At launch: a Burn whose wipe was cut short is wiped now, before anything can open the account.
+    func finishCutShortWipe() {
+        guard FileManager.default.fileExists(atPath: Self.wipeDueFile(burnStore).path) else { return }
+        destroyEverything(leavingNoTrace: true, keepingBurnOrder: true)
+        Vault.scrubLeftovers()
+    }
+
     /// At launch: a burn that wasn't finished carries on.
     func resumeBurnCleanup() {
         guard burnStore.exists else { return }
@@ -9962,10 +9971,20 @@ extension AppModel {
 
     /// From the lock screen there's no passcode: the recovery code opens the account just long enough to
     /// leave. Only this device's own account opens; the screen stays locked throughout.
+    ///
+    /// A code, once given, is always checked: also when the keys are still in memory because the screen is only
+    /// covered. Without a code only an open, uncovered account can leave, so nothing behind the lock screen skips it.
     private func open(recoveryCode: String?) throws {
-        guard identity == nil else { return }
-        guard let code = recoveryCode, let seed = Identity.seed(fromRecoveryCode: code),
-              let identity = try? Identity(seed: seed),
+        guard let code = recoveryCode else {
+            guard identity != nil, !covered, phase == .unlocked else { throw LeaveError.wrongRecoveryCode }
+            return
+        }
+        guard let seed = Identity.seed(fromRecoveryCode: code) else { throw LeaveError.wrongRecoveryCode }
+        if let identity {
+            guard Self.sameBytes(seed, identity.seed) else { throw LeaveError.wrongRecoveryCode }
+            return
+        }
+        guard let identity = try? Identity(seed: seed),
               let stored = try? vault.load(with: identity) else { throw LeaveError.wrongRecoveryCode }
         self.identity = identity
         slot = 0
@@ -9987,6 +10006,12 @@ extension AppModel {
 
     /// Everything a detached account keeps: no direct chats, no messages in groups or channels, no stories,
     /// requests, reports, one-time chats or unsent envelopes. Groups and channels stay so you're still in them.
+    /// Compares two secrets in time that doesn't depend on where they first differ.
+    static func sameBytes(_ a: Data, _ b: Data) -> Bool {
+        guard a.count == b.count else { return false }
+        return zip(a, b).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) } == 0
+    }
+
     static func withoutChats(_ data: AppData, keepingDevices: Bool) -> AppData {
         var kept = data
         kept.conversations = data.conversations.filter { $0.kind != .direct }.map {

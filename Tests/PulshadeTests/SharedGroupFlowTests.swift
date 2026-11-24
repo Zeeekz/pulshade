@@ -573,13 +573,11 @@ struct SharedGroupFlowTests {
     }
 
     private func linkNewDevice(to model: AppModel) async throws -> AppModel {
-        let code = model.makeLinkCode()
         let linker = DeviceLinker()
-        linker.start(code)
-        for _ in 0..<20 where model.pendingLink == nil {
-            try await Task.sleep(for: .milliseconds(200))
-            await model.syncOnce()
-        }
+        linker.offer()
+        // The logged-in device scans the code the new one shows.
+        let shownCode = try #require(linker.joinCode)
+        #expect(model.acceptJoinCode(shownCode))
         model.approveLink()
         await model.syncOnce()
         for _ in 0..<30 where linker.stage != .confirming { try await Task.sleep(for: .milliseconds(250)) }

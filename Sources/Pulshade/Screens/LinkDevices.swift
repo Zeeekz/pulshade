@@ -1,16 +1,14 @@
 import SwiftUI
 
-/// On a new device: show a code for a logged-in device to scan, or scan (or paste) one from it, wait for it
-/// to be approved there, then choose a passcode for this device.
+/// On a new device: show a code for a logged-in device to scan, wait for it to be approved there, then choose a
+/// passcode for this device. The new device never answers a code the other one shows: someone filming both screens
+/// could answer it first with matching digits, while a code that carries this device's own request can't be swapped.
 struct LinkLoginFlow: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     var back: () -> Void
 
     @State private var linker = DeviceLinker()
-    @State private var scanner = QRScanner()
-    @State private var scanning = false
-    @State private var pasted = ""
     @State private var style = LockStyle.remembered.forChoosing
     @State private var passcode = ""
     @State private var confirm = ""
@@ -27,33 +25,21 @@ struct LinkLoginFlow: View {
             }
         }
         .animation(.snappy, value: linker.stage)
-        .onChange(of: scanner.found) { _, text in
-            guard let text else { return }
-            scanning = false
-            linker.start(text)
-        }
         .onAppear { if linker.joinCode == nil { linker.offer() } }
-        .onDisappear { scanner.stop() }
     }
 
     private func leave() {
         linker.cancel()
-        scanner.stop()
         back()
     }
 
     private var entry: some View {
         OnboardingPage(title: "Log in with QR code",
-                       subtitle: scanning ? "Hold up the code from Link a new device on your other device."
-                           : "On a device that's already logged in, open Settings, then Devices, then Link a new device, and scan this code.",
+                       subtitle: "On a device that's already logged in, open Settings, then Devices, then Link a new device, and scan this code.",
                        back: leave) {
             VStack(spacing: 16) {
                 ZStack {
-                    if scanning {
-                        RoundedRectangle(cornerRadius: 16).fill(Ink.raised)
-                        CameraPreview(session: scanner.session)
-                            .clipShape(.rect(cornerRadius: 16))
-                    } else if let join = linker.joinCode {
+                    if let join = linker.joinCode {
                         QRCode(text: JoinCode.link(join), size: 210)
                     } else {
                         RoundedRectangle(cornerRadius: 16).fill(Ink.raised)
@@ -61,32 +47,18 @@ struct LinkLoginFlow: View {
                     }
                 }
                 .frame(width: 240, height: 240)
-                .overlay {
-                    if scanning { RoundedRectangle(cornerRadius: 16).strokeBorder(theme.accent.opacity(0.6), lineWidth: 1.5) }
-                }
-                if !scanning && linker.joinCode != nil {
+                if linker.joinCode != nil {
                     checkCode
                 }
                 if case let .failed(reason) = linker.stage {
                     ProblemText(reason)
                 }
-                TextField("", text: $pasted, prompt: Text("Or paste the link code").foregroundStyle(Ink.faint))
-                    .textFieldStyle(LargeFieldStyle())
-                    .font(.system(size: 13, design: .monospaced))
-                    #if os(iOS)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    #endif
-                    .onSubmit { linker.start(pasted) }
             }
         } actions: {
-            if !pasted.isEmpty {
-                Button("Use code") { linker.start(pasted) }.buttonStyle(PrimaryButtonStyle())
-            } else if scanning {
-                Button("Stop scanning") { scanner.stop(); scanning = false }.buttonStyle(SecondaryButtonStyle())
-            } else {
-                Button { Task { scanning = await scanner.start() } } label: {
-                    Label("Scan their code instead", systemImage: "camera.viewfinder")
+            if case .failed = linker.stage {
+                Button("Show a new code") {
+                    linker.cancel()
+                    linker.offer()
                 }
                 .buttonStyle(SecondaryButtonStyle())
             }
@@ -201,13 +173,12 @@ struct LinkLoginFlow: View {
     }
 }
 
-/// On a device that's logged in: show a code for a new device, then approve it.
+/// On a device that's logged in: scan the new device's code, then approve it. It never shows a code of its own for
+/// a new device to answer, since whoever answers first could be someone who saw it.
 struct LinkDeviceSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
-    @State private var code = ""
-    @State private var copied = false
     @State private var scanner = QRScanner()
     @State private var scanning = false
     @State private var problem: String?
@@ -225,7 +196,7 @@ struct LinkDeviceSheet: View {
                         .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(theme.accent.opacity(0.6), lineWidth: 1.5))
                     Text("Point the camera at the code on the new device. Only link devices you own.")
                         .font(.system(size: 12)).foregroundStyle(Ink.dim).multilineTextAlignment(.center)
-                    Button("Show my code instead") {
+                    Button("Stop scanning") {
                         scanner.stop()
                         scanning = false
                     }
@@ -235,7 +206,12 @@ struct LinkDeviceSheet: View {
                 } else {
                     Button {
                         problem = nil
-                        Task { scanning = await scanner.start() }
+                        Task {
+                            scanning = await scanner.start()
+                            if !scanning {
+                                problem = "This device can't use a camera. Link from a device that can, such as your phone."
+                            }
+                        }
                     } label: {
                         Label("Scan the new device's code", systemImage: "camera.viewfinder")
                     }
@@ -243,28 +219,13 @@ struct LinkDeviceSheet: View {
                     if let problem {
                         ProblemText(problem)
                     }
-                    Text("Or, if the new device can scan, show it this code.")
+                    Text("On the new device, choose Log in with QR code, then scan the code it shows from here. Only link devices you own.")
                         .font(.system(size: 12)).foregroundStyle(Ink.dim).multilineTextAlignment(.center)
-                    QRCode(text: code, size: 170)
-                    Button {
-                        copyToClipboard(code, clearAfter: 120)
-                        withAnimation(.snappy) { copied = true }
-                    } label: {
-                        Label(copied ? "Copied" : "Copy code", systemImage: copied ? "checkmark" : "doc.on.doc")
-                            .font(.system(size: 12, weight: .semibold))
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(theme.accent)
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.small)
-                        Text("Waiting for the new device…").font(.system(size: 11)).foregroundStyle(Ink.faint)
-                    }
                 }
             }
             .animation(.snappy, value: model.pendingLink?.request.deviceID)
             .onDisappear { model.linkConfirmation = nil }
         }
-        .onAppear { if code.isEmpty { code = model.makeLinkCode() } }
         .onChange(of: scanner.found) { _, text in
             guard let text else { return }
             scanning = false

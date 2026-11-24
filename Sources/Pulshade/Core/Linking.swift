@@ -268,8 +268,9 @@ extension LinkCrypto {
 }
 
 extension LinkRequest {
-    /// Six digits both devices show while linking. They only match when the device asking is the one in your
-    /// hand, so someone who saw the code can't get in by answering it first.
+    /// Six digits both devices show while linking, so you can see the device you scanned is the one in your hand.
+    /// Not a defence on their own: anyone who sees them can grind a key to match, which is why a logged-in device
+    /// only ever scans the new device's code (which carries this request) and never shows one to be answered.
     var checkCode: String {
         let digest = SHA256.hash(data: Data("pulshade.link.check".utf8) + ephemeral)
         let number = digest.prefix(4).reduce(UInt32(0)) { $0 << 8 | UInt32($1) } % 1_000_000
@@ -291,7 +292,6 @@ final class DeviceLinker {
     private(set) var confirmation: String?
     /// Whether the device that sent the account can show the same digits (builds from before it can't).
     var senderConfirms: Bool { bundle?.confirms == true }
-    private(set) var code: LinkCode?
     /// The code this device shows while it waits to be scanned.
     private(set) var joinCode: String?
     /// The relay the account arrived through, which this device then keeps using.
@@ -311,20 +311,6 @@ final class DeviceLinker {
         LinkRequest(deviceID: deviceID, name: deviceDisplayName, ephemeral: ephemeral.publicKey.rawRepresentation,
                     bundleSendID: bundleMailbox.sendID, selfSendID: selfMailbox.sendID,
                     keyPin: (try? DeviceKey(seed: deviceKeySeed, persona: nil).pin) ?? Data())
-    }
-
-    /// Uses a code from a logged-in device.
-    func start(_ text: String) {
-        guard let code = LinkCode(text) else {
-            stage = .failed("That isn't a PULSHADE link code")
-            return
-        }
-        self.code = code
-        relay = code.reachableRelay
-        stage = .waiting
-        let request = request
-        task?.cancel()
-        task = Task { await run(code, request) }
     }
 
     /// Shows a code for a logged-in device to scan, and waits for it to send the account.
@@ -351,23 +337,6 @@ final class DeviceLinker {
     func confirm() {
         guard stage == .confirming, bundle != nil else { return }
         stage = .received
-    }
-
-    private func run(_ code: LinkCode, _ request: LinkRequest) async {
-        guard let url = URL(string: code.reachableRelay),
-              let plain = try? JSONEncoder().encode(request),
-              let sealed = try? ChaChaPoly.seal(plain, using: LinkCrypto.requestKey(code.secret)).combined else {
-            stage = .failed("Couldn't prepare the request")
-            return
-        }
-        let relay = RelayClient(base: url)
-        do {
-            try await relay.deposit(sealed, to: code.sendID)
-        } catch {
-            stage = .failed("Can't reach the relay")
-            return
-        }
-        await waitForBundle(relay, secret: code.secret)
     }
 
     /// Waits for your other device to approve and send the account (up to ten minutes).

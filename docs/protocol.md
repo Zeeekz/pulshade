@@ -47,7 +47,9 @@ inside the app and seeds the artwork you see for it.
 
 **Checking who you are talking to** (the "pulse check"): both phones work out the same code from both identities (each a
 signing-key fingerprint together with its agreement key and a commitment to its post-quantum keys, `pulshade.safety.v3`), sorted so the order does not matter. It is shown as 10 emoji (60 bits), 30 digits, two colours, and a QR code that
-carries 160 bits. Comparing in person, or scanning the other phone's QR, marks the contact verified. Nothing is
+carries 160 bits. Comparing all 30 digits in person (about 100 bits), or scanning the other phone's QR, marks the contact
+verified; the emoji alone don't, since one shared 60-bit code can be matched in about 2^30 tries by someone choosing keys
+for both sides. The same search takes about 2^50 for the digits and 2^80 for the QR, so scanning is the strongest check. Nothing is
 verified for you automatically: the first time you meet a key you trust it, the way most messengers do, and the code
 is how you catch someone sitting in the middle. There is no key transparency log.
 
@@ -331,11 +333,13 @@ code) still can't stand in for one of that friend's devices unannounced. Restori
 makes new device keys, so friends see the restored device as new. A data file copied to another device can't open its
 device keys there and makes new ones too. Handshakes without device keys (builds before 17) are not taken.
 
-**Linking a new device.** The logged-in device shows a QR code holding a one-time secret and a mailbox. The new device
-answers with a fresh key and the pin of its own device keys. Both screens show six digits to compare; you approve. The
-approving device pins the new device's keys from that request, and sends the pins of your devices with the account. The account (keys, contacts, groups,
-personas, settings) is then sent encrypted to that key mixed with the one-time secret. Only the first device to answer a
-code counts. The consequence you should know: **a linked device holds your identity keys.** Losing one is as serious as
+**Linking a new device.** The new device shows a QR code holding a one-time secret, a fresh key, the pin of its own
+device keys and the mailbox it waits on. The logged-in device scans it with the camera (never from a link another app
+opened) and you approve. The approving device pins the new device's keys from that request, and sends the pins of your
+devices with the account. The account (keys, contacts, groups, personas, settings) is then sent encrypted to that key
+mixed with the one-time secret, and both screens show eight digits to compare before the new device takes it. The
+logged-in device never shows a code for a new device to answer: a request posted in answer to a code can be swapped by
+anyone who saw it, with six check digits ground to match in about a million tries. The consequence you should know: **a linked device holds your identity keys.** Losing one is as serious as
 losing the main phone for the identity (though not for past messages, since each device has its own ratchets).
 
 **Personas.** A persona is a separate identity: its own seed, keys, mailboxes, contacts, chats and settings. Its

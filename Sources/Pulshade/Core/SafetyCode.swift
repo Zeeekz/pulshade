@@ -19,8 +19,9 @@ struct SafetyCode: Equatable {
 
     private static let emojiSet = Array("🌙⭐️🔥🌊⚡️🍀🌸🍄🐺🦊🐙🦋🐝🦉🐬🌵🌈❄️🍒🍋🥑🎧🎲🎯🚀🛸⚓️🔮💎🗝🧲🪐🌋🗻🏝🎈🎸🥁🎺🧩🪁🛹🧊🍩🍿🌶🧀🥨🦖🐉🦄🐢🦜🐠🌻🌴🪸🕯💡📡🛰🧭⏳🔔").map(String.init)
 
-    /// Ten emoji, easy to read out loud: six bits each, sixty in all, far too many for someone in the middle to
-    /// find keys that happen to match. They come from their own hash, so they share nothing with the digits.
+    /// Ten emoji for a quick look: six bits each, sixty in all. Not enough to verify with: both sides see one code made
+    /// from both identities, so someone in the middle choosing keys for both can find a matching pair in about 2^30
+    /// tries. Only the digits (about 2^50 that way) or the QR code (about 2^80) verify. They come from their own hash, so they share nothing with the digits.
     var emoji: [String] {
         let source = Array(SHA256.hash(data: Data("pulshade.safety.emoji".utf8) + Data(bytes)))
         let bits = source.prefix(8).reduce(UInt64(0)) { $0 << 8 | UInt64($1) }

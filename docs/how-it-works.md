@@ -175,7 +175,10 @@ chat on their side, so it reconnects them straight away.
 **Pulse check.** Both people see the same ten emoji (60 bits), 30 digits, colours and QR code, derived from both
 identities: each one's signing-key fingerprint together with its agreement key, so swapping either key changes the code.
 An invite carries the signing key's signature over the agreement key, and an invite without a valid one is refused (an
-app from before this is told to update). Scanning the other screen with the camera, or confirming the emoji match, marks the contact verified.
+app from before this is told to update). Scanning the other screen with the camera, or confirming all 30 digits match, marks the contact verified. The emoji
+are a quick look only: 60 bits from one code shared by both sides can be matched by someone in the middle choosing keys
+for both, so they don't verify on their own. The digits would take about 2^50 tries that way and the QR code about 2^80,
+so scanning is the strongest check.
 
 **Removing a contact.** Removing someone takes them off every one of your devices, with their keys, mailboxes and
 stories, and tells their app to forget you and your chat, the same message a burner sends when it burns, so the
@@ -230,11 +233,11 @@ else follows. A broadcast is the same message sent privately to each person.
 
 **Linked devices.** One account, several devices, like Signal. Your identity keys are shared between your devices,
 but each device has its own id, its own mailboxes and its own ratchet session with every contact device, so no
-message key is ever used twice. Linking: the logged-in device shows a QR code holding a one-time secret and a
-mailbox; the new device answers with a fresh key; you approve it; and the account (keys, contacts, groups, personas,
-settings) is sent encrypted to that key mixed with the secret, with message history following over the new device's
-session. Only the first device to answer a code counts, and both devices show six digits to compare before you
-approve. The new device then introduces itself to every contact, calling itself just "Mac" or "iPhone". A contact's
+message key is ever used twice. Linking: the new device shows a QR code holding a one-time secret, a fresh key and
+its request; the logged-in device scans it with the camera; you approve it; and the account (keys, contacts, groups,
+personas, settings) is sent encrypted to that key mixed with the secret, with message history following over the new
+device's session. The logged-in device never shows a code for a new device to answer, so someone who sees both screens
+can't slip a device of their own into your account; both devices then show eight digits to compare before the new one takes the account. The new device then introduces itself to every contact, calling itself just "Mac" or "iPhone". A contact's
 chat gets a line, "<name>'s account added a new device", when a device they didn't have before appears, and one of your
 own devices that another of your devices linked (not this one) is marked in your device list until you confirm or stop
 syncing it. People send to all your devices; what you do on one is synced to the others through an encrypted session between them.

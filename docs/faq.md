@@ -102,7 +102,7 @@ chats, groups, calls and stories. A username only adds a way to be found by peop
 
 **How do I know I'm talking to the right person?**
 Use Pulse check. Both of you see the same ten emoji, 30 digits, colours and QR code, derived from both your keys.
-If they match, nobody is in the middle.
+Scan their screen, or check all 30 digits match: then nobody is in the middle. The emoji are only a quick look.
 
 **What are disappearing messages?**
 A chat can have a timer; when it ends, each message disappears from every device. It works only as far as the other
@@ -192,7 +192,7 @@ sent while you were logged out can't be opened. We can't open it or link it to y
 or 180 days after its last save.
 
 **Can I use Pulshade on several devices?**
-Yes, linked devices share one account. A QR code from a linked device logs a new one in.
+Yes, linked devices share one account. The new device shows a QR code; scan it from a device that's already logged in.
 
 **What happens to my chats if I Detach the only device?**
 The people you chat with are told to clear their one-to-one chat with you (they keep you as a contact). If you are
