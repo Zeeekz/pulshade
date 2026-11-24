@@ -207,6 +207,8 @@ no accounts, can't tell who is a child. If you think a child is using Pulshade, 
 If we change this policy we'll update the date above, add a line to the list below and tell people in the app's
 announcements. The code and documentation show what the app does at any time.
 
+- **Build 21:** spare keys: up to three per friend instead of one, also used when the keys of a chat need mending; one of
+  the three can be used more than once until it's replaced.
 - **Build 14:** waiting messages are no longer limited by the server's memory. They wait on its disk, sealed in segments
   that each have a key of their own, and a segment with nothing waiting in it has its key forgotten and is overwritten and
   deleted as soon as the last message in it is collected (before, collected mail was cleared out of one journal file every
