@@ -127,9 +127,15 @@ struct BlobRelayTests {
         #expect(prepared.attachment.pieceCount == 3)
         try await BlobTransfer.upload(prepared, to: relay) { _ in }
         let head = try #require(try await relay.blobHead(prepared.attachment.id))
-        #expect(head.complete && head.size == prepared.attachment.sealedSize)
+        // The relay holds the file padded to its size step (whole MiB above one MiB), not its real size.
+        #expect(prepared.attachment.padded == 3 * BlobCrypto.sealedPiece)
+        #expect(head.complete && head.size == prepared.attachment.storedSize && head.size != prepared.attachment.sealedSize)
         let back = try await BlobTransfer.download(prepared.attachment, from: relay) { _ in }
         #expect(back == original)
+        // An app from before padding ignores `padded`, asks only for the sealed part, and still opens it.
+        var old = prepared.attachment
+        old.padded = nil
+        #expect(try await BlobTransfer.download(old, from: relay) { _ in } == original)
         // Another test locking an app at the same moment drops every connection in the process, which can cut the
         // erase off part way (and then whether it landed isn't known). Tried again until it says so or the file is gone.
         var erased = await BlobTransfer.erase(prepared.attachment, from: relay)

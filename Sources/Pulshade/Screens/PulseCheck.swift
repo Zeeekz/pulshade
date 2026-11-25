@@ -1,10 +1,9 @@
 import SwiftUI
 
-/// Verify someone face to face: scan their screen with the camera, or compare all 30 digits by eye and confirm.
-/// The emoji and colours are a quick look only. Ten emoji are 60 bits, and since both screens show one code made from
-/// both people's keys, someone in the middle choosing keys for both sides can make them match in about 2^30 tries.
-/// The digits (about 100 bits) would take about 2^50 tries, and the QR code (160 bits) about 2^80, so only they verify,
-/// the QR best. A code made from each person's own keys separately, as Signal does, is the lasting fix.
+/// Verify someone face to face: scan their screen with the camera, or compare all 60 digits by eye and confirm.
+/// The code is each person's own fingerprint side by side (`SafetyCode`), as Signal's safety numbers are, so someone in
+/// the middle would have to make a key matching one person's fingerprint, not two codes matching each other. The emoji
+/// and colours are a quick look only and never verify anyone.
 struct PulseCheckView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
@@ -19,11 +18,14 @@ struct PulseCheckView: View {
 
     private var mine: String { model.me(persona)?.fingerprint ?? "" }
     private var code: SafetyCode {
-        SafetyCode(mine: mine, mineAgreement: model.me(persona)?.card.agreement ?? Data(),
-                   minePQ: model.me(persona)?.pq.pin.commitment ?? Data(),
-                   theirs: fingerprint, theirsAgreement: contact?.agreementKey ?? Data(),
-                   theirsPQ: contact?.pq?.commitment ?? Data())
+        let me = model.me(persona)
+        return SafetyCode(mine: .init(account: mine, signing: me?.card.signing ?? Data(), agreement: me?.card.agreement ?? Data(),
+                                      pq: me?.pq.pin),
+                          theirs: .init(account: fingerprint, signing: contact?.signingKey ?? Data(),
+                                        agreement: contact?.agreementKey ?? Data(), pq: contact?.pq))
     }
+    /// Their QR code was from an app before per-person fingerprints.
+    @State private var outdated = false
     private var contact: Contact? { model.contact(fingerprint, in: persona) }
     private var verified: Bool { contact?.verified ?? false }
 
@@ -70,12 +72,14 @@ struct PulseCheckView: View {
                 .frame(height: 200)
 
                 VStack(spacing: 6) {
-                    Text(code.digits.prefix(3).joined(separator: "  ") + "\n" + code.digits.suffix(3).joined(separator: "  "))
-                        .font(.system(size: 17, weight: .semibold, design: .monospaced))
+                    let digits = code.digits
+                    Text(stride(from: 0, to: digits.count, by: 4).map { digits[$0..<min($0 + 4, digits.count)].joined(separator: "  ") }
+                        .joined(separator: "\n"))
+                        .font(.system(size: 16, weight: .semibold, design: .monospaced))
                         .foregroundStyle(Ink.text)
                         .multilineTextAlignment(.center)
                         .textSelection(.enabled)
-                    Text("To verify, scan their screen or check all 30 digits match. The emoji are only a quick look.")
+                    Text("To verify, scan their screen or check all 60 digits match. The emoji are only a quick look. If theirs shows 30 digits, they need to update Pulshade first.")
                         .font(.system(size: 12)).foregroundStyle(Ink.dim)
                         .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
@@ -84,7 +88,7 @@ struct PulseCheckView: View {
                 if let result {
                     HStack(spacing: 8) {
                         Image(systemName: result ? "checkmark.seal.fill" : "xmark.octagon.fill")
-                        Text(result ? "Verified" : "Codes don't match")
+                        Text(result ? "Verified" : outdated ? "\(model.displayName(fingerprint)) needs to update Pulshade first" : "Codes don't match")
                     }
                     .font(.system(size: 14, weight: .bold))
                     .foregroundStyle(result ? AnyShapeStyle(theme.gradient) : AnyShapeStyle(Color.red))
@@ -104,8 +108,8 @@ struct PulseCheckView: View {
                     } else {
                         Button { confirm(true) } label: { Image(systemName: "checkmark") }
                             .buttonStyle(GlowButtonStyle(size: 50))
-                            .help("All 30 digits match")
-                            .accessibilityLabel("All 30 digits match")
+                            .help("All 60 digits match")
+                            .accessibilityLabel("All 60 digits match")
                     }
                 }
             }
@@ -115,7 +119,9 @@ struct PulseCheckView: View {
         .onChange(of: scanner.found) { _, text in
             guard let text else { return }
             withAnimation(.snappy) { scanning = false }
-            confirm(text == code.scanText)
+            let scanned = code.check(scanned: text)
+            outdated = scanned == .outdated
+            confirm(scanned == .match)
         }
         .onDisappear { scanner.stop() }
     }
@@ -126,6 +132,7 @@ struct PulseCheckView: View {
             scanning = false
         } else {
             result = nil
+            outdated = false
             Task { if await scanner.start() { scanning = true } }
         }
     }

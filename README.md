@@ -1,6 +1,6 @@
 # Pulshade
 
-Anonymous, end-to-end encrypted messaging for Mac and iPhone. No phone number, no email, no username.
+Anonymous, end-to-end encrypted messaging for iPhone. No phone number, no email, no username.
 
 Built by Zeekz.
 
@@ -24,7 +24,7 @@ Built by Zeekz.
   profile, contacts and groups in a sealed backup that only your recovery code opens (never your chats); or burn it
   everywhere, as if it never existed.
 - **The rest of a messenger.** Groups, channels, broadcasts, voice notes, calls, reactions, replies, disappearing
-  messages, linked devices, and in-person verification (Pulse check). Stories you choose the audience and length of,
+  messages, and in-person verification (Pulse check). Stories you choose the audience and length of,
   can edit after posting, and see who viewed, with the views encrypted like messages.
 
 ## What the server sees
@@ -53,7 +53,7 @@ The full design, from the key derivations to the decoy passcode's disk layout, i
 
 ## Requirements
 
-macOS 26 or later, or iOS 26 or later.
+An iPhone with iOS 26 or later.
 
 ## Building from source
 
@@ -66,8 +66,7 @@ webtunnel, from Tor Project's [lyrebird](https://gitlab.torproject.org/tpo/anti-
 which takes a few minutes.
 
 ```bash
-./scripts/build-app.sh debug      # builds build/Pulshade.app, a development build
-open build/Pulshade.app
+./scripts/install-iphone.sh       # builds a development build and installs it on a plugged-in iPhone
 ```
 
 ```bash
@@ -75,7 +74,7 @@ swift test                        # the tests that run on their own, no server n
 ./scripts/fuzz.sh 60              # mutates the parsers for a minute under AddressSanitizer
 ```
 
-The apps are in `Sources/Pulshade` (the Mac and iPhone share all their code) and the Tor
+The app is in `Sources/Pulshade` (an iPhone app; the Swift package also builds it on a Mac so the tests can run there) and the Tor
 bridge in `tor/`. The server is not published.
 
 ## Security

@@ -330,7 +330,6 @@ struct PhotoBackdropEditor: View {
             }
         }
         .padding(20)
-        .frame(minWidth: Platform.isPhone ? nil : 460, minHeight: Platform.isPhone ? nil : 680)
         .background(Ink.base)
         .interactiveDismissDisabled()
         .onAppear {
@@ -340,13 +339,13 @@ struct PhotoBackdropEditor: View {
         }
     }
 
-    /// The preview keeps this screen's shape (a chat window's on the Mac), as large as fits.
+    /// The preview keeps this screen's shape, as large as fits.
     private func previewSize(in space: CGSize) -> CGSize {
         #if os(iOS)
         let screen = UIScreen.main.bounds.size
         let aspect = min(screen.width, screen.height) / max(screen.width, screen.height)
         #else
-        let aspect: CGFloat = 0.8
+        let aspect: CGFloat = 0.5 // macOS: test build only
         #endif
         let width = min(space.width, space.height * aspect)
         return CGSize(width: width, height: width / aspect)

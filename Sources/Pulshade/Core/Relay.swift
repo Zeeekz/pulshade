@@ -498,6 +498,28 @@ struct RelayClient {
         }
     }
 
+    /// Lets go of one lane's connections once what's under way on them has finished: a lane used for one thing, or a
+    /// sending lane whose turn is over (see `Lanes`). Over Tor its circuit is left to close by itself once idle; nothing
+    /// will be sent on it again, since its name is never used again.
+    static func retire(lane: String) {
+        let prefix = lane + "|"
+        func isLane(_ name: String) -> Bool {
+            // A session's name is the lane, the relay's host and whether it goes over Tor; hosts have no "|".
+            name.hasPrefix(prefix) && name.dropFirst(prefix.count).split(separator: "|", omittingEmptySubsequences: false).count == 2
+        }
+        let old = lock.withLock { () -> [URLSession] in
+            established = established.filter { !isLane($0) }
+            let names = sessions.keys.filter(isLane)
+            return names.compactMap { sessions.removeValue(forKey: $0) }
+        }
+        old.forEach { $0.finishTasksAndInvalidate() }
+    }
+
+    /// Lanes with connections open now, for tests.
+    static var openLanes: [String] {
+        lock.withLock { sessions.keys.map { name in name.split(separator: "|", omittingEmptySubsequences: false).dropLast(2).joined(separator: "|") } }
+    }
+
     /// Drops every lane's connections, so the next requests open new ones (after Tor is switched on or off).
     /// `finishing` lets requests already under way end on the old ones instead of cutting them off.
     static func closeAll(finishing: Bool = false) {
@@ -695,6 +717,15 @@ struct RelayClient {
         _ = try await post("v1/ack", JSONEncoder().encode(["acks": acks]))
     }
 
+    /// Moves from one of this phone's mailboxes to a fresh one (`/v1/move`): the fresh one takes over the old one's standing
+    /// on the relay, so mail for it waits the full month even while this phone is off. True once the relay has done it; an
+    /// older relay (no such route), or an old mailbox with no standing to give, says no.
+    func moveMailbox(from: Data, to: Data) async -> Bool {
+        guard let body = try? JSONEncoder().encode(["from": from.hex, "to": to.hex]),
+              let (_, response) = try? await post("v1/move", body, work: "move") else { return false }
+        return (response as? HTTPURLResponse)?.statusCode == 204
+    }
+
     // MARK: Push
 
     /// Whether this relay can send wake-up pushes at all.
@@ -720,8 +751,11 @@ struct RelayClient {
         guard status == 204 else { throw PushRefused(status: status) }
     }
 
-    func unregisterPush(keys: [Data]) async throws {
-        _ = try await post("v1/push/off", JSONEncoder().encode(["keys": keys.map(\.hex)]), work: "push")
+    /// Takes these mailboxes' wake-ups off the relay. With `token`, only this phone's (the relay can wake several phones
+    /// for one mailbox: every member of a group); relays from before take it off for every phone.
+    func unregisterPush(keys: [Data], token: String? = nil) async throws {
+        struct Body: Encodable { var keys: [String]; var token: String? }
+        _ = try await post("v1/push/off", JSONEncoder().encode(Body(keys: keys.map(\.hex), token: token)), work: "push")
     }
 
     /// Everything the relay holds for this device's token, for when there are no keys to name mailboxes with.
@@ -877,6 +911,28 @@ struct RelayClient {
         return data
     }
 
+    /// What taking a one-time slot found.
+    enum Taken {
+        /// It was there, and the relay erased it as it handed it over: nobody else can take it.
+        case taken(Data)
+        /// Nothing there (someone took it first, or it was never left).
+        case empty
+        /// A relay from before taking existed: read it with `backup` and erase it with `deleteBackup` instead.
+        case unsupported
+    }
+
+    /// Reads a one-time slot and has the relay erase it in the same step, so two devices asking at once can't both get
+    /// it. Signed with the label `pulshade.backup.take.v1`.
+    func takeBackup(key: Data, sig: Data, ts: UInt64, limit: Int = 64 * 1024) async throws -> Taken {
+        let (data, status) = try await backupRequest("take", key: key, sig: sig, ts: ts, limit: limit)
+        switch status {
+        case 200 where data.count <= limit: return .taken(data)
+        case 410: return .empty
+        case 404: return .unsupported
+        default: throw BackupError.refused
+        }
+    }
+
     func deleteBackup(key: Data, sig: Data, ts: UInt64) async throws {
         let (_, status) = try await backupRequest("delete", key: key, sig: sig, ts: ts)
         guard (200..<300).contains(status) || status == 404 else { throw BackupError.refused }
@@ -888,7 +944,8 @@ struct RelayClient {
         request.httpMethod = "POST"
         request.timeoutInterval = 120
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if action == "get" { await prove(&request, "backup-read|\(key.hex)") }
+        // A take is counted as a read.
+        if action == "get" || action == "take" { await prove(&request, "backup-read|\(key.hex)") }
         let body = try JSONEncoder().encode(Proof(sig: sig.base64EncodedString(), ts: ts))
         guard let (data, response) = try? await load(request, body: body, limit: limit),
               let status = (response as? HTTPURLResponse)?.statusCode else { throw BackupError.unreachable }
@@ -910,31 +967,6 @@ struct RelayClient {
         return (data, response)
     }
 }
-
-#if os(macOS)
-extension RelayClient {
-    /// The latest Mac release, nil when none is published. Checked against the release key by the caller.
-    func latestRelease() async throws -> Release? {
-        var request = URLRequest(url: base.appending(path: "v1/update/mac"))
-        request.timeoutInterval = Tor.uses(base) ? 45 : 15
-        let (data, response) = try await load(request, limit: 1024 * 1024)
-        let status = (response as? HTTPURLResponse)?.statusCode
-        if status == 404 { return nil }
-        guard status == 200, data.count <= 1024 * 1024 else { throw URLError(.badServerResponse) }
-        return try JSONDecoder().decode(Release.self, from: data)
-    }
-
-    /// The zipped app. Large, so it may take a few minutes over Tor.
-    func releaseArchive(maxBytes: Int = 256 * 1024 * 1024) async throws -> Data {
-        var request = URLRequest(url: base.appending(path: "v1/update/mac.zip"))
-        request.timeoutInterval = 120
-        await prove(&request, "update")
-        let (data, response) = try await load(request, limit: maxBytes)
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
-        return data
-    }
-}
-#endif
 
 extension Data {
     var hex: String { map { String(format: "%02x", $0) }.joined() }
@@ -1005,7 +1037,7 @@ extension RelayClient {
         let status = (response as? HTTPURLResponse)?.statusCode
         if status == 404 { return nil }
         guard status == 200, let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let size = object["size"] as? Int, size >= 0, size <= BlobCrypto.maxFile,
+              let size = object["size"] as? Int, size >= 0, size <= BlobPadding.relayMax,
               let complete = object["complete"] as? Bool else { throw URLError(.badServerResponse) }
         // A 100 MB file is ~100 pieces, so the bitmap is a handful of bytes. Cap it before decoding: an
         // oversized string would otherwise turn into millions of Set inserts.

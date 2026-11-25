@@ -32,8 +32,9 @@ is never written to its disk. Here is every kind of thing, in plain words:
 | **Spare keys** (up to three per friend, so a friend who logs back in or whose keys need mending can write to you straight away) | The server's disk, in the sealed-backup store | One-time ones erased by your friend when they use one, all of them by you when you remove that friend; otherwise replaced every 5 to 10 days, and 180 days without an update at most | No. Only you and that friend can work out where it is or open it, and it holds no message. |
 | **Group link previews** (one per join link an admin makes) | The server's disk, in the sealed-backup store | Rewritten while the link is in use; erased when the link is reset or deleted; 180 days without an update at most | No. Only people who have the link can find or open it. It holds the group's name, picture, description and size, which anyone with the link can see. |
 | **Public @handle and profile** (only if you choose one) | The server's disk | Until you let it go | Yes, it is public by your choice. |
-| **The server's own records and keys** (handle directory, held handles, moderation lists, announcements; its push and onion keys) | The server's disk | While the service runs | Only the server, which needs them to work. Sealed with its storage key, which is held in memory only and never written to the disk; after a reboot the server stays locked until we unlock it. The admin password is kept only as a hash. |
-| **Wake-up token** (on iPhone while notifications are on, which is the default) | The server's memory, and a sealed file on its disk | While notifications are on (gone within seconds of turning them off; dropped after 7 days without a renewal) | It is a device token and nothing else. |
+| **The server's own records and keys** (handle directory, held handles, moderation lists, announcements; its push and onion keys) | The server's disk | While the service runs | Only the server, which needs them to work. Sealed with its storage key, which is held in the server's memory and on our own computer, not on the server's disk; after a reboot the server stays locked until we unlock it. A new server's key is on its disk until we move it into memory, and a deleted copy can survive on a disk, so the server can seal everything again with a new key that was never on the disk. The admin password is kept only as a hash. |
+| **Wake-up token** (while notifications are on, which is the default) | The server's memory, and a sealed file on its disk | While notifications are on (gone within seconds of turning them off; dropped after 7 days without a renewal) | It is your phone's device token, kept with the mailboxes it wakes you for (your chats, your groups and your @handle's request mailbox), and when it runs out, to the hour. Whoever runs or seizes the server can see which mailboxes belong to one phone, and which phones read one group. |
+| **Which mailboxes have been collected from** (so made-up mailboxes can't fill the server) | The server's memory, and a sealed file on its disk | 12 weeks after your phone last fetched from it | A mailbox id with roughly how much has been collected from it, the day it was first used (for its first week only) and the week it was last used. No name, address or message. |
 
 Photos, voice notes and text travel inside the encrypted message itself, so they wait like any message: sealed on the server's disk, until collected.
 
@@ -52,9 +53,13 @@ passcode and Burn also erase your files from the server. All three wipe your pho
 requests in the same moment without waiting (on an account's only device; if your phone is offline then, the server
 forgets the files within 30 days at most). Burn goes further: see below.
 
-What the server can still see about a file, as with any message: that something of about that size was uploaded,
-when it was uploaded and collected, and, if you connect without Tor, your IP address while you do. It can't see what
-it is, what it's called or who it is for.
+What the server can still see about a file, as with any message: that something was uploaded, its size rounded up to
+a step (from build 22 files are padded, so the server sees roughly how big, not the exact size), when it was uploaded and
+when each copy was collected, and, if you connect without Tor, your IP address while you do. It can't see what it is,
+what it's called or who it is for, and from build 22 its list of collectors always has the same shape, so it doesn't say
+how many people it went to. A picture you send as a file goes without its hidden details (where and when it was taken,
+the camera), and any file goes under a plain name such as "photo.jpg" unless you choose to send its own; documents and
+videos can carry details of their own that Pulshade can't remove, and the app says so before they go.
 
 ## What we collect
 
@@ -62,7 +67,7 @@ it is, what it's called or who it is for.
 see your recovery code, your passcode, your keys or your contacts.
 
 **Messages and calls.** These are encrypted on your device before they leave it. Our server only passes on sealed
-envelopes, padded to a few fixed sizes. We can't read them. Envelopes wait on the server's disk, sealed in segment files that each have a key of their own (the keys are kept in a file sealed with a key that is never written to the disk), and recent ones also in its memory. They are deleted once collected (the file that held them is overwritten and removed at once, or, if it still holds someone else's waiting mail, rewritten without the collected mail within a minute or so) or after 30 days, and are not logged.
+envelopes, padded to a few fixed sizes. We can't read them. Envelopes wait on the server's disk, sealed in segment files that each have a key of their own (the keys are kept in a file sealed with the server's storage key, which is kept in its memory, not on its disk), and recent ones also in its memory. They are deleted once collected (the file that held them is overwritten and removed at once, or, if it still holds someone else's waiting mail, rewritten without the collected mail within a minute or so) or after 30 days, and are not logged.
 
 **Files.** A file you send is encrypted on your device in pieces, with a fresh key that is sent only inside the
 end-to-end encrypted message, and uploaded once to our server, which seals it again and keeps it on its disk until
@@ -92,8 +97,8 @@ to three spare keys for you on the server ahead of time, and yours leaves the sa
 two of you can work out, sealed with a key only the two of you can make, and every spare is the same size. The server
 can't open it or tell whose it is. Each one is written and read on its own connection, at random times, so the server
 can't easily tie the spares of one person together, but it does see when a spare is written, read or erased, and if
-you connect without Tor, your IP address during that request. Two of the spares are used once: the friend who uses
-one erases it. The third is only used when those are gone, and can be used more than once until it's replaced.
+you connect without Tor, your IP address during that request. Two of the spares are used once: the server hands
+one out and erases it in the same step, so two of a friend's devices can't both use it. The third is only used when those are gone, and can be used more than once until it's replaced.
 Removing a friend erases yours for them. Otherwise each is replaced every 5 to 10 days, and one nobody updates
 (after a Burn, say) is erased after 180 days; it is no use to anyone without your keys.
 
@@ -109,7 +114,11 @@ could in principle match the address that sent a message with the one that colle
 on Fast you are trusting us not to; Tor removes the need.
 
 **What the server can see about traffic.** It can see that a sealed envelope arrived at a random mailbox, when, and
-how large (within a few set sizes). It can't see who sent it, who you are behind Tor, or what is inside.
+how large (within a few set sizes). It can't see who sent it, who you are behind Tor, or what is inside. Over Tor the app
+spreads what it does over separate connections (each chat's mailboxes over a few, each group, each delivery receipt and
+each file on their own), moves to new mailboxes every week and waits a random 5 to 20 seconds before saying a message
+arrived, so the server can't simply read off who talks to whom. It can still try to match them up from timing over a
+long time, as any server that carries both ends can, and the wake-up token above links the mailboxes of one phone.
 
 **Your phone's address book: never.** Pulshade doesn't ask for your contacts and doesn't read them. You add friends
 by scanning a code or sharing a link, so there is no phone-number matching and nothing to upload.
@@ -158,9 +167,9 @@ word it for each region.]
 
 ## Outside the app
 
-- Wherever you download Pulshade from, such as the App Store or our website, sees your IP address and what you
-  download. Apple also checks the app when a Mac first opens it. These services have their own policies.
-- On iPhone, while notifications are on (the default; you can turn them off in Settings → Notifications), Pulshade
+- Wherever you download Pulshade from, such as the App Store, sees your IP address and what you download. These
+  services have their own policies.
+- While notifications are on (the default; you can turn them off in Settings → Notifications), Pulshade
   wakes your locked phone for new messages and friend requests. The app asks Apple's push service for a device token,
   outside Tor, and notifications go through Apple's service: Apple sees your device token and when a notification is
   delivered, never message contents, and Pulshade's server keeps your token, in memory and in a sealed file on its
@@ -172,7 +181,7 @@ word it for each region.]
 - If you choose the Snowflake bridge, the app reaches the bridge through a content-delivery network's front and uses
   public STUN servers to set up the connection, and those see your IP address (Tor itself still carries your traffic).
 - A link you tap in a message opens in your browser or another app, which has its own policy.
-- Your phone or computer may keep its own records of notifications and app use, which we can't control. By default,
+- Your phone may keep its own records of notifications and app use, which we can't control. By default,
   notifications say only "New message".
 
 ## Your choices and rights
@@ -183,7 +192,9 @@ word it for each region.]
   any sealed messages you sent that are still waiting for friends to collect, erase your files and empty and close your
   mailboxes. If the server can't be reached, your phone keeps that order, sealed, and tries again a minute later, then
   every hour while Pulshade is open, until the server confirms, and then deletes it; a message tells you when it is done.
-  The order can erase things but can't read anything. Messages already collected by a friend's phone can't be taken
+  The order can erase things but can't read anything. Until it is deleted (at most 30 days), someone who examines the
+  phone can tell that an account was burned on it, and see the mailbox codes it still has to clear (not names or
+  messages); the Burn screen says so. Messages already collected by a friend's phone can't be taken
   back, though an up-to-date Pulshade on their side forgets you and everything you sent.
 - Because we hold no account details about you, we usually can't tell which data is yours. For a public handle, contact
   us at [contact address] and we'll act on what we can verify.
@@ -207,6 +218,23 @@ no accounts, can't tell who is a child. If you think a child is using Pulshade, 
 If we change this policy we'll update the date above, add a line to the list below and tell people in the app's
 announcements. The code and documentation show what the app does at any time.
 
+- **Build 22 (one iPhone):** Pulshade is iPhone only and an account works on one device. Linking a second device and
+  copying chats or settings between your own devices are gone, so nothing about your account is sent to another device
+  of yours. Devices linked on an older build are signed out after the update, and your contacts are told they're gone.
+- **Build 22 (who talks to whom):** Tor is chosen already on the first screen (Fast is still there, with what it shows the
+  server said plainly); typing indicators are off for new accounts; the second tick comes 5 to 20 seconds after a message
+  arrives, on a connection of its own; each chat's mailbox moves every week; files are padded to size steps and pictures
+  sent as files lose their hidden details and their name; the wake-up token's link to your mailboxes, and that it outlives
+  a Burn on an iPhone, are said plainly.
+- **Build 22:** a one-time spare key is erased by the server as it is handed out, so it can't be used twice; the server
+  can seal everything it keeps again with a new storage key; the side files kept beside a sealed backup are sealed by
+  the server too. Corrected: the server's storage key is kept off its disk once we move it into memory, not from the
+  start (a new server's key is on its disk until then).
+  The passcode is stretched with Argon2id and checked with the device's Secure Enclave on every try; the
+  lock screen's settings (which keypad, wiping after wrong guesses) are kept sealed with your passcode file instead of
+  as plain app preferences; new accounts wipe the device after 10 wrong guesses in a row; auto-lock can lock at once,
+  locks when the phone locks, and can close everything; the Burn screen says what a Burn leaves on the phone
+  until the server is done.
 - **Build 21:** spare keys: up to three per friend instead of one, also used when the keys of a chat need mending; one of
   the three can be used more than once until it's replaced.
 - **Build 14:** waiting messages are no longer limited by the server's memory. They wait on its disk, sealed in segments

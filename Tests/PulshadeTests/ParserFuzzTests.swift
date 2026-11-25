@@ -43,7 +43,6 @@ import PulshadeShared
             let text = (prefixes.randomElement(using: &dice) ?? "") + body
             _ = Base32.decode(text)
             _ = Invite(code: text)
-            _ = JoinCode(text)
             _ = ChatLink(text)
             _ = Invite.allowedRelay(text)
             _ = Data(hexString: text)

@@ -5,14 +5,23 @@ The design in full, for anyone checking Pulshade's claims. The short version is 
 ## Your account
 
 **Identity.** 32 random bytes made on your device; every key is derived from them. Your passcode seals them in
-`identity.lock` (PBKDF2-SHA256, 600,000 rounds, AES-GCM), with the key also mixed with a secret only this device's
-Secure Enclave can produce, so a copied lock file can't be guessed at on another computer. The whole file is
-sealed again with a key kept in the Keychain and replaced every time Pulshade locks, so an old copy left in the
-SSD's spare blocks no longer opens, even on this device, once its key has been replaced (`identity.bio`, for Touch
-ID, works the same way).
+`identity.lock` (AES-GCM). The passcode is first stretched with Argon2id (64 MiB of memory, 3 passes, one run per
+try), then each slot's key also mixes in the answer this device's Secure Enclave gives for that passcode: the chip
+multiplies a point on the curve made from the stretched passcode by a key that never leaves it. An answer for one
+passcode says nothing about another, so every single guess needs this device's chip: a copied lock file can't be
+guessed at on another computer, and neither can answers someone once got out of the chip. What's left is guessing on
+the device itself (or with code running on it), at the chip's speed and the Argon2id cost per guess: a 6-digit PIN
+would likely fall to that within hours to days (an estimate, not measured), a long passcode doesn't. Where there is no Secure Enclave (the Simulator)
+only Argon2id stands in the way. The whole file is sealed again with a key kept in the Keychain and
+replaced every time Pulshade locks, so an old copy left in the SSD's spare blocks no longer opens, even on this
+device, once its key has been replaced (`identity.bio`, for Face ID or Touch ID, works the same way). Lock files from before
+build 22 used PBKDF2 and a Secure Enclave secret that didn't depend on the passcode; the real passcode's slot is
+upgraded at its next unlock, and a decoy or panic passcode set before stays in the old form until it is set again.
+The lock file also holds the lock screen's own settings (which keypad, and the wipe after wrong guesses), so no
+other app or preference editor can read or change them.
 
 **Storage.** Chats live in `data-*.vault`, sealed with a key derived from the identity and padded to 64 KB, 128 KB
-and so on. The folder is kept out of backups, and on iPhone the files can't be read while the phone is locked. If
+and so on. The folder is kept out of backups, and the files can't be read while the phone is locked. If
 the passcode is right but the data won't open, Pulshade stays locked and changes nothing, rather than opening an
 empty account that would save over it. The recovery code is the only way back in.
 
@@ -20,22 +29,31 @@ empty account that would save over it. The recovery code is the only way back in
 first tells the people you chat with to clear their one-to-one chat with you (they keep you as a contact), waiting
 four seconds at most; offline, or if that can't be sent in time, it wipes anyway and they are told when the account
 is next recovered.
-- *Lock* closes the vault. Everything stays on the device, encrypted; the passcode (or Touch ID) opens it again.
+- *Lock* closes the vault. Everything stays on the device, encrypted; the passcode (or Face ID or Touch ID) opens it again.
+  Auto-lock (Immediately, 1, 5 or 15 minutes, or never) also locks when the iPhone locks, unless it's set to
+  never; Immediately locks the moment you leave Pulshade. An automatic lock hides everything behind the passcode but
+  keeps receiving, so friends still get delivery ticks; the keys stay in memory until you press Lock. Turn on *Close
+  everything when it locks* and an automatic lock closes the vault like Lock does: keys and chats leave memory, and
+  nothing comes in until you unlock. Either way it behaves the same with or without a decoy or panic passcode: typing
+  one at a hidden account closes it and opens that one. New accounts wipe this device after 10 wrong guesses in a row
+  (5, 10, 20 or off in Settings). A 4-digit PIN from an older build has to be changed before anything else, and a
+  decoy or panic passcode set up then is chosen again in the same step, so it can still be typed on the new keypad.
+  The keypad's length is only a hint: its Enter key takes a PIN of any length.
 - *Detach* wipes this device at once, with no questions and no waiting on the network: everything on it is
-  overwritten and the app starts fresh. Nothing is sent, so your other linked devices keep the account (and every
-  chat; a QR code from one of them logs you back in). Your profile, @handles, contacts, groups, personas and
-  settings come back with the recovery code from the sealed backup (below), but every chat, story and request on
-  this device is gone for good. From the lock screen the flame can also do a Detach that first seals the account
-  with the recovery code and tells your other devices and contacts; every device is then wiped.
+  overwritten and the app starts fresh. Your profile, @handles, contacts, groups, personas and settings come back
+  with the recovery code from the sealed backup (below), but every chat, story and request on this device is gone
+  for good. From the lock screen the flame can also do a Detach that first seals the account with the recovery code
+  and tells your contacts; the device is then wiped.
 - *Burn* deletes the account as if it never existed: every chat for both sides, every contact forgets you, every
-  @handle is retired (unclaimable for three months, and tied to no one), the server's backup and waiting messages are gone, every device is wiped, and this one keeps
+  @handle is retired (unclaimable for three months, and tied to no one), the server's backup and waiting messages are gone, and this device keeps
   nothing (not even a revoked Keychain key). The recovery code can't bring it back.
 
 The flame on the lock screen does Detach (this device) or Burn without the passcode, using the recovery code instead.
 
 **Files.** A file (up to 100 MB) is not sent inside a message. The app seals it on the device in pieces of 1 MiB with
 ChaCha20-Poly1305 and a fresh random 256-bit key, binding each piece to its place so pieces can't be swapped, reordered
-or cut short, and uploads the sealed pieces once to the relay under a random id. The key, the id, the file's name and
+or cut short, and uploads the sealed pieces once to the relay under a random id. Each piece is sealed only with the
+bytes it had when the file was first read, so a file changed before an upload is retried never reuses a nonce. The key, the id, the file's name and
 type and an erase secret travel only inside the ordinary end-to-end encrypted message. The relay seals each file a
 second time with its own random key for that file, keeps the pieces on its disk and the key in a sealed index, and
 can't open either layer. The receiving app fetches the pieces into memory, opens and checks them there, and shows the
@@ -43,6 +61,12 @@ file; it never writes it to disk unless the person taps "Save a copy". Deleting 
 (whose hash is all the relay holds) and the relay overwrites the pieces, removes them and destroys the file's key; an
 erase that can't be sent is remembered and tried again. Anything left is erased after 30 days (7 in groups). The relay can see that a
 file of about that size was uploaded and collected, and when.
+
+**Calls.** The caller sends a random room and call key inside an ordinary end-to-end encrypted message. The audio goes
+through that room on the relay, which passes packets between the two devices in it and can't open them: each packet is
+sealed with ChaCha20-Poly1305, padded to one size, numbered so a replay is refused, under a key made from the call key
+and a random salt each connection picks for itself. So two of your devices answering the same call at once never seal
+under the same key and nonce.
 
 **The sealed backup.** So that Detach can be instant, the app keeps one backup of your profile, @handles, contacts,
 groups, personas and settings (never chats, stories or requests, nor a message still waiting to be sent, nor
@@ -54,28 +78,34 @@ size says little. A few minutes after something in it changes (a random 1.5 to 1
 lined up with an edit) the app saves it again, over Tor if Tor is on; it is also saved once a week, which restarts
 the relay's 180-day clock. Only the main identity does this, never a decoy or panic account. Settings has a switch:
 off erases the copy at once. Burn erases it too. Restoring with the recovery code brings it back, and it stays on the
-relay, saved over as things change.
+relay, saved over as things change. Each backup carries a count and the date it was made inside its seal. Restoring
+shows "Backup from <date>" and asks first; a device that still has the account's data refuses a copy older than the
+newest it made or restored. A freshly installed or detached device can't tell, so the date is what shows an old copy.
 
 **Decoy and panic passcodes.** `identity.lock` always holds three equal-sized slots and there are always four data
 files, real or random, padded to the same sizes and rewritten together whenever Pulshade locks, so the disk doesn't
 show what's set up. The decoy passcode opens a separate, empty identity wearing your name, theme and settings, and
 its Settings look exactly like the real ones (setting a decoy or panic passcode there only pretends). Touch ID and
 Face ID turn off while a decoy or panic passcode is set, since they'd open an account without asking which. The
-panic passcode shreds the real identity, the decoy and Touch ID under a fresh Secure Enclave key, then opens an
-empty account that becomes an ordinary one.
+panic passcode shreds the real identity, the decoy and the Face ID or Touch ID copy under a fresh Secure Enclave key, then opens an
+empty account that becomes an ordinary one. Their keys go at once; the files themselves (and the media pool) are
+moved into the vault's `work` folder, which is always there, under random names and overwritten in the background,
+and anything left there is finished at the next launch. Every unlock answers at the same moment after the passcode
+is checked (0.4 s), whether it opened the real account, a decoy or the panic one, and the panic seals its new
+account with the stretch the check already did, so it takes no longer.
 
-**On your device.** Touch ID uses a key that lives inside the Secure Enclave and only works after a fingerprint
-match; it unlocks a second sealed copy of your identity. Voice notes are recorded and played from memory, never a
-file. Screenshots and screen recordings of the Mac window come out blank unless you turn that off. On iPhone, which
-has no way to block screenshots, Pulshade draws itself in the layer iOS keeps out of them (the one behind password
-fields), so they come out blank too, and it covers itself while the screen is recorded, mirrored or shared. The message box
+**On your device.** Face ID and Touch ID use a key that lives inside the Secure Enclave and only works after a face or
+fingerprint match; it unlocks a second sealed copy of your identity. Voice notes are recorded and played from memory, never a
+file. iOS has no way to block screenshots, so Pulshade draws itself in the layer iOS keeps out of them (the one
+behind password fields): they come out blank, and it covers itself while the screen is recorded, mirrored or shared.
+You can turn this off. The message box
 has autocorrect off, so the keyboard doesn't learn what you type. Copies stay on the device they were made on (no
 Universal Clipboard), and the recovery code is never offered for copying. Saving a picture from a chat adds it to Photos, which the app can only add to, never read. Notifications say only "New message"
 unless you choose otherwise, because the system stores notification text in its own database, outside Pulshade's
 encryption, and may keep it after Pulshade clears them, which it does whenever it locks.
 
 **What's on the disk outside the vault.** A few things have to be readable before the passcode, and nothing in them
-is about your account: the theme, the menu bar icon and the screen-protection switches (so the lock screen looks
+is about your account: the theme and the screen-protection switches (so the lock screen looks
 right), in the system's preferences file; the Tor switch and the bridge choice, in `bridges.sealed`, sealed with a
 Keychain key of its own because private bridge lines are worth hiding; and Tor's own state and cache of relay lists,
 in `Application Support/Pulshade/tor` and `Caches/Pulshade/tor`, so later launches connect faster and keep the same
@@ -106,9 +136,16 @@ Every message then gets its own key, used once and deleted, and every reply mixe
 - *Sparse post-quantum ratchet:* both sides keep offering fresh ML-KEM-768 keys and answering the other's, but in small
   erasure-coded pieces, one in every message, always the same size (random filler when there is nothing to send), so no
   message is bigger and sizes show nothing. Once an answer is complete and both sides know it, the secret goes into the
-  root key at the next new chain. In a back-and-forth chat that is a new post-quantum secret about every 35 to 40
-  messages, so someone who breaks X25519 later is locked out again soon, not only before the handshake (like Signal's
-  triple ratchet). An app from before it is told to update first and nothing is exchanged until it does.
+  root key at the next new chain. In a back-and-forth chat of short messages that is a new post-quantum secret about
+  every 6 to 10 messages, so someone who breaks X25519 later is locked out again soon, not only before the handshake
+  (like Signal's triple ratchet). If one side has sent 200 messages with no new secret going in (or 20, the newest a
+  week or more after the last one went in), the app asks that device for new keys, whose handshake is post-quantum
+  again. An app from before it is told to update first and nothing is exchanged until it does.
+- *Keys kept for messages that haven't come:* a skipped message's key is kept for at most 30 days, and only for the
+  other side's five newest chains, so a message held back can't be opened with a device seized long after.
+- *Handshake secrets:* the secret half of an ask for keys is kept at most 8 days (a friend request's, 32), and goes as
+  soon as the session it was for opens; a spare key's, while it is up and 10 days after it is replaced. An answer that
+  comes later can't be opened, and the chat asks for new keys.
 
 **Envelopes.** Each ratchet message is then sealed twice. The outer seal uses a fresh X25519 key and
 ChaCha20-Poly1305, padded to fixed sizes, and hides your agreement key. The inner seal mixes in an X25519 exchange
@@ -118,7 +155,8 @@ other control messages are signed with ML-DSA as well as Ed25519, and both must 
 post-quantum keys are known, nothing classical is accepted from them, so it can't be downgraded. The first envelope
 each way, which has to introduce the keys, is the one exception; an app from before is told to update. Only you could have made it, so the recipient knows it's from you,
 but the recipient could have made it too, so it proves nothing to anyone else: nothing you say is signed. Your
-signing key vouches once for your agreement key, never for a message. Each persona writes with its own device id,
+signing key vouches once for your agreement key, never for a message. The ML-DSA signature on key setup covers the keys
+and, on a friend request, your card, but not the request's note. Each persona writes with its own device id,
 and anything sent outside a ratchet session (introductions, erasing) is stamped and counted once, so it can't be
 replayed. The server sees random blobs and send ids, and none of what's inside.
 
@@ -172,13 +210,15 @@ optional note; nothing is set up until you accept, and accepting moves the two o
 people's requests are dropped silently. A request from someone who's already your friend means they've lost the
 chat on their side, so it reconnects them straight away.
 
-**Pulse check.** Both people see the same ten emoji (60 bits), 30 digits, colours and QR code, derived from both
-identities: each one's signing-key fingerprint together with its agreement key, so swapping either key changes the code.
-An invite carries the signing key's signature over the agreement key, and an invite without a valid one is refused (an
-app from before this is told to update). Scanning the other screen with the camera, or confirming all 30 digits match, marks the contact verified. The emoji
-are a quick look only: 60 bits from one code shared by both sides can be matched by someone in the middle choosing keys
-for both, so they don't verify on their own. The digits would take about 2^50 tries that way and the QR code about 2^80,
-so scanning is the strongest check.
+**Pulse check.** As with Signal's safety numbers, each person has a fingerprint of their own: SHA-512 iterated 5,200
+times over their account, signing key, agreement key and post-quantum keys. Both screens show the two side by side as
+60 digits (30 from each), with ten emoji, two colours and a QR code that carries both whole fingerprints. Swapping
+someone's keys changes only their half, so someone in the middle would have to find keys whose fingerprint matches the
+real person's, not just make two codes agree. An invite carries the signing key's signature over the agreement key, and
+an invite without a valid one is refused (an app from before this is told to update). Scanning the other screen with the
+camera, or confirming all 60 digits match, marks the contact verified. The emoji are a quick look only and never verify.
+A code from an app before this (30 digits, or an older QR) never matches, and the screen says that person needs to
+update.
 
 **Removing a contact.** Removing someone takes them off every one of your devices, with their keys, mailboxes and
 stories, and tells their app to forget you and your chat, the same message a burner sends when it burns, so the
@@ -213,12 +253,13 @@ else a new key that person never gets; someone added doesn't get what was said b
 sealed for up to 7 days and can't tell who reads it over Tor. Each member's device keeps its own key chain in
 each group, started from fresh random bytes and moved on with every post, and hands its starting point to the other
 members' devices over private, post-quantum sessions; group keys are handed out sealed with post-quantum keys as well
-as classical ones. So someone who takes a member's phone can't open the group posts it had already read, and once you
-unlink that phone from another of your devices, every group you're in moves to new keys it can't work out, so it reads
-nothing said there from then on. Your contacts are told too, by the device that unlinked it over its own session:
-they drop that phone, never write to it again and never take it back (a device with new keys shows as a new device). If
-two of your devices unlink each other, contacts drop both and hold your next device until they allow it. The
-trade-off: group messages show "sent" rather than ticking per member.
+as classical ones. So someone who takes a member's phone can't open the group posts it had already read. When a phone linked on an older
+build is unlinked, every group you're in moves to new keys it can't work out, so it reads nothing said there from then
+on, and your contacts drop it for good and hold any new device of your account until they allow it. In groups, should
+an unlinked phone try to keep your place by moving it to keys of its own, the members see two moves of one place and
+take neither: they hold both back, an admin takes the place out, and you are added again over a chat (a group whose owner's place is fought over is closed). When two admins change a group
+at the same moment, the one higher in the owner's list wins, everywhere alike. The trade-off: group messages show "sent"
+rather than ticking per member.
 
 **Groups, channels and broadcasts.** Groups and channels share one mailbox (a channel's followers can't see who else
 follows: only its staff keep that list, in a mailbox of their own). A group saved from the older format, where every
@@ -229,18 +270,18 @@ Admins add people from their contacts and remove members; only the owner appoint
 or deletes it for everyone; anyone else who deletes it leaves. In a group the owner can also make someone a mod: a
 Mod tag, posting when only admins can, and taking ordinary members out (never admins, the owner or other mods),
 nothing else. Everyone else only accepts a mod's update if it removes members and changes nothing besides. Channel followers only learn who can post, not who
-else follows. A broadcast is the same message sent privately to each person.
+else follows. A channel is followed only through its staff: an invite carries a staff member's signature naming the
+account that sent it, so nobody can pass on an invite they got and become the one you follow it through, and a channel
+code names its channel, so following one takes only that channel without asking. A broadcast is the same message sent
+privately to each person.
 
-**Linked devices.** One account, several devices, like Signal. Your identity keys are shared between your devices,
-but each device has its own id, its own mailboxes and its own ratchet session with every contact device, so no
-message key is ever used twice. Linking: the new device shows a QR code holding a one-time secret, a fresh key and
-its request; the logged-in device scans it with the camera; you approve it; and the account (keys, contacts, groups,
-personas, settings) is sent encrypted to that key mixed with the secret, with message history following over the new
-device's session. The logged-in device never shows a code for a new device to answer, so someone who sees both screens
-can't slip a device of their own into your account; both devices then show eight digits to compare before the new one takes the account. The new device then introduces itself to every contact, calling itself just "Mac" or "iPhone". A contact's
-chat gets a line, "<name>'s account added a new device", when a device they didn't have before appears, and one of your
-own devices that another of your devices linked (not this one) is marked in your device list until you confirm or stop
-syncing it. People send to all your devices; what you do on one is synced to the others through an encrypted session between them.
+**One device per account.** An account lives on one iPhone. There is no way to link a second device: moving to a new
+phone is done with the recovery code, which brings back the profile, contacts, groups and personas but not the chats.
+Builds before 22 could link more devices. When such a device updates, the keeper is the one with the lowest device id
+among those used in the last month: it tells the others to wipe themselves, tells every contact those devices are
+unlinked, and moves every group to new keys they can't work out. A device wipes only when that word from the keeper
+arrives, leaving the files on the server for the keeper, so a device list gone stale can never wipe the last phone in use.
+A contact on an older build can still have more than one device, and messages to them still go to each of them.
 
 **Link previews.** Off by default. When on, the sender's device builds them while you type and sends them inside the
 encrypted message, like Signal: the person receiving it never contacts the website. The sender's device fetches the
@@ -256,19 +297,23 @@ clock still shows and sends the right times.
 ## The servers and the network
 
 **Pulshade's servers.** The official app talks to Pulshade's own servers and nothing else. An invite, profile,
-friend request or linking code that names any other server is refused, and the app never connects to one, whatever
-a contact once said. Every code you scan or open asks before it does anything, and a `pulshade://` link from another
-app can never link a device; that only works from the camera. The code is open, so anyone can check what the app and
+or friend request that names any other server is refused, and the app never connects to one, whatever a contact once
+said. Every code you scan or open asks before it does anything. The code is open, so anyone can check what the app and
 the server do; a build someone makes themselves uses its own server, and isn't Pulshade.
 
 **The server (relay).** A small Rust program. No accounts and no request logs (it prints only start-up and error lines, and a count when it is short of room, none naming an address or a mailbox). A waiting envelope is written to the server's disk before the sender is told it was taken, sealed, in a segment file with a key of its own (the keys are kept in an index sealed by the server's storage key), and the server keeps no copy beside it in memory (a message collected a moment after it lands is read back from the disk). It is deleted on pickup or after 30 days; their ids are random, so they don't reveal how busy it is. How much can wait is limited by the mail's share of the disk (2 GiB unless set otherwise) and, per mailbox, by a byte cap; a full share turns new mail away (the sender keeps it and tries again) and never drops mail that is already waiting. Wake-up registrations (which device token to wake for which mailbox, only for phones with notifications on) are kept the same way, in a sealed file that is rewritten within seconds of a change and drops a phone as soon as it turns notifications off. Waiting envelopes survive a restart, a crash and a reboot. When a phone has collected an envelope it is marked gone; a segment with nothing left waiting in it has its key forgotten and its file overwritten with random bytes and deleted at once (within a fraction of a second), and one kept alive by a single slow reader is rewritten without the collected mail once most of it is gone, and after a burn or a recall straight away. On a disk that writes new blocks elsewhere overwriting only helps; what makes old bytes unreadable is that they are sealed, the segment's key is forgotten, and the storage key is held only in memory. The handle directory, held handles, moderation
 lists and accounts' sealed backups (no chats) are saved to disk too, the first three sealed with the same storage
 key, as are the push key and the onion service's key (Arti's own keystore is kept in memory, and
-the relay hands it the unsealed key at start). On a Mac that key is in the Keychain. On the Linux server it is never
-written to disk: it sits in a memory-only folder (ramfs, which is never swapped out) and on the operator's Mac, and
-after a reboot the relay stays locked until the operator sends it back (`pulshade-admin server unlock`). So a copy of
-the disk, a snapshot or its backups hold nothing that can be opened; someone who controls the running server could
-still read the key from memory. A
+the relay hands it the unsealed key at start), and so are the backups' side files. On the Linux server that key is kept off the disk once the operator moves it there (a new server's install writes
+it to `/etc/pulshade` until then): it sits in a memory-only folder (ramfs, which is never swapped out) and on the
+operator's Mac, and after a reboot the relay stays locked until the operator sends it back (`pulshade-admin server
+unlock`). Moving it shreds the copy on the disk, but a flash disk can keep old blocks, so the relay can be re-keyed
+(with the relay's re-key command): every file sealed with the storage key is sealed again with a new key that was never on the
+disk. The keys inside the indexes stay as they were, so mail and files from before a re-key stay as open to the old key
+as before until they expire (30 days at most). Inside the relay the storage key sits in a memory page of its own that is
+locked (never swapped) and zeroed when let go, keys and index text are wiped after use, and on Linux the relay won't
+start while the server swaps to a disk. So a copy of the disk, a snapshot or its backups hold nothing that opens with a
+key that was never on that disk; someone who controls the running server could still read the key from memory. A
 backup that hasn't been saved again for 180 days (a detached account's, once its device is gone) is erased. The server turns off core dumps, so a crash never writes its memory to disk. Rate
 limits never keep an IP address, only a hash with a salt that's replaced every hour. Admin actions need the operator's token, which only root
 on the server can read (the relay keeps just a hash of it); the Pulshade app has no admin in it at all. Abuse reports are sealed to
@@ -284,7 +329,7 @@ work: a fraction of a second's hashing, tied to that request and used once. Requ
 all share a single allowance. Plain http is used for the onion address,
 which Tor already encrypts end to end.
 
-**Tor in the app.** Tor (Arti, Tor's Rust implementation) runs inside the app on the Mac and the iPhone, built from
+**Tor in the app.** Tor (Arti, Tor's Rust implementation) runs inside the app on the iPhone, built from
 source in `tor/`; there's nothing else to install. It listens on 127.0.0.1 behind a password picked at each launch,
 and every lane (each persona, each public inbox, sending, linking, reports, each call) signs in with its own name,
 so each gets its own circuits and none can be linked to another by address. If a lane's circuit is slow to connect,

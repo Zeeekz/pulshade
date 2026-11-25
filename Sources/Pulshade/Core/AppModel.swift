@@ -8,9 +8,6 @@ import Network
 #if canImport(PulshadeShared)
 import PulshadeShared
 #endif
-#if os(macOS)
-import AppKit
-#endif
 #if os(iOS)
 import UIKit
 #endif
@@ -23,8 +20,6 @@ final class AppModel {
 
     private(set) var phase: Phase
     private(set) var identity: Identity?
-    /// True while applying another of your devices' news, so it isn't echoed back.
-    var applyingSync = false
     private(set) var link: Link = .offline
     /// Which passcode slot is open. 0 is the real identity; decoys never see decoy settings.
     private(set) var slot = 0
@@ -43,8 +38,10 @@ final class AppModel {
     var burnPending = false
     /// What to tell the person about a Burn, shown over every screen even after the wipe.
     var burnNotice: String?
-    /// After approving: the digits the new device must show too. Cleared when you say they match, or cancel.
-    var linkConfirmation: String?
+    /// While `endLinkedDevices` runs, so it runs once at a time.
+    @ObservationIgnored var endingLinks = false
+    /// While a device left over from linking wipes itself: the files on the relay stay for the device keeping the account.
+    @ObservationIgnored var leavingForAnotherDevice = false
     @ObservationIgnored let burnStore: BurnOrderStore
     @ObservationIgnored private var burnTask: Task<Void, Never>?
     /// How far a file's upload or download has got (0...1), by message. In memory only: a phone keeps no file.
@@ -84,8 +81,6 @@ final class AppModel {
         if error is DecodingError { return "Part of it is in a shape this version doesn't know." }
         return "The file couldn't be read."
     }
-    /// Another of your devices has a newer profile than this version can read. Set until PULSHADE is updated.
-    private(set) var profileNeedsUpdate = false
     /// The format this build saves profiles in. Only tests change it, to stand in for an older or newer version.
     var profileFormat = AppData.currentFormat
     /// Set for a moment when you switch to another persona, so the screen can show the change over.
@@ -95,7 +90,7 @@ final class AppModel {
     /// Contacts whose "compare your Pulse check" prompt was put away this time the app is open. Only in memory: which
     /// contacts you verified is in the vault, and a list of names on disk outside it would say who you talk to.
     var verifyPromptDismissed: Set<String> = []
-    /// A chat something outside the window (a notification, the menu bar) asked to show.
+    /// A chat something outside the app (a notification, a link) asked to show.
     var requestedConversation: Conversation.ID?
     /// A code that arrived as a pulshade:// link, waiting for the scan screen to use it.
     var openedCode: String?
@@ -104,6 +99,21 @@ final class AppModel {
     /// A handle from a profile link (`pulshade://u/<handle>`, a "Pulshade" button on a website), waiting for
     /// Contacts to look it up. Nothing is sent until you ask: it only shows the profile and its request button.
     var openedHandle: String?
+    /// A short web link opened from outside, waiting for Pulshade to be open to be looked up.
+    var openedShort: ShortCode?
+    /// Why a link couldn't be opened, to show once.
+    var linkProblem: String?
+    /// Short links being put up now, by what they're for (`shortKey`). Memory only.
+    @ObservationIgnored var preparingShort: Set<String> = []
+    /// Each channel's code as handed out while the app is open (`makeInviteCode`). Memory only.
+    @ObservationIgnored var channelCodes: [Data: String] = [:]
+    /// Long codes whose short link couldn't be put up just now: their long link is shared instead. Memory only.
+    var shortLinkFailed: Set<String> = []
+    /// Groups' and channels' names `findProfile` found, until whoever searched opens them. Memory only.
+    @ObservationIgnored var foundPublicNames: [String: PublicNameCard] = [:]
+    /// When public names were last looked after (`tendPublicNamesNow`), and whether that's still going. Memory only.
+    @ObservationIgnored var namesTended = Date.distantPast
+    @ObservationIgnored var tendingNames = false
     /// The key check that came with `openedHandle`'s link, if any: its profile must be that account's.
     var openedKeyCheck: String?
     /// The call ringing or in progress, if any. One at a time.
@@ -140,8 +150,6 @@ final class AppModel {
     static var adminKey: Data? = (Bundle.main.object(forInfoDictionaryKey: "PulshadeAdminKey") as? String)
         .flatMap { Data(base64Encoded: $0.trimmingCharacters(in: .whitespacesAndNewlines)) }
     private var openAfterUnlock: Conversation.ID?
-    /// Reopens the main window if it was closed. Set by the window itself.
-    var openMainWindow: (() -> Void)?
 
     /// Conversation → (fingerprint → when they last typed). Memory only.
     private(set) var typing: [Conversation.ID: [String: Date]] = [:]
@@ -180,7 +188,6 @@ final class AppModel {
     /// relay can't line an upload up with an edit). Tests shorten the wait.
     @ObservationIgnored private var backupTask: Task<Void, Never>?
     @ObservationIgnored static var backupWait: ClosedRange<Int> = 90...600
-    private var activityMonitor: Any?
     private var lastActivity = Date()
     private var profileTask: Task<Void, Never>?
 
@@ -206,6 +213,9 @@ final class AppModel {
         #endif
         Ink.source = { [weak self] in self?.theme ?? .dark }
         finishCutShortWipe()
+        // Whatever a panic set aside and the app was closed before it had overwritten.
+        vault.finishSetAside()
+        moveLockSettingsIntoVault()
         guard watchSystem else { return }
         #if os(iOS)
         // Collecting while locked is switched off: the helper's keys (left by an earlier build) go at launch, before the
@@ -215,6 +225,16 @@ final class AppModel {
         resumeBurnCleanup()
         #if os(iOS)
         CallRinger.shared.model = self
+        // The iPhone locking locks Pulshade too.
+        NotificationCenter.default.addObserver(forName: UIApplication.protectedDataWillBecomeUnavailableNotification, object: nil,
+                                               queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.deviceLocked() }
+        }
+        // The Keychain answers again: lock settings an older build left in preferences can move now.
+        NotificationCenter.default.addObserver(forName: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil,
+                                               queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.moveLockSettingsIntoVault() }
+        }
         #endif
         // Tor takes a moment to connect: start it now, in the background, so it's ready by the first request.
         let onionOnly = URL(string: AppData.defaultRelay).map(Tor.isOnion) == true && AppData.directRelay == nil
@@ -223,29 +243,6 @@ final class AppModel {
         if (Tor.enabled && !awaitingChoice) || onionOnly {
             DispatchQueue.global(qos: .utility).async { Tor.start() }
         }
-        #if os(macOS)
-        activityMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .mouseMoved, .leftMouseDown, .scrollWheel]) {
-            [weak self] event in
-            self?.lastActivity = Date()
-            return event
-        }
-        let center = NSWorkspace.shared.notificationCenter
-        for name in [NSWorkspace.screensDidSleepNotification, NSWorkspace.sessionDidResignActiveNotification] {
-            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor in self?.lock(keepingKeys: true) }
-            }
-        }
-        DemoContact.shared.start()
-        // While locked, announcements still come, as a notification: they're public, so no vault is opened.
-        Task { [weak self] in
-            while true {
-                let locked = self.map { $0.phase != .unlocked } ?? false
-                let reached = locked ? await AnnouncementWatch.check() : true
-                try? await Task.sleep(for: .seconds(reached ? 60 : 15))
-                if self == nil { return }
-            }
-        }
-        #endif
     }
 
     // MARK: Phone lifecycle
@@ -315,6 +312,7 @@ final class AppModel {
 
     func didEnterBackground() {
         backgroundedAt = Date()
+        leftApp()
         if phase == .unlocked, data.security.onlineStatus { sendPresence(false) }
         presenceDue = [:]
         save()
@@ -335,7 +333,7 @@ final class AppModel {
     /// A call push woke Pulshade. If it is unlocked, it reconnects and fetches at once, so the caller's name reaches the
     /// call screen while it is still ringing.
     func callPushArrived() {
-        if phase == .unlocked { reconnect() } else if phase == .locked { warmUp() }
+        if phase == .unlocked { reconnect(urgent: true) } else if phase == .locked { warmUp() }
     }
 
     /// A message push woke Pulshade. Unlocked, it reconnects and fetches at once, then stays awake until the message
@@ -345,6 +343,8 @@ final class AppModel {
     func messagePushArrived() async {
         guard phase == .unlocked else { warmUp(); return }
         let started = Date()
+        pushHandlingSince = started
+        defer { if pushHandlingSince == started { pushHandlingSince = nil } }
         callPushArrived()
         while true {
             try? await Task.sleep(for: .milliseconds(500))
@@ -352,9 +352,10 @@ final class AppModel {
             let arrived = lastIncomingAt >= started
             // Nothing came for this push: no point holding the app awake for it.
             if !arrived && waited > 15 { return }
-            // The message is in; done once its receipt is sealed and has left the outbox.
+            // The message is in; done once its receipt is sealed and has left the outbox. The receipt waits a random
+            // moment first (`queueReceipt`), as long as what's left of iOS's time allows.
             if arrived && pendingReceipts.isEmpty && data.outbox.isEmpty { return }
-            if waited > 25 { return }
+            if waited > Self.pushWindow - 1 { return }
         }
     }
     #endif
@@ -372,6 +373,11 @@ final class AppModel {
         // The wake-up banner has done its job once Pulshade is open.
         Task { await Notifier.shared.clearWakeBanners() }
         #endif
+        if lockWhenBack, phase == .unlocked, call == nil {
+            lockWhenBack = false
+            lock(keepingKeys: true)
+        }
+        lockWhenBack = false
         guard phase == .unlocked, let since = backgroundedAt else { return }
         let minutes = data.security.autoLockMinutes
         if minutes > 0, Date().timeIntervalSince(since) > Double(minutes) * 60 { lock(keepingKeys: true) } else { lastActivity = Date() }
@@ -386,25 +392,29 @@ final class AppModel {
     }
 
     /// After a spell in the background, where iOS shuts Tor's port and lets connections die: Tor listens again,
-    /// the dead connections go, and every lane checks in at once. Until then a failure is the background's
-    /// fault, not the relay's, so the offline strip waits.
-    private func reconnect() {
+    /// the dead connections go, and the lanes check in again, the main one at once and each of the others at its own
+    /// random moment (`staggerLanes`), or within a few seconds when a wake-up push is waiting for its message (`urgent`).
+    /// Until then a failure is the background's fault, not the relay's, so the offline strip waits.
+    private func reconnect(urgent: Bool = false) {
         relayFailures = 0
         lastRelayContact = Date()
         resumedAt = Date()
         Task.detached(priority: .userInitiated) {
             Tor.wake()
             await MainActor.run {
+                if self.phase == .unlocked, self.trafficShaping { self.staggerLanes(urgent: urgent) }
                 RelayClient.closeAll()
-                if self.phase == .unlocked { Task { await self.syncOnce() } }
+                // Tests have no lanes running on their own: one full round does it there.
+                if self.phase == .unlocked, !self.trafficShaping { Task { await self.syncOnce() } }
                 // Anything announced while it was away, now rather than at the next minute.
                 self.nextAnnouncementCheck = Date()
             }
         }
     }
 
-    /// Pull down on the chats: what coming back from the background does (Tor woken, stale connections dropped, every
-    /// lane checked at once), and the call waits for it, up to a few seconds, so the spinner has something to show.
+    /// Pull down on the chats: what coming back from the background does (Tor woken, stale connections dropped, the main
+    /// lane checked at once and the others each at their own moment), and the call waits for the main one, up to a few
+    /// seconds, so the spinner has something to show.
     func refresh() async {
         guard phase == .unlocked else { return }
         relayFailures = 0
@@ -416,8 +426,16 @@ final class AppModel {
         var finished = false
         Task {
             await Task.detached(priority: .userInitiated) { Tor.wake() }.value
+            guard trafficShaping else {
+                RelayClient.closeAll()
+                await syncOnce()
+                finished = true
+                return
+            }
+            staggerLanes()
             RelayClient.closeAll()
-            await syncOnce()
+            let main = Lane(relay: nil, name: "main")
+            await poll(main, keys: currentLanes()[main] ?? [])
             finished = true
         }
         let deadline = Date().addingTimeInterval(6)
@@ -451,7 +469,9 @@ final class AppModel {
     func create(identity: Identity, profile: Profile, passcode: String) async throws {
         guard passcode.count >= LockStyle.minimumLength else { throw PasscodeSetupError.tooShort }
         let vault = vault
-        try await Task.detached { try vault.create(identity, passcode: passcode) }.value
+        let settings = newLockSettings
+        try await Task.detached { try vault.create(identity, passcode: passcode, settings: settings) }.value
+        pendingLockStyle = nil
         self.identity = identity
         slot = 0
         data = AppData()
@@ -469,14 +489,15 @@ final class AppModel {
         let identity = try Identity(seed: seed)
         let vault = vault
         let stored = backup == nil ? try storedData(identity) : AppData()
-        try await Task.detached { try vault.create(identity, passcode: passcode) }.value
+        let settings = newLockSettings
+        try await Task.detached { try vault.create(identity, passcode: passcode, settings: settings) }.value
+        pendingLockStyle = nil
         self.identity = identity
         slot = 0
         if var backup {
             // The passcodes behind these were on the old device only.
             backup.decoySeed = nil
             backup.panicSeed = nil
-            backup.linkOffers = []
             backup.relay = data.relay
             data = backup
         } else {
@@ -495,7 +516,7 @@ final class AppModel {
         if backup != nil { startFreshSessions() }
         // Recovered from the sealed backup, with no chats: anyone still holding their side of one is told to clear
         // it, in case the device this came from was wiped (Detach) before it could say so. Contacts stay.
-        if backup != nil, !hasOtherDevices { clearChatsForContacts() }
+        if backup != nil { clearChatsForContacts() }
         // The stories your friends have up were on the device that was wiped, and no backup holds them: they're asked to
         // send the ones still up again (a friend on an older build ignores it, and you see only what they post next).
         if backup != nil {
@@ -677,10 +698,10 @@ final class AppModel {
     static var spareSpacing: ClosedRange<TimeInterval> = 240...720
     static var spareLifetime: ClosedRange<TimeInterval> = 5 * 86_400...10 * 86_400
     /// How long a replaced spare is still honoured, and the oldest one a friend's device will take.
-    /// A replaced spare only matters while an answer to it could still arrive (the relay keeps mail a week), so
-    /// it's kept a little longer than that and no more. A friend's device takes none older than a spare is ever up,
-    /// plus that.
-    static let spareGrace: TimeInterval = replayWindow + 2 * 86_400
+    /// A replaced spare only matters while an answer to it could still arrive, but its secret half is what opens that
+    /// session, so it is kept 10 days and no more (docs/protocol.md, section 2): an answer that comes later can't be
+    /// opened, and the chat mends by asking again. A friend's device takes none older than a spare is ever up, plus that.
+    static let spareGrace: TimeInterval = 10 * 86_400
     static var spareMaxAge: TimeInterval { spareLifetime.upperBound + spareGrace }
     /// How many answers to a last-resort spare are remembered, to refuse one sent again.
     static let spareAnswersKept = 64
@@ -721,6 +742,8 @@ final class AppModel {
         var keys: SpareSlot.Keys
         var card: SpareSlot.Card
         var client: RelayClient
+        /// The relay erased it as it handed it over (`takeBackup`), so there is nothing left to erase.
+        var taken = false
     }
 
     /// Fetches each friend's spare and answers it; a device with none waiting (or that can't be reached) is asked
@@ -745,14 +768,28 @@ final class AppModel {
                     // either, there's nothing to take; if it is, the second one-time one is preferred to it. With
                     // traffic shaping a few random seconds pass between one read and the next, so the relay can't
                     // easily tell from the timing which slots belong together.
+                    // A one-time spare is taken: the relay hands it over and erases it in one step, so two of your
+                    // devices repairing at once can't both start from it. A relay from before that is read as it
+                    // always was, and the spare erased afterwards (see `erase` below). The last-resort one is only read.
                     func read(_ n: Int) async -> FoundSpare? {
                         guard n < target.slots.count, let client = slotClients[n] else { return nil }
                         let slot = target.slots[n]
                         if spread > 0, n > 0 { try? await Task.sleep(for: .seconds(Double.random(in: 2...8))) }
-                        let (key, sig, ts) = SpareSlot.proof("pulshade.backup.get.v1", slot.keys)
-                        guard let blob = try? await client.backup(key: key, sig: sig, ts: ts),
-                              let card = SpareSlot.open(blob, with: slot.keys) else { return nil }
-                        return FoundSpare(slot: slot.slot, keys: slot.keys, card: card, client: client)
+                        var blob: Data?, taken = false
+                        if !slot.slot.reusable {
+                            let (key, sig, ts) = SpareSlot.proof("pulshade.backup.take.v1", slot.keys)
+                            switch try? await client.takeBackup(key: key, sig: sig, ts: ts) {
+                            case .taken(let data)?: (blob, taken) = (data, true)
+                            case .unsupported?: break
+                            case .empty?, nil: return nil
+                            }
+                        }
+                        if !taken {
+                            let (key, sig, ts) = SpareSlot.proof("pulshade.backup.get.v1", slot.keys)
+                            blob = try? await client.backup(key: key, sig: sig, ts: ts)
+                        }
+                        guard let blob, let card = SpareSlot.open(blob, with: slot.keys) else { return nil }
+                        return FoundSpare(slot: slot.slot, keys: slot.keys, card: card, client: client, taken: taken)
                     }
                     // Not too old, and (for a one-time one) not answered already on this run: dead on their side.
                     func usable(_ spare: FoundSpare?) -> FoundSpare? {
@@ -772,13 +809,13 @@ final class AppModel {
                 add()
             }
         }
-        // A one-time spare that was taken is erased from the relay (both sides hold the slot's key), so it can't be
-        // taken twice and doesn't sit in the backup store. Its maker leaves a new one when their app next runs. Only
-        // once it has been dealt with: one left unanswered (keys opened another way meanwhile) stays up for next time,
-        // instead of leaving the friend's slot empty for days while their app thinks it's there. The last-resort one
-        // stays: its maker replaces it.
+        // A one-time spare is gone from the relay once it has been taken (the relay erased it as it handed it over), so
+        // it can't be taken twice and doesn't sit in the backup store; its maker leaves a new one when their app next
+        // runs. One taken and then not used (keys opened another way meanwhile) is gone too, as Signal's one-time keys
+        // are: the friend's last-resort spare is still there. From a relay without taking it was only read, and is
+        // erased here once it has been dealt with, as before. The last-resort one stays: its maker replaces it.
         func erase(_ index: Int) {
-            guard let spare = found[index], !spare.slot.reusable else { return }
+            guard let spare = found[index], !spare.slot.reusable, !spare.taken else { return }
             let (dkey, dsig, dts) = SpareSlot.proof("pulshade.backup.del.v1", spare.keys)
             Task { try? await spare.client.deleteBackup(key: dkey, sig: dsig, ts: dts) }
         }
@@ -930,7 +967,9 @@ final class AppModel {
     /// sealed backup holds. Every wrong guess is counted the same, whichever slots exist.
     private func noteWrongGuess() {
         failedAttempts += 1
-        if WipeAfterFailures.reached(failedAttempts) { wipeNow() }
+        // The setting may still be waiting to move into the lock file: tried again before it's needed.
+        moveLockSettingsIntoVault()
+        if WipeAfterFailures.reached(failedAttempts, limit: lockWipeAfter) { wipeNow() }
     }
 
     #if DEBUG
@@ -938,24 +977,96 @@ final class AppModel {
     var unlockHook: (@Sendable (String) throws -> Vault.Opened)?
     #endif
 
+    /// The passcode as the last `openVault` stretched it, for a panic to seal the landing account with (see
+    /// `Vault.panic`). Taken, and dropped, straight after.
+    @ObservationIgnored private var lastStretch: SymmetricKey?
+
     /// Opens the vault with a passcode off the main thread. Only a thrown `VaultError.wrongPasscode` means the guess was
     /// wrong; any other error (Keychain trouble, a damaged or missing file) says nothing about the guess.
     private func openVault(_ passcode: String) async throws -> Vault.Opened {
         let vault = vault
+        lastStretch = nil
         #if DEBUG
         if let hook = unlockHook { return try await Task.detached { try hook(passcode) }.value }
         #endif
-        return try await Task.detached { try vault.unlock(passcode: passcode) }.value
+        let (opened, stretched) = try await Task.detached { try vault.unlockKeepingStretch(passcode: passcode) }.value
+        lastStretch = stretched
+        return opened
     }
 
+    /// The real "wipe after wrong guesses" setting, kept sealed in the lock file (`Vault.LockSettings`), so it is known
+    /// while locked but nothing outside Pulshade can read or change it. 0 is off.
+    private var lockWipeAfter: Int {
+        _ = lockSettingsRevision
+        return vault.lockSettings?.wipeAfter ?? unmovedLockSettings?.wipeAfter ?? 0
+    }
+
+    /// The settings an older build kept as plain preferences, while the lock file has none yet (`moveLockSettingsIntoVault`
+    /// hasn't managed to move them): what the lock screen goes by meanwhile, so an updated account's wipe isn't off, nor
+    /// its keypad the wrong one, until then. Never once the lock file has settings, so a preference can't override them.
+    private var unmovedLockSettings: Vault.LockSettings? {
+        guard vault.exists, (vault.lockSettings ?? Vault.LockSettings()) == Vault.LockSettings() else { return nil }
+        let defaults = UserDefaults.standard
+        let style = (defaults.string(forKey: LockStyle.key) ?? defaults.string(forKey: LockStyle.legacyKey)).flatMap(LockStyle.init(rawValue:))
+        let wipe = defaults.integer(forKey: WipeAfterFailures.key)
+        let settings = Vault.LockSettings(style: style?.rawValue, wipeAfter: WipeAfterFailures.choices.contains(wipe) && wipe > 0 ? wipe : nil)
+        return settings == Vault.LockSettings() ? nil : settings
+    }
+
+    /// Moves on with every change of the settings kept in the lock file, so screens showing them redraw.
+    private var lockSettingsRevision = 0
+
     /// "Wipe after wrong attempts": 0 is off. Only from the real account, so a decoy can't turn it off.
-    var wipeAfterAttempts: Int { isPrimary ? WipeAfterFailures.limit : facadeWipeAfter ?? WipeAfterFailures.limit }
+    var wipeAfterAttempts: Int { isPrimary ? lockWipeAfter : facadeWipeAfter ?? lockWipeAfter }
 
     func setWipeAfterAttempts(_ n: Int) {
         guard WipeAfterFailures.choices.contains(n) else { return }
         // In a decoy the row looks and behaves the same, but the real setting is left alone.
         guard isPrimary else { facadeWipeAfter = n; return }
-        WipeAfterFailures.limit = n
+        try? vault.updateLockSettings { $0.wipeAfter = n }
+        lockSettingsRevision += 1
+    }
+
+    /// Which keypad the lock screen shows first, kept sealed in the lock file with the setting above. Only a hint about
+    /// the keyboard: every secret is tried against every slot whatever it looks like. Chosen before there's an account,
+    /// it waits in memory for the lock file the account is made with.
+    var lockStyle: LockStyle {
+        get {
+            _ = lockSettingsRevision
+            return vault.lockSettings?.style.flatMap(LockStyle.init(rawValue:)) ?? unmovedLockSettings?.style.flatMap(LockStyle.init(rawValue:))
+                ?? pendingLockStyle ?? .passcode
+        }
+        set {
+            defer { lockSettingsRevision += 1 }
+            if vault.exists, (try? vault.updateLockSettings({ $0.style = newValue.rawValue })) != nil {
+                pendingLockStyle = nil
+            } else {
+                pendingLockStyle = newValue
+            }
+        }
+    }
+    @ObservationIgnored private var pendingLockStyle: LockStyle?
+
+    /// What a lock file made now starts with: the keypad just chosen, and a wipe after 10 wrong guesses.
+    private var newLockSettings: Vault.LockSettings {
+        Vault.LockSettings(style: pendingLockStyle?.rawValue, wipeAfter: WipeAfterFailures.newAccountDefault)
+    }
+
+    /// Builds before these settings were sealed kept them as plain preferences, where anything that could write the
+    /// app's preferences could turn the wipe off. They move into the lock file once, and the preferences go. Tried at
+    /// launch, when the device's protected data becomes available, before each guess and at each unlock, until it has
+    /// worked (the Keychain may not answer yet at launch). Until then the preferences are read (`unmovedLockSettings`).
+    func moveLockSettingsIntoVault() {
+        guard vault.exists, let settings = vault.lockSettings, settings == Vault.LockSettings() else { return }
+        let defaults = UserDefaults.standard
+        let style = defaults.string(forKey: LockStyle.key) ?? defaults.string(forKey: LockStyle.legacyKey)
+        let wipe = defaults.integer(forKey: WipeAfterFailures.key)
+        guard (try? vault.updateLockSettings({
+            $0.style = style.flatMap(LockStyle.init(rawValue:))?.rawValue
+            $0.wipeAfter = WipeAfterFailures.choices.contains(wipe) ? wipe : 0
+        })) != nil else { return }
+        lockSettingsRevision += 1
+        for key in [LockStyle.key, LockStyle.legacyKey, WipeAfterFailures.key] { defaults.removeObject(forKey: key) }
     }
 
     /// What a decoy shows for "wipe after wrong guesses" once it has been changed there. Memory only.
@@ -963,8 +1074,15 @@ final class AppModel {
     /// When a decoy says its backup was last saved (it keeps none). Memory only.
     @ObservationIgnored private var facadeBackupAt: Date?
 
-    /// Whether the real account is still behind a 4-digit PIN, which is shorter than a new one may be.
-    var hasShortPIN: Bool { isPrimary && LockStyle.remembered == .pin4 }
+    /// Whether the lock screen still asks for a 4-digit PIN, shorter than a new one may be, or the account open was opened
+    /// with a secret that short: it must be changed before anything else (`RootView`). The same in a decoy, which shares
+    /// the keypad: a real account made to change its PIN and a decoy not would differ. The second half catches an account
+    /// whose keypad another (a decoy changed first) already moved on.
+    var hasShortPIN: Bool { lockStyle == .pin4 || openedWithShortSecret }
+
+    /// The account open was unlocked with a secret shorter than a new one may be. Memory only; cleared by the sheet that
+    /// changes it once all of it is done (`ChangePasscodeSheet`), so the sheet stays up until then.
+    var openedWithShortSecret = false
 
     /// Puts the real account behind a new passcode. The current one is checked first, and opens the same account in the
     /// same slot; nothing else about the lock file changes, so a decoy or panic passcode keeps working.
@@ -990,36 +1108,52 @@ final class AppModel {
         failedAttempts = 0
     }
 
+    /// How long after the passcode is checked an unlock may answer, at the soonest, whatever the passcode opened. What
+    /// follows the check differs: the account still covered is only shown again, a real account's data is read, a panic
+    /// rewrites the lock file and sets the real account's files aside, a decoy typed over a covered account closes that
+    /// one first. Each answers at this moment (or later, if its own work takes longer), so the time a passcode takes
+    /// doesn't say which kind it was. Tests set it to nothing.
+    @ObservationIgnored var unlockSettle: Duration = .milliseconds(400)
+
     func unlock(passcode: String) async -> Bool {
+        moveLockSettingsIntoVault()
         // Each wrong guess makes the next one wait longer.
         if failedAttempts > 2 {
             try? await Task.sleep(for: .seconds(min(30, 1 << min(failedAttempts - 2, 5))))
         }
+        let opened: Vault.Opened
+        do {
+            opened = try await openVault(passcode)
+        } catch VaultError.wrongPasscode {
+            noteWrongGuess()
+            return false
+        } catch {
+            // Keychain trouble or a damaged file isn't a wrong guess: no count, no wipe.
+            return false
+        }
+        let settled = ContinuousClock.now + unlockSettle
+        let stretched = lastStretch
+        lastStretch = nil
         if covered {
-            let opened: Vault.Opened
-            do {
-                opened = try await openVault(passcode)
-            } catch VaultError.wrongPasscode {
-                noteWrongGuess()
-                return false
-            } catch {
-                // Keychain trouble or a damaged file isn't a wrong guess: no count, no wipe.
-                return false
+            if case let .identity(who, at) = opened, at == slot, who.fingerprint == identity?.fingerprint {
+                try? await Task.sleep(until: settled)
+                uncover()
+                return true
             }
-            guard case let .identity(who, at) = opened, at == slot, who.fingerprint == identity?.fingerprint else {
-                noteWrongGuess()
-                return false
-            }
-            uncover()
-            return true
+            // Another passcode than the one this account opens with: a decoy, the panic passcode, or the real one over a
+            // decoy left covered. Everything open closes, as a lock you press closes it, and the passcode opens what it
+            // opens, as it would from the locked screen. So covering works the same whether or not a decoy or panic
+            // passcode is set, and gives neither away.
+            covered = false
+            lock()
         }
         dataUnreadable = false
         do {
             let vault = vault
-            let opened = try await openVault(passcode)
             switch opened {
             case let .identity(identity, slot):
                 let stored = try storedData(identity)
+                try? await Task.sleep(until: settled)
                 self.identity = identity
                 self.slot = slot
                 data = stored
@@ -1027,7 +1161,9 @@ final class AppModel {
                 // Looks like a normal unlock. Behind it, everything real is gone, and the landing identity
                 // becomes the main one, so nothing about it looks like a disguise afterwards.
                 do {
-                    try await Task.detached { try vault.panic(keeping: landing, slot: slot, passcode: passcode) }.value
+                    try await Task.detached {
+                        try vault.panic(keeping: landing, slot: slot, passcode: passcode, stretched: stretched)
+                    }.value
                 } catch {
                     // The real account couldn't be destroyed. Don't report success or open the landing account
                     // over whatever is still on disk; refusing the unlock is the safe outcome.
@@ -1042,20 +1178,23 @@ final class AppModel {
                 helperKnown = false
                 // The real account's mailboxes can't be named any more: take this phone's token off the relay instead.
                 withdrawPush()
+                let stored = try storedData(landing)
+                try? await Task.sleep(until: settled)
                 self.identity = landing
                 self.slot = 0
-                data = try storedData(landing)
+                data = stored
             }
             failedAttempts = 0
+            openedWithShortSecret = passcode.count < LockStyle.minimumLength
             didUnlock()
             if data.pendingBackupForget != nil { Task { await forgetPendingBackup() } }
             // A decoy is an empty account: the real one's wake-ups stop until the real one is unlocked again.
             if !isPrimary { withdrawPush() }
+            moveLockSettingsIntoVault()
             await bindToDevice(passcode: passcode)
             return true
         } catch {
             // Only a passcode that opened nothing is a wrong guess. Unreadable data, Keychain errors and the like aren't.
-            if case VaultError.wrongPasscode = error { noteWrongGuess() }
             return false
         }
     }
@@ -1073,12 +1212,13 @@ final class AppModel {
         }
     }
 
-    /// Lock files from before the Secure Enclave binding get it on the next unlock. The other slots stay as they are (a
-    /// decoy or panic passcode may be in one, whatever this account's saved data says) and keep opening without the
-    /// device's secret until they are next rewritten. Only where a binding can be made: otherwise this would rewrite
-    /// the file on every unlock for nothing.
+    /// Lock files older than this build's form (PBKDF2, or not yet bound to the Secure Enclave) are brought up to date on
+    /// the real account's next unlock: its slot is sealed again with Argon2id and the chip's answer for the passcode. The
+    /// other slots stay as they are (a decoy or panic passcode may be in one, whatever this account's saved data says)
+    /// and keep opening the old way until they are next set. Only when there's something to change: otherwise this would
+    /// rewrite the file on every unlock for nothing.
     private func bindToDevice(passcode: String) async {
-        guard isPrimary, Vault.canBindToDevice, let identity, !vault.isDeviceBound else { return }
+        guard isPrimary, let identity, vault.needsUpgrade else { return }
         let vault = vault
         try? await Task.detached { try vault.create(identity, passcode: passcode, replacing: true) }.value
     }
@@ -1122,7 +1262,7 @@ final class AppModel {
         purgeExpired()
         migrateInlineMedia()
         wrapDataFilesTogether()
-        pruneLinkOffers()
+        pruneHandshakeSecrets()
         data.seenEnvelopes = data.seenEnvelopes.filter { $0.value > Date().addingTimeInterval(-Self.seenRetention) }
         // Unused contact invites die with the relay's 7-day retention.
         data.invites.removeAll { $0.channel == nil && !$0.isPublic && $0.createdAt < Date().addingTimeInterval(-7 * 24 * 3600) }
@@ -1162,7 +1302,7 @@ final class AppModel {
         nextAnnouncementCheck = Date().addingTimeInterval(trafficShaping ? 5 : 0)
         vault.dropOldCatalog()
         announcementsVersion = nil
-        announceProfiles()
+        endLinkedDevicesWhenOnline()
         relistStrandedProfiles()
         // Once only: asking the relay about every persona's handles at each unlock would tie them together.
         if !data.handlesTidied {
@@ -1183,9 +1323,6 @@ final class AppModel {
         // stayed there, and each start then took its shared groups for ones from before format 24 and closed them.
         data.format = AppData.currentFormat
         save()
-        #if os(macOS)
-        DemoContact.shared.takeWaitingRequests(model: self)
-        #endif
     }
 
     /// Once, on the first unlock of data saved by a build before device keys (format 22 or older). Its ratchet sessions
@@ -1249,7 +1386,7 @@ final class AppModel {
     }
 
     /// When this build's relay is an onion service, a local relay address is that same relay reached the old way
-    /// (the Mac's own or Wi-Fi address), which Tor can't reach: switch to the onion address and Tor. The mailboxes
+    /// (a local or Wi-Fi address), which Tor can't reach: switch to the onion address and Tor. The mailboxes
     /// don't change, only the way there. Contacts or messages that named a local address by hand use the default.
     private func moveToOnionRelay() {
         let onion = AppData.defaultRelay
@@ -1274,10 +1411,12 @@ final class AppModel {
     /// Open and showing chats: unlocked, and not covered.
     var isOpen: Bool { phase == .unlocked && !covered }
 
-    /// Whether an automatic lock may keep the keys loaded. Not with a decoy or panic passcode, which need the
-    /// passcode to pick the account, and not while burning.
+    /// Whether an automatic lock may keep the keys loaded: unless "close everything" is chosen (`fullLock`), and not
+    /// while burning. The same with or without a decoy or panic passcode, and in a decoy as in the real account: typing
+    /// another passcode at a covered screen closes what's open and opens that one (`unlock`), so nothing about locking
+    /// gives a decoy away.
     private var canCover: Bool {
-        data.security.keepReceivingLocked && isPrimary && !hasDecoy && !hasPanic && !burning && identity != nil
+        data.security.keepReceivingLocked && !burning && identity != nil
     }
 
     /// Hides everything but keeps receiving, so messages still arrive and delivery receipts still go out.
@@ -1298,17 +1437,13 @@ final class AppModel {
         failedAttempts = 0
         lastActivity = Date()
         withAnimation(.smooth(duration: 0.5)) { covered = false }
-        Task { await syncOnce() }
+        resync()
     }
 
-    /// Locks. `keepingKeys` is for the automatic locks (idle, leaving the app, the Mac sleeping): with the setting on
+    /// Locks. `keepingKeys` is for the automatic locks (idle, leaving the app, the iPhone locking): with the setting on
     /// they only cover. A lock you press yourself always closes everything.
     func lock(keepingKeys: Bool = false) {
         guard phase == .unlocked else { return }
-        #if os(macOS)
-        // The demo contact stays open for days: only a lock pressed by hand closes it.
-        if keepingKeys, DemoContact.isOn { return }
-        #endif
         if covered { return }
         if keepingKeys, canCover { cover(); return }
         dismissBanner()
@@ -1325,6 +1460,9 @@ final class AppModel {
         presenceDue = [:]
         data.outbox.removeAll { $0.ephemeral == true }
         pendingReceipts = []
+        duplicateReceipts = [:]
+        laneResumeAt = [:]
+        sendLanes.reset()
         Notifier.shared.clearAll()
         // Its mailbox keys must not stay in memory for whoever unlocks next. The relay keeps the registration, so a
         // locked Pulshade is still woken for new mail.
@@ -1353,18 +1491,22 @@ final class AppModel {
     /// and every setting Pulshade keeps outside the vault, bridges and the Tor switch included. Detach keeps
     /// those, since the device still needs them to reach the relay.
     func destroyEverything(leavingNoTrace: Bool = false, keepingBurnOrder: Bool = false) {
+        // A wipe the app is killed in the middle of is finished at the next launch (`finishCutShortWipe`).
+        Self.markWipeDue(burnStore, keepingSettings: !leavingNoTrace)
         if call != nil { hangUp() }
+        covered = false
         Notifier.shared.clearAll()
         // The notification helper's keys and contacts go with everything else.
         HelperStore.clear()
         helperKnown = false
         // This account's mailboxes stop waking the phone. Done first, while the account's keys are still known.
         let hadPush = pushTold != nil || data.security.pushWake
-        if hadPush, case let keys = currentLanes()[Lane(relay: nil, name: "main")] ?? [], !keys.isEmpty {
+        if hadPush, case let keys = pushKeys().union(pushTold?.keys ?? []), !keys.isEmpty {
             let named = Array(keys)
+            let token = pushTold?.token
             Task {
                 for start in stride(from: 0, to: named.count, by: 256) {
-                    try? await client(nil, lane: "push")?.unregisterPush(keys: Array(named[start..<min(start + 256, named.count)]))
+                    try? await client(nil, lane: "push")?.unregisterPush(keys: Array(named[start..<min(start + 256, named.count)]), token: token)
                 }
             }
         }
@@ -1472,7 +1614,10 @@ final class AppModel {
     /// (see `restore`). With other devices on the account nothing is sent: they still have the chats.
     func detachNow() async {
         guard !detaching else { return }
-        guard identity != nil, phase == .unlocked, !hasOtherDevices, link == .online else { wipeNow(); return }
+        guard identity != nil, phase == .unlocked, link == .online else { wipeNow(); return }
+        // Marked before anything goes to the relay: if the app is killed in the few seconds it waits, the next launch
+        // wipes this device before anything can open it. Without the mark there's no waiting at all.
+        guard Self.markWipeDue(burnStore) else { wipeNow(); return }
         detaching = true
         clearChatsForContacts()
         var done = false
@@ -1674,31 +1819,14 @@ final class AppModel {
             .reduce(0) { $0 + $1.unread }
     }
 
-    /// Chats with something new, newest first, for the menu bar.
-    var unreadConversations: [Conversation] {
-        allConversationsSorted.filter { $0.unread > 0 && !$0.muted }
-    }
-
     /// Brings Pulshade forward on a chat. If it's locked, the chat opens right after unlocking.
     func open(_ id: Conversation.ID) {
-        #if os(macOS)
-        if let window = NSApp?.windows.first(where: { $0.canBecomeMain }) {
-            window.makeKeyAndOrderFront(nil)
-        } else {
-            openMainWindow?()
-        }
-        NSApp?.activate(ignoringOtherApps: true)
-        #endif
         if phase == .unlocked { requestedConversation = id } else { openAfterUnlock = id }
     }
 
     /// Whether Pulshade is the front app. False when there's no app at all, as in tests.
     private var appActive: Bool {
-        #if os(macOS)
-        NSApp?.isActive ?? false
-        #else
         Bundle.main.bundleURL.pathExtension == "app" && Platform.isActive
-        #endif
     }
 
     private func notify(_ message: Message, at i: Int) {
@@ -1773,8 +1901,15 @@ final class AppModel {
             save()
         }
         let relay = data.invites.first { $0.receiveKey == receiveKey }?.relay
-        return (try? Invite(kind: channel == nil ? .contact : .channel, identity: me,
-                            sendID: Mailbox.sendID(for: receiveKey), relay: relay).code) ?? ""
+        // A channel's code is asked for each time its screen is drawn. Its signature comes out different every time it's
+        // made, so the same code is handed back while the app is open: a screen (and its short link) keyed on the text
+        // would otherwise see a new code at every redraw.
+        if channel != nil, let kept = channelCodes[receiveKey] { return kept }
+        let code = (try? Invite(kind: channel == nil ? .contact : .channel, identity: me,
+                                sendID: Mailbox.sendID(for: receiveKey), relay: relay,
+                                channel: channel.flatMap { conversation($0) }.map(\.wireID)).code) ?? ""
+        if channel != nil, !code.isEmpty { channelCodes[receiveKey] = code }
+        return code
     }
 
     /// Accepts someone's invite: opens a mailbox for them and says hello.
@@ -1792,7 +1927,7 @@ final class AppModel {
         let followKey = Self.followKey(invite.fingerprint, owner)
         let followedLately = known.map { !$0.hidden } == true && invite.kind == .channel
             && data.followsAsked[followKey]?.contains { $0.tag == invite.codeTag && Date().timeIntervalSince($0.at) < 3 * 86_400 } == true
-        if invite.kind == .channel { noteFollowAsked(invite.fingerprint, persona: owner, tag: invite.codeTag) }
+        if invite.kind == .channel { noteFollowAsked(invite.fingerprint, persona: owner, tag: invite.codeTag, channel: invite.channel) }
         if followedLately, let known { save(); return known }
         // Another of their channels before they've answered the first: the hello would have to go classical again, and
         // their app turns that away once it has read the first. It goes once their keys are known (`sendFollowsLater`).
@@ -1840,7 +1975,6 @@ final class AppModel {
         contact.devices = [link]
         guard let meCard = card(sendID: mailbox.sendID, persona: owner) else { return nil }
         upsert(contact)
-        syncContact(contact.fingerprint, contact.persona)
         seal(.hello(meCard, request), to: contact.fingerprint, persona: owner)
         shareStories(with: contact)
         save()
@@ -1851,7 +1985,6 @@ final class AppModel {
         guard let i = data.contacts.firstIndex(where: { $0.fingerprint == fingerprint }) else { return }
         data.contacts[i].nickname = nickname
         refreshDirectTitle(fingerprint)
-        syncContact(fingerprint, data.contacts[i].persona)
         save()
     }
 
@@ -1935,7 +2068,6 @@ final class AppModel {
     func setVerified(_ fingerprint: String, _ verified: Bool) {
         guard let i = data.contacts.firstIndex(where: { $0.fingerprint == fingerprint }) else { return }
         withAnimation(.snappy) { data.contacts[i].verified = verified }
-        syncContact(fingerprint, data.contacts[i].persona)
         save()
     }
 
@@ -1966,7 +2098,6 @@ final class AppModel {
         convo.persona = owner
         guard kind == .direct || kind == .broadcast else { return convo }
         withAnimation(.snappy) { data.conversations.insert(convo, at: 0) }
-        if kind != .direct { syncConversation(convo.id) }
         save()
         return convo
     }
@@ -2010,13 +2141,11 @@ final class AppModel {
         // where the relay would hold it in memory for as long as the group's mail lives.
         if convo.shared != nil, relayClipsEnabled, let light = lightened(wire) {
             postLightened(light, full: wire, in: id, message: message.id)
-            sync(.sent(ref(convo), wire))
             lastTypingSent[id] = nil
             save()
             return true
         }
         if postIfShared(.message(wire), in: id, message: message.id) {
-            sync(.sent(ref(convo), wire))
             lastTypingSent[id] = nil
             save()
             return true
@@ -2033,7 +2162,6 @@ final class AppModel {
                 enqueue(.message(wire), to: member, message: message.id)
             }
         }
-        sync(.sent(ref(convo), wire))
         if recipients.isEmpty { setStatus(.sent, for: [message.id]) }
         lastTypingSent[id] = nil
         save()
@@ -2235,6 +2363,8 @@ final class AppModel {
     /// as the message naming it can wait (30 days), so the message doesn't arrive to a file that is already gone. Group
     /// files keep the group's own week.
     static let chatFileLife: TimeInterval = 30 * 86_400
+    /// How long a phone waits before fetching a photo or clip whose pointer just arrived (one opened by hand isn't held).
+    static let blobFetchDelay: ClosedRange<Double> = 2...20
 
     private func deliverClip(_ clip: Data, id: UUID, to contact: Contact, known: Attachment?, lifetime: TimeInterval = AppModel.chatFileLife,
                              only wanted: [Int]? = nil, kind: Attachment.Kind = .video) {
@@ -2245,12 +2375,13 @@ final class AppModel {
         if let known, known.expires > RelayClock.now { enqueue(.clipBlob(id: id, clip: known), to: contact); return }
         clipWaiting[id, default: []].append(contact)
         guard clipUploads[id] == nil else { return }
-        guard let relay = client(nil, lane: "blob"),
+        guard let relay = blobClient(),
               let prepared = try? BlobTransfer.prepare(data: clip, kind: kind, lifetime: min(max(lifetime, 3600) + 3600, Self.chatFileLife)) else {
             clipUploaded(id, clip: clip, nil)
             return
         }
         clipUploads[id] = Task { [weak self] in
+            defer { RelayClient.retire(lane: relay.lane) }
             var done: Attachment?
             do {
                 try await BlobTransfer.upload(prepared, to: relay) { _ in }
@@ -2312,24 +2443,263 @@ final class AppModel {
 
     /// Makes one token for each person a file goes to and tells the relay who is to collect it, so it can erase the file
     /// when they all have. Nil if the relay couldn't be told: the file then goes without tokens and stays until it is
-    /// deleted or expires.
+    /// deleted or expires. The list has a fixed shape (`BlobReaders`), so the relay can't count the people or their
+    /// devices: entries nobody reads, and uses nobody's device will spend, are spent by this phone later (`BlobSpend`).
     private func registerReaders(for contacts: [Contact], of a: Attachment) async -> [String: Data]? {
         var tokens: [String: Data] = [:]
-        var readers: [(hash: Data, uses: Int)] = []
+        var devices: [(token: Data, count: Int)] = []
         for contact in contacts where tokens[Self.personKey(contact)] == nil {
             let token = Data.random(32)
             tokens[Self.personKey(contact)] = token
-            readers.append((Data(SHA256.hash(data: token)), max(1, contact.devices.count)))
+            devices.append((token, max(1, contact.devices.count)))
         }
-        guard !readers.isEmpty, readers.count <= 1024, let relay = client(nil, lane: "blob") else { return nil }
-        do { try await relay.blobReaders(a.id, secret: a.secret, readers: readers) } catch { return nil }
+        let plan = Self.readerPlan(devices, size: a.storedSize)
+        guard !devices.isEmpty, plan.records.count <= 1024, let relay = blobClient() else { return nil }
+        defer { RelayClient.retire(lane: relay.lane) }
+        do { try await relay.blobReaders(a.id, secret: a.secret, readers: plan.records) } catch { return nil }
+        let now = Date()
+        for spend in plan.spends {
+            data.blobSpends.append(BlobSpend(id: a.id, token: spend.token, uses: spend.uses,
+                                             due: now.addingTimeInterval(trafficShaping ? .random(in: Self.blobSpendDelay) : 0),
+                                             expires: a.expires))
+        }
+        if !plan.spends.isEmpty { save() }
         return tokens
     }
 
+    /// When this phone spends the uses of a file's reader list that nobody else will: at a random moment between ten
+    /// minutes and six hours after sending, each on a connection of its own.
+    static let blobSpendDelay: ClosedRange<Double> = 600...21_600
+
+    /// The reader list for people with these tokens and numbers of devices (`BlobReaders`), in random order, and the uses
+    /// this phone has to spend itself: all of each made-up entry's, and those of each real one beyond its devices.
+    static func readerPlan(_ readers: [(token: Data, count: Int)], size: Int)
+        -> (records: [(hash: Data, uses: Int)], spends: [(token: Data, uses: Int)]) {
+        let shape = BlobReaders.shape(devices: readers.map(\.count), size: size)
+        var records: [(hash: Data, uses: Int)] = []
+        var spends: [(token: Data, uses: Int)] = []
+        for reader in readers {
+            records.append((Data(SHA256.hash(data: reader.token)), shape.uses))
+            let extra = shape.uses - min(reader.count, shape.uses)
+            if extra > 0 { spends.append((reader.token, extra)) }
+        }
+        for _ in readers.count..<max(readers.count, shape.count) {
+            let token = Data.random(32)
+            records.append((Data(SHA256.hash(data: token)), shape.uses))
+            spends.append((token, shape.uses))
+        }
+        return (records.shuffled(), spends)
+    }
+
+    // MARK: Mailboxes that move
+
+    /// How long this device reads a contact on one mailbox before it moves to a fresh one.
+    static let mailboxLife: TimeInterval = 7 * 86_400
+    /// How long a mailbox moved from is still read once every device of theirs writes to the new one: as long as the relay
+    /// keeps mail (`TTL`, 30 days), for what they sent there before they heard.
+    static let formerMailboxLife: TimeInterval = 30 * 86_400
+
+    /// Every mailbox this device reads a contact on: the one it reads now, and those it moved from that may still get mail.
+    static func mailboxes(of c: Contact) -> [Data] {
+        (c.receiveKey.map { [$0] } ?? []) + (c.formerMailboxes ?? []).map(\.key).filter { $0 != c.receiveKey }
+    }
+
+    /// Moves each friend's mailbox once a week (MD-001): a fresh one, which this device tells each of their devices about
+    /// inside its session (`Payload.mailbox`). The old one is still read until every device of theirs has written to the new
+    /// one, and then for as long as mail can wait. A friend whose app doesn't move (a build before 22) keeps writing to the
+    /// old one, which is then read for as long as they do, and this device doesn't move again until they have: so nothing
+    /// sent to an old mailbox is ever missed. Each friend's week starts at its own random moment, so moves don't line up.
+    ///
+    /// The relay is asked first (`RelayClient.moveMailbox`): the fresh mailbox takes over the old one's standing there, so a
+    /// friend's mail to it waits the full month like any mail, not the two days the relay gives a mailbox nobody has collected
+    /// from. Only once it has said yes does this device move and tell them; until then (an older relay, say) it stays put.
+    /// Returns the moves started, for whoever wants to wait for them (the tests).
+    @discardableResult
+    func tendMailboxes(now: Date = Date()) -> [Task<Void, Never>] {
+        var changed = false
+        var started: [Task<Void, Never>] = []
+        for i in data.contacts.indices {
+            let c = data.contacts[i]
+            if let formers = c.formerMailboxes, formers.contains(where: { ($0.until ?? .distantFuture) < now }) {
+                let left = formers.filter { ($0.until ?? .distantFuture) >= now }
+                data.contacts[i].formerMailboxes = left.isEmpty ? nil : left
+                changed = true
+            }
+            guard c.receiveKey != nil, !c.isSelf, !c.hidden, !c.awaitingAcceptance, c.departing == nil, !c.devices.isEmpty,
+                  c.devices.allSatisfy({ !$0.id.isEmpty && $0.session?.canSend == true }) else { continue }
+            guard let since = c.mailboxSince else {
+                data.contacts[i].mailboxSince = now.addingTimeInterval(-(trafficShaping ? .random(in: 0..<Self.mailboxLife) : 0))
+                changed = true
+                continue
+            }
+            guard now.timeIntervalSince(since) >= Self.mailboxLife,
+                  (data.contacts[i].formerMailboxes ?? []).allSatisfy({ $0.until != nil }) else { continue }
+            if let move = startMailboxMove(contact: i, now: now) { started.append(move) }
+        }
+        if changed { save() }
+        return started
+    }
+
+    /// Moves being asked of the relay, by contact, so housekeeping doesn't start a second one. Memory only.
+    @ObservationIgnored private var mailboxMoving: Set<String> = []
+    /// When a move the relay didn't make may be asked for again, by contact. Memory only.
+    @ObservationIgnored private var mailboxMoveRetry: [String: Date] = [:]
+    /// How long after a move the relay didn't make (unreachable, an older relay, too many at once) it is asked again.
+    static let mailboxMoveRetryAfter: TimeInterval = 6 * 3600
+
+    /// Asks the relay to move contact `i`'s mailbox to a fresh one, on the lane the old one is read on (so the relay learns
+    /// nothing it doesn't see already: both are read there from now on), and moves once it has.
+    private func startMailboxMove(contact i: Int, now: Date) -> Task<Void, Never>? {
+        let c = data.contacts[i]
+        let key = sessionKeyPrefix(c)
+        guard let old = c.receiveKey, !mailboxMoving.contains(key), (mailboxMoveRetry[key] ?? .distantPast) <= now else { return nil }
+        let fresh = Mailbox.make().receiveKey
+        let lane = currentLanes().first { $0.value.contains(old) }?.key
+        guard let relay = client(lane?.relay, lane: lane?.name ?? "main") else { return nil }
+        mailboxMoving.insert(key)
+        let (fingerprint, persona) = (c.fingerprint, c.persona)
+        return Task { [weak self] in
+            let moved = await relay.moveMailbox(from: old, to: fresh)
+            guard let self else { return }
+            self.mailboxMoving.remove(key)
+            guard let j = self.contactIndex(fingerprint, persona), self.data.contacts[j].receiveKey == old else { return }
+            guard moved else {
+                self.mailboxMoveRetry[key] = Date().addingTimeInterval(Self.mailboxMoveRetryAfter)
+                return
+            }
+            self.mailboxMoveRetry[key] = nil
+            self.moveMailbox(contact: j, to: fresh, now: now)
+            self.save()
+        }
+    }
+
+    private func sessionKeyPrefix(_ c: Contact) -> String { "\(c.persona?.uuidString ?? "main")|\(c.fingerprint)" }
+
+    /// Moves this device to `fresh` (which the relay has already given the old one's standing) for contact `i`, and tells
+    /// each of their devices.
+    private func moveMailbox(contact i: Int, to fresh: Data, now: Date = Date()) {
+        guard let old = data.contacts[i].receiveKey else { return }
+        data.contacts[i].formerMailboxes = (data.contacts[i].formerMailboxes ?? []) + [FormerMailbox(key: old, until: nil)]
+        data.contacts[i].receiveKey = fresh
+        data.contacts[i].mailboxSince = now
+        data.contacts[i].movedHeard = []
+        enqueue(.mailbox(sendID: Mailbox.sendID(for: fresh)), to: data.contacts[i])
+    }
+
+    /// A message from device `d` of contact `i` came on `mailbox`. On the one read now, after a move: once every device of
+    /// theirs has written there, the mailboxes before it are kept only as long as mail can wait.
+    private func noteMailboxHeard(_ mailbox: Data, contact i: Int, device d: Int) {
+        let c = data.contacts[i]
+        guard mailbox == c.receiveKey, let formers = c.formerMailboxes, formers.contains(where: { $0.until == nil }) else { return }
+        let id = c.devices[d].id
+        var heard = c.movedHeard ?? []
+        if !id.isEmpty, !heard.contains(id) { heard.append(id) }
+        data.contacts[i].movedHeard = heard
+        guard awaitedOnNewMailbox(contact: i).isEmpty else { return }
+        settleMailboxMove(contact: i)
+    }
+
+    /// How long after a move a device of theirs not yet heard on the new mailbox is told about it again, and again after
+    /// as long each time: the first `Payload.mailbox` can be lost (sealed to a session they had already replaced, say).
+    static let mailboxRetell: TimeInterval = 3 * 86_400
+
+    /// The ids of contact `i`'s devices still to be heard from on the mailbox read now before the ones before it are let
+    /// go of. Not a device left out of sending (`isDormant`: silent a month while another of theirs talks): it was never
+    /// told of the move, and waiting for it would stop this friend's mailbox from ever moving again. If it comes back
+    /// within 30 days of that it still finds the old mailbox read; later than that, what it sends there is lost, as is
+    /// anything it was sent while it was left out.
+    func awaitedOnNewMailbox(contact i: Int) -> [Data] {
+        let heard = data.contacts[i].movedHeard ?? []
+        let counted = data.contacts[i].devices.indices.filter { !data.contacts[i].devices[$0].id.isEmpty && !isDormant(contact: i, device: $0) }
+        // Nobody left to count (no device with an id) is not "everyone heard": the mailboxes before are kept.
+        guard !counted.isEmpty else { return [Data()] }
+        return counted.map { data.contacts[i].devices[$0].id }.filter { !heard.contains($0) }
+    }
+
+    /// Every device that counts has written to the mailbox read now: those before it are read only as long as mail can wait.
+    private func settleMailboxMove(contact i: Int, now: Date = Date()) {
+        let until = now.addingTimeInterval(Self.formerMailboxLife)
+        data.contacts[i].formerMailboxes = data.contacts[i].formerMailboxes?.map { FormerMailbox(key: $0.key, until: $0.until ?? until) }
+    }
+
+    /// Keeps a move from being stuck (`tendMailboxes` moves no further while a mailbox before still waits for every device
+    /// of theirs): one waiting only on devices that have gone dormant since is settled, and a device not heard on the new
+    /// mailbox `mailboxRetell` after the move is told it again. Part of the upkeep, next to `tendMailboxes`.
+    func tendMailboxMoves(now: Date = Date()) {
+        var changed = false
+        for i in data.contacts.indices {
+            guard let formers = data.contacts[i].formerMailboxes, formers.contains(where: { $0.until == nil }),
+                  let key = data.contacts[i].receiveKey else { continue }
+            let awaited = awaitedOnNewMailbox(contact: i)
+            if awaited.isEmpty {
+                settleMailboxMove(contact: i, now: now)
+                changed = true
+                continue
+            }
+            let last = ([data.contacts[i].mailboxSince] + formers.filter { $0.until == nil }.map(\.retold)).compactMap { $0 }.max()
+            guard let last, now.timeIntervalSince(last) >= Self.mailboxRetell else { continue }
+            let retell = Payload.mailbox(sendID: Mailbox.sendID(for: key))
+            for d in data.contacts[i].devices.indices where awaited.contains(data.contacts[i].devices[d].id) {
+                // Only the newest word of a move is any use: one still waiting to go is replaced, not doubled.
+                data.contacts[i].devices[d].pending.removeAll { if case .mailbox = $0.payload { return true } else { return false } }
+                data.contacts[i].devices[d].pending.append(PendingPayload(payload: retell))
+            }
+            data.contacts[i].formerMailboxes = formers.map {
+                var former = $0
+                if former.until == nil { former.retold = now }
+                return former
+            }
+            sendPending(contact: i)
+            changed = true
+        }
+        if changed { save() }
+    }
+
+    /// Spends what's due of `blobSpends`, each token on a connection of its own, its uses a few seconds apart. One whose
+    /// file has expired is dropped: the relay has forgotten it anyway.
+    private func tendBlobSpends() {
+        let now = Date()
+        if data.blobSpends.contains(where: { $0.expires < now }) { data.blobSpends.removeAll { $0.expires < now } }
+        let due = data.blobSpends.filter { $0.due <= now && !blobSpending.contains($0.token) }
+        for spend in due {
+            guard let relay = blobClient() else { return }
+            blobSpending.insert(spend.token)
+            let shaping = trafficShaping
+            Task { [weak self] in
+                defer { RelayClient.retire(lane: relay.lane) }
+                var spent = 0
+                for _ in 0..<spend.uses {
+                    guard (try? await relay.blobDone(spend.id, token: spend.token)) != nil else { break }
+                    spent += 1
+                    if shaping { try? await Task.sleep(for: .seconds(Double.random(in: 1...6))) }
+                }
+                guard let self else { return }
+                self.blobSpending.remove(spend.token)
+                guard let i = self.data.blobSpends.firstIndex(where: { $0.token == spend.token && $0.id == spend.id }) else { return }
+                if spent >= self.data.blobSpends[i].uses {
+                    self.data.blobSpends.remove(at: i)
+                } else {
+                    // Tried again later for what's left.
+                    self.data.blobSpends[i].uses -= spent
+                    self.data.blobSpends[i].due = Date().addingTimeInterval(shaping ? .random(in: 300...1800) : 0)
+                }
+                self.save()
+            }
+        }
+    }
+    /// Tokens being spent right now. Memory only.
+    @ObservationIgnored private var blobSpending: Set<Data> = []
+
+    /// A connection for one file transfer (or one erase, or one token), used for nothing else (`Lanes.once`): the relay
+    /// can't link two files, or a file and a persona's mail, by the circuit they came on. Let go of when done
+    /// (`RelayClient.retire(lane:)`).
+    private func blobClient() -> RelayClient? { client(nil, lane: Lanes.once("blob")) }
+
     /// Tells the relay this phone has the whole file, so it can be erased once everyone has it. Tried a few times.
     private func spendToken(of a: Attachment) {
-        guard let token = a.token, let relay = client(nil, lane: "blob") else { return }
+        guard let token = a.token, let relay = blobClient() else { return }
         Task.detached {
+            defer { RelayClient.retire(lane: relay.lane) }
             for delay in [0.0, 5, 30, 120] {
                 try? await Task.sleep(for: .seconds(delay))
                 if (try? await relay.blobDone(a.id, token: token)) != nil { return }
@@ -2345,10 +2715,15 @@ final class AppModel {
         if data.stories.contains(where: { $0.id == id && $0.author == fp && $0.persona == persona && $0.isReady }) { return }
         if let at = mediaMessage(id, persona: .some(persona)), data.conversations[at.convo].persona == persona,
            !Self.isPending(data.conversations[at.convo].messages[at.message]) { return }
-        guard let relay = client(nil, lane: "blob") else { return }
+        guard let relay = blobClient() else { return }
         clipFetching.insert(key)
         clipActivity[key] = Date()
+        // Not the moment the pointer arrives: a download straight after a fetch would pair this phone's mailbox with the
+        // file, and with whoever uploaded it, on the relay.
+        let wait = trafficShaping ? Double.random(in: Self.blobFetchDelay) : 0
         Task { [weak self] in
+            defer { RelayClient.retire(lane: relay.lane) }
+            try? await Task.sleep(for: .seconds(wait))
             let clip = try? await BlobTransfer.download(a, from: relay) { _ in }
             await MainActor.run {
                 guard let self else { return }
@@ -2397,12 +2772,14 @@ final class AppModel {
     /// Sends a file: sealed on this phone piece by piece, uploaded once to the relay, and named in an ordinary
     /// end-to-end encrypted message that holds the key. The message goes out once the upload is complete. See
     /// docs/blob-store.md.
-    func sendFile(_ url: URL, replyTo: Message? = nil, in id: Conversation.ID) {
+    /// A picture goes without its hidden details (where it was taken, the camera, when), and any file goes under a
+    /// neutral name ("photo.jpg", "document.pdf") unless `keepName` (see `FileScrub`).
+    func sendFile(_ url: URL, keepName: Bool = false, replyTo: Message? = nil, in id: Conversation.ID) {
         guard let i = index(of: id), canPost(in: data.conversations[i]) else { return }
         let lifetime = data.conversations[i].kind == .direct ? Self.chatFileLife : 7 * 86_400
         Task { [weak self] in
             do {
-                let prepared = try await Task.detached { try BlobTransfer.prepare(url, lifetime: lifetime) }.value
+                let prepared = try await Task.detached { try BlobTransfer.prepareForSending(url, keepName: keepName, lifetime: lifetime) }.value
                 self?.beginSending(prepared, replyTo: replyTo, in: id)
             } catch let error as BlobError {
                 self?.fileProblem = error.words
@@ -2430,13 +2807,14 @@ final class AppModel {
 
     /// (Re)starts an upload for a message of yours whose file is still where it was.
     private func startUpload(_ prepared: BlobTransfer.Prepared, message messageID: UUID, in id: Conversation.ID) {
-        guard let client = client(nil, lane: "blob") else { fileFailed[messageID] = "No connection."; return }
+        guard let client = blobClient() else { fileFailed[messageID] = "No connection."; return }
         fileFailed[messageID] = nil
         fileTasks[messageID]?.cancel()
         let report: @Sendable (Double) -> Void = { [weak self] value in
             Task { @MainActor in self?.fileProgress[messageID] = value }
         }
         fileTasks[messageID] = Task { [weak self] in
+            defer { RelayClient.retire(lane: client.lane) }
             do {
                 try await BlobTransfer.upload(prepared, to: client, progress: report)
                 await MainActor.run { self?.finishUpload(messageID, in: id) }
@@ -2466,25 +2844,20 @@ final class AppModel {
                                                                    snippet: $0.snippet, picture: $0.picture) },
                                preview: nil, attachment: a, noForward: message.noForward)
         // A shared group gets one pointer, without tokens: the file stays until it's deleted or runs out.
-        if postIfShared(.message(wire), in: id, message: message.id) { sync(.sent(ref(convo), wire)); save(); return }
+        if postIfShared(.message(wire), in: id, message: message.id) { save(); return }
         let recipients = audience(convo)
-        if recipients.isEmpty { setStatus(.sent, for: [message.id]); sync(.sent(ref(convo), wire)); save(); return }
-        // The file is erased from the relay once everyone it goes to has it: each person (and your own other devices)
-        // gets a pointer with a token of their own.
-        let own = selfIndex.map { data.contacts[$0] }.flatMap { $0.devices.isEmpty ? nil : $0 }
-        let ref = ref(convo)
+        if recipients.isEmpty { setStatus(.sent, for: [message.id]); save(); return }
+        // The file is erased from the relay once everyone it goes to has it: each person gets a pointer with a token
+        // of their own.
         Task { [weak self] in
             guard let self else { return }
-            let tokens = await self.registerReaders(for: recipients + (own.map { [$0] } ?? []), of: a)
+            let tokens = await self.registerReaders(for: recipients, of: a)
             await MainActor.run {
                 for member in recipients {
                     var mine = wire
                     mine.attachment?.token = tokens?[Self.personKey(member)]
                     self.enqueue(.message(mine), to: member, message: message.id)
                 }
-                var forMyDevices = wire
-                forMyDevices.attachment?.token = own.flatMap { tokens?[Self.personKey($0)] }
-                self.sync(.sent(ref, forMyDevices))
                 self.save()
             }
         }
@@ -2494,7 +2867,9 @@ final class AppModel {
     /// Files if the person asks.
     func openFile(of message: Message) async throws -> Data {
         guard let a = message.attachment else { throw BlobError.gone }
-        guard let client = client(nil, lane: "blob") else { throw BlobError.gone }
+        // Opened when the person asks, so not tied to when its message arrived; on a connection of its own all the same.
+        guard let client = blobClient() else { throw BlobError.gone }
+        defer { RelayClient.retire(lane: client.lane) }
         let id = message.id
         fileProgress[id] = 0
         fileFailed[id] = nil
@@ -2555,7 +2930,7 @@ final class AppModel {
     /// secrets that allow them are gone. Only when this is the account's one device: with others, they still show those
     /// files, so nothing is erased. Offline, the files expire within 7 days.
     private func eraseAllFilesOnRelayNow() {
-        guard isPrimary, !hasOtherDevices else { return }
+        guard isPrimary, !leavingForAnotherDevice else { return }
         var wipes = data.blobWipes
         for convo in data.conversations {
             for m in convo.messages where m.isMine { if let a = m.attachment { wipes.append(BlobWipe(id: a.id, secret: a.secret, expires: a.expires)) } }
@@ -2563,8 +2938,16 @@ final class AppModel {
         for story in data.stories where story.author == "me" {
             if let a = story.clipBlob { wipes.append(BlobWipe(id: a.id, secret: a.secret, expires: a.expires)) }
         }
-        guard !wipes.isEmpty, let relay = client(nil, lane: "blob") else { return }
-        Task.detached { for wipe in wipes { _ = try? await relay.blobDelete(wipe.id, secret: wipe.secret) } }
+        // All at once, so the wipe stays instant, but each on a connection of its own, so the relay isn't handed every
+        // file of the account (every persona's) together in its last moments.
+        guard !wipes.isEmpty else { return }
+        for wipe in wipes {
+            guard let relay = blobClient() else { return }
+            Task.detached {
+                _ = try? await relay.blobDelete(wipe.id, secret: wipe.secret)
+                RelayClient.retire(lane: relay.lane)
+            }
+        }
     }
 
     /// Works through the files waiting to be erased on the relay.
@@ -2572,10 +2955,13 @@ final class AppModel {
     func runBlobWipes() -> Task<Void, Never> {
         let now = RelayClock.now
         data.blobWipes.removeAll { $0.expires < now.addingTimeInterval(-86_400) }
-        guard !data.blobWipes.isEmpty, let client = client(nil, lane: "blob") else { return Task {} }
+        guard !data.blobWipes.isEmpty, reachable(nil) != nil else { return Task {} }
         let list = data.blobWipes
         return Task { [weak self] in
             for wipe in list {
+                // Each on a connection of its own, as it was uploaded.
+                guard let client = await self?.blobClient() else { return }
+                defer { RelayClient.retire(lane: client.lane) }
                 if (try? await client.blobDelete(wipe.id, secret: wipe.secret)) != nil {
                     await MainActor.run {
                         self?.data.blobWipes.removeAll { $0.id == wipe.id }
@@ -2613,8 +2999,6 @@ final class AppModel {
         wire.forwarded = message.forwarded
         if postIfShared(.message(wire), in: id, message: message.id) {
             sendSharedClip(clip, id: message.id, in: id)
-            sync(.sent(ref(convo), wire))
-            if !applyingSync, let me = selfIndex, !data.contacts[me].devices.isEmpty { deliverClip(clip, id: message.id, to: data.contacts[me], known: nil) }
             lastTypingSent[id] = nil
             save()
             return
@@ -2624,9 +3008,6 @@ final class AppModel {
             enqueue(.message(wire), to: member, message: message.id)
             deliverClip(clip, id: message.id, to: member, known: nil)
         }
-        // Your other devices get the message and the clip too.
-        sync(.sent(ref(convo), wire))
-        if !applyingSync, let me = selfIndex, !data.contacts[me].devices.isEmpty { deliverClip(clip, id: message.id, to: data.contacts[me], known: nil) }
         if recipients.isEmpty { setStatus(.sent, for: [message.id]) }
         lastTypingSent[id] = nil
         save()
@@ -3326,7 +3707,6 @@ final class AppModel {
         if !postIfShared(.unsend(ids: [messageID]), in: id) {
             for member in audience(convo) { enqueue(.unsend(ids: [messageID]), to: member) }
         }
-        sync(.unsend(ids: [messageID]))
         save()
     }
 
@@ -3341,7 +3721,6 @@ final class AppModel {
                 for member in audience(convo) { enqueue(.reaction(message: messageID, emoji: next), to: member) }
             }
         }
-        sync(.reaction(message: messageID, emoji: next))
         save()
     }
 
@@ -3437,7 +3816,6 @@ final class AppModel {
             guard data.conversations[i].amAdmin else { return }
             applyTimer(seconds, at: i)
             publishSharedChange(i)
-            sync(.disappearing(ref(data.conversations[i]), seconds: seconds))
             save()
             return
         }
@@ -3446,7 +3824,6 @@ final class AppModel {
         if convo.kind == .direct {
             for member in audience(convo) { enqueue(.disappearing(conversation: nil, seconds: seconds), to: member) }
         }
-        sync(.disappearing(ref(convo), seconds: seconds))
         save()
     }
 
@@ -3562,10 +3939,12 @@ final class AppModel {
                 }
             }
         }
-        sync(.deleted(ref(convo)))
+        // Its public name goes too (let go of on the relay in the background, tried until it's done).
+        dropPublicName(of: id)
         removeLocally(id)
         save()
         if !data.partingPosts.isEmpty { kick() }
+        if !data.namesToRelease.isEmpty { Task { await releasePendingNames() } }
     }
 
     /// How many posts of gone groups are kept waiting at most, and for how long.
@@ -3581,7 +3960,10 @@ final class AppModel {
         let cutoff = Date().addingTimeInterval(-Self.partingPostsKeepFor)
         if data.partingPosts.contains(where: { $0.post.queued < cutoff }) { data.partingPosts.removeAll { $0.post.queued < cutoff } }
         while let next = data.partingPosts.first {
-            guard let client = client(nil, lane: Outgoing.lane(for: next.persona)) else { break }
+            // Each on a lane of its own, used once: a group's last word says nothing about the persona's other groups.
+            let lane = Lanes.once("parting")
+            guard let client = client(nil, lane: lane) else { break }
+            defer { RelayClient.retire(lane: lane) }
             let post = next.post
             do {
                 do {
@@ -3619,7 +4001,6 @@ final class AppModel {
             for message in convo.messages.filter({ !$0.isMine && !$0.isSystem }).suffix(convo.unread) { queueReceipt(message.id, to: sender, read: true) }
         }
         data.conversations[i].unread = 0
-        sync(.read(ref(data.conversations[i])))
         save()
     }
 
@@ -3961,7 +4342,6 @@ final class AppModel {
         withAnimation(.snappy) { data.stories.insert(story, at: 0) }
         fanOut(story, to: self.audience(of: story).map { ($0, true) })
         trackUpload(of: story.id)
-        if story.isSyncable { var shared = story; shared.delivery = nil; sync(.story(shared)) }
         save()
     }
 
@@ -4006,7 +4386,6 @@ final class AppModel {
         storyBacklog[id] = nil
         fanOut(story, to: after.map { c in (c, !before.contains { $0.fingerprint == c.fingerprint }) })
         trackUpload(of: id)
-        if story.isSyncable { var shared = story; shared.delivery = nil; sync(.story(shared)) }
         save()
     }
 
@@ -4017,7 +4396,6 @@ final class AppModel {
         dropUnsent(story: id)
         noteRemoved("me|\(id)")
         for c in audience(of: story) { enqueue(.storyRemoved(id: id), to: c) }
-        sync(.storyRemoved(id))
         save()
     }
 
@@ -4414,12 +4792,12 @@ final class AppModel {
             if isSelf {
                 data.contacts[i].devices[d].unconfirmed = true
             } else {
-                if holdsNewDevices(contact: i) { data.contacts[i].devices[d].unconfirmed = true }
-                noteNewDevice(of: data.contacts[i])
+                let hold = holdsNewDevices(contact: i, vouched: vouchedPins.contains(vouchKey(contact: i, pin: pin)))
+                if hold { data.contacts[i].devices[d].unconfirmed = true }
+                noteNewDevice(of: data.contacts[i], held: hold)
             }
         }
         // Your other devices pin it too.
-        if !isSelf { syncContact(data.contacts[i].fingerprint, data.contacts[i].persona) }
     }
 
     func me(_ persona: UUID?) -> Identity? {
@@ -4487,7 +4865,7 @@ final class AppModel {
     }
 
     /// Before a chat is shown: switches to the persona it belongs to, so the screen never shows one identity while the
-    /// chat sends as another (a notification, the menu bar or a link can open any persona's chat).
+    /// chat sends as another (a notification or a link can open any persona's chat).
     func becomeOwner(of id: Conversation.ID) {
         guard let convo = conversation(id), !belongsHere(convo) else { return }
         switchPersona(convo.persona)
@@ -4513,7 +4891,6 @@ final class AppModel {
         let persona = Persona(seed: Identity.generate().seed,
                               profile: Profile(name: name, color: Int.random(in: 0..<Signature.colors.count)))
         withAnimation(.snappy) { data.personas.append(persona) }
-        sync(.persona(persona))
         save()
         return persona
     }
@@ -4533,13 +4910,13 @@ final class AppModel {
             data.personas.removeAll { $0.id == id }
         }
         identityCache[id] = nil
-        sync(.personaDeleted(id))
         save()
     }
 
     // MARK: Public profiles & requests
 
-    enum DirectoryError: Error { case invalidHandle, taken, reserved, held, full, unreachable, invalid }
+    /// `publicName`: the name is a group's or channel's (`PublicNameCard`), checked and kept for `openFoundPublicName`.
+    enum DirectoryError: Error { case invalidHandle, taken, reserved, held, full, unreachable, invalid, publicName }
 
     /// Requests waiting for the active persona.
     var requests: [FriendRequest] { data.requests.filter { $0.persona == activePersona } }
@@ -4584,7 +4961,6 @@ final class AppModel {
                 try? await Task.sleep(for: .seconds(persona == nil ? Double.random(in: 5...30) : Double.random(in: 60...900)))
                 guard let self, self.phase == .unlocked else { return }
                 await self.republish(persona)
-                self.syncPublicProfile(persona)
                 self.save()
             }
         }
@@ -4600,13 +4976,27 @@ final class AppModel {
         card.links = Self.sharedLinks(profile)
         card.notes = Self.sharedNotes(profile)
         let blob = try JSONEncoder.pulshade.encode(card)
-        // Milliseconds, so quick successive edits are still each "newer" than the last.
-        let updated = UInt64(Date().timeIntervalSince1970 * 1000)
+        let updated = directoryStamp(handle)
         let message = Data("pulshade.dir.v1".utf8) + Data(handle.utf8) + withUnsafeBytes(of: updated.bigEndian) { Data($0) } + blob
         let sig = try me.signingKey.signature(for: message)
         return .init(key: me.card.signing.base64EncodedString(), blob: blob.base64EncodedString(),
                      sig: sig.base64EncodedString(), updated: updated)
     }
+
+    /// The time a directory entry says it was made, in the milliseconds the relay counts in: the relay's clock (not this
+    /// device's, which can say where in the world it is set, or how far off it runs), rounded up to the whole minute, so
+    /// anyone who looks a handle up learns only the minute it last changed. One made within the same minute as the last
+    /// (for any handle: handles are listed newest first) counts a minute on, so each is still newer than the one before.
+    func directoryStamp(_ handle: String, now: Date = RelayClock.now) -> UInt64 {
+        let minute: UInt64 = 60_000
+        let ms = UInt64(max(0, now.timeIntervalSince1970) * 1000)
+        var stamp = (ms + minute - 1) / minute * minute
+        if stamp <= lastDirectoryStamp { stamp = lastDirectoryStamp + minute }
+        lastDirectoryStamp = stamp
+        return stamp
+    }
+    /// The last stamp given to a directory entry. Memory only.
+    @ObservationIgnored private var lastDirectoryStamp: UInt64 = 0
 
     /// Lists the active persona under @handle so anyone who knows it can send a request. The first handle becomes
     /// the main one; a second or third is in use alongside it (up to `maxHandles`, counting any kept for you).
@@ -4614,9 +5004,8 @@ final class AppModel {
         guard let handle = DirectoryProfile.validHandle(raw) else { throw DirectoryError.invalidHandle }
         guard let client = client(nil, lane: Self.directoryLane(activePersona)) else { throw DirectoryError.unreachable }
         let persona = activePersona
-        let entry = try signedEntry(handle: handle, persona: persona)
         do {
-            try await client.claim(handle, entry)
+            try await claimOwn(handle, persona: persona, on: client)
         } catch RelayClient.DirectoryError.taken {
             throw DirectoryError.taken
         } catch RelayClient.DirectoryError.reserved {
@@ -4640,7 +5029,6 @@ final class AppModel {
         }
         profile.updatedAt = Date()
         setProfile(profile, for: persona)
-        syncPublicProfile(persona)
         save()
     }
 
@@ -4653,7 +5041,6 @@ final class AppModel {
         profile.handle = handle
         profile.updatedAt = Date()
         setProfile(profile, for: persona)
-        syncPublicProfile(persona)
         save()
     }
 
@@ -4676,7 +5063,6 @@ final class AppModel {
                 retirePublicInvites(of: persona, except: Set(left.map { me.publicInboxKey(handle: $0) }))
             }
         }
-        syncPublicProfile(persona)
         save()
     }
 
@@ -4692,7 +5078,6 @@ final class AppModel {
         profile.moreHandles = nil
         profile.updatedAt = Date()
         setProfile(profile, for: persona)
-        syncPublicProfile(persona)
         save()
     }
 
@@ -4720,8 +5105,23 @@ final class AppModel {
         guard let client = client(nil, lane: Self.directoryLane(persona)) else { return }
         // Every handle in use shows the same profile.
         for handle in profile(for: persona).activeHandles {
-            guard let entry = try? signedEntry(handle: handle, persona: persona) else { continue }
-            try? await client.claim(handle, entry)
+            try? await claimOwn(handle, persona: persona, on: client)
+        }
+    }
+
+    /// Lists `handle` for `persona`. Entries are stamped to the minute (`directoryStamp`), so one made on another of the
+    /// account's devices (or before a restore) in the same minute can be as new as this one, which the relay turns away
+    /// as stale: then this goes once more, stamped after the one the relay holds, if that one is this persona's own.
+    private func claimOwn(_ handle: String, persona: UUID?, on client: RelayClient) async throws {
+        let entry = try signedEntry(handle: handle, persona: persona)
+        do {
+            try await client.claim(handle, entry)
+        } catch RelayClient.DirectoryError.taken {
+            guard let held = try? await client.lookup(handle), held.key == entry.key, held.updated >= entry.updated else {
+                throw RelayClient.DirectoryError.taken
+            }
+            lastDirectoryStamp = max(lastDirectoryStamp, held.updated)
+            try await client.claim(handle, try signedEntry(handle: handle, persona: persona))
         }
     }
 
@@ -4732,7 +5132,16 @@ final class AppModel {
         let found: RelayClient.DirectoryEntry?
         do { found = try await client.lookup(handle) } catch { throw DirectoryError.unreachable }
         guard let entry = found else { return nil }
-        guard let profile = verified(entry, handle: handle) else { throw DirectoryError.invalid }
+        guard let profile = verified(entry, handle: handle) else {
+            // A group's or channel's public name, from the same pool of names.
+            // Nothing is opened here: this runs in the background too (a contact's handle being checked), and only
+            // someone who searched for it should see its screen (`openFoundPublicName`).
+            if let card = PublicNameCard.verified(entry, handle: handle) {
+                foundPublicNames[handle] = card
+                throw DirectoryError.publicName
+            }
+            throw DirectoryError.invalid
+        }
         return profile
     }
 
@@ -4944,7 +5353,6 @@ final class AppModel {
         requestNotes["\(persona?.uuidString ?? "main")|\(profile.fingerprint)"] = String(note.prefix(280))
         seal(.request(meCard, request, note: String(note.prefix(280))),
              to: profile.fingerprint, persona: persona)
-        syncContact(contact.fingerprint, persona)
         save()
         return contact
     }
@@ -4969,6 +5377,7 @@ final class AppModel {
             peer.pqCommit = old.pqCommit
             peer.revoked = old.revoked
             peer.contested = old.contested
+            peer.unlinked = old.unlinked
             // Every device of theirs already known stays, with the keys pinned for it and whether it's held: a request is
             // no way round them. The asking device joins them; one not among them is a new device like any other. Links
             // still waiting for a device's id (an invite not answered yet) are what this request answers, so they go.
@@ -4979,7 +5388,8 @@ final class AppModel {
                 var link = link
                 if !devices.isEmpty {
                     newDevice = true
-                    if data.security.holdNewDevices || old.contested != nil { link.unconfirmed = true }
+                    // A request carries no vouch: after their account unlinked a device, a new one waits for a yes too.
+                    if data.security.holdNewDevices || old.contested != nil || old.unlinked != nil { link.unconfirmed = true }
                 }
                 devices.append(link)
             }
@@ -4991,16 +5401,14 @@ final class AppModel {
         peer.relay = Invite.allowedRelay(request.card.relay)
         upsert(peer)
         withAnimation(.snappy) { data.requests.removeAll { $0.id == id } }
-        sync(.requestResolved(fingerprint: request.fingerprint, persona: request.persona))
         if let i = contactIndex(peer.fingerprint, peer.persona) {
-            if newDevice { noteNewDevice(of: data.contacts[i]) }
+            if newDevice { noteNewDevice(of: data.contacts[i], held: data.contacts[i].devices.last?.unconfirmed == true) }
             if let d = data.contacts[i].devices.firstIndex(where: { $0.id == asking }) {
                 acceptSession(request.handshake, contact: i, device: d, context: .request)
             }
         }
         enqueue(.accepted(sendID: mailbox.sendID), to: peer)
         shareStories(with: peer)
-        syncContact(peer.fingerprint, peer.persona)
         let convo = startConversation(kind: .direct, title: peer.displayName, members: [peer.fingerprint],
                                       persona: .some(request.persona))
         noteConnected(convo.id)
@@ -5024,13 +5432,11 @@ final class AppModel {
         data.contacts[i].addedAt = old.addedAt
         // Checked in person against these exact keys, so it still holds if they haven't changed.
         data.contacts[i].verified = old.verified && old.agreementKey == request.card.agreementKey
-        syncContact(request.fingerprint, request.persona)
         save()
     }
 
     func declineRequest(_ id: FriendRequest.ID) {
         if let request = data.requests.first(where: { $0.id == id }) {
-            sync(.requestResolved(fingerprint: request.fingerprint, persona: request.persona))
         }
         withAnimation(.snappy) { data.requests.removeAll { $0.id == id } }
         save()
@@ -5041,7 +5447,6 @@ final class AppModel {
         guard let request = data.requests.first(where: { $0.id == id }) else { return }
         if !data.blocked.contains(request.fingerprint) { data.blocked.append(request.fingerprint) }
         data.blockedNames[request.fingerprint] = request.card.name
-        sync(.blocked(request.fingerprint))
         declineRequest(id)
     }
 
@@ -5051,7 +5456,6 @@ final class AppModel {
         guard let c = contact(fingerprint, in: persona), !c.isSelf else { return }
         if !data.blocked.contains(fingerprint) { data.blocked.append(fingerprint) }
         data.blockedNames[fingerprint] = c.displayName
-        sync(.blocked(fingerprint))
         forget(c)
         save()
         refreshPush()
@@ -5063,7 +5467,6 @@ final class AppModel {
             data.blocked.removeAll { $0 == fingerprint }
             data.blockedNames[fingerprint] = nil
         }
-        sync(.unblocked(fingerprint))
         save()
     }
 
@@ -5079,7 +5482,6 @@ final class AppModel {
         persona.burnsAt = Date().addingTimeInterval(lifetime)
         if oneTimeChat { persona.oneTimeChat = true }
         withAnimation(.snappy) { data.personas.append(persona) }
-        sync(.persona(persona))
         save()
         return persona.id
     }
@@ -5101,7 +5503,6 @@ final class AppModel {
         let endsAt = Date(timeIntervalSince1970: Date().addingTimeInterval(lifetime).timeIntervalSince1970.rounded(.down))
         if let i = data.personas.firstIndex(where: { $0.id == id }) {
             data.personas[i].burnsAt = endsAt
-            sync(.persona(data.personas[i]))
         }
         return ChatLink(invite: makeInviteCode(persona: .some(id)), endsAt: endsAt)
     }
@@ -5179,7 +5580,6 @@ final class AppModel {
     func removeContact(_ fingerprint: String, persona: UUID?) {
         guard let c = contact(fingerprint, in: persona), !c.isSelf, !c.hidden else { return }
         if !c.awaitingAcceptance { enqueue(.burn, to: c) }
-        sync(.contactRemoved(fingerprint: fingerprint, persona: persona))
         // Chat keys that aren't ready yet (an account just recovered, a friend who hasn't answered) leave the notice
         // waiting inside the contact, and deleting the contact would delete it: their app would never hear. So the
         // person goes from your screens at once and the record stays, hidden, until the notice has gone out.
@@ -5273,7 +5673,6 @@ final class AppModel {
             try? await Task.sleep(for: .seconds(1.5))
             guard !Task.isCancelled, let self else { return }
             for c in self.contacts(of: persona) { self.enqueue(self.profilePayload(persona, for: c.fingerprint), to: c) }
-            self.sync(.profile(persona: persona, self.profile(for: persona)))
             self.save()
             await self.republish(persona)
         }
@@ -5303,7 +5702,6 @@ final class AppModel {
     }
 
     private func mirrorSecurity() {
-        UserDefaults.standard.set(data.security.menuBarIcon, forKey: "pulshade.menuBar")
         UserDefaults.standard.set(data.security.blockCapture, forKey: "pulshade.blockCapture")
         UserDefaults.standard.set(data.security.blurWhenInactive, forKey: "pulshade.blur")
         if Tor.enabled != data.security.tor {
@@ -5319,10 +5717,6 @@ final class AppModel {
     }
 
     var blockCapture: Bool { phase == .unlocked ? data.security.blockCapture : Self.captureBlocked }
-
-    var showsMenuBarIcon: Bool {
-        phase == .unlocked ? data.security.menuBarIcon : UserDefaults.standard.object(forKey: "pulshade.menuBar") as? Bool ?? true
-    }
 
     func updateSecurity(_ change: (inout SecuritySettings) -> Void) {
         let before = data.security
@@ -5366,6 +5760,25 @@ final class AppModel {
         lock(keepingKeys: true)
     }
 
+    /// The iPhone locked: Pulshade locks with it, unless auto-lock is set to never. Not during a call (locking
+    /// hangs up) or while a story is going out; then it locks when it's next brought back.
+    func deviceLocked() {
+        guard phase == .unlocked, data.security.autoLockMinutes > 0 || data.security.lockImmediately else { return }
+        if call != nil || storyUploadProgress != nil { lockWhenBack = true; return }
+        lock(keepingKeys: true)
+    }
+
+    /// Pulshade went to the background. With "Immediately" it locks now, with the same
+    /// exceptions as `deviceLocked`.
+    func leftApp() {
+        guard phase == .unlocked, data.security.lockImmediately else { return }
+        if call != nil || storyUploadProgress != nil { lockWhenBack = true; return }
+        lock(keepingKeys: true)
+    }
+
+    /// A lock put off by a call or a story upload, done when the app is next brought back.
+    @ObservationIgnored private var lockWhenBack = false
+
     /// Face ID would open one identity without asking which, skipping a decoy, so it's off while one is set.
     var biometricsBlocked: Bool { hasDecoy || hasPanic }
     var biometricsOn: Bool { !biometricsBlocked && vault.hasBiometrics }
@@ -5404,6 +5817,32 @@ final class AppModel {
         helperKnown = false
         save()
         rebalanceFiles()
+    }
+
+    /// Puts the decoy and panic passcodes behind new ones, keeping what they open: the same decoy account (and anything in
+    /// it) and the same panic landing account, sealed again the way this build seals a slot (Argon2id, tied to this
+    /// device's Secure Enclave). Asked for with the real account's new PIN when a 4-digit one must go
+    /// (`ChangePasscodeSheet`), so neither is left on a keypad the lock screen no longer shows, nor sealed the older way.
+    /// A new passcode may already open its own slot (a second try after one half worked), never any other. In a decoy it
+    /// changes nothing, as setting either up there doesn't.
+    func renewDisguises(decoy: String?, panic: String?) async throws {
+        for new in [decoy, panic].compactMap({ $0 }) where new.count < LockStyle.minimumLength { throw PasscodeSetupError.tooShort }
+        if let decoy, decoy == panic { throw PasscodeSetupError.inUse }
+        guard isPrimary, phase == .unlocked, identity != nil else { return }
+        let vault = vault
+        func opensOnly(_ passcode: String, slot: Int) async -> Bool {
+            switch await Task.detached(operation: { try? vault.unlock(passcode: passcode) }).value {
+            case nil: return true
+            case let .identity(_, at)?: return at == slot && slot == 1
+            case let .panic(_, at)?: return at == slot && slot == 2
+            }
+        }
+        let decoyWho = try data.decoySeed.map { try Identity(seed: $0) }
+        let landing = try data.panicSeed.map { try Identity(seed: $0) }
+        if let decoy, decoyWho != nil, !(await opensOnly(decoy, slot: 1)) { throw PasscodeSetupError.inUse }
+        if let panic, landing != nil, !(await opensOnly(panic, slot: 2)) { throw PasscodeSetupError.inUse }
+        if let decoy, let decoyWho { try await Task.detached { try vault.setSlot(1, identity: decoyWho, passcode: decoy) }.value }
+        if let panic, let landing { try await Task.detached { try vault.setSlot(2, identity: landing, passcode: panic, panic: true) }.value }
     }
 
     func removeDecoy() {
@@ -5515,9 +5954,13 @@ final class AppModel {
             try vault.unlockWithBiometrics(reason: "unlock PULSHADE")
         }).value else { return false }
         if covered {
-            guard slot == self.slot, identity.fingerprint == self.identity?.fingerprint else { return false }
-            uncover()
-            return true
+            if slot == self.slot, identity.fingerprint == self.identity?.fingerprint {
+                uncover()
+                return true
+            }
+            // Face ID turned on in another account than the one covered: that one closes, as with a passcode (`unlock`).
+            covered = false
+            lock()
         }
         dataUnreadable = false
         guard let stored = try? storedData(identity) else { return false }
@@ -5610,7 +6053,7 @@ final class AppModel {
                 seal(.ratchet(message), contact: i, device: d, message: item.message, ephemeral: item.payload.isEphemeral,
                      collapse: item.payload.collapseKind, resendOf: item.resendOf,
                      story: item.payload.storyID, viewReport: item.payload.storyViewID, rings: item.payload.rings,
-                     framed: framed, wakes: item.payload.isInvite)
+                     framed: framed, wakes: item.payload.isInvite, lane: item.payload.isReceipt ? Lanes.once("receipt") : nil)
             }
             data.contacts[i].devices[d].session = session
         }
@@ -5667,7 +6110,8 @@ final class AppModel {
     /// This device, as a contact should reach it: its id and the mailbox it reads them on.
     private func myDevice(for i: Int) -> DeviceCard {
         if data.contacts[i].receiveKey == nil { data.contacts[i].receiveKey = Mailbox.make().receiveKey }
-        return DeviceCard(id: deviceID(for: data.contacts[i].persona), sendID: Mailbox.sendID(for: data.contacts[i].receiveKey!))
+        return DeviceCard(id: deviceID(for: data.contacts[i].persona), sendID: Mailbox.sendID(for: data.contacts[i].receiveKey!),
+                          vouch: data.contacts[i].persona == nil ? data.deviceVouch : nil)
     }
 
     /// Opens a session with one device, introducing this device at the same time.
@@ -5682,15 +6126,81 @@ final class AppModel {
     }
 
     /// Keeps an ask for keys that a newer one replaces: its answer may already be on the relay, waiting for this phone
-    /// to wake. Only a few, and none older than the relay keeps anything.
+    /// to wake. Only a few, and none older than `askLifetime`.
     private func keepEarlierAsk(_ ask: PendingHandshake, contact i: Int, device d: Int) {
         var asks = (data.contacts[i].devices[d].earlierAsks ?? []) + [ask]
-        asks.removeAll { Date().timeIntervalSince($0.startedAt) > Self.replayWindow }
+        asks.removeAll { Date().timeIntervalSince($0.startedAt) > Self.askLifetime }
         data.contacts[i].devices[d].earlierAsks = Array(asks.suffix(Self.earlierAsksKept))
     }
 
     /// How many asks for keys, before the current one, are still taken an answer for.
     static let earlierAsksKept = 3
+    /// How long the secret half of an unanswered ask for keys is kept: an answer that comes later can't be opened, and the
+    /// chat mends by asking again (see docs/protocol.md, section 2). A friend request waiting to be accepted keeps its
+    /// ask for `requestAskLifetime`, since nothing else can finish it.
+    static let askLifetime: TimeInterval = 8 * 86_400
+    static let requestAskLifetime: TimeInterval = replayWindow
+
+    /// Forgets handshake secrets past their time: asks older than `askLifetime` (a request's, `requestAskLifetime`), and
+    /// replaced spares past `spareGrace`. At unlock and with the rest of the upkeep, so they go on time even with the app
+    /// left open. A device left with no keys and no ask is asked again (or its spare taken) by `resumeKeyFetch`.
+    /// Old keys of skipped messages go the same way (`Ratchet.skippedLifetime`).
+    @discardableResult
+    func pruneHandshakeSecrets(now: Date = Date()) -> Bool {
+        var changed = false
+        for i in data.contacts.indices {
+            let life = data.contacts[i].awaitingAcceptance ? Self.requestAskLifetime : Self.askLifetime
+            for d in data.contacts[i].devices.indices {
+                let link = data.contacts[i].devices[d]
+                if let asks = link.earlierAsks, asks.contains(where: { now.timeIntervalSince($0.startedAt) > life }) {
+                    let kept = asks.filter { now.timeIntervalSince($0.startedAt) <= life }
+                    data.contacts[i].devices[d].earlierAsks = kept.isEmpty ? nil : kept
+                    changed = true
+                }
+                if let ask = link.handshake, now.timeIntervalSince(ask.startedAt) > life {
+                    changed = true
+                    data.contacts[i].devices[d].handshake = nil
+                    if link.session == nil && !data.contacts[i].awaitingAcceptance && !link.id.isEmpty {
+                        data.contacts[i].devices[d].needsKeys = true
+                    }
+                }
+                if let session = link.session, session.hasExpiredSkipped(now: now) {
+                    data.contacts[i].devices[d].session?.dropExpiredSkipped(now: now)
+                    changed = true
+                }
+            }
+            let grace = now.addingTimeInterval(-Self.spareGrace)
+            if data.contacts[i].oldSpares?.contains(where: { ($0.retiredAt ?? .distantPast) <= grace }) == true {
+                data.contacts[i].oldSpares?.removeAll { ($0.retiredAt ?? .distantPast) <= grace }
+                if data.contacts[i].oldSpares?.isEmpty == true { data.contacts[i].oldSpares = nil }
+                changed = true
+            }
+        }
+        return changed
+    }
+
+    /// When this device last opened fresh keys with a device because the post-quantum ratchet had stalled, by
+    /// `sessionKey`. Memory only: at most one such ask a day per device.
+    @ObservationIgnored private var pqRefreshedAt: [String: Date] = [:]
+
+    /// Opens fresh keys with any device whose session's post-quantum ratchet has stalled (`Ratchet.postQuantumStalled`):
+    /// the new handshake's root is post-quantum, as SPQR starts over when its epochs stop moving. The chat goes on on the
+    /// old keys until the answer comes.
+    private func refreshStalledPostQuantum() {
+        let now = Date()
+        for i in data.contacts.indices where !data.contacts[i].awaitingAcceptance {
+            for d in data.contacts[i].devices.indices {
+                let link = data.contacts[i].devices[d]
+                guard let session = link.session, session.canSend, session.postQuantumStalled, link.handshake == nil,
+                      link.awaitingHello != true, link.needsUpdate != true, link.unconfirmed != true,
+                      !isDormant(contact: i, device: d) else { continue }
+                let key = sessionKey(contact: i, device: d)
+                guard now.timeIntervalSince(pqRefreshedAt[key] ?? .distantPast) > 86_400, !sparesFetching.contains(key) else { continue }
+                pqRefreshedAt[key] = now
+                startHandshake(contact: i, device: d)
+            }
+        }
+    }
 
     /// Takes back an ask for keys still waiting in the outbox: it was answered already, through an earlier one.
     /// Whether it was: false when it has gone, or is going.
@@ -5784,7 +6294,7 @@ final class AppModel {
     /// Seals a payload to one of a contact's devices, as the persona that knows them, and queues it.
     private func seal(_ payload: Payload, contact i: Int, device d: Int, message: UUID? = nil, ephemeral: Bool = false,
                       collapse: String? = nil, resendOf: UUID? = nil, story: UUID? = nil, viewReport: UUID? = nil, rings: Bool = false, framed: Bool = false,
-                      wakes: Bool = false, toSendID: Data? = nil, toRelay: String?? = nil) {
+                      wakes: Bool = false, toSendID: Data? = nil, toRelay: String?? = nil, lane: String? = nil) {
         let c = data.contacts[i]
         guard c.devices.indices.contains(d), let me = me(c.persona) else { return }
         let blob: Data
@@ -5821,12 +6331,12 @@ final class AppModel {
         var asksToWake = wakes
         if case .request = payload { asksToWake = true }
         var outgoing = Outgoing(sendID: sendID, blob: blob, relay: toRelay ?? c.relay, message: message, ephemeral: ephemeral ? true : nil,
-                                story: story, viewReport: viewReport, lane: c.persona == nil ? nil : Outgoing.lane(for: c.persona), rings: rings ? true : nil,
+                                story: story, viewReport: viewReport, lane: lane ?? (c.persona == nil ? nil : Outgoing.lane(for: c.persona)), rings: rings ? true : nil,
                                 wakes: asksToWake ? true : nil)
         if introduces { outgoing.introduces = true }
-        // A signal is let go by the relay if it isn't collected soon, so a device that's away doesn't come back to a
-        // pile of "typing" and "I'm here"; the newest of a kind replaces the one before.
-        if ephemeral { outgoing.life = Self.signalLife }
+        // A signal carries no lifetime of its own (from build 22): one marked short-lived told the relay which deposits
+        // were typing or "I'm here" rather than messages. A device that's away still doesn't come back to a pile of them:
+        // the newest of a kind replaces the one before, and typing that arrives late is ignored (`isFreshSignal`).
         if let collapse {
             outgoing.collapse = Self.collapseTag(collapse, sendID: sendID, from: deviceID(for: c.persona))
             outgoing.collapseKind = collapse
@@ -5841,12 +6351,29 @@ final class AppModel {
             outgoing.recallHash = stamp.hash
         }
         data.outbox.append(outgoing)
+        #if DEBUG
+        sealTap?(outgoing)
+        #endif
         kick()
     }
 
-    /// How long the relay keeps a signal nobody collects: long enough to cross a slow Tor circuit, short enough that
-    /// it means something when it lands.
-    static let signalLife = 120
+    #if DEBUG
+    /// Tests: every envelope sealed for a contact, as it goes into the outbox.
+    @ObservationIgnored var sealTap: ((Outgoing) -> Void)?
+    #endif
+
+    /// How old a typing signal may be, from when it reached the relay, and still be shown: long enough to cross a slow
+    /// Tor circuit, short enough that it means something when it lands. ("I'm here" has its own, `presenceLife`.)
+    static let signalLife: TimeInterval = 20
+
+    /// Whether a signal that reached the relay at `deposited` (by this device's clock) is still worth showing. One
+    /// with no time (an older relay) counts as fresh. `deposited` is the relay's `age` taken from this device's `Date()`
+    /// when it was fetched (`RelayClient.fetch`), so it is compared with `Date()` too: `RelayClock.now` would count the
+    /// difference between the two clocks as time gone by.
+    static func isFreshSignal(deposited: Date?, now: Date = Date()) -> Bool {
+        guard let deposited else { return true }
+        return now.timeIntervalSince(deposited) <= signalLife
+    }
 
     /// How long one collapse tag lasts. A signal is only kept two minutes and a key request that crosses a boundary
     /// just leaves one extra copy (the receiver ignores a stale ask), so the tag can change often.
@@ -6159,7 +6686,7 @@ final class AppModel {
     }
 
     /// The part of `refreshHelper` that decides what the Keychain should hold (apart from where it runs), so tests reach it on
-    /// a Mac too. With the setting off (including every account saved before it was a choice, which counts as off), the bundle
+    /// macOS too. With the setting off (including every account saved before it was a choice, which counts as off), the bundle
     /// with the account's keys and the confirmed digests are removed, once what the helper had taken off the relay has been read.
     /// If they can't be removed, it is tried again on the next pass instead of being taken as done.
     func reconcileHelper() {
@@ -6343,6 +6870,11 @@ final class AppModel {
     /// When a contact answered this device's ask for new keys, by contact and device. Memory only.
     @ObservationIgnored private var keysAnsweredAt: [String: Date] = [:]
 
+    /// Device keys of contacts that came with a vouch from a device of theirs still trusted (`vouchKey`). Memory only.
+    @ObservationIgnored private var vouchedPins: Set<String> = []
+
+    /// The secrets of new devices' codes this device has sent the account to since it was opened. Memory only.
+
     /// One of a contact's devices by id. A device we only knew by its mailbox learns its id here.
     private func deviceIndex(_ i: Int, _ id: Data) -> Int? {
         if let d = data.contacts[i].devices.firstIndex(where: { $0.id == id }) { return d }
@@ -6356,7 +6888,7 @@ final class AppModel {
     }
 
     @discardableResult
-    private func upsertDevice(_ i: Int, id: Data, sendID: Data) -> Int {
+    private func upsertDevice(_ i: Int, id: Data, sendID: Data, vouched: Bool = false) -> Int {
         let isSelf = data.contacts[i].isSelf
         // Known by this very id before now (not an old slot without one that `deviceIndex` names now).
         let knownByID = !id.isEmpty && data.contacts[i].devices.contains { $0.id == id }
@@ -6364,9 +6896,9 @@ final class AppModel {
             // A device of a friend's that now reads another mailbox is as good as a new device (anyone with their account's
             // keys could claim its id): said in the chat, and held again if you ask before new devices.
             if !isSelf, knownByID, data.contacts[i].devices[d].sendID != sendID, !data.contacts[i].devices[d].sendID.isEmpty {
-                if holdsNewDevices(contact: i) { data.contacts[i].devices[d].unconfirmed = true }
-                noteNewDevice(of: data.contacts[i])
-                syncContact(data.contacts[i].fingerprint, data.contacts[i].persona)
+                let hold = holdsNewDevices(contact: i, vouched: vouched)
+                if hold { data.contacts[i].devices[d].unconfirmed = true }
+                noteNewDevice(of: data.contacts[i], held: hold)
             }
             data.contacts[i].devices[d].sendID = sendID
             return d
@@ -6383,12 +6915,11 @@ final class AppModel {
         // so say so where the person would see it (their chat, or the list of your own devices).
         let announce = !data.contacts[i].devices.isEmpty && !id.isEmpty
         var link = DeviceLink(id: id, sendID: sendID)
-        let hold = announce && !isSelf && holdsNewDevices(contact: i)
+        let hold = announce && !isSelf && holdsNewDevices(contact: i, vouched: vouched)
         if announce && (isSelf || hold) { link.unconfirmed = true }
         data.contacts[i].devices.append(link)
-        if announce && !isSelf { noteNewDevice(of: data.contacts[i]) }
+        if announce && !isSelf { noteNewDevice(of: data.contacts[i], held: hold) }
         // Your other devices hold it too.
-        if hold { syncContact(data.contacts[i].fingerprint, data.contacts[i].persona) }
         return data.contacts[i].devices.count - 1
     }
 
@@ -6400,9 +6931,23 @@ final class AppModel {
     /// How long an unlinked device's session is kept, only to read a removal the other way round from it.
     static let revokedSessionLife: TimeInterval = 30 * 24 * 3600
 
-    /// New devices of contact `i` wait until you allow them: you ask that for everyone, or two of theirs unlinked each other.
-    private func holdsNewDevices(contact i: Int) -> Bool {
-        data.security.holdNewDevices || data.contacts[i].contested != nil
+    /// New devices of contact `i` wait until you allow them: you ask that for everyone, two of theirs unlinked each other,
+    /// or their account unlinked a device and no device of theirs you still trust vouched for this one (`vouched`).
+    private func holdsNewDevices(contact i: Int, vouched: Bool = false) -> Bool {
+        data.security.holdNewDevices || data.contacts[i].contested != nil || (data.contacts[i].unlinked != nil && !vouched)
+    }
+
+    /// Whether `vouch` comes from a device of contact `i` this device still trusts (listed, allowed, with the keys pinned
+    /// for it, never unlinked), for their device `device` with keys `pin`.
+    private func vouchHolds(_ vouch: DeviceVouch, contact i: Int, device: Data, pin: Data) -> Bool {
+        guard let pq = accountPQ(contact: i), vouch.by != device,
+              let voucher = data.contacts[i].devices.first(where: { $0.id == vouch.by }), voucher.unconfirmed != true,
+              voucher.keyPin == vouch.card.pin, !isRevoked(contact: i, id: vouch.by, pin: vouch.card.pin) else { return false }
+        return vouch.checks(account: data.contacts[i].signingKey, accountPQ: pq, device: device, pin: pin)
+    }
+
+    private func vouchKey(contact i: Int, pin: Data) -> String {
+        "\(data.contacts[i].persona?.uuidString ?? "main")|\(data.contacts[i].fingerprint)|\(pin.hex)"
     }
 
     /// A device contact `i`'s account unlinked, by its id or by its keys.
@@ -6439,15 +6984,25 @@ final class AppModel {
     /// that device's keys (signed for by their account) could have opened, so this is their account and a device of
     /// theirs still on it. The devices are dropped and never taken back; they can only return with new device keys, as a
     /// new device. A device can't unlink itself this way (that's `deviceRemoved`).
-    private func devicesUnlinked(_ ids: [Data], by: Data, contact i: Int) {
-        guard !by.isEmpty, data.contacts[i].devices.contains(where: { $0.id == by }) else { return }
+    private func devicesUnlinked(_ ids: [Data], kept: [Data]? = nil, by: Data, contact i: Int) {
+        guard !by.isEmpty, data.contacts[i].devices.contains(where: { $0.id == by && $0.unconfirmed != true }) else { return }
         var dropped = 0
         for id in ids.prefix(Self.maxDevicesPerContact) where !id.isEmpty && id != by && !isRevoked(contact: i, id: id, pin: nil) {
             if data.contacts[i].devices.contains(where: { $0.id == id }) { dropped += 1 }
             revoke(id, pin: nil, by: by, contact: i)
         }
+        // From now on their new devices wait for a yes unless a device of theirs still trusted vouches for them
+        // (`DeviceVouch`): the device they unlinked still has the account's keys.
+        if ids.contains(where: { !$0.isEmpty && $0 != by }) { data.contacts[i].unlinked = Date() }
+        // Their devices the one that unlinked doesn't know of (added by the one taken out, say) wait for a yes too.
+        if let kept {
+            let known = Set(kept.prefix(Self.maxDevicesPerContact)).union([by])
+            for d in data.contacts[i].devices.indices where !data.contacts[i].devices[d].id.isEmpty
+                && !known.contains(data.contacts[i].devices[d].id) && data.contacts[i].devices[d].unconfirmed != true {
+                data.contacts[i].devices[d].unconfirmed = true
+            }
+        }
         if dropped > 0 { noteUnlinked(of: data.contacts[i]) }
-        syncContact(data.contacts[i].fingerprint, data.contacts[i].persona)
         save()
     }
 
@@ -6460,7 +7015,7 @@ final class AppModel {
               Date().timeIntervalSince(gone.at) < Self.revokedSessionLife,
               let plain = try? session.decrypt(message) else { return }
         data.contacts[i].revoked?[r].session = session
-        guard let inner = try? Payload.fromWire(plain), case let .devicesUnlinked(ids) = inner,
+        guard let inner = try? Payload.fromWire(plain), case let .devicesUnlinked(ids, _) = inner,
               let by = gone.by, ids.contains(by) else { return }
         revoke(by, pin: nil, by: gone.id, contact: i)
         for k in (data.contacts[i].revoked ?? []).indices { data.contacts[i].revoked?[k].session = nil }
@@ -6477,7 +7032,6 @@ final class AppModel {
                     date: Date()))
             }
         }
-        syncContact(contact.fingerprint, contact.persona)
         save()
     }
 
@@ -6492,13 +7046,12 @@ final class AppModel {
 
     /// A line in the chat with a contact whose account just added a device we hadn't seen. Their messages and ours
     /// reach it from now on, as with any device of theirs, which matters most when it isn't theirs.
-    private func noteNewDevice(of contact: Contact) {
+    private func noteNewDevice(of contact: Contact, held: Bool) {
         // A friend always has a chat to say it in, even one you haven't written in yet. Someone known only from a
         // group has none, and isn't told about.
         guard !contact.hidden, !contact.awaitingAcceptance else { return }
         let convo = startConversation(kind: .direct, title: "", members: [contact.fingerprint], persona: .some(contact.persona))
         guard let c = index(of: convo.id) else { return }
-        let held = data.security.holdNewDevices || contact.contested != nil
         data.conversations[c].messages.append(Message(sender: "system", text: "\(contact.displayName)'s account added a new device"
                                                       + (held ? ". Your messages wait until you allow it." : ""), date: Date()))
     }
@@ -6578,7 +7131,6 @@ final class AppModel {
         guard let i = contactIndex(fingerprint, persona), !data.contacts[i].isSelf else { return }
         for d in data.contacts[i].devices.indices where data.contacts[i].devices[d].unconfirmed == true { release(contact: i, device: d) }
         // Your other devices let it through too.
-        syncContact(fingerprint, persona)
         save()
     }
 
@@ -6597,16 +7149,6 @@ final class AppModel {
             data.contacts[c].devices[k].heldMail = again
         }
     }
-
-    /// Says the device that introduced itself as yours is yours, so the warning goes.
-    func confirmLinkedDevice(_ id: Data) {
-        guard let i = selfIndex, let d = data.contacts[i].devices.firstIndex(where: { $0.id == id }) else { return }
-        data.contacts[i].devices[d].unconfirmed = nil
-        save()
-    }
-
-    /// Devices of your own account that introduced themselves without this device approving them.
-    var unconfirmedDevices: [DeviceLink] { linkedDevices.filter { $0.unconfirmed == true } }
 
     /// Whether a hello was sent before the other device answered ours: the two started at once, ours won and theirs
     /// got here after our session was already open. Taking it would replace that session with one they no longer have
@@ -6740,18 +7282,7 @@ final class AppModel {
             nextAnnouncementCheck = Date().addingTimeInterval(60)
             Task { await refreshAnnouncements(waiting: false) }
         }
-        #if os(macOS)
-        if Date() >= nextUpdateCheck, Updater.enabled, let client = client(nil, lane: "update") {
-            nextUpdateCheck = Date().addingTimeInterval(6 * 3600)
-            Task { await Updater.shared.check(client) }
-        }
-        #endif
     }
-
-    #if os(macOS)
-    /// The first check waits a minute after launch, so it doesn't compete with getting connected.
-    private var nextUpdateCheck = Date().addingTimeInterval(60)
-    #endif
 
     private func startSync() {
         syncTask?.cancel()
@@ -6792,41 +7323,107 @@ final class AppModel {
     private var polling: Set<Lane> = []
     /// Mailboxes being fetched right now, so two fetches never collect (and handle) the same envelope.
     private var fetching: Set<Data> = []
-    /// The last time something was sent, to keep the sending lane's circuit from going cold.
-    private var lastSent: [String: Date] = [:]
+    /// Which circuit each sending lane is on now (`SendLanes`). Memory only.
+    @ObservationIgnored private var sendLanes = SendLanes()
 
     /// Mailboxes grouped by relay and by who they belong to. Each persona, each public profile's request
     /// mailbox and the reports mailbox is its own lane, so the relay can't tell from one request that
-    /// they're the same person.
-    private func currentLanes() -> [Lane: Set<Data>] {
+    /// they're the same person. Over Tor a persona's one-to-one mailboxes are spread over a few lanes, and every shared
+    /// group is read on its own (see `Lanes`).
+    func currentLanes() -> [Lane: Set<Data>] {
         func name(_ persona: UUID?) -> String { persona?.uuidString ?? "main" }
+        let split = isolatesLanes
+        let salt = laneSalt
+        func fetchLane(_ persona: UUID?, _ key: Data) -> String {
+            split ? Lanes.fetchLane(persona: persona, bucket: Lanes.bucket(of: key, salt: salt)) : name(persona)
+        }
         var lanes: [Lane: Set<Data>] = [Lane(relay: nil, name: "main"): []]
-        for c in data.contacts { if let key = c.receiveKey { lanes[Lane(relay: c.relay, name: name(c.persona)), default: []].insert(key) } }
+        for c in data.contacts { for key in Self.mailboxes(of: c) { lanes[Lane(relay: c.relay, name: fetchLane(c.persona, key)), default: []].insert(key) } }
         for invite in data.invites {
-            let lane = invite.isPublic ? "public-" + name(invite.persona) : name(invite.persona)
+            let lane = invite.isPublic ? "public-" + name(invite.persona) : fetchLane(invite.persona, invite.receiveKey)
             lanes[Lane(relay: invite.relay, name: lane), default: []].insert(invite.receiveKey)
         }
-        for offer in data.linkOffers { lanes[Lane(relay: nil, name: "link"), default: []].insert(offer.receiveKey) }
-        // A persona whose only mail is in shared groups still needs its lane: the group mailboxes ride along on it.
-        for convo in data.conversations where convo.shared.map({ !$0.gone }) == true {
-            let lane = Lane(relay: nil, name: name(convo.persona))
+        // Shared groups are read on lanes of their own over Tor; otherwise they ride along on their persona's lane, which
+        // a persona whose only mail is in groups still needs.
+        let groups = liveGroups
+        for convo in groups {
+            let lane = Lane(relay: nil, name: groupLane(convo, among: groups.count))
             if lanes[lane] == nil { lanes[lane] = [] }
         }
         return lanes
     }
 
-    /// One lane's loop: check, wait a random moment, check again, until the lane goes away or Pulshade locks.
+    /// Shared groups still in use on this device.
+    private var liveGroups: [Conversation] { data.conversations.filter { $0.shared.map { !$0.gone } == true } }
+
+    /// The lane a shared group is read on: over Tor, its own while there are at most `Lanes.maxGroupLanes`, otherwise one
+    /// of that many shared only with other groups; over a direct connection, its persona's.
+    func groupLane(_ convo: Conversation, among count: Int) -> String {
+        guard isolatesLanes else { return convo.persona?.uuidString ?? "main" }
+        guard count > Lanes.maxGroupLanes else { return "group|" + convo.id.uuidString }
+        return "groups/" + String(Lanes.bucket(of: Data(convo.id.uuidString.utf8), salt: laneSalt, count: Lanes.maxGroupLanes))
+    }
+
+    /// Whether traffic is spread over separate lanes (`Lanes`). Over Tor each lane is a circuit of its own; over a direct
+    /// connection they all come from one address, so spreading buys nothing and only uses up the relay's allowance of
+    /// waiting fetches for that address.
+    var isolatesLanes: Bool {
+        #if DEBUG
+        if isolateLanesForTests { return true }
+        #endif
+        return reachable(nil).flatMap(URL.init(string:)).map(Tor.uses) ?? false
+    }
+    #if DEBUG
+    /// Tests run without Tor: this has them use the lanes Tor would.
+    @ObservationIgnored var isolateLanesForTests = false
+    #endif
+
+    /// Which of a persona's fetch lanes each mailbox goes on: made from the account's seed, so every device of the account
+    /// (and the account restored) spreads them the same way, and the relay never sees one mailbox read beside different
+    /// others. Without an identity, nothing is fetched anyway.
+    private var laneSalt: Data {
+        guard let seed = identity?.seed else { return Data(count: 32) }
+        return Data(HMAC<SHA256>.authenticationCode(for: Data("pulshade.lanes.v1".utf8), using: SymmetricKey(data: seed)))
+    }
+
+    /// One lane's loop: check, wait a random moment, check again, until the lane goes away or Pulshade locks. A lane that
+    /// goes away (a group left, say) lets go of its connections.
     private func pollLane(_ lane: Lane) async {
-        defer { polling.remove(lane) }
+        defer {
+            polling.remove(lane)
+            if currentLanes()[lane] == nil { RelayClient.retire(lane: lane.name) }
+        }
         let owner = identity?.fingerprint
-        try? await Task.sleep(for: .milliseconds(Int.random(in: 0...2000)))
+        // The first check waits its turn too (see `staggerLanes`): main at once, the rest each at their own moment.
+        if trafficShaping, laneResumeAt[lane] == nil { laneResumeAt[lane] = Date().addingTimeInterval(resumeDelay(lane, urgent: false)) }
         while !Task.isCancelled, phase == .unlocked, identity?.fingerprint == owner {
+            if let at = laneResumeAt[lane], at > Date() {
+                try? await Task.sleep(for: .seconds(min(at.timeIntervalSinceNow, 60)))
+                continue
+            }
             guard let keys = currentLanes()[lane] else { return }
             let waited = await poll(lane, keys: keys)
             // A fetch that waited on the relay already spent its time there: go straight back, with a moment's
             // jitter. One that didn't (an older relay, an error, an empty lane) waits its turn as before.
             try? await Task.sleep(for: .seconds(waited ? Double.random(in: 0.1...0.6) : Double.random(in: 1.5...3)))
         }
+    }
+
+    /// When each lane may next ask the relay, after a reconnect. Memory only.
+    @ObservationIgnored private var laneResumeAt: [Lane: Date] = [:]
+
+    private func resumeDelay(_ lane: Lane, urgent: Bool) -> TimeInterval {
+        let mainPersona = lane.name == "main" || lane.name.hasPrefix("main/")
+        return Lanes.resumeDelay(lane: lane.name, mainPersona: mainPersona, urgent: urgent)
+    }
+
+    /// After coming back to the front, a refresh or an unlock: each lane starts again at its own random moment rather
+    /// than all in the same second, which would show the relay they're one phone's. `urgent` (a wake-up push, waiting
+    /// for its message) keeps the spread to a few seconds.
+    private func staggerLanes(urgent: Bool = false) {
+        guard trafficShaping else { return }
+        let now = Date()
+        laneResumeAt = Dictionary(uniqueKeysWithValues: currentLanes().keys.map { ($0, now.addingTimeInterval(resumeDelay($0, urgent: urgent))) })
     }
 
     /// How long a lane's fetch asks the relay to wait for mail. Tests use plain checks, at a steady beat.
@@ -6926,21 +7523,26 @@ final class AppModel {
         }
     }
 
-    /// Sending, retries and receipts, every couple of seconds. Also keeps the sending lane's circuit warm, so
-    /// pressing send doesn't wait for Tor to build one.
+    /// Sending, retries and receipts, every couple of seconds.
     private func housekeep() async {
         drainHelperInbox()
         tendSharedGroups()
         tendJoinLinks()
+        tendPublicNamesNow()
         tendStoryUpload()
         refreshPush()
         watchTor()
         watchStall()
+        if pruneHandshakeSecrets() { save() }
         resumeKeyFetch()
         retryStaleHandshakes()
         retryUnreadable()
         nudgeStuckDevices()
+        refreshStalledPostQuantum()
         tendSpares()
+        tendBlobSpends()
+        tendMailboxMoves()
+        tendMailboxes()
         // Held follows whose person's keys came some other way (another of your devices, say).
         for c in data.contacts where c.followLater != nil && c.pq != nil { sendFollowsLater(c.fingerprint, persona: c.persona) }
         // An app left open for days would otherwise keep every envelope digest it ever saw. Only assign when
@@ -6979,17 +7581,9 @@ final class AppModel {
         // A long upload mustn't hold up everything else housekeeping does, so sending runs on its own; the tests
         // send and then look, so there it is waited for.
         if trafficShaping { Task { await flush() } } else { await flush() }
-        if trafficShaping {
-            // Each sending lane that's been used lately is kept warm on its own, so no two personas share a connection.
-            // The main persona's lane is always kept warm; another's only while it's being used.
-            lastSent = lastSent.filter { $0.key == Outgoing.lane(for: nil) || Date().timeIntervalSince($0.value) < 600 }
-            if lastSent[Outgoing.lane(for: nil)] == nil { lastSent[Outgoing.lane(for: nil)] = .distantPast }
-            for (lane, at) in lastSent where Date().timeIntervalSince(at) > 45 {
-                guard let client = client(nil, lane: lane) else { continue }
-                lastSent[lane] = Date()
-                Task { _ = await client.health() }
-            }
-        }
+        // Sending lanes are not kept warm (a lane pinged every minute links everything sent on it, burst to burst): one
+        // that has gone quiet is let go of, and the next send builds a fresh one (`SendLanes`).
+        for lane in sendLanes.takeIdle() { RelayClient.retire(lane: lane) }
     }
 
     // MARK: Connection health
@@ -7068,7 +7662,7 @@ final class AppModel {
         let toSnowflake = !Bridges.autoUsesSnowflake
         Task.detached(priority: .userInitiated) { [weak self] in
             Bridges.switchAuto(toSnowflake: toSnowflake)
-            await MainActor.run { if let self, self.phase == .unlocked { Task { await self.syncOnce() } } }
+            await MainActor.run { if let self, self.phase == .unlocked { self.resync() } }
         }
     }
 
@@ -7096,7 +7690,7 @@ final class AppModel {
                     Tor.wake()
                     await MainActor.run {
                         RelayClient.closeAll()
-                        if self.phase == .unlocked { Task { await self.syncOnce() } }
+                        if self.phase == .unlocked { self.resync() }
                     }
                 }
             }
@@ -7158,7 +7752,13 @@ final class AppModel {
         let reached = await Self.reach(client)
         if !reached { lastRelayContact = .distantPast }
         noteRelay(reached: reached)
-        if reached { Task { await syncOnce() } }
+        if reached { resync() }
+    }
+
+    /// Everything checked again: each lane at its own moment (`staggerLanes`), the main one at once. In tests, which have
+    /// no lanes running on their own, one full round.
+    private func resync(urgent: Bool = false) {
+        if trafficShaping { staggerLanes(urgent: urgent) } else { Task { await syncOnce() } }
     }
 
     /// The check the app makes by itself. Gentler: a connection busy with a big upload answers slowly, which isn't
@@ -7208,8 +7808,11 @@ final class AppModel {
 
     /// What the relay was last told about this phone's push, so it's only told again when something changed. Dropped
     /// at lock: it holds this account's mailbox keys, which a decoy or another account must never see or act on.
-    private var pushTold: (token: String, keys: Set<Data>, sound: Bool, tone: MessageTone, voip: String?, at: Date)?
+    /// `parts` are the requests they went in (`pushParts`), so what's taken off later goes in the same company.
+    private var pushTold: (token: String, keys: Set<Data>, parts: [Set<Data>], sound: Bool, tone: MessageTone, voip: String?, at: Date)?
     private var pushBusy = false
+    /// After a registration didn't go through, nothing more is asked of the relay before this (`pushRetryWait`).
+    private var pushRetryAt: Date?
     /// Where push stands, in words, for Settings: off, waiting for Apple, refused by the relay, or registered.
     private(set) var pushStatus = ""
     /// Asked Apple for a token this launch, so it isn't asked again every couple of seconds.
@@ -7220,23 +7823,66 @@ final class AppModel {
 
     /// The mailboxes wake-ups cover: the main identity's, without those of people you've blocked or whose chat you've
     /// muted. Anyone who knows a mailbox can write to it, so a banner for it would otherwise be theirs to ring.
-    private func pushKeys() -> Set<Data> {
-        var keys = currentLanes()[Lane(relay: nil, name: "main")] ?? []
+    func pushKeys() -> Set<Data> { Set(pushParts().flatMap { $0 }) }
+
+    /// The same mailboxes, in the parts they're registered in, each with a request of its own on a connection of its own
+    /// (`refreshPush`): your @handle's request mailbox, your one-to-one mailboxes spread as they are for fetching
+    /// (`Lanes.bucket`), and each shared group on its own. So no one request names everything this phone is woken for.
+    /// (The relay still holds one token for them all: see docs/push-notifications.md.)
+    /// Only where lanes are kept apart (`isolatesLanes`, over Tor). Over a direct connection every request comes from the
+    /// same address, so splitting hides nothing, and a part per group soon used up the relay's 60 wake-up requests an hour
+    /// for that address (renewed every 15 minutes): there it is one part, sent 256 mailboxes at a time as before build 22.
+    func pushParts() -> [Set<Data>] {
+        var parts: [Set<Data>] = []
         // Friend requests arrive at the public mailbox of your @handle, which has a lane of its own so the relay can't
-        // tell it belongs to the same person. Waking the phone for one puts it under the same push token as the rest,
-        // so it's only done when chosen.
-        if data.security.pushRequests { keys.formUnion(currentLanes()[Lane(relay: nil, name: "public-main")] ?? []) }
-        for c in data.contacts where c.persona == nil {
-            guard let key = c.receiveKey else { continue }
-            let muted = data.conversations.contains { $0.kind == .direct && $0.persona == nil && $0.members == [c.fingerprint] && $0.muted }
-            if muted || data.blocked.contains(c.fingerprint) { keys.remove(key) }
+        // tell it belongs to the same person.
+        if data.security.pushRequests {
+            let handle = Set(data.invites.filter { $0.isPublic && $0.persona == nil && $0.relay == nil }.map(\.receiveKey))
+            if !handle.isEmpty { parts.append(handle) }
         }
+        var direct: [Int: Set<Data>] = [:]
+        let salt = laneSalt
+        for c in data.contacts where c.persona == nil && c.relay == nil {
+            let muted = data.conversations.contains { $0.kind == .direct && $0.persona == nil && $0.members == [c.fingerprint] && $0.muted }
+            if muted || data.blocked.contains(c.fingerprint) { continue }
+            for key in Self.mailboxes(of: c) { direct[Lanes.bucket(of: key, salt: salt), default: []].insert(key) }
+        }
+        for invite in data.invites where !invite.isPublic && invite.persona == nil && invite.relay == nil {
+            direct[Lanes.bucket(of: invite.receiveKey, salt: salt), default: []].insert(invite.receiveKey)
+        }
+        parts += direct.keys.sorted().compactMap { direct[$0] }
         // Shared groups wake the phone through their current mailbox, unless muted.
         for convo in data.conversations where convo.persona == nil && !convo.muted {
-            if let shared = convo.shared, !shared.gone, let epoch = shared.current { keys.insert(epoch.receiveKey) }
+            if let shared = convo.shared, !shared.gone, let epoch = shared.current { parts.append([epoch.receiveKey]) }
         }
-        return keys
+        parts = parts.filter { !$0.isEmpty }
+        guard isolatesLanes else {
+            let all = parts.reduce(into: Set<Data>()) { $0.formUnion($1) }
+            return all.isEmpty ? [] : [all]
+        }
+        return parts
     }
+
+    /// The requests that take mailboxes no longer covered (`keys`) off the relay: those of each part they were registered
+    /// in go together, 256 at a time, since that request named them together anyway. (One request per mailbox used up the
+    /// relay's allowance as quickly as the parts did.)
+    static func pushRemovals(told parts: [Set<Data>], keys: Set<Data>) -> [[Data]] {
+        parts.flatMap { part -> [[Data]] in
+            let gone = part.subtracting(keys).sorted { $0.hex < $1.hex }
+            return stride(from: 0, to: gone.count, by: 256).map { Array(gone[$0..<min($0 + 256, gone.count)]) }
+        }
+    }
+
+    /// How long to leave the relay alone after a registration didn't go through. Refused (over its 60 an hour, say): 15
+    /// to 60 minutes, at random; trying again at every turn of the upkeep, every couple of seconds, only kept it over.
+    /// Not reached at all, nothing was counted, so sooner: 1 to 5 minutes. A registration still in place lasts days on the
+    /// relay, so a wait costs no wake-ups.
+    static func pushRetryWait(refused: Bool) -> TimeInterval {
+        refused ? .random(in: 900...3600) : .random(in: 60...300)
+    }
+
+    /// The pause between wake-up registrations' parts.
+    static let pushPartGap: ClosedRange<Double> = 1...20
 
     /// Whether this phone should be woken through Apple when mail lands.
     private var pushWanted: Bool { data.security.pushWake && data.security.notifications }
@@ -7273,44 +7919,67 @@ final class AppModel {
                 return
             }
             guard !keys.isEmpty else { pushStatus = "No mailboxes to register yet"; return }
+            if let wait = pushRetryAt, Date() < wait { return }
             let sound = data.security.notificationSound
             let tone = data.security.messageTone
             let voip = CallRinger.voipToken
             if let told = pushTold, told.token == token, told.keys == keys, told.sound == sound, told.tone == tone, told.voip == voip,
                Date().timeIntervalSince(told.at) < 15 * 60 { return }
             // Mailboxes registered before and not now (a contact blocked or muted since) are taken off the relay.
-            let stale = Array((pushTold?.keys ?? []).subtracting(keys))
+            let removals = Self.pushRemovals(told: pushTold?.parts ?? [], keys: keys)
+            let registered = pushParts()
+            let parts = registered.shuffled()
+            let shaping = trafficShaping
             pushBusy = true
             Task {
                 defer { pushBusy = false }
                 // The relay forgets registrations when it restarts and can't say so, so they're renewed every 15 minutes.
-                guard let client = client(nil, lane: "push"), await client.pushEnabled() else {
+                let check = Lanes.once("push")
+                defer { RelayClient.retire(lane: check) }
+                guard let client = client(nil, lane: check), await client.pushEnabled() else {
                     pushStatus = "The server isn't set up for wake-ups"
+                    pushRetryAt = Date().addingTimeInterval(Self.pushRetryWait(refused: false))
                     return
                 }
-                // A phone's mailboxes go in a few calls; the relay takes 256 at a time.
-                let all = keys.sorted { $0.hex < $1.hex }
+                // Each part in a request of its own, on a connection of its own, at its own moment (`pushParts`); the
+                // relay takes 256 mailboxes at a time.
                 var ok = true
-                for start in stride(from: 0, to: all.count, by: 256) {
-                    let chunk = Array(all[start..<min(start + 256, all.count)])
-                    do {
-                        try await client.registerPush(keys: chunk, token: token, sandbox: Push.sandbox, sound: sound, tone: tone, voip: voip)
-                    } catch {
-                        ok = false
-                        pushStatus = (error as? PushRefused).map { "The server refused the registration (\($0.status))" } ?? "Couldn't reach the server to register"
-                        break
+                for (n, part) in parts.enumerated() {
+                    if n > 0, shaping { try? await Task.sleep(for: .seconds(Double.random(in: Self.pushPartGap))) }
+                    let lane = Lanes.once("push")
+                    defer { RelayClient.retire(lane: lane) }
+                    guard let client = self.client(nil, lane: lane) else { ok = false; break }
+                    let all = part.sorted { $0.hex < $1.hex }
+                    for start in stride(from: 0, to: all.count, by: 256) {
+                        do {
+                            try await client.registerPush(keys: Array(all[start..<min(start + 256, all.count)]), token: token,
+                                                          sandbox: Push.sandbox, sound: sound, tone: tone, voip: voip)
+                        } catch {
+                            ok = false
+                            let refused = error as? PushRefused
+                            let retry = Date().addingTimeInterval(Self.pushRetryWait(refused: refused != nil))
+                            pushRetryAt = retry
+                            let when = "trying again at \(retry.formatted(date: .omitted, time: .shortened))"
+                            pushStatus = refused.map { "The server refused the registration (\($0.status)), \(when)" } ?? "Couldn't reach the server to register, \(when)"
+                            break
+                        }
                     }
+                    if !ok { break }
                 }
                 if ok {
-                    for start in stride(from: 0, to: stale.count, by: 256) {
-                        try? await client.unregisterPush(keys: Array(stale[start..<min(start + 256, stale.count)]))
+                    pushRetryAt = nil
+                    for batch in removals {
+                        let lane = Lanes.once("push")
+                        try? await self.client(nil, lane: lane)?.unregisterPush(keys: batch, token: token)
+                        RelayClient.retire(lane: lane)
                     }
-                    pushTold = (token, keys, sound, tone, voip, Date())
-                    pushStatus = "Registered \(keys.count) mailbox\(keys.count == 1 ? "" : "es") at \(Date().formatted(date: .omitted, time: .shortened)), token ending \(token.suffix(4))"
+                    pushTold = (token, keys, registered, sound, tone, voip, Date())
+                    pushStatus = "Registered \(keys.count) mailbox\(keys.count == 1 ? "" : "es") in \(parts.count) part\(parts.count == 1 ? "" : "s") at \(Date().formatted(date: .omitted, time: .shortened)), token ending \(token.suffix(4))"
                 }
             }
         } else {
             let forgotten = keys.union(pushTold?.keys ?? [])
+            let told = pushTold?.token ?? Push.token
             pushTold = nil
             pushAsked = false
             UIApplication.shared.unregisterForRemoteNotifications()
@@ -7320,7 +7989,7 @@ final class AppModel {
                 defer { pushBusy = false }
                 let all = Array(forgotten)
                 for start in stride(from: 0, to: all.count, by: 256) {
-                    try? await client(nil, lane: "push")?.unregisterPush(keys: Array(all[start..<min(start + 256, all.count)]))
+                    try? await client(nil, lane: "push")?.unregisterPush(keys: Array(all[start..<min(start + 256, all.count)]), token: told)
                 }
             }
         }
@@ -7399,10 +8068,10 @@ final class AppModel {
         // for the same person (the ratchet reads them in either order). Big ones share one connection, so more than
         // a couple at once only makes each slower, and slow enough to time out; short ones are tiny and always
         // get through.
-        func pick() -> (item: Outgoing, client: RelayClient, lane: String)? {
+        func pick() -> (item: Outgoing, lane: String)? {
             guard !aborted else { return nil }
             let now = Date()
-            var best: (item: Outgoing, client: RelayClient, lane: String)?
+            var best: (item: Outgoing, lane: String)?
             var seenSmall: Set<Data> = [], seenBig: Set<Data> = []
             for item in data.outbox where !tried.contains(item.id) && !sendingIDs.contains(item.id) {
                 let relay = item.relay ?? data.relay
@@ -7421,10 +8090,10 @@ final class AppModel {
                     guard !seenSmall.contains(item.sendID), !sendingSmallMail.contains(item.sendID) else { continue }
                     seenSmall.insert(item.sendID)
                 }
-                guard let client = client(item.relay, lane: lane) else { continue }
+                guard reachable(item.relay) != nil else { continue }
                 // A lane without a working route finds one first, once: not for every item that's waiting.
-                if Tor.uses(client.base), !client.isEstablished, routeFinding.contains(lane) { continue }
-                if best == nil || item.weight < best!.item.weight { best = (item, client, lane) }
+                if routeFinding.contains(lane) { continue }
+                if best == nil || item.weight < best!.item.weight { best = (item, lane) }
             }
             guard let best else { return nil }
             let big = best.item.isBulk
@@ -7433,11 +8102,19 @@ final class AppModel {
             return best
         }
 
-        await withTaskGroup(of: (Outgoing, String, Error?).self) { group in
+        await withTaskGroup(of: (Outgoing, String, String, Error?).self) { group in
             var running = 0
             while true {
                 while let next = pick() {
-                    let item = next.item, client = next.client, lane = next.lane
+                    let item = next.item, lane = next.lane
+                    // The circuit for this lane now: a fresh one after a quiet spell (`SendLanes`). A lane used once
+                    // (a receipt) is already fresh, and is let go of as soon as it's done.
+                    let once = lane.hasPrefix(Lanes.oncePrefix)
+                    let current = once ? (name: lane, retired: nil) : sendLanes.current(lane)
+                    if let retired = current.retired { RelayClient.retire(lane: retired) }
+                    guard let client = client(item.relay, lane: current.name) else { tried.insert(item.id); continue }
+                    if !once { sendLanes.note(current.name, busy: 1) }
+                    let sentOn = current.name
                     let findsRoute = Tor.uses(client.base) && !client.isEstablished
                     if findsRoute { routeFinding.insert(lane) }
                     tried.insert(item.id)
@@ -7456,12 +8133,13 @@ final class AppModel {
                             try await client.deposit(item.blob, to: item.sendID, wake: item.message != nil || item.rings == true || item.wakes == true, ring: item.rings == true,
                                                      recall: item.recallN.flatMap { n in item.recallHash.map { (n, $0) } },
                                                      life: item.life, collapse: item.collapse)
-                            return (item, lane, nil)
-                        } catch { return (item, lane, error) }
+                            return (item, lane, sentOn, nil)
+                        } catch { return (item, lane, sentOn, error) }
                     }
                 }
-                guard running > 0, let (item, lane, error) = await group.next() else { break }
+                guard running > 0, let (item, lane, sentOn, error) = await group.next() else { break }
                 running -= 1
+                if lane.hasPrefix(Lanes.oncePrefix) { RelayClient.retire(lane: sentOn) } else { sendLanes.note(sentOn, busy: -1) }
                 routeFinding.remove(lane)
                 sendingIDs.remove(item.id)
                 if sendingBig.remove(item.id) != nil { sendingBigMail.remove(item.sendID) } else { sendingSmallMail.remove(item.sendID) }
@@ -7509,7 +8187,6 @@ final class AppModel {
                         mailboxBackoff[item.sendID] = nil
                     }
                 } else {
-                    if !lane.hasSuffix(Self.bulkSuffix) { lastSent[lane] = Date() }
                     lastDepositOK = Date()
                     data.outbox.removeAll { $0.id == item.id }
                     mailboxBackoff[item.sendID] = nil
@@ -7594,7 +8271,7 @@ final class AppModel {
 
     /// Which persona reads a mailbox: the one whose contact or invite owns it.
     private func persona(forMailbox receiveKey: Data) -> UUID?? {
-        if let c = data.contacts.first(where: { $0.receiveKey == receiveKey }) { return .some(c.persona) }
+        if let c = data.contacts.first(where: { Self.mailboxes(of: $0).contains(receiveKey) }) { return .some(c.persona) }
         if let invite = data.invites.first(where: { $0.receiveKey == receiveKey }) { return .some(invite.persona) }
         return nil
     }
@@ -7636,7 +8313,6 @@ final class AppModel {
         deposited = envelope.deposited
         // A logged-in device no longer shows a code for new devices to answer (someone filming both screens could
         // answer it with digits ground to match): it only scans theirs. Nothing that lands on a link mailbox is a request.
-        if data.linkOffers.contains(where: { $0.receiveKey == envelope.receiveKey }) { return .handled }
         guard let persona = persona(forMailbox: envelope.receiveKey), let me = me(persona) else { return .junk }
         let opened: Envelope.Opened
         do {
@@ -7664,7 +8340,6 @@ final class AppModel {
                 data.contacts[known].pq = pin
                 // What was waiting for their keys goes now, and your other devices are told them.
                 sendPending(contact: known)
-                syncContact(fp, persona)
                 sendFollowsLater(fp, persona: persona)
             }
             if opened.postQuantum, data.contacts[known].pqCardSent != true { data.contacts[known].pqCardSent = true }
@@ -7726,10 +8401,13 @@ final class AppModel {
                   contact(fp, in: invite.persona)?.pq == nil || contact(fp, in: invite.persona)?.pq == pin,
                   pinMatchesInvite(pin, contact: contact(fp, in: invite.persona)),
                   let mine = self.me(invite.persona),
-                  Handshake.devicePin(of: request, HandshakeParties(from: signer, to: mine.card.signing, device: device), accountPQ: pin,
-                                      context: .hello) != nil
+                  let helloPin = Handshake.devicePin(of: request, HandshakeParties(from: signer, to: mine.card.signing, device: device),
+                                                     accountPQ: pin, context: .hello)
             else { return .junk }
             markSeen()
+            // A device their account unlinked gets nothing by saying hello on a code (a friend's follow included, which
+            // otherwise changes nothing about them and only lets them in).
+            if let i = contactIndex(fp, invite.persona), isRevoked(contact: i, id: device, pin: helloPin) { return .junk }
             acceptHello(card, request, fingerprint: fp, device: device, via: invite, pq: pin, sentAt: opened.sentAt)
             noteReads(opened, from: fp, persona: invite.persona)
             // Following through a channel's code: invited into its mailbox now that their app's abilities are known (when
@@ -7783,10 +8461,6 @@ final class AppModel {
                 // Anyone who knows a username can send requests from throwaway keys: the oldest make way.
                 if data.requests.count > Self.maxRequests { data.requests.removeLast(data.requests.count - Self.maxRequests) }
             }
-            sync(.requestReceived(incoming))
-            #if os(macOS)
-            DemoContact.shared.requestArrived(incoming.id, model: self)
-            #endif
             if data.security.notifications {
                 Notifier.shared.post(("PULSHADE", "New friend request"), conversation: incoming.id, sound: data.security.notificationSound)
             }
@@ -7816,7 +8490,17 @@ final class AppModel {
             // Its own keys must sign it, under a card its account signed for this id: anything else isn't taken.
             guard card.id == device, !device.isEmpty, let pin = askerPin(request, contact: i, device: device, context: .device),
                   !isRevoked(contact: i, id: device, pin: pin) else { return .junk }
-            let d = upsertDevice(i, id: card.id, sendID: card.sendID)
+            // Vouched for by a device of theirs still trusted: not held for want of one (`holdsNewDevices`).
+            let vouched = !data.contacts[i].isSelf && card.vouch.map { vouchHolds($0, contact: i, device: device, pin: pin) } == true
+            if vouched { vouchedPins.insert(vouchKey(contact: i, pin: pin)) }
+            let d = upsertDevice(i, id: card.id, sendID: card.sendID, vouched: vouched)
+            // Held only because their account unlinked a device, and now vouched for with the keys it was held under. A hold
+            // for any other reason (you ask before new devices, on this device or another of yours) isn't a vouch's to lift.
+            if vouched, data.contacts[i].unlinked != nil, data.contacts[i].devices[d].unconfirmed == true,
+               !holdsNewDevices(contact: i, vouched: true),
+               data.contacts[i].devices[d].keyPin == nil || data.contacts[i].devices[d].keyPin == pin {
+                release(contact: i, device: d)
+            }
             // The same hello again (a relay redelivery) must not replace the session it already opened.
             if data.contacts[i].devices[d].session != nil && data.contacts[i].devices[d].acceptedHello == request.ephemeral {
                 return .handled
@@ -7887,7 +8571,10 @@ final class AppModel {
                     return .handled
                 }
             }
-            data.contacts[i].devices[d].earlierAsks?.removeAll { $0.publicEphemeral == answer.replyTo }
+            // The session is open: the ask it answers and every ask older than it are of no more use (while these keys work,
+            // an answer to one is refused as older than them), so their secret halves go now. One made after it stays, in case
+            // they answered that too and move to it.
+            data.contacts[i].devices[d].earlierAsks?.removeAll { $0.publicEphemeral == answer.replyTo || $0.startedAt <= pending.startedAt }
             if data.contacts[i].devices[d].earlierAsks?.isEmpty == true { data.contacts[i].devices[d].earlierAsks = nil }
             // What they wrote on the keys this replaces, still on its way, stays readable for now.
             if let old = link.session { keepRecovered(old, sessionKey(contact: i, device: d)) }
@@ -7924,17 +8611,20 @@ final class AppModel {
             // An answer to the last-resort spare that was taken already (sent again, by the relay or anyone): finishing
             // it a second time would put the chat back on keys it has moved on from.
             if let used, used.place.reusable, used.answers?.contains(answer.ephemeral) == true { return .handled }
-            let d = upsertDevice(i, id: card.id, sendID: card.sendID)
             guard let used, let theirPin,
                   let session = try? Handshake.complete(used.handshake, answer, me: me, responderAgreement: data.contacts[i].agreementKey,
                                                         responderPin: theirPin) else {
                 // A spare this device no longer has (it was used already, or the account was recovered from a backup
-                // older than it): what they write on it can't be read here. Ask them for new keys instead, and expect
-                // what they already wrote on it to be unreadable for a while, without asking again over each one.
+                // older than it): what they write on it can't be read here. Nothing in it was checked against a device's
+                // keys, so it adds no device and moves none to another mailbox: only a device already known by this very
+                // id is asked for new keys, at the mailbox it already has (its ask is checked as usual). Expect what they
+                // already wrote on it to be unreadable for a while, without asking again over each one.
+                guard let d = data.contacts[i].devices.firstIndex(where: { $0.id == card.id }) else { return .junk }
                 deadSpareFrom[sessionKey(contact: i, device: d)] = Date()
                 if data.contacts[i].devices[d].handshake == nil { startHandshake(contact: i, device: d) }
                 return .handled
             }
+            let d = upsertDevice(i, id: card.id, sendID: card.sendID)
             pinDeviceKey(theirPin, contact: i, device: d)
             if used.place.reusable {
                 // The last-resort spare stays for anyone else who needs it, until it's replaced; this answer is noted.
@@ -8023,6 +8713,7 @@ final class AppModel {
             if var session = data.contacts[i].devices[d].session, let opened = try? session.decrypt(message) {
                 data.contacts[i].devices[d].session = session
                 heard(contact: i, device: d)
+                noteMailboxHeard(envelope.receiveKey, contact: i, device: d)
                 // They're on the keys this device made from their spare: they have our answer.
                 if data.contacts[i].devices[d].spareTakenAt != nil { data.contacts[i].devices[d].spareTakenAt = nil }
                 plain = opened
@@ -8200,18 +8891,18 @@ final class AppModel {
         case .deviceRemoved:
             guard let i = contactIndex(fp, persona), data.contacts[i].devices.count > 1 else { break }
             data.contacts[i].devices.removeAll { $0.id == device }
-        case let .devicesUnlinked(ids):
+        case let .devicesUnlinked(ids, kept):
             // Your own devices hear of it by sync (`deviceLoggedOut`).
             guard let i = contactIndex(fp, persona), !data.contacts[i].isSelf else { break }
-            devicesUnlinked(ids, by: device, contact: i)
+            devicesUnlinked(ids, kept: kept, by: device, contact: i)
         case .erased:
             eraseTraces(of: fp)
         case .hello, .request, .pqIntro, .sessionInit, .deviceHello, .sessionAccept, .spareAccept, .ratchet, .collected:
             break
         case let .sync(event):
-            // Only your own devices may tell this one what you did.
+            // Only another device of this account, on a build that could link.
             guard sender.isSelf else { break }
-            applySync(event)
+            handleOwnDevice(event)
         case let .callOffer(invite):
             guard !sender.isSelf, !sender.hidden else { break }
             receiveCall(invite, from: sender)
@@ -8455,7 +9146,10 @@ final class AppModel {
         case let .reaction(message, emoji):
             applyReaction(emoji, to: message, from: sender)
         case let .typing(shared):
-            guard data.security.typingIndicators, let i = conversationIndex(shared, from: sender) else { break }
+            // A typing signal waits on the relay as long as a message would, so one that reached it a while ago says
+            // nothing now.
+            guard data.security.typingIndicators, Self.isFreshSignal(deposited: deposited),
+                  let i = conversationIndex(shared, from: sender) else { break }
             typing[data.conversations[i].id, default: [:]][fp] = Date()
         case let .wantsPresence(wants):
             guard !sender.isSelf, let i = contactIndex(fp, persona) else { break }
@@ -8494,13 +9188,19 @@ final class AppModel {
             // Only a direct chat is deleted this way. A group's owner deletes it in the group's own mailbox.
             guard shared == nil, let i = conversationIndex(nil, from: sender) else { break }
             removeLocally(data.conversations[i].id)
+        case let .mailbox(sendID):
+            // That device of theirs reads us on a new mailbox now (`tendMailboxes` on their side). Only the device the session
+            // is with can say so, so it isn't a new device and nothing is held.
+            guard sendID.count == 32, let i = contactIndex(fp, persona), let d = deviceIndex(i, device),
+                  data.contacts[i].devices[d].session != nil else { break }
+            data.contacts[i].devices[d].sendID = sendID
+            save()
         case let .accepted(sendID):
             // They accepted our request: switch to the private mailbox they opened for us.
             guard sender.awaitingAcceptance, sendID.count == 32 else { break }
             sender.sendID = sendID
             sender.awaitingAcceptance = false
             upsert(sender)
-            syncContact(fp, persona)
             let convo = startConversation(kind: .direct, title: sender.displayName, members: [fp], persona: .some(persona))
             noteConnected(convo.id)
             shareStories(with: sender)
@@ -8508,7 +9208,8 @@ final class AppModel {
     }
 
     /// Most people kept for one channel who said hello on its code and haven't got in yet.
-    static var maxCodeStrangers = 1_000
+    @ObservationIgnored var maxCodeStrangers = AppModel.defaultMaxCodeStrangers
+    static let defaultMaxCodeStrangers = 1_000
     /// How long someone who said hello on a channel's code and never got in is kept: as long as their invite lasts.
     static let codeStrangerLife: TimeInterval = inviteLife
 
@@ -8548,7 +9249,7 @@ final class AppModel {
             return stranger(c) && now.timeIntervalSince(c.addedAt) > Self.codeStrangerLife && !queued(c) && !invitedLately(c)
         })
         var held = contacts.indices.filter { !gone.contains($0) && contacts[$0].viaCode == channel && contacts[$0].persona == persona && stranger(contacts[$0]) }
-        while held.count >= Self.maxCodeStrangers {
+        while held.count >= maxCodeStrangers {
             guard let oldest = held.filter({ !queued(contacts[$0]) }).min(by: { contacts[$0].addedAt < contacts[$1].addedAt }) else { break }
             gone.insert(oldest)
             held.removeAll { $0 == oldest }
@@ -8557,7 +9258,7 @@ final class AppModel {
             data.contacts = contacts.indices.filter { !gone.contains($0) }.map { contacts[$0] }
             save()
         }
-        return held.count < Self.maxCodeStrangers
+        return held.count < maxCodeStrangers
     }
 
     private func acceptHello(_ card: PeerCard, _ request: SessionInit, fingerprint fp: String, device: Data,
@@ -8582,7 +9283,6 @@ final class AppModel {
                 data.contacts[i].avatar = card.avatar
                 data.contacts[i].color = card.color
                 data.invites.removeAll { $0.receiveKey == invite.receiveKey }
-                syncContact(fp, persona)
                 save()
                 return
             }
@@ -8629,7 +9329,6 @@ final class AppModel {
             upsert(peer)
             data.invites.removeAll { $0.receiveKey == invite.receiveKey }
             answer()
-            syncContact(fp, persona)
             _ = startConversation(kind: .direct, title: peer.displayName, members: [fp], persona: .some(persona))
             shareStories(with: peer)
         }
@@ -8637,7 +9336,8 @@ final class AppModel {
 
     /// How many people a channel's code lets in on its own in an hour. The rest wait (kept, and let in as the hour allows),
     /// so someone with the code can't make staff send an invite and rekey for a crowd of throwaway accounts at once.
-    static var channelAdmitsPerHour = 60
+    @ObservationIgnored var channelAdmitsPerHour = AppModel.defaultChannelAdmitsPerHour
+    static let defaultChannelAdmitsPerHour = 60
 
     /// Invites people who followed through a channel's code, up to the hourly limit; the rest wait. Only people who are new
     /// count: someone already in the roster, or invited within the hour, or already waiting is skipped (one identity saying
@@ -8661,7 +9361,7 @@ final class AppModel {
         let friends = Set(data.contacts.filter { $0.persona == persona && !$0.hidden }.map(\.fingerprint))
         queue = queue.filter { friends.contains($0) } + queue.filter { !friends.contains($0) }.shuffled()
         let recent = (channelAdmits[id] ?? []).filter { now.timeIntervalSince($0) < 3600 }
-        let room = max(0, Self.channelAdmitsPerHour - recent.count)
+        let room = max(0, channelAdmitsPerHour - recent.count)
         let go = Array(queue.prefix(room))
         var rest = Array(queue.dropFirst(room))
         channelAdmits[id] = recent + go.map { _ in now }
@@ -8705,8 +9405,10 @@ final class AppModel {
         guard let i = conversationIndex(wire.conversation, from: sender, create: true) else { return }
         if wire.conversation != nil, !data.conversations[i].canPost(sender.fingerprint) { return }
         guard !data.conversations[i].messages.contains(where: { $0.id == wire.id }) else {
-            // Sent again because the relay may have lost it: say again that it's here, so their tick catches up.
-            if wire.conversation == nil { queueReceipt(wire.id, to: sender) }
+            // Sent again because the relay may have lost it: say again that it's here, so their tick catches up. Only
+            // so often (`Lanes.duplicateReceiptGap`), so sending the same message over and over can't be used to find
+            // out when this device is running.
+            if wire.conversation == nil { queueReceipt(wire.id, to: sender, duplicate: true) }
             return
         }
         let date = dated(wire.date)
@@ -8836,9 +9538,6 @@ final class AppModel {
             let seen = openConversation == data.conversations[i].id && appActive && sendsReadReceipts(data.conversations[i])
             queueReceipt(wire.id, to: sender, read: seen)
         }
-        #if os(macOS)
-        DemoContact.shared.messageArrived(message, in: data.conversations[i].id, from: sender, model: self)
-        #endif
     }
 
     /// Shows a contact's @handle only once the directory has it signed by their key, so nobody can pass themselves
@@ -8860,23 +9559,53 @@ final class AppModel {
         return data.personas.first(where: { $0.id == convo.persona })?.oneTimeChat != true
     }
 
-    /// Delivery receipts wait a random while and go out together, so a receipt doesn't follow a fetch closely
-    /// enough to show the relay who was writing to whom.
+    /// Delivery receipts wait a random while (`Lanes.receiptDelay`, 5 to 20 seconds) and go out together, each on a
+    /// connection used for nothing else (`Lanes.once`), so a receipt doesn't follow the fetch that brought the message
+    /// closely enough, or on the same circuit as anything else, to show the relay who was writing to whom.
     /// Read receipts are batched the same way.
-    private func queueReceipt(_ id: UUID, to sender: Contact, read: Bool = false) {
+    private func queueReceipt(_ id: UUID, to sender: Contact, read: Bool = false, duplicate: Bool = false) {
         lastIncomingAt = Date()
+        if duplicate, !allowDuplicateReceipt(id, from: sender) { return }
         // Delivery receipts always go (the sender would otherwise keep sending again); read receipts only with the setting on.
         if let i = pendingReceipts.firstIndex(where: { $0.fingerprint == sender.fingerprint && $0.persona == sender.persona
                                                        && $0.read == read }) {
-            pendingReceipts[i].ids.append(id)
+            if !pendingReceipts[i].ids.contains(id) { pendingReceipts[i].ids.append(id) }
             return
         }
-        // Woken by a push in the background there is only a few seconds to spare, and the push itself already
-        // told Apple when this device heard, so the wait is short then.
-        let wait = trafficShaping ? (appActive ? Double.random(in: 1...5) : Double.random(in: 0.2...0.8)) : 0
+        let wait = trafficShaping ? Lanes.receiptWait(room: appActive ? nil : backgroundRoom) : 0
         pendingReceipts.append(ReceiptBatch(fingerprint: sender.fingerprint, persona: sender.persona, ids: [id], read: read,
                                             due: Date().addingTimeInterval(wait)))
     }
+
+    /// When a receipt for a duplicate went out, by message, and those sent for each contact (fingerprint and persona) in
+    /// the last hour. Memory only.
+    @ObservationIgnored private var duplicateReceipts: [UUID: Date] = [:]
+    @ObservationIgnored private var duplicateReceiptsByContact: [String: [Date]] = [:]
+
+    /// Whether a duplicate of message `id` may be answered with a receipt now: once a day for each message, and no more
+    /// than `Lanes.duplicateReceiptsPerHour` an hour for each contact.
+    func allowDuplicateReceipt(_ id: UUID, from sender: Contact, now: Date = Date()) -> Bool {
+        if let at = duplicateReceipts[id], now.timeIntervalSince(at) < Lanes.duplicateReceiptGap { return false }
+        let who = presenceKey(sender.fingerprint, sender.persona)
+        let recent = (duplicateReceiptsByContact[who] ?? []).filter { now.timeIntervalSince($0) < 3600 }
+        guard recent.count < Lanes.duplicateReceiptsPerHour else { duplicateReceiptsByContact[who] = recent; return false }
+        duplicateReceiptsByContact[who] = recent + [now]
+        if duplicateReceipts.count > 5000 { duplicateReceipts = duplicateReceipts.filter { now.timeIntervalSince($0.value) < Lanes.duplicateReceiptGap } }
+        duplicateReceipts[id] = now
+        return true
+    }
+
+    /// Seconds left of the time iOS gives a wake-up push, less what sending a receipt on a fresh circuit takes. Nil when
+    /// there is no such limit (the app in front, the macOS test build, or no push being handled).
+    private var backgroundRoom: TimeInterval? {
+        guard let started = pushHandlingSince else { return nil }
+        return Self.pushWindow - Date().timeIntervalSince(started) - Self.receiptSendTime
+    }
+    /// When the wake-up push being handled now arrived. Memory only.
+    @ObservationIgnored private var pushHandlingSince: Date?
+    /// About what iOS allows a woken app, and what a receipt on a fresh circuit needs of it.
+    static let pushWindow: TimeInterval = 28
+    static let receiptSendTime: TimeInterval = 8
 
     func sendDueReceipts() {
         let now = Date()
@@ -9065,458 +9794,118 @@ final class AppModel {
     }
 }
 
-// MARK: - Linked devices
+// MARK: - One device per account
 
 extension AppModel {
-    /// Your other devices, kept as a hidden contact under your main identity.
+    /// An account lives on one iPhone. Builds before 22 could link more: those were kept as a hidden contact of your own
+    /// (`Contact.isSelf`) holding your other devices, which `endLinkedDevices` takes apart.
     private var selfIndex: Int? { data.contacts.firstIndex { $0.isSelf } }
 
-    private func ensureSelf() -> Int? {
-        if let i = selfIndex { return i }
-        guard let identity else { return nil }
-        var me = Contact(fingerprint: identity.fingerprint, name: "My devices", signingKey: identity.card.signing,
-                         agreementKey: identity.card.agreement, sendID: Data(), receiveKey: Mailbox.make().receiveKey, hidden: true)
-        me.devices = []
-        me.isSelf = true
-        data.contacts.append(me)
-        return data.contacts.count - 1
+    /// Once the relay is in reach after an unlock, ends any linking left from an older build.
+    func endLinkedDevicesWhenOnline() {
+        guard selfIndex != nil else { return }
+        Task { [weak self] in
+            while let self, self.phase == .unlocked, self.selfIndex != nil {
+                if self.link == .online { await self.endLinkedDevices(); return }
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
     }
 
-    /// The other devices logged in to this account.
-    var linkedDevices: [DeviceLink] { selfIndex.map { data.contacts[$0].devices } ?? [] }
-
-    /// Stops syncing with one of your devices (a lost or stolen phone, say). Your other devices are told to drop it too,
-    /// and every group moves to keys it can't work out (`renewGroupSecret`), so it reads nothing said there from then on.
-    func unlinkDevice(_ id: Data) {
-        guard let i = selfIndex, data.contacts[i].devices.contains(where: { $0.id == id }) else { return }
-        revoke(id, pin: data.contacts[i].devices.first { $0.id == id }?.keyPin, by: data.deviceID, contact: i)
-        // Sent to the devices left, not the one taken out.
-        sync(.deviceLoggedOut(id))
-        // Every contact drops it, told by this device over its own session (under the id each persona's contacts know).
-        for c in data.contacts where !c.isSelf && !c.awaitingAcceptance && !c.devices.isEmpty {
-            enqueue(.devicesUnlinked([Self.deviceID(id, for: c.persona)]), to: c)
+    /// Ends linking left from an older build, on the device that keeps the account: the one with the lowest id among
+    /// the account's devices heard from in the last month (`dormantAfter`). One silent longer, or never heard from (a Mac
+    /// put away, a phone wiped by an instant Detach), doesn't count. It is unlinked like the rest but never makes this
+    /// device give way. The keeper tells the others to wipe themselves (`accountDetached`, which every build since linking
+    /// obeys). Once that has left for every device that counts, it tells every contact they're all unlinked, forgets
+    /// them and moves the groups to keys they can't work out. Any other device does nothing here: it keeps the account
+    /// until the keeper's word arrives (`leaveForAnotherDevice`), so a device list gone stale can never wipe the only
+    /// phone left. Should two devices each think they keep it, both keep it, which loses nothing.
+    func endLinkedDevices() async {
+        guard !endingLinks, !burning, !burnPending, !detaching, let identity, let i = selfIndex else { return }
+        let now = Date()
+        let mine = data.deviceID
+        func recent(_ d: DeviceLink) -> Bool { d.lastHeard.map { now.timeIntervalSince($0) < Self.dormantAfter } ?? false }
+        let siblings = data.contacts[i].devices.filter { $0.id != mine }
+        // One known only by its mailbox can't be compared with: wait, keeping the account.
+        if siblings.contains(where: { $0.id.isEmpty && recent($0) }) { return }
+        let live = siblings.filter { !$0.id.isEmpty && recent($0) }
+        guard live.allSatisfy({ mine.hex < $0.id.hex }) else { return }
+        endingLinks = true
+        defer { endingLinks = false }
+        if !live.isEmpty {
+            let liveIDs = Set(live.map(\.id))
+            func waiting(_ d: DeviceLink) -> Bool {
+                d.pending.contains { if case .sync(.accountDetached) = $0.payload { true } else { false } }
+            }
+            if !data.contacts[i].devices.contains(where: { liveIDs.contains($0.id) && waiting($0) }) {
+                enqueue(.sync(.accountDetached), to: data.contacts[i])
+            }
+            _ = try? await sendEverything()
+            // Burn, Detach or a lock while it was sending: they go on, this waits for the next unlock.
+            guard !burning, !burnPending, !detaching, phase == .unlocked, self.identity?.seed == identity.seed,
+                  let i = selfIndex else { return }
+            // Not yet gone to one of them (no session yet, say): tried again at the next unlock.
+            if data.contacts[i].devices.contains(where: { liveIDs.contains($0.id) && waiting($0) }) { return }
         }
-        renewGroupSecret()
+        guard let i = selfIndex else { return }
+        let others = data.contacts[i].devices.map(\.id).filter { !$0.isEmpty && $0 != mine }
+        if !others.isEmpty {
+            for c in data.contacts where !c.isSelf && !c.awaitingAcceptance && !c.devices.isEmpty {
+                enqueue(.devicesUnlinked(others.map { Self.deviceID($0, for: c.persona) }, kept: [deviceID(for: c.persona)]), to: c)
+            }
+        }
+        data.contacts.remove(at: i)
+        if !others.isEmpty { renewGroupSecret() }
         save()
-    }
-
-    /// Another of your devices logged out, or unlinked one: it's dropped here too. That device moves the groups on.
-    private func forgetLinkedDevice(_ id: Data) {
-        guard id != data.deviceID, let i = selfIndex else { return }
-        revoke(id, pin: data.contacts[i].devices.first { $0.id == id }?.keyPin, by: nil, contact: i)
-        save()
-    }
-
-    /// Tells your other devices what you just did. Does nothing while applying their news, so nothing echoes.
-    func sync(_ event: SyncEvent) {
-        guard !applyingSync, let i = selfIndex, !data.contacts[i].devices.isEmpty else { return }
-        enqueue(.sync(event), to: data.contacts[i])
-    }
-
-    func syncContact(_ fingerprint: String, _ persona: UUID?) {
-        guard let c = contact(fingerprint, in: persona), !c.isSelf else { return }
-        sync(.contact(card(of: c)))
-    }
-
-    func syncConversation(_ id: Conversation.ID) {
-        guard let c = conversation(id), c.kind != .direct else { return }
-        if let shared = c.shared {
-            sync(.sharedGroup(persona: c.persona, settings: shared.settings, epochs: shared.readable, staffKey: shared.staffKey, inviter: shared.ownerAccount))
-            return
+        kick()
+        if !live.isEmpty {
+            burnNotice = "Pulshade now works on one iPhone per account. Your account stays on this iPhone, and your other devices were signed out."
         }
-        // Only a broadcast list is carried to your other devices by a card; a group's settings are its own.
-        if c.kind == .broadcast { sync(.conversation(card(of: c))) }
     }
 
-    func ref(_ convo: Conversation) -> ConvoRef {
-        ConvoRef(shared: convo.kind == .direct ? nil : convo.wireID, peer: convo.kind == .direct ? convo.members.first : nil,
-                 persona: convo.persona)
-    }
-
-    private func card(of c: Contact) -> ContactCard {
-        ContactCard(fingerprint: c.fingerprint, name: c.name, nickname: c.nickname, avatar: c.avatar, banner: c.banner, color: c.color,
-                    verified: c.verified, signingKey: c.signingKey, agreementKey: c.agreementKey,
-                    devices: c.devices.map { DeviceCard(id: $0.id, sendID: $0.sendID, held: c.isSelf ? nil : $0.unconfirmed, key: $0.keyPin) },
-                    relay: c.relay, hidden: c.hidden,
-                    awaitingAcceptance: c.awaitingAcceptance, persona: c.persona, pq: c.pq, pqCommit: c.pqCommit,
-                    revoked: c.revoked.map { $0.map { DeviceCard(id: $0.id, sendID: Data(), key: $0.pin) } },
-                    contested: c.contested != nil ? true : nil)
-    }
-
-    private func card(of c: Conversation) -> ConversationCard {
-        ConversationCard(id: c.id, kind: c.kind, title: c.title, avatar: c.avatar, about: c.about, owner: c.owner,
-                         admins: c.admins, postPolicy: c.postPolicy, version: c.version, members: c.members,
-                         persona: c.persona, disappearAfter: c.disappearAfter, pinned: c.pinned, muted: c.muted, mods: c.mods,
-                         group: c.groupID)
-    }
-
-    private func conversationIndex(for ref: ConvoRef, create: Bool) -> Int? {
-        if let shared = ref.shared { return groupIndex(shared, persona: ref.persona) }
-        guard let peer = ref.peer else { return nil }
-        if let found = data.conversations.firstIndex(where: { $0.kind == .direct && $0.members == [peer] && $0.persona == ref.persona }) {
-            return found
+    /// The device keeping the account told this one to go (or an older build detached every device). Contacts are told
+    /// this device is gone, then it wipes, leaving the files on the relay, which the account still shows elsewhere. It
+    /// wipes even if the goodbyes can't go: the account is already in the other device's hands.
+    private func leaveForAnotherDevice() {
+        guard !burning, !burnPending, !detaching, !leavingForAnotherDevice, let identity else { return }
+        for c in data.contacts where !c.isSelf && !c.awaitingAcceptance { enqueue(.deviceRemoved, to: c) }
+        // Marked first, as Burn does: killed while it waits, the next launch wipes this device before anything opens it.
+        guard Self.markWipeDue(burnStore, keepingSettings: true) else { return }
+        leavingForAnotherDevice = true
+        Task {
+            _ = try? await sendEverything()
+            defer { leavingForAnotherDevice = false }
+            // A Burn started meanwhile does the wipe itself, with its own order.
+            guard !burning, !burnPending, self.identity?.seed == identity.seed else { return }
+            destroyEverything()
+            Vault.scrubLeftovers()
+            burnNotice = "Pulshade now works on one iPhone per account. Your account stays on your other device, so this iPhone was signed out."
         }
-        guard create, contact(peer, in: ref.persona) != nil else { return nil }
-        _ = startConversation(kind: .direct, title: "", members: [peer], persona: .some(ref.persona))
-        return data.conversations.firstIndex { $0.kind == .direct && $0.members == [peer] && $0.persona == ref.persona }
     }
 
-    /// Adds a contact (or their new devices) learned from another of your devices, and introduces this device.
-    private func adopt(_ card: ContactCard) {
-        if let i = contactIndex(card.fingerprint, card.persona) {
-            data.contacts[i].name = card.name
-            data.contacts[i].nickname = card.nickname
-            data.contacts[i].avatar = card.avatar
-            data.contacts[i].banner = card.banner
-            data.contacts[i].color = card.color
-            data.contacts[i].verified = card.verified
-            data.contacts[i].hidden = card.hidden
-            data.contacts[i].awaitingAcceptance = card.awaitingAcceptance
-            // Another of your devices pinned these (only ever from a card that verified): the same account's keys.
-            var learned = false
-            if data.contacts[i].pqCommit == nil, data.contacts[i].pq == nil, let commit = card.pqCommit, commit.count == PQPin.commitmentSize {
-                data.contacts[i].pqCommit = commit
-            }
-            if data.contacts[i].pq == nil, let pin = card.pq, pin.isWellFormed, pinMatchesInvite(pin, contact: data.contacts[i]) {
-                data.contacts[i].pq = pin
-                learned = true
-            }
-            // Devices that were waiting for the keys to say hello start now.
-            if learned {
-                for d in data.contacts[i].devices.indices where data.contacts[i].devices[d].session == nil && data.contacts[i].devices[d].handshake == nil
-                    && !card.awaitingAcceptance { startHandshake(contact: i, device: d) }
-                sendFollowsLater(data.contacts[i].fingerprint, persona: data.contacts[i].persona)
-            }
-            // Devices their account unlinked, as another of yours heard: dropped here too, before the list below.
-            for gone in card.revoked ?? [] { revoke(gone.id, pin: gone.key, by: nil, contact: i) }
-            if card.contested == true, data.contacts[i].contested == nil { data.contacts[i].contested = Date() }
-            for device in card.devices {
-                if let d = data.contacts[i].devices.firstIndex(where: { (!device.id.isEmpty && $0.id == device.id) || $0.sendID == device.sendID }) {
-                    // The same device on another mailbox: another of yours saw it change, and holds it again if it says so.
-                    let moved = !device.id.isEmpty && data.contacts[i].devices[d].sendID != device.sendID
-                    if moved { data.contacts[i].devices[d].sendID = device.sendID }
-                    // Other keys than the ones this device pinned: another of yours met a different device under this id, which
-                    // counts like a move. What it says about holding is about that device, so its "allowed" isn't taken here.
-                    let local = data.contacts[i].devices[d].keyPin
-                    let keyChanged = device.key != nil && local != nil && device.key != local
-                    // Held on another of your devices: held here too, unless you allowed it here (a move or new keys hold it
-                    // anyway). Allowed there, for the keys pinned here: allowed here, and what it sent is read.
-                    if device.held == true, moved || keyChanged || data.contacts[i].devices[d].unconfirmed != false {
-                        data.contacts[i].devices[d].unconfirmed = true
-                    }
-                    if device.held == false, !keyChanged, data.contacts[i].devices[d].unconfirmed == true { release(contact: i, device: d) }
-                    // Keys another of yours pinned, for a device this one hasn't had a handshake with yet.
-                    if data.contacts[i].devices[d].keyPin == nil, let key = device.key, key.count == 32 {
-                        data.contacts[i].devices[d].keyPin = key
-                    }
-                } else {
-                    var link = DeviceLink(id: device.id, sendID: device.sendID)
-                    if let key = device.key, key.count == 32 { link.keyPin = key }
-                    // A device new to this one: held if another of yours holds it, or if this one asks before new devices.
-                    // One their account unlinked, as this device already knows, isn't taken back.
-                    if isRevoked(contact: i, id: device.id, pin: device.key) { continue }
-                    if device.held == true || (device.held == nil && holdsNewDevices(contact: i) && !data.contacts[i].devices.isEmpty) {
-                        link.unconfirmed = true
-                    } else if device.held == false {
-                        link.unconfirmed = false
-                    }
-                    data.contacts[i].devices.append(link)
-                    startHandshake(contact: i, device: data.contacts[i].devices.count - 1)
-                }
-            }
-            return
-        }
-        guard !myFingerprints.contains(card.fingerprint) else { return }
-        var c = Contact(fingerprint: card.fingerprint, name: card.name, nickname: card.nickname, avatar: card.avatar,
-                        signingKey: card.signingKey, agreementKey: card.agreementKey, sendID: Data(),
-                        receiveKey: Mailbox.make().receiveKey, hidden: card.hidden)
-        c.revoked = card.revoked?.prefix(Self.maxRevoked).map { RevokedDevice(id: $0.id, pin: $0.key, by: nil, at: Date()) }
-        c.contested = card.contested == true ? Date() : nil
-        let gone = Set((card.revoked ?? []).map(\.id))
-        c.devices = card.devices.filter { !gone.contains($0.id) }.map {
-            var link = DeviceLink(id: $0.id, sendID: $0.sendID)
-            link.unconfirmed = $0.held
-            if let key = $0.key, key.count == 32 { link.keyPin = key }
-            return link
-        }
-        c.banner = card.banner
-        c.color = card.color
-        c.verified = card.verified
-        c.relay = card.relay
-        c.awaitingAcceptance = card.awaitingAcceptance
-        c.persona = card.persona
-        if let commit = card.pqCommit, commit.count == PQPin.commitmentSize { c.pqCommit = commit }
-        if let pin = card.pq, pin.isWellFormed, pinMatchesInvite(pin, contact: c) { c.pq = pin }
-        upsert(c)
-        // Say hello from this device, unless we're still waiting for them to accept a request.
-        // Without their post-quantum keys nothing can be sealed to them yet: the device that has them tells this one (above).
-        guard !card.awaitingAcceptance, c.pq != nil, let i = contactIndex(c.fingerprint, c.persona) else { return }
-        for d in data.contacts[i].devices.indices { startHandshake(contact: i, device: d) }
-    }
-
-    private func adopt(_ card: ConversationCard) {
-        // Only a direct chat or a broadcast list comes by card. A group or channel in the older format isn't brought to this
-        // device any more, and a shared one comes with its settings and keys (see `historyForNewDevice`).
-        guard card.kind == .direct || card.kind == .broadcast else { return }
-        if let i = card.kind == .direct ? index(of: card.id) : groupIndex(card.group ?? card.id, persona: card.persona) {
-            guard card.version >= data.conversations[i].version else { return }
-            data.conversations[i].title = card.title
-            data.conversations[i].avatar = card.avatar
-            data.conversations[i].about = card.about
-            data.conversations[i].owner = card.owner
-            data.conversations[i].admins = card.admins
-            data.conversations[i].mods = card.mods ?? data.conversations[i].mods
-            data.conversations[i].postPolicy = card.postPolicy
-            data.conversations[i].version = card.version
-            data.conversations[i].members = card.members
-            data.conversations[i].disappearAfter = card.disappearAfter
-            return
-        }
-        var convo = Conversation(id: card.id, kind: card.kind, title: card.title, avatar: card.avatar, members: card.members)
-        if index(of: card.id) != nil, card.kind != .direct {
-            // This device has the group as another persona under that id already.
-            convo.id = Conversation.localID(group: card.group ?? card.id, persona: card.persona)
-        }
-        if convo.id != (card.group ?? card.id) { convo.groupID = card.group ?? card.id }
-        convo.about = card.about
-        convo.owner = card.owner
-        convo.admins = card.admins
-        convo.mods = card.mods ?? []
-        convo.postPolicy = card.postPolicy
-        convo.version = card.version
-        convo.persona = card.persona
-        convo.disappearAfter = card.disappearAfter
-        convo.pinned = card.pinned ?? false
-        convo.muted = card.muted ?? false
-        withAnimation(.snappy) { data.conversations.insert(convo, at: 0) }
-    }
-
-    /// Applies something you did on another of your devices, here.
-    func applySync(_ event: SyncEvent) {
-        applyingSync = true
-        defer { applyingSync = false }
+    /// Word from another device of this account, on a build that could link. Only the two that end the account here are
+    /// taken: everything else it says was synced data, which an account on one device no longer takes.
+    func handleOwnDevice(_ event: SyncEvent) {
         switch event {
-        case .hello:
-            break
-        case let .callHandled(id):
-            // Answered or declined on another of your devices.
-            if call?.invite.id == id, call?.outgoing == false, call?.phase == .ringing { stopCall() }
-        case let .sent(ref, wire):
-            guard let i = conversationIndex(for: ref, create: true),
-                  !data.conversations[i].messages.contains(where: { $0.id == wire.id }) else { break }
-            let mine = me(ref.persona)?.fingerprint
-            let reply = wire.reply.map { ReplyRef(id: $0.id, author: $0.author == mine ? "me" : $0.author, snippet: $0.snippet,
-                                                  picture: $0.picture.flatMap { $0.count <= ReplyRef.maxPicture ? $0 : nil }) }
-            var message = Message(id: wire.id, sender: "me", text: wire.text, image: wire.image, voice: wire.voice?.checked,
-                                  date: dated(wire.date), status: .sent,
-                                  expiresAt: wire.expiresIn.map { dated(wire.date).addingTimeInterval($0) }, reply: reply,
-                                  preview: wire.preview)
-            message.noForward = wire.noForward == true ? true : nil
-            message.forwarded = wire.forwarded == true ? true : nil
-            if let clip = wire.clip {
-                message.video = Data()
-                message.clipSeconds = min(max(clip.seconds, 0), ChatVideo.maxSeconds)
-            }
-            withAnimation(.snappy) { data.conversations[i].messages.append(message) }
-            if wire.clip != nil { assembleClip(wire.id, persona: data.conversations[i].persona) }
-        case let .reaction(id, emoji):
-            for i in data.conversations.indices {
-                if let m = data.conversations[i].messages.firstIndex(where: { $0.id == id }) {
-                    data.conversations[i].messages[m].reactions["me"] = emoji
-                }
-            }
-        case let .unsend(ids):
-            for i in data.conversations.indices {
-                data.conversations[i].messages.removeAll { ids.contains($0.id) && $0.isMine }
-            }
-        case let .deleted(ref):
-            if let i = conversationIndex(for: ref, create: false) { removeLocally(data.conversations[i].id) }
-        case let .disappearing(ref, seconds):
-            if let i = conversationIndex(for: ref, create: true), data.conversations[i].disappearAfter != seconds {
-                applyTimer(seconds, at: i)
-            }
-        case let .contact(card):
-            adopt(card)
-        case let .conversation(card):
-            // A shared group follows its own settings, not a card.
-            guard (card.kind == .direct ? conversation(card.id) : groupIndex(card.group ?? card.id, persona: card.persona)
-                    .map { data.conversations[$0] })?.shared == nil else { break }
-            adopt(card)
-        case let .sharedGroup(persona, settings, epochs, staffKey, inviter):
-            adoptSharedGroup(persona: persona, settings: settings, epochs: epochs)
-            if let inviter, let i = groupIndex(settings.group, persona: persona), data.conversations[i].shared?.ownerAccount == nil {
-                data.conversations[i].shared?.ownerAccount = inviter
-            }
-            if let key = staffKey, key.count == 32, let i = groupIndex(settings.group, persona: persona), data.conversations[i].shared?.staffKey != key,
-               data.conversations[i].shared?.settings.kind == .channel {
-                data.conversations[i].shared?.staffKey = key
-            }
-        case let .profile(persona, incoming):
-            // Newest wins, so devices that drifted apart settle on the same profile. But not one from a device that
-            // knows fewer fields than this one (it would wipe the rest), and one from a newer device can't be read in
-            // full, so it waits for an update.
-            let current = self.profile(for: persona)
-            let theirFormat = incoming.format ?? 0
-            guard theirFormat <= profileFormat else { profileNeedsUpdate = true; break }
-            guard theirFormat >= (current.format ?? 0) else { break }
-            guard (incoming.updatedAt ?? .distantPast) > (current.updatedAt ?? .distantPast) else { break }
-            var incoming = incoming
-            incoming.links = Optional(ProfileLink.cleaned(incoming.links)).flatMap { $0.isEmpty ? nil : $0 }
-            incoming.notes = Optional(ProfileNote.cleaned(incoming.notes, keepAudience: true)).flatMap { $0.isEmpty ? nil : $0 }
-            setProfile(incoming, for: persona)
-            // Whichever device stopped using a handle let go of it there; this one only follows which are in use,
-            // and reads the request mailbox of each.
-            readPublicInboxes(of: persona)
-        case let .persona(persona):
-            if let i = data.personas.firstIndex(where: { $0.id == persona.id }) {
-                data.personas[i] = persona
-            } else {
-                data.personas.append(persona)
-            }
-        case let .personaDeleted(id):
-            deletePersona(id)
-        case let .story(synced):
-            guard removedStories["me|\(synced.id)"] == nil else { break }
-            var story = synced
-            story.mediaFile = nil
-            if let i = data.stories.firstIndex(where: { $0.id == story.id }) {
-                // An edit made on another device. Each device hears about views itself, so keep both lists.
-                guard story.author == "me", data.stories[i].author == "me" else { break }
-                var edited = story
-                edited.viewers = (data.stories[i].viewers ?? [:]).merging(story.viewers ?? [:]) { min($0, $1) }
-                data.stories[i] = edited
-            } else {
-                data.stories.insert(story, at: 0)
-            }
-        case let .contactRemoved(fingerprint, persona):
-            if let c = contact(fingerprint, in: persona), !c.isSelf { forget(c) }
-        case let .storyRemoved(id):
-            noteRemoved("me|\(id)")
-            data.stories.removeAll { $0.id == id && $0.author == "me" }
-            dropUnsent(story: id)
-        case let .blocked(fp):
-            if !data.blocked.contains(fp) { data.blocked.append(fp) }
-            data.requests.removeAll { $0.fingerprint == fp }
-            // Blocked from a chat on another device: drop them here too.
-            for c in data.contacts where c.fingerprint == fp && !c.isSelf {
-                if data.blockedNames[fp] == nil { data.blockedNames[fp] = c.displayName }
-                forget(c)
-            }
-        case let .unblocked(fp):
-            data.blocked.removeAll { $0 == fp }
-            data.blockedNames[fp] = nil
-        case let .read(ref):
-            if let i = conversationIndex(for: ref, create: false) { data.conversations[i].unread = 0 }
-        case let .publicInvite(persona, receiveKey, relay):
-            adoptPublicInvite(persona: persona, receiveKey: receiveKey, relay: relay)
-        case let .requestReceived(request):
-            guard !data.blocked.contains(request.fingerprint), contactIndex(request.fingerprint, request.persona) == nil,
-                  !data.requests.contains(where: { $0.fingerprint == request.fingerprint && $0.persona == request.persona })
-            else { break }
-            withAnimation(.snappy) { data.requests.insert(request, at: 0) }
-        case let .requestResolved(fingerprint, persona):
-            withAnimation(.snappy) { data.requests.removeAll { $0.fingerprint == fingerprint && $0.persona == persona } }
-        case let .deviceLoggedOut(id):
-            forgetLinkedDevice(id)
-        case let .groupSecret(secret):
-            adoptGroupSecret(secret)
-        case let .groupChains(persona, group, keys):
-            // From another of your own devices: members' chains only, never your own account's (each device has its own).
-            guard let i = groupIndex(group, persona: persona), let shared = data.conversations[i].shared, !shared.gone,
-                  let me = memberKeys(persona, group: data.conversations[i].wireID) else { break }
-            let members = keys.prefix(GroupDirectBody.maxEach).filter { $0.sender != me.publicKey && shared.settings.isMember($0.sender) }
-            if !members.isEmpty, takeChainKeys(Array(members), from: nil, at: i) { rereadHeldMail(at: i) }
         case .accountErased:
+            // Burned on that device. The files on the relay are that device's to erase.
+            guard !burning, !burnPending else { return }
+            leavingForAnotherDevice = true
             destroyEverything(leavingNoTrace: true)
+            leavingForAnotherDevice = false
             Vault.scrubLeftovers()
         case .accountDetached:
-            // Contacts stop writing to this device; the account itself waits in the backup. This is a full wipe:
-            // caches and Tor state go too, not just the vault.
-            for c in data.contacts where !c.isSelf && !c.awaitingAcceptance { enqueue(.deviceRemoved, to: c) }
-            Task {
-                try? await sendEverything()
-                wipeNow()
-            }
-        case let .history(id, messages):
-            guard let i = index(of: id) else { break }
-            let known = Set(data.conversations[i].messages.map(\.id))
-            let now = Date()
-            let fresh = messages.filter { !known.contains($0.id) && ($0.expiresAt ?? .distantFuture) > now }
-                .map(Self.withoutFileReferences)
-            guard !fresh.isEmpty else { break }
-            data.conversations[i].messages.append(contentsOf: fresh)
-            data.conversations[i].messages.sort { $0.date < $1.date }
+            leaveForAnotherDevice()
+        default:
+            break
         }
     }
 
-    /// Reads the same public mailbox as your other devices, so a request to your @handle reaches all of them.
-    private func adoptPublicInvite(persona: UUID?, receiveKey: Data?, relay: String?) {
-        guard let receiveKey else {
-            data.invites.removeAll { $0.isPublic && $0.persona == persona }
-            return
-        }
-        if !data.invites.contains(where: { $0.receiveKey == receiveKey }) {
-            data.invites.append(OpenInvite(receiveKey: receiveKey, persona: persona, relay: relay, isPublic: true))
-        }
-        readPublicInboxes(of: persona, and: receiveKey)
-    }
-
-    /// Makes sure this device reads the request mailbox of every handle a persona has in use (each is worked out
-    /// from the account and the handle, so every device arrives at the same ones), and winds down any other.
-    private func readPublicInboxes(of persona: UUID?, and extra: Data? = nil) {
-        guard let me = me(persona) else { return }
-        var keys = Set(profile(for: persona).activeHandles.map { me.publicInboxKey(handle: $0) })
-        for key in keys {
-            if let i = data.invites.firstIndex(where: { $0.receiveKey == key }) {
-                data.invites[i].retiresAt = nil
-            } else {
-                data.invites.append(OpenInvite(receiveKey: key, persona: persona, isPublic: true))
-            }
-        }
-        if let extra { keys.insert(extra) }
-        retirePublicInvites(of: persona, except: keys)
-    }
-
-    /// Sends your other devices a persona's public mailbox and profile together.
-    func syncPublicProfile(_ persona: UUID?) {
-        let invite = data.invites.first { $0.isPublic && $0.persona == persona && $0.retiresAt == nil }
-        sync(.publicInvite(persona: persona, receiveKey: profile(for: persona).handle == nil ? nil : invite?.receiveKey,
-                           relay: invite?.relay))
-        sync(.profile(persona: persona, profile(for: persona)))
-    }
-
-    /// On unlock, tells your other devices how your profiles look here. Whichever is newest wins everywhere,
-    /// which also heals devices that drifted apart.
-    func announceProfiles() {
-        guard !linkedDevices.isEmpty else { return }
-        syncPublicProfile(nil)
-        for persona in data.personas where !persona.isBurner { syncPublicProfile(persona.id) }
-    }
-
-    // MARK: Linking a new device (the device that's already logged in)
-
-    /// How long a link code can be answered or approved.
-    static let linkOfferLife: TimeInterval = 15 * 60
-
-    /// Codes that have run out are dropped, so a QR code seen long ago can't be answered or approved any more.
-    func pruneLinkOffers() {
-        let before = data.linkOffers.count
-        data.linkOffers.removeAll { Date().timeIntervalSince($0.createdAt) > Self.linkOfferLife }
-        if data.linkOffers.count != before { save() }
-    }
-
-    /// A new device whose code this one scanned, waiting for you to approve it.
-    var pendingLink: (offer: LinkOffer, request: LinkRequest)? {
-        guard let offer = data.linkOffers.last(where: { $0.request != nil && Date().timeIntervalSince($0.createdAt) <= Self.linkOfferLife }),
-              let request = offer.request else { return nil }
-        return (offer, request)
-    }
-
-    enum ScanResult { case device, contact(Contact), chat(Conversation.ID), expired, unknown, refused, outdated }
+    enum ScanResult { case contact(Contact), chat(Conversation.ID), expired, unknown, outdated }
 
     /// What a code would do, shown for a yes before anything happens.
     struct CodePreview: Equatable {
-        enum Kind: Equatable { case contact, channel, chat(endsAt: Date), device }
+        enum Kind: Equatable { case contact, channel, chat(endsAt: Date) }
         var kind: Kind
         /// A relay the code names that isn't yours: it would see your connection from then on.
         var relay: String?
@@ -9525,7 +9914,6 @@ extension AppModel {
     func inspectCode(_ text: String) -> CodePreview? {
         let code = scannedPayload(text)
         if let link = ChatLink(code) { return CodePreview(kind: .chat(endsAt: link.endsAt), relay: foreignRelay(Invite(code: link.invite)?.relay)) }
-        if JoinCode(code) != nil { return CodePreview(kind: .device) }
         guard let invite = Invite(code: code) else { return nil }
         return CodePreview(kind: invite.kind == .channel ? .channel : .contact, relay: foreignRelay(invite.relay))
     }
@@ -9535,239 +9923,39 @@ extension AppModel {
         return relay
     }
 
-    /// Whatever the camera read: a new device's code waits for approval, a friend's invite adds them,
-    /// a one-time chat link opens its chat. A code that arrived as a link from another app never links a
-    /// device: only the camera, pointed at your own new device, can do that.
-    func useScannedCode(_ text: String, fromLink: Bool = false) -> ScanResult {
+    /// Whatever the camera read: a friend's invite adds them, a one-time chat link opens its chat.
+    func useScannedCode(_ text: String) -> ScanResult {
         let code = scannedPayload(text)
         if let link = ChatLink(code) {
             return joinChatLink(link).map(ScanResult.chat) ?? .expired
         }
-        if JoinCode(code) != nil && fromLink { return .refused }
-        if acceptJoinCode(code) { return .device }
         if Invite(code: code) != nil, let contact = addContact(code: code, nickname: "") { return .contact(contact) }
         return Invite.isOutdated(code) ? .outdated : .unknown
-    }
-
-    /// A code shown by a new device: it waits for you to approve it. The only way a device is linked, since the code
-    /// itself carries the new device's request and keys, so nobody who merely saw it can swap in their own.
-    func acceptJoinCode(_ text: String) -> Bool {
-        guard let code = JoinCode(text) else { return false }
-        // "This machine" on the new device means nothing here; it's then on the same relay as you.
-        let relay = LinkCode(secret: code.secret, sendID: Data(), relay: code.relay).reachableRelay
-        var offer = LinkOffer(receiveKey: Mailbox.make().receiveKey, secret: code.secret)
-        offer.request = code.request
-        offer.relay = relay == AppData.defaultRelay || relay == data.relay ? nil : relay
-        data.linkOffers.removeAll { $0.request != nil }
-        withAnimation(.snappy) { data.linkOffers.append(offer) }
-        save()
-        return true
-    }
-
-    func cancelLink() {
-        data.linkOffers.removeAll()
-        save()
-    }
-
-    /// Approves the waiting device: sends it the account, encrypted to it, and starts keeping it in sync.
-    func approveLink() {
-        guard let identity, let (offer, request) = pendingLink, let selfIndex = ensureSelf(),
-              let theirs = try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: request.ephemeral) else { return }
-        let ephemeral = Curve25519.KeyAgreement.PrivateKey()
-        guard let shared = try? ephemeral.sharedSecretFromKeyAgreement(with: theirs) else { return }
-
-        let me = data.contacts[selfIndex]
-        // With the keys each one proved, this device's own first, so the new device knows them from the start.
-        guard let mine = deviceKey(for: nil) else { return }
-        let siblings = [DeviceCard(id: data.deviceID, sendID: Mailbox.sendID(for: me.receiveKey ?? Data()), name: deviceDisplayName,
-                                   key: mine.card.pin)]
-            + me.devices.map { DeviceCard(id: $0.id, sendID: $0.sendID, name: $0.name, key: $0.keyPin) }
-        let bundle = LinkBundle(seed: identity.seed, profile: data.profile, personas: data.personas,
-                                contacts: data.contacts.filter { !$0.isSelf }.map(card(of:)),
-                                conversations: data.conversations.map(card(of:)),
-                                theme: data.theme, relay: data.relay, inviteRelay: data.inviteRelay, security: data.security,
-                                blocked: data.blocked, siblings: siblings,
-                                publicInvites: data.invites.filter(\.isPublic), requests: data.requests, confirms: true,
-                                groupSecret: data.groupSecret)
-        guard let plain = try? JSONEncoder.pulshade.encode(bundle),
-              let sealed = try? ChaChaPoly.seal(plain, using: LinkCrypto.bundleKey(shared, secret: offer.secret)).combined else { return }
-        data.outbox.append(Outgoing(sendID: request.bundleSendID, blob: ephemeral.publicKey.rawRepresentation + sealed, relay: offer.relay))
-        // Shown here until the new device's own digits have been compared; in memory only.
-        linkConfirmation = LinkCrypto.confirmCode(shared, secret: offer.secret)
-
-        var link = DeviceLink(id: request.deviceID, sendID: request.selfSendID)
-        link.name = String(request.name.prefix(60))
-        // The keys the new device made, as its request (which came through the code) named them: its handshake must
-        // prove these, or it shows as a device you didn't approve.
-        link.keyPin = request.keyPin
-        // Message history and stories follow once the new device opens its session with this one.
-        link.pending = historyForNewDevice().map { PendingPayload(payload: .sync($0), message: nil) }
-        data.contacts[selfIndex].devices.removeAll { $0.id == request.deviceID }
-        data.contacts[selfIndex].devices.append(link)
-        // This device opens the session with the new one, and the new one only answers. If both opened one
-        // at once, a late loser could replace the session the history was already sent on.
-        startHandshake(contact: selfIndex, device: data.contacts[selfIndex].devices.count - 1)
-        data.linkOffers.removeAll()
-        save()
-        kick()
-    }
-
-    /// Every chat's past messages, in pieces small enough for the relay, then live stories.
-    /// A message with any media from the sealed pool put back inline and the file references taken off.
-    private func withMediaInline(_ stored: Message) -> Message {
-        var message = stored
-        if message.imageFile != nil {
-            message.image = imageData(for: stored)
-            message.imageFile = nil
-        }
-        if message.videoFile != nil {
-            message.video = videoData(for: stored)
-            message.videoFile = nil
-        }
-        if message.voice?.audioFile != nil {
-            message.voice?.audio = voiceAudio(for: stored) ?? Data()
-            message.voice?.audioFile = nil
-        }
-        if stored != message, message.image == nil, message.video == nil, message.voice?.audio.isEmpty ?? true {
-            message.mediaGone = true
-        }
-        return message
-    }
-
-    /// Another device's file references point into its own pool: never opened, overwritten or counted here.
-    private static func withoutFileReferences(_ received: Message) -> Message {
-        var message = received
-        guard message.imageFile != nil || message.videoFile != nil || message.voice?.audioFile != nil else { return message }
-        message.imageFile = nil
-        message.videoFile = nil
-        message.voice?.audioFile = nil
-        if message.image == nil, message.video == nil, message.voice?.audio.isEmpty ?? true { message.mediaGone = true }
-        return message
-    }
-
-    private func historyForNewDevice() -> [SyncEvent] {
-        let limit = 1_000_000
-        let now = Date()
-        var events: [SyncEvent] = []
-        for convo in data.conversations {
-            // A group or channel that shares one mailbox first, so the messages that follow have somewhere to go.
-            if let shared = convo.shared {
-                events.append(.sharedGroup(persona: convo.persona, settings: shared.settings, epochs: shared.readable, staffKey: shared.staffKey, inviter: shared.ownerAccount))
-            }
-            // One in the older format is not carried to a new device: it can't be used there either.
-            guard !convo.isOldFormat else { continue }
-            var chunk: [Message] = []
-            var size = 0
-            for stored in convo.messages where (stored.expiresAt ?? .distantFuture) > now {
-                // A file reference means nothing on another device (the file is in this one's pool): the bytes go
-                // instead, inside the sealed sync, as they did before the pool, and that device seals them its own way.
-                let message = withMediaInline(stored)
-                let bytes = (try? JSONEncoder.pulshade.encode(message).count) ?? 0
-                if !chunk.isEmpty && size + bytes > limit {
-                    events.append(.history(conversation: convo.id, messages: chunk))
-                    chunk = []
-                    size = 0
-                }
-                chunk.append(message)
-                size += bytes
-            }
-            if !chunk.isEmpty { events.append(.history(conversation: convo.id, messages: chunk)) }
-        }
-        events += data.stories.filter { $0.isLive && $0.isSyncable }.map { .story($0) }
-        return events
-    }
-
-    // MARK: Becoming a linked device (the new device)
-
-    /// Sets this device up as another device of the account in the bundle, then introduces it to everyone.
-    func finishLink(_ bundle: LinkBundle, deviceID: Data, deviceKeySeed: Data, selfMailbox: Mailbox, relay: String,
-                    passcode: String) async throws {
-        guard passcode.count >= LockStyle.minimumLength else { throw PasscodeSetupError.tooShort }
-        let identity = try Identity(seed: bundle.seed)
-        let vault = vault
-        try await Task.detached { try vault.create(identity, passcode: passcode) }.value
-        self.identity = identity
-        slot = 0
-        var fresh = AppData()
-        fresh.deviceID = deviceID
-        // The keys whose pin the request carried.
-        fresh.deviceKey = try vault.sealDeviceSeed(deviceKeySeed)
-        fresh.profile = bundle.profile
-        fresh.personas = bundle.personas
-        fresh.theme = bundle.theme
-        fresh.relay = relay
-        fresh.inviteRelay = bundle.inviteRelay
-        fresh.security = bundle.security
-        fresh.blocked = bundle.blocked
-        fresh.invites = bundle.publicInvites ?? []
-        fresh.requests = bundle.requests ?? []
-        fresh.groupSecret = bundle.groupSecret.flatMap { $0.count == 32 ? $0 : nil }
-        data = fresh
-        adoptConnectionChoice()
-
-        // Your other devices.
-        var me = Contact(fingerprint: identity.fingerprint, name: "My devices", signingKey: identity.card.signing,
-                         agreementKey: identity.card.agreement, sendID: Data(), receiveKey: selfMailbox.receiveKey, hidden: true)
-        me.devices = bundle.siblings.map {
-            var link = DeviceLink(id: $0.id, sendID: $0.sendID)
-            link.name = $0.name
-            if let key = $0.key, key.count == 32 { link.keyPin = key }
-            link.awaitingHello = $0.id == bundle.siblings.first?.id ? true : nil
-            return link
-        }
-        me.isSelf = true
-        data.contacts.append(me)
-
-        applyingSync = true
-        for card in bundle.conversations { adopt(card) }
-        applyingSync = false
-        // Contacts last: adopting them says hello from this device.
-        for card in bundle.contacts { adopt(card) }
-        // The device that approved this one opens its own session with us; introduce ourselves to the rest.
-        if let i = selfIndex {
-            for d in data.contacts[i].devices.indices where data.contacts[i].devices[d].id != bundle.siblings.first?.id {
-                startHandshake(contact: i, device: d)
-            }
-        }
-        didUnlock()
     }
 }
 
 // MARK: - Detach & burn
 
 extension AppModel {
-    enum LeaveError: Error { case wrongRecoveryCode, offline, backupNotRemoved, burnNotSaved }
+    enum LeaveError: Error { case wrongRecoveryCode, offline, backupNotRemoved, burnNotSaved, wipeNotMarked }
 
-    /// Whether this account also lives on another device, so detaching only this one loses nothing.
-    var hasOtherDevices: Bool { !linkedDevices.isEmpty }
-
-    enum DetachScope { case thisDevice, everyDevice }
-
-    /// Takes the account off this device (or every device), keeping everything but the chats.
-    ///
-    /// Only this device, with others still on the account: they drop it from their list and contacts stop
-    /// sending here; nothing else changes. Otherwise the recovery code is needed first. The account (profile,
-    /// @handles, contacts, groups, personas, settings) is sealed and left on the relay for it, without a
-    /// single message, story or request, and every device is wiped.
-    func detach(_ scope: DetachScope, recoveryCode: String? = nil) async throws {
+    /// Takes the account off this device, keeping everything but the chats. The recovery code is needed first. The
+    /// account (profile, @handles, contacts, groups, personas, settings) is sealed and left on the relay for it,
+    /// without a single message, story or request, and the device is wiped.
+    func detach(recoveryCode: String? = nil) async throws {
         try open(recoveryCode: recoveryCode)
         guard let identity else { return }
-        if scope == .thisDevice && hasOtherDevices {
-            for c in data.contacts where !c.isSelf && !c.awaitingAcceptance { enqueue(.deviceRemoved, to: c) }
-            sync(.deviceLoggedOut(data.deviceID))
-            try await sendEverything()
-            destroyEverything()
-            Vault.scrubLeftovers()
-            return
-        }
         guard let code = recoveryCode, Identity.seed(fromRecoveryCode: code) == identity.seed else {
             throw LeaveError.wrongRecoveryCode
         }
-        if hasOtherDevices {
-            sync(.accountDetached)
-            try await sendEverything()
+        guard Self.markWipeDue(burnStore) else { throw LeaveError.wipeNotMarked }
+        do {
+            try await leaveBackup(of: identity)
+        } catch {
+            // Nothing was wiped, and the person is told it didn't work: the mark goes, or the next launch would wipe.
+            Self.clearWipeDue(burnStore)
+            throw error
         }
-        try await leaveBackup(of: identity)
         destroyEverything(leavingNoTrace: true)
         Vault.scrubLeftovers()
     }
@@ -9806,7 +9994,13 @@ extension AppModel {
             if c.awaitingAcceptance { seal(.erased, to: c.fingerprint, persona: c.persona) } else { enqueue(.erased, to: c) }
         }
         for id in data.stories.filter({ $0.author == "me" }).map(\.id) { deleteStory(id) }
-        sync(.accountErased)
+        // Groups' and channels' public names are let go of while their keys are still here: once wiped, nobody could.
+        // A release has to be signed at the moment it's sent, so it can't wait in the burn order; a few seconds at most.
+        for name in data.publicNames { dropPublicName(of: name.conversation) }
+        let names = Task { await self.releasePendingNames(); await self.revokeAllShortLinks() }
+        let namesTimer = Task { try? await Task.sleep(for: .seconds(15)); names.cancel() }
+        await names.value
+        namesTimer.cancel()
         let order = makeBurnOrder(identity: identity, outboxBefore: outboxBefore)
         burning = false
         // Marked first, so a wipe cut short (the app killed, the battery gone) is finished at the next launch.
@@ -9827,29 +10021,71 @@ extension AppModel {
         destroyEverything(leavingNoTrace: true, keepingBurnOrder: true)
         Vault.scrubLeftovers()
         if finished { return .complete }
-        burnNotice = "This phone is wiped. Pulshade is finishing the erase on the server and will keep trying until it is done."
+        burnNotice = "This phone is wiped. Pulshade is finishing the erase on the server and will keep trying until it is done, for up to 30 days. Until then this device keeps a sealed note of what's left, which shows an account was burned here."
         startBurnLoop()
         return .pending
     }
 
+    /// Mailboxes in one part of a burn order: what the relay takes in one request (`MAX_BURN_MAILBOXES`), well inside
+    /// its 256 KiB for the whole request.
+    static let burnMailboxesPerPart = 2048
+
     /// Everything a Burn still has to do on the relay, signed now while the keys are known: erase the backup, retire the
     /// handles, take back what is still waiting, erase the files, empty and close every mailbox, and drop the farewells.
-    private func makeBurnOrder(identity: Identity, outboxBefore: Set<UUID>) -> BurnOrder {
-        let ts = UInt64(RelayClock.now.timeIntervalSince1970)
-        func signed(_ label: String, key: Data, by signer: Curve25519.Signing.PrivateKey) -> BurnOrder.Signed {
+    /// In parts (`BurnOrder.Part`): one for each persona, with its handle, recall key and mailboxes (the main one's also
+    /// erases the backup), and one for the files, each signed with a time of its own, so no one request ties the personas
+    /// together.
+    func makeBurnOrder(identity: Identity, outboxBefore: Set<UUID>) -> BurnOrder {
+        let now = UInt64(RelayClock.now.timeIntervalSince1970)
+        // Each part's time is a little before now, by a different random amount: the relay accepts signatures up to
+        // 30 days old, and parts all stamped with the same second would say they're one order.
+        func stamp() -> UInt64 { now - (trafficShaping ? UInt64.random(in: 0...900) : 0) }
+        func signed(_ label: String, key: Data, by signer: Curve25519.Signing.PrivateKey, ts: UInt64) -> BurnOrder.Signed {
             let message = Data(label.utf8) + key + withUnsafeBytes(of: ts.bigEndian) { Data($0) }
             return BurnOrder.Signed(key: key, sig: (try? signer.signature(for: message)) ?? Data())
         }
-        var order = BurnOrder(ts: ts, relay: reachable(nil) ?? data.relay)
-        order.backup = signed("pulshade.burn.backup.v1", key: identity.backupSigningKey.publicKey.rawRepresentation, by: identity.backupSigningKey)
-        let personas: [UUID?] = [nil] + data.personas.map { Optional($0.id) }
-        for persona in personas {
-            guard let me = me(persona) else { continue }
-            order.handles.append(signed("pulshade.burn.retire.v1", key: me.card.signing, by: me.signingKey))
-            order.recall.append(me.recallKey)
+        var order = BurnOrder(ts: now, relay: reachable(nil) ?? data.relay)
+        var parts: [BurnOrder.Part] = []
+        // Every persona anything is kept under, even one whose own entry is gone: its contacts' mailboxes are closed all
+        // the same, only without its signature (the relay rations those, `UNSIGNED_CLOSINGS_PER_HOUR`).
+        var personas: [UUID?] = [nil] + data.personas.map { Optional($0.id) }
+        for persona in data.contacts.map(\.persona) + data.invites.map(\.persona) where !personas.contains(persona) {
+            personas.append(persona)
         }
-        order.blobs = data.blobWipes
-        order.mailboxes = Array(Set(currentLanes().values.flatMap { $0 })).prefix(2048).map { $0 }
+        for persona in personas {
+            let owner: Identity? = persona == nil ? identity : self.me(persona)
+            var boxes = Set(data.contacts.filter { $0.persona == persona }.flatMap(Self.mailboxes(of:)))
+            boxes.formUnion(data.invites.filter { $0.persona == persona }.map(\.receiveKey))
+            // The relay takes `burnMailboxesPerPart` at a time; past that the persona's mailboxes go in more parts, each
+            // signed with its handle like the first (retiring a handle twice does nothing more), so none are left out
+            // and none is held to the ration for unsigned closings.
+            let all = boxes.sorted { $0.hex < $1.hex }
+            for start in stride(from: 0, to: max(all.count, 1), by: Self.burnMailboxesPerPart) {
+                var part = BurnOrder.Part(ts: stamp())
+                if let me = owner {
+                    part.handles = [signed("pulshade.burn.retire.v1", key: me.card.signing, by: me.signingKey, ts: part.ts)]
+                }
+                if start == 0 {
+                    if persona == nil {
+                        part.backup = signed("pulshade.burn.backup.v1", key: identity.backupSigningKey.publicKey.rawRepresentation,
+                                             by: identity.backupSigningKey, ts: part.ts)
+                    }
+                    if let owner { part.recall = [owner.recallKey] }
+                }
+                part.mailboxes = Array(all[start..<min(start + Self.burnMailboxesPerPart, all.count)])
+                if !part.isEmpty { parts.append(part) }
+            }
+        }
+        // The files on their own: erasing them needs only each file's secret, and says nothing about whose they were.
+        if !data.blobWipes.isEmpty {
+            for start in stride(from: 0, to: data.blobWipes.count, by: 1024) {
+                var part = BurnOrder.Part(ts: stamp())
+                part.blobs = Array(data.blobWipes[start..<min(start + 1024, data.blobWipes.count)])
+                parts.append(part)
+            }
+        }
+        order.parts = parts
+        order.ts = parts.map(\.ts).min() ?? now
         var room = 4_000_000
         for item in data.outbox where !outboxBefore.contains(item.id) {
             guard let address = reachable(item.relay), room >= item.blob.count else { continue }
@@ -9875,12 +10111,38 @@ extension AppModel {
             return true
         }
         guard let base = URL(string: order.relay) else { burnStore.delete(); burnPending = false; return true }
-        let client = RelayClient(base: base, lane: "burn")
-        if !order.serverDone, let body = try? order.requestBody(), (try? await client.burn(body)) != nil {
-            order.serverDone = true
-            burnStore.save(order)
+        if var parts = order.parts {
+            // Each part on a connection of its own, in a random order, a random few seconds apart.
+            var first = true
+            for k in parts.indices.shuffled() where !parts[k].done {
+                if !first, trafficShaping { try? await Task.sleep(for: .seconds(Double.random(in: Self.burnPartGap))) }
+                if Task.isCancelled { break }
+                first = false
+                let lane = Lanes.once("burn")
+                let sent: Bool
+                if parts[k].isEmpty {
+                    sent = true
+                } else if let body = try? BurnOrder.requestBody(parts[k]) {
+                    sent = (try? await RelayClient(base: base, lane: lane).burn(body)) != nil
+                } else {
+                    sent = false
+                }
+                RelayClient.retire(lane: lane)
+                guard sent else { continue }
+                parts[k].done = true
+                order.parts = parts
+                burnStore.save(order)
+            }
+        } else {
+            let client = RelayClient(base: base, lane: Lanes.once("burn"))
+            if !order.serverDone, let body = try? order.requestBody(), (try? await client.burn(body)) != nil {
+                order.serverDone = true
+                burnStore.save(order)
+            }
+            RelayClient.retire(lane: client.lane)
         }
-        // The farewells, a few at a time; each that is taken is crossed off.
+        // The farewells, a few at a time, each on a connection of its own (sharing one would tie those contacts together);
+        // each that is taken is crossed off.
         var left = order.farewells
         while !left.isEmpty, !Task.isCancelled {
             let batch = Array(left.prefix(6))
@@ -9888,7 +10150,9 @@ extension AppModel {
                 for farewell in batch {
                     group.addTask {
                         guard let url = URL(string: farewell.relay) else { return (farewell, true) }
-                        do { try await RelayClient(base: url, lane: "burn").deposit(farewell.blob, to: farewell.sendID); return (farewell, true) }
+                        let lane = Lanes.once("farewell")
+                        defer { RelayClient.retire(lane: lane) }
+                        do { try await RelayClient(base: url, lane: lane).deposit(farewell.blob, to: farewell.sendID); return (farewell, true) }
                         catch is RelayTooLarge { return (farewell, true) }
                         catch { return (farewell, false) }
                     }
@@ -9908,6 +10172,9 @@ extension AppModel {
         return true
     }
 
+    /// The pause between a Burn's parts.
+    static let burnPartGap: ClosedRange<Double> = 2...12
+
     /// Tries the burn order now, again a minute later, then every hour, until the relay confirms.
     func startBurnLoop() {
         burnTask?.cancel()
@@ -9922,20 +10189,36 @@ extension AppModel {
         }
     }
 
-    /// Set just before a Burn wipes this device and gone once the wipe is done. Found at launch, the wipe was cut short.
+    /// Set before any wipe of this device starts (and before a Burn or Detach talks to the relay), and gone once the wipe
+    /// is done. Found at launch, the wipe was cut short.
     static func wipeDueFile(_ store: BurnOrderStore) -> URL {
         store.file.deletingPathExtension().appendingPathExtension("wipe-due")
     }
 
+    /// What the mark holds for a wipe that keeps the settings Pulshade needs to reach the relay (Detach of one device of
+    /// several). Empty is a wipe that leaves no trace.
+    private static let keepingSettingsMark = Data("keep".utf8)
+
+    /// Marks a wipe as due. A mark already there is kept as it is (a wipe that leaves no trace never becomes one that
+    /// keeps the settings). True if a mark is there afterwards.
     @discardableResult
-    static func markWipeDue(_ store: BurnOrderStore) -> Bool {
-        FileManager.default.createFile(atPath: wipeDueFile(store).path, contents: Data())
+    static func markWipeDue(_ store: BurnOrderStore, keepingSettings: Bool = false) -> Bool {
+        let file = wipeDueFile(store)
+        if FileManager.default.fileExists(atPath: file.path) { return true }
+        return FileManager.default.createFile(atPath: file.path, contents: keepingSettings ? keepingSettingsMark : Data())
     }
 
-    /// At launch: a Burn whose wipe was cut short is wiped now, before anything can open the account.
+    static func clearWipeDue(_ store: BurnOrderStore) {
+        try? FileManager.default.removeItem(at: wipeDueFile(store))
+    }
+
+    /// At launch: a wipe that was cut short (a Burn or Detach waiting on the relay, or a wipe itself, when the app was
+    /// killed) is finished now, before anything can open the account.
     func finishCutShortWipe() {
-        guard FileManager.default.fileExists(atPath: Self.wipeDueFile(burnStore).path) else { return }
-        destroyEverything(leavingNoTrace: true, keepingBurnOrder: true)
+        let file = Self.wipeDueFile(burnStore)
+        guard FileManager.default.fileExists(atPath: file.path) else { return }
+        let keeping = (try? Data(contentsOf: file)) == Self.keepingSettingsMark
+        destroyEverything(leavingNoTrace: !keeping, keepingBurnOrder: true)
         Vault.scrubLeftovers()
     }
 
@@ -9954,6 +10237,9 @@ extension AppModel {
         }
         await retireHandles(persona: id)
         for convo in data.conversations where convo.persona == id { delete(convo.id) }
+        // Its groups' and channels' names are let go of, and short links to its invites marked, before its keys are gone.
+        await releasePendingNames()
+        await revokeShortLinks(ofPersona: id)
         for c in data.contacts where c.persona == id && !c.isSelf {
             if c.awaitingAcceptance { seal(.erased, to: c.fingerprint, persona: id) } else { enqueue(.erased, to: c) }
         }
@@ -9994,7 +10280,7 @@ extension AppModel {
     /// Sends Detach or Burn's farewells from the lock screen, then locks again if they couldn't go.
     func leaveFromLock(burning: Bool, recoveryCode: String) async throws {
         do {
-            if burning { try await burn(recoveryCode: recoveryCode) } else { try await detach(.thisDevice, recoveryCode: recoveryCode) }
+            if burning { try await burn(recoveryCode: recoveryCode) } else { try await detach(recoveryCode: recoveryCode) }
         } catch {
             if phase == .locked {
                 identity = nil
@@ -10035,17 +10321,20 @@ extension AppModel {
         kept.setAsideUnseen = nil
         // The media pool's filler belongs to this device's files: never in a backup or a detached copy.
         kept.mediaFillers = nil
+        // Reader uses this device still has to spend are about files it sent: chat, like the rest.
+        kept.blobSpends = []
         kept.requests = []
         kept.outbox = []
         kept.chatCodes = []
-        kept.linkOffers = []
         if !keepingDevices, let i = kept.contacts.firstIndex(where: \.isSelf) { kept.contacts[i].devices = [] }
         return kept
     }
 
     /// `unreadable`: a copy is on the relay but this version can't open it (it may come from a newer one). It must
-    /// not be taken for no backup, or starting over would later save across it.
-    enum BackupLookup { case found(AppData), none, unreachable, unreadable }
+    /// not be taken for no backup, or starting over would later save across it. `older`: the copy the relay gave is
+    /// older than one this device already made or restored for the account (the relay served an old one), so it isn't
+    /// restored; its date, if it says one.
+    enum BackupLookup { case found(AppData), none, unreachable, unreadable, older(Date?) }
 
     /// The account a log out left on the relay, opened with the recovery code's key.
     func backup(of identity: Identity) async -> BackupLookup {
@@ -10063,6 +10352,11 @@ extension AppModel {
         // What a backup couldn't give back isn't kept: a backup never holds anything set aside on the device it came from.
         restored.setAside = nil
         restored.setAsideUnseen = nil
+        // Older than one this device made or restored for this account (its saved data is still here): the relay handed
+        // back an old copy. Not restored. A device that has none of the account's data can't tell; it shows the date.
+        if let seen = (try? vault.load(with: identity))?.backupStamp, (restored.backupStamp?.counter ?? 0) < seen.counter {
+            return .older(restored.backupStamp?.madeAt)
+        }
         return .found(restored)
     }
 
@@ -10080,7 +10374,7 @@ extension AppModel {
         await flush()
         do {
             guard let client = client(nil, lane: "backup") else { throw LeaveError.offline }
-            let sealed = try Self.sealedBackup(of: data, with: identity)
+            let sealed = try Self.sealedBackup(of: data, with: identity, stamp: .next(after: data.backupStamp))
             let (key, sig, ts) = backupProof("pulshade.backup.put.v1", identity, body: sealed)
             try await client.putBackup(sealed, key: key, sig: sig, ts: ts, forgetHash: forgetHash(for: identity))
         } catch {
@@ -10110,6 +10404,8 @@ extension AppModel {
         var kept = withoutChats(data, keepingDevices: false)
         kept.backupSavedAt = nil
         kept.backupDigest = nil
+        // Its stamp goes in as it is sealed (`stamped`), so an unchanged account still compares equal.
+        kept.backupStamp = nil
         // Nothing you wrote that is still waiting to be sent: that is chat, and chats never go in the backup.
         // No session keys either: a recovered account opens fresh ones with every contact (`startFreshSessions`), so a
         // copy of the backup, with the recovery code, shows no chat key that was ever used. Only a contact who hasn't
@@ -10165,9 +10461,16 @@ extension AppModel {
         return data.subdata(in: 5..<(5 + length))
     }
 
-    static func sealedBackup(of data: AppData, with identity: Identity) throws -> Data {
-        let plain = try JSONEncoder.pulshade.encode(backupContents(of: data))
+    static func sealedBackup(of data: AppData, with identity: Identity, stamp: BackupStamp) throws -> Data {
+        let plain = try JSONEncoder.pulshade.encode(stamped(backupContents(of: data), stamp))
         return try AES.GCM.seal(padded(plain), using: identity.backupKey).combined!
+    }
+
+    /// What a backup holds, with its stamp: inside the seal, so the relay can't change its count or date.
+    static func stamped(_ contents: AppData, _ stamp: BackupStamp) -> AppData {
+        var out = contents
+        out.backupStamp = stamp
+        return out
     }
 
     /// Called after every save: waits a random few minutes, then saves the backup if anything in it changed.
@@ -10183,6 +10486,37 @@ extension AppModel {
         }
     }
 
+    /// What decides whether the backup changed enough to upload (`saveBackup`): its contents without what changes on its
+    /// own often enough that an upload right after would tie this backup on the relay to it. Spares change every few days
+    /// per friend (an upload every few minutes while they're first made; one made since an upload is simply not in it, and
+    /// its friend falls back). Mailbox moves (`tendMailboxes`) happen weekly
+    /// for each friend, on theirs and on this side: a backup going up minutes after each would tell the relay which
+    /// mailboxes are this account's. Both still go in the backup, with the next upload that happens anyway or the weekly
+    /// one. A recovery from a backup made before a move still works: the recovered account opens fresh sessions, and the
+    /// hello that opens each names the mailbox it reads (`DeviceCard.sendID`), which the friend's device then writes to.
+    /// What was waiting in a mailbox moved to since is not read.
+    static func backupChangeDigest(of data: AppData) -> Data? {
+        var kept = backupContents(of: data)
+        for c in kept.contacts.indices {
+            kept.contacts[c].spare = nil
+            kept.contacts[c].oldSpares = nil
+            kept.contacts[c].moreSpares = nil
+            kept.contacts[c].receiveKey = nil
+            kept.contacts[c].mailboxSince = nil
+            kept.contacts[c].formerMailboxes = nil
+            kept.contacts[c].movedHeard = nil
+            for d in kept.contacts[c].devices.indices {
+                kept.contacts[c].devices[d].sendID = Data()
+                // The word of a move, while it waits for a session to go on.
+                kept.contacts[c].devices[d].pending.removeAll { if case .mailbox = $0.payload { return true } else { return false } }
+            }
+        }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .secondsSince1970
+        encoder.outputFormatting = .sortedKeys
+        return (try? encoder.encode(kept)).map { Data(SHA256.hash(data: $0)) }
+    }
+
     /// Seals and uploads the backup if it changed (or is a week old). Quiet on failure: it tries again later.
     @discardableResult
     func saveBackup() async -> Bool {
@@ -10192,14 +10526,9 @@ extension AppModel {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .secondsSince1970
         encoder.outputFormatting = .sortedKeys
-        guard let plain = try? encoder.encode(Self.backupContents(of: data)) else { return false }
-        // Spares change every few days per friend: on their own they don't ask for an upload (that would be one every
-        // few minutes while they're first made, and a timing link between spares and this backup on the relay). They
-        // go with the next save that happens anyway; one made since is simply not in it, and its friend falls back.
-        var withoutSpares = Self.backupContents(of: data)
-        for c in withoutSpares.contacts.indices { withoutSpares.contacts[c].spare = nil; withoutSpares.contacts[c].oldSpares = nil; withoutSpares.contacts[c].moreSpares = nil }
-        guard let digestPlain = try? encoder.encode(withoutSpares) else { return false }
-        let digest = Data(SHA256.hash(data: digestPlain))
+        let stamp = BackupStamp.next(after: data.backupStamp)
+        guard let plain = try? encoder.encode(Self.stamped(Self.backupContents(of: data), stamp)) else { return false }
+        guard let digest = Self.backupChangeDigest(of: data) else { return false }
         let week = data.backupSavedAt.map { Date().timeIntervalSince($0) > 7 * 24 * 3600 } ?? true
         if digest == data.backupDigest, !week { return true }
         guard let sealed = try? AES.GCM.seal(Self.padded(plain), using: identity.backupKey).combined else { return false }
@@ -10213,6 +10542,7 @@ extension AppModel {
         guard self.identity?.fingerprint == identity.fingerprint, data.security.keepBackup else { return true }
         data.backupDigest = digest
         data.backupSavedAt = Date()
+        data.backupStamp = stamp
         save()
         return true
     }
@@ -10264,7 +10594,7 @@ extension AppModel {
         }
     }
 
-    private func backupProof(_ label: String, _ identity: Identity, body: Data? = nil) -> (key: Data, sig: Data, ts: UInt64) {
+    func backupProof(_ label: String, _ identity: Identity, body: Data? = nil) -> (key: Data, sig: Data, ts: UInt64) {
         let signer = identity.backupSigningKey
         let key = signer.publicKey.rawRepresentation
         let ts = UInt64(RelayClock.now.timeIntervalSince1970)
@@ -10363,7 +10693,7 @@ extension AppModel {
         guard call == nil, let contact = contact(fingerprint, in: persona), !contact.hidden else { return }
         let invite = CallInvite(id: UUID(), room: .random(32), key: .random(32))
         call = ActiveCall(invite: invite, peer: fingerprint, persona: persona, outgoing: true, phase: .ringing,
-                          speaker: Platform.isPhone)
+                          speaker: true)
         enqueue(.callOffer(invite), to: contact)
         save()
         kick()
@@ -10385,7 +10715,6 @@ extension AppModel {
         CallRinger.shared.answeredInApp()
         #endif
         enqueue(.callAnswer(id: current.invite.id, accepted: true), to: contact)
-        sync(.callHandled(current.invite.id))
         save()
         kick()
         connectCall()
@@ -10396,7 +10725,6 @@ extension AppModel {
         if let contact = contact(current.peer, in: current.persona) {
             enqueue(.callAnswer(id: current.invite.id, accepted: false), to: contact)
         }
-        sync(.callHandled(current.invite.id))
         noteCall("Declined call", current)
         stopCall()
         save()
@@ -10453,16 +10781,8 @@ extension AppModel {
             enqueue(.callAnswer(id: invite.id, accepted: false), to: sender)
             return
         }
-        #if os(macOS)
-        if DemoContact.isOn {
-            // The demo contact doesn't take calls: turned down straight away, without ringing.
-            enqueue(.callAnswer(id: invite.id, accepted: false), to: sender)
-            kick()
-            return
-        }
-        #endif
         call = ActiveCall(invite: invite, peer: sender.fingerprint, persona: sender.persona, outgoing: false, phase: .ringing,
-                          speaker: Platform.isPhone)
+                          speaker: true)
         let name = data.security.notificationContent == .hidden ? "PULSHADE" : sender.displayName
         var onCallScreen = false
         #if os(iOS)
@@ -10574,11 +10894,31 @@ extension AppModel {
 }
 
 extension AppModel {
+    /// What a web link stands for, opened as its own link would be. Each waits on its screen while Pulshade is locked; a
+    /// short link is looked up once Pulshade is open (`openedShort`).
+    func openTarget(_ target: WebLinks.Target) {
+        switch target {
+        case let .name(handle, check): openedKeyCheck = check; openedHandle = handle
+        case let .group(code): openedGroupLink = OpenedGroupLink(code: code)
+        case let .invite(code): openedCode = code
+        case let .chat(link): openedCode = link.link
+        case let .short(code): openedShort = code
+        }
+    }
+
     /// A pulshade:// link opened from outside: a profile link goes to Contacts, anything else to the scan screen.
     /// Both wait there while Pulshade is locked.
     func open(_ url: URL) {
+        // A web link (`https://<domain>/name` or `/+code`): the same as the pulshade:// link it stands for.
+        if let target = WebLinks.parse(url) {
+            openTarget(target)
+            return
+        }
         guard url.scheme?.lowercased() == "pulshade" else { return }
-        if let code = GroupLinkCode(url.absoluteString) {
+        // `pulshade://i/<letters>`, the pulsh.me page's Open button for a short link.
+        if url.host()?.lowercased() == "i", url.pathComponents.count == 2, let short = ShortCode(url.lastPathComponent) {
+            openedShort = short
+        } else if let code = GroupLinkCode(url.absoluteString) {
             openedGroupLink = OpenedGroupLink(code: code)
         } else if let link = DirectoryProfile.handle(fromLink: url) {
             openedKeyCheck = link.keyCheck
@@ -10714,7 +11054,6 @@ extension AppModel {
         convo.version = 1
         withAnimation(.snappy) { data.conversations.insert(convo, at: 0) }
         if let i = index(of: convo.id) { invite(members, at: i) }
-        syncConversation(convo.id)
         save()
         return index(of: convo.id).map { data.conversations[$0] }
     }
@@ -10771,7 +11110,7 @@ extension AppModel {
         for person in added {
             shared.invited[person.fingerprint] = Date()
             shared.invitedEpoch[person.fingerprint] = epoch.number
-            enqueue(.groupInvite(GroupInvite(settings: shared.settings, epoch: epoch, code: code)), to: person)
+            enqueue(.groupInvite(vouched(GroupInvite(settings: shared.settings, epoch: epoch, code: code), at: i)), to: person)
         }
         data.conversations[i].shared = shared
         if kind == .channel { for person in added { noteAdmitted(person.fingerprint, at: i) } }
@@ -10804,6 +11143,15 @@ extension AppModel {
         save()
     }
 
+    /// A channel's invite with this staff member's word that the account sending it is theirs (`StaffVouch`).
+    private func vouched(_ invite: GroupInvite, at i: Int) -> GroupInvite {
+        guard invite.settings.kind == .channel, let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID),
+              invite.settings.isAdmin(keys.publicKey), let me = me(data.conversations[i].persona) else { return invite }
+        var out = invite
+        out.vouch = StaffVouch.make(keys, group: invite.settings.group, account: me.card.signing)
+        return out
+    }
+
     // MARK: Being invited
 
     /// An invite over a chat with someone you know. A group or channel this account isn't in yet waits for you to say yes
@@ -10823,7 +11171,8 @@ extension AppModel {
                 // Invited again (an answer that went astray, or added back after missing a key): taken only if it is the
                 // settings held, the next version and one its signer may make, or a later one the owner signed.
                 // Anything else could be someone rewriting the group.
-                guard s == shared.settings || shared.settings.accepts(s) || shared.settings.acceptsJump(s) else { return }
+                guard s == shared.settings || shared.settings.accepts(s) || shared.settings.acceptsJump(s),
+                      shared.disputed?.contains(s.signer) != true else { return }
                 // A group this account left (or was taken out of) comes back only when it has been added again: newer
                 // settings that list it as a member, which only an admin can make. The settings from before, sent again
                 // by anyone who still holds them, bring nothing back. A channel's follower comes back only through the
@@ -10857,7 +11206,13 @@ extension AppModel {
             // A new group comes from a friend. Someone known only through another group or a channel can't put this
             // account in one (and so get its name and picture card back); a channel's own invite is how it is followed.
             if s.kind == .group, sender.hidden { return }
-            let match = s.kind == .channel && !consented ? takeFollowAsked(sender.fingerprint, persona: sender.persona, tag: invite.code) : .none
+            // A channel comes only from its staff, by their word (`StaffVouch`): someone who forwards an invite they were
+            // sent can't become the account this one follows it through. Staff on an app from before can't give it.
+            if s.kind == .channel, invite.vouch?.checks(s, account: sender.signingKey) != true {
+                if invite.vouch == nil { noteChannelInviteTooOld(from: sender) }
+                return
+            }
+            let match = s.kind == .channel && !consented ? takeFollowAsked(sender.fingerprint, persona: sender.persona, tag: invite.code, group: s.group) : .none
             let followed = match == .matched
             // Nor a channel, unless it's the one whose code you followed: anyone who said hello on a channel's code, or
             // the staff of a channel you follow, would otherwise have a way to send you invites (and notifications) of
@@ -10890,7 +11245,6 @@ extension AppModel {
             data.conversations[i].shared?.reader.forget(epoch: 0)
         }
         if !s.isMember(keys.publicKey), !quiet { enqueue(.groupJoin(group: s.group, card: card), to: sender) }
-        if let i = groupIndex(s.group, persona: sender.persona) { syncConversation(data.conversations[i].id) }
         save()
     }
 
@@ -11127,10 +11481,16 @@ extension AppModel {
         let limit = group.uuidString + card.signingKey.hex
         guard Date().timeIntervalSince(channelKeyAnswered[limit] ?? .distantPast) > 600 else { return }
         channelKeyAnswered[limit] = Date()
-        enqueue(.groupInvite(GroupInvite(settings: shared.settings, epoch: current)), to: sender)
+        enqueue(.groupInvite(vouched(GroupInvite(settings: shared.settings, epoch: current), at: i)), to: sender)
     }
 
 #if DEBUG
+    /// For tests: the invite this device would send for one of its channels now, with its word as staff, naming `code`.
+    func vouchedInviteForTests(_ id: Conversation.ID, code: Data?) -> GroupInvite? {
+        guard let i = index(of: id), let shared = data.conversations[i].shared, let epoch = shared.current else { return nil }
+        return vouched(GroupInvite(settings: shared.settings, epoch: epoch, code: code), at: i)
+    }
+
     /// For tests: lets people who followed through the channel's code in, as a hello would.
     func admitFromCodeForTests(_ fingerprints: [String], in id: Conversation.ID) {
         if let i = index(of: id) { admitFromCode(fingerprints, at: i) }
@@ -11146,7 +11506,6 @@ extension AppModel {
     }
 
     /// For tests: the history a newly linked device would be sent.
-    func historyForTests() -> [SyncEvent] { historyForNewDevice() }
 #endif
 
     // MARK: A channel's followers
@@ -11204,7 +11563,7 @@ extension AppModel {
               let target = contact(fingerprint, in: data.conversations[i].persona), takesChannels(target) else { return }
         shared.staffInvited = (shared.staffInvited ?? [:]).merging([fingerprint: Date()]) { _, new in new }
         data.conversations[i].shared = shared
-        enqueue(.groupInvite(GroupInvite(settings: shared.settings, epoch: epoch, staff: true, staffKey: shared.staffKey)), to: target)
+        enqueue(.groupInvite(vouched(GroupInvite(settings: shared.settings, epoch: epoch, staff: true, staffKey: shared.staffKey), at: i)), to: target)
         save()
     }
 
@@ -11223,7 +11582,7 @@ extension AppModel {
         let adminKeys = Set(shared.settings.admins).subtracting([shared.settings.owner])
         for (account, fingerprint) in shared.knownAs where adminKeys.contains(where: { Identity.fingerprint(of: $0) == fingerprint }) {
             guard let contact = contact(account, in: data.conversations[i].persona) else { continue }
-            enqueue(.groupInvite(GroupInvite(settings: shared.settings, epoch: epoch, staff: true, staffKey: shared.staffKey)), to: contact)
+            enqueue(.groupInvite(vouched(GroupInvite(settings: shared.settings, epoch: epoch, staff: true, staffKey: shared.staffKey), at: i)), to: contact)
         }
         publishRoster(at: i)
         save()
@@ -11260,10 +11619,10 @@ extension AppModel {
         next.sign(with: keys)
         guard shared.settings.accepts(next), next.fitsInMailbox else { return false }
         data.conversations[i].shared?.previous = shared.settings
+        data.conversations[i].shared?.noteAdded(from: shared.settings, to: next)
         data.conversations[i].shared?.settings = next
         applySharedSettings(at: i)
         post(.groupSettings(next), at: i)
-        syncConversation(data.conversations[i].id)
         // Posts held because their sender wasn't listed yet (a newcomer asking for chains before its card was in) are
         // read again now that it may be, as they are when someone else's settings arrive.
         rereadHeldMail(at: i)
@@ -11316,9 +11675,6 @@ extension AppModel {
         if data.conversations[i].disappearAfter != s.disappearAfter { applyTimer(s.disappearAfter, at: i) }
         if shared.joining, s.isMember(mine) {
             data.conversations[i].shared?.joining = false
-            #if os(macOS)
-            DemoContact.shared.joinedGroup(data.conversations[i].id, model: self)
-            #endif
         }
     }
 
@@ -11385,12 +11741,12 @@ extension AppModel {
         shared = data.conversations[i].shared ?? shared
         shared.previous = shared.settings
         install(next, in: &shared)
+        shared.noteAdded(from: shared.settings, to: settings)
         shared.settings = settings
         shared.chatInEpoch = false
         shared.chatsInEpoch = nil
         data.conversations[i].shared = shared
         applySharedSettings(at: i)
-        syncConversation(data.conversations[i].id)
         rereadHeldMail(at: i)
         save()
     }
@@ -11438,18 +11794,7 @@ extension AppModel {
         let secret = Data.random(32)
         data.groupSecret = secret
         data.groupRenewAfter = Date()
-        sync(.groupSecret(secret))
         for i in data.conversations.indices { renewMemberKeys(at: i) }
-        save()
-    }
-
-    /// A new group secret from another of this account's devices. Groups move to it when that device's new settings
-    /// arrive, or, if they don't, from this device a little later.
-    private func adoptGroupSecret(_ secret: Data) {
-        guard secret.count == 32, secret != data.groupSecret else { return }
-        stampGroups(with: data.groupSecret ?? Data())
-        data.groupSecret = secret
-        data.groupRenewAfter = Date().addingTimeInterval(Self.groupRenewWait)
         save()
     }
 
@@ -11514,10 +11859,13 @@ extension AppModel {
         shared = data.conversations[i].shared ?? shared
         shared.previous = shared.settings
         install(epoch, in: &shared)
+        shared.noteAdded(from: s, to: next)
         shared.settings = next
         shared.chatInEpoch = false
         shared.chatsInEpoch = nil
         shared.memberSecret = nil
+        shared.renewing = held
+        shared.renewals = Array(((shared.renewals ?? []) + [RenewalMark(old: old.publicKey, new: new.publicKey, version: next.version)]).suffix(RenewalMark.kept))
         // Sessions were opened under the old keys; new ones are opened under the new as they're needed.
         shared.peers = nil
         shared.chainAsked = nil
@@ -11528,7 +11876,6 @@ extension AppModel {
             // The staff mailbox's key and the roster: the old key opens neither from now on.
             if next.owner == new.publicKey { rotateStaffKey(at: i) } else { publishRoster(at: i) }
         }
-        syncConversation(convo.id)
         save()
         return true
     }
@@ -11536,7 +11883,8 @@ extension AppModel {
     /// Groups still on an older group secret are moved on, once this device may (`groupRenewAfter`), at most every ten
     /// minutes each. An account that has no group secret yet gets one from its lead device.
     private func tendGroupSecret() {
-        if data.groupSecret == nil, identity != nil, isLeadDevice(nil) {
+        settleForeignMoves()
+        if data.groupSecret == nil, identity != nil {
             renewGroupSecret()
             return
         }
@@ -11548,6 +11896,71 @@ extension AppModel {
             groupRenewTried[id] = now
             if renewMemberKeys(at: i) { groupRenewTried[id] = nil }
         }
+    }
+
+    /// Groups where this account's place was moved to keys this device couldn't make (`SharedGroup.foreignMove`). Once
+    /// the group secret that makes them arrives (another of this account's devices moved it), the move is taken. If it
+    /// hasn't after `groupRenewWait`, a device holding the account's old keys made it: this device moves the same place to
+    /// a key of its own from the same version, so every member sees two moves of one place and holds both back
+    /// (`disputeRenewal`), and leaves, asking to be added again.
+    private func settleForeignMoves() {
+        for i in data.conversations.indices {
+            guard let shared = data.conversations[i].shared, !shared.gone, let move = shared.foreignMove,
+                  let me = me(data.conversations[i].persona) else { continue }
+            let gid = data.conversations[i].wireID
+            let makeable = [data.groupSecret, shared.memberSecret].compactMap { $0 }.map { GroupMemberKeys(seed: me.seed, group: gid, secret: $0).publicKey }
+            let taker = move.members.map(\.signingKey).first { !shared.settings.isMember($0) }
+            if let taker, makeable.contains(taker) {
+                data.conversations[i].shared?.foreignMove = nil
+                data.conversations[i].shared?.foreignMoveAt = nil
+                adoptSettings(move, at: i)
+                continue
+            }
+            guard Date().timeIntervalSince(shared.foreignMoveAt ?? .distantPast) > Self.groupRenewWait else { continue }
+            counterMove(move, at: i)
+        }
+    }
+
+    /// Moves this account's place in group `i` to a throwaway key, from the same version as `move` (another device's move
+    /// of the same place): members then hold two moves of one place, so they take neither (`disputeRenewal`). Then this
+    /// device leaves the group.
+    private func counterMove(_ move: GroupSettings, at i: Int) {
+        guard let shared = data.conversations[i].shared, let keys = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID),
+              let current = shared.current, groupNumberRange.contains(current.number + 1) else { return }
+        let s = shared.settings
+        let gid = data.conversations[i].wireID
+        let decoy = GroupMemberKeys(seed: .random(32), group: gid)
+        let card = MemberCard.make(decoy, group: gid, name: "", avatar: nil, color: nil)
+        let epoch = GroupEpoch.fresh(number: current.number + 1)
+        func swap(_ key: Data) -> Data { key == keys.publicKey ? decoy.publicKey : key }
+        var counter = s
+        counter.members = s.members.map { $0.signingKey == keys.publicKey ? card : $0 }
+        counter.owner = swap(s.owner)
+        counter.admins = s.admins.map(swap)
+        counter.mods = s.mods.map(swap)
+        counter.epoch = epoch.number
+        counter.epochCheck = epoch.check
+        counter.version = move.version
+        counter.sign(with: keys)
+        if s.renewal(to: counter) != nil, counter.fitsInMailbox {
+            let channel = s.kind == .channel
+            let readers = counter.members.filter { $0.signingKey != decoy.publicKey } + (channel ? (shared.roster?.live ?? []) : [])
+            post(.groupRekey(GroupRekey.make(epoch, group: gid, for: readers, tagged: channel)), at: i)
+            post(.groupSettings(counter), at: i)
+            // The group goes from this device, outbox and all: these still go out, with retries (`partingPosts`).
+            if let after = data.conversations[i].shared {
+                let parting = after.outbox.filter { !$0.ephemeral }.map {
+                    PartingPost(post: $0, persona: data.conversations[i].persona, known: after.postedTo.contains($0.sendID.hex))
+                }
+                data.partingPosts = Array((data.partingPosts + parting).suffix(Self.partingPostsKept))
+            }
+        }
+        data.conversations[i].shared?.foreignMove = nil
+        data.conversations[i].shared?.foreignMoveAt = nil
+        defer { if !data.partingPosts.isEmpty { kick() } }
+        leftShared(at: i, note: "A device holding your account's old keys moved your place in this group, so the members can't tell which is you. "
+                   + "If it isn't one of yours, unlink it in Devices, and ask an admin to add you again.")
+        save()
     }
 
     // MARK: Posting
@@ -11612,10 +12025,19 @@ extension AppModel {
     /// Posts what's waiting in every shared group's outbox, oldest first, one group at a time each.
     func flushSharedGroups() async {
         for convo in data.conversations where !(convo.shared?.outbox.isEmpty ?? true) && !groupFlushing.contains(convo.id) {
-            guard let client = client(nil, lane: Outgoing.lane(for: convo.persona)) else { continue }
+            // Over Tor each group is posted to on a lane of its own, apart from the persona's one-to-one sending and from
+            // its other groups, on a circuit that lasts one burst of posting (`SendLanes`).
+            let base = isolatesLanes ? Lanes.groupSendLane(convo.id) : Outgoing.lane(for: convo.persona)
+            let lane = sendLanes.current(base)
+            if let retired = lane.retired { RelayClient.retire(lane: retired) }
+            guard let client = client(nil, lane: lane.name) else { continue }
             let id = convo.id
             groupFlushing.insert(id)
-            defer { groupFlushing.remove(id) }
+            sendLanes.note(lane.name, busy: 1)
+            defer {
+                groupFlushing.remove(id)
+                sendLanes.note(lane.name, busy: -1)
+            }
             while let next = index(of: id).flatMap({ data.conversations[$0].shared?.outbox.first }) {
                 // Typing that waited too long means nothing now.
                 if next.ephemeral, Date().timeIntervalSince(next.queued) > 10 {
@@ -11650,9 +12072,10 @@ extension AppModel {
 
     /// A chat video in a shared group: the clip goes up once, sealed, and everyone gets one pointer to it.
     func sendSharedClip(_ clip: Data, id: UUID, in convoID: UUID) {
-        guard let relay = client(nil, lane: "blob"),
+        guard let relay = blobClient(),
               let prepared = try? BlobTransfer.prepare(data: clip, kind: .video, lifetime: 7 * 86_400) else { return }
         Task { [weak self] in
+            defer { RelayClient.retire(lane: relay.lane) }
             do { try await BlobTransfer.upload(prepared, to: relay) { _ in } } catch { return }
             guard let self, let i = self.index(of: convoID) else { return }
             if let m = self.data.conversations[i].messages.lastIndex(where: { $0.id == id && $0.isMine }) {
@@ -11668,12 +12091,13 @@ extension AppModel {
     /// mailbox as it always did, so it is never lost.
     private func postLightened(_ light: (wire: WireMessage, bytes: Data, kind: Attachment.Kind), full: WireMessage,
                                in convoID: UUID, message: UUID) {
-        guard let relay = client(nil, lane: "blob"),
+        guard let relay = blobClient(),
               let prepared = try? BlobTransfer.prepare(data: light.bytes, kind: light.kind, lifetime: 7 * 86_400) else {
             postIfShared(.message(full), in: convoID, message: message)
             return
         }
         Task { [weak self] in
+            defer { RelayClient.retire(lane: relay.lane) }
             var uploaded = true
             do { try await BlobTransfer.upload(prepared, to: relay) { _ in } } catch { uploaded = false }
             guard let self, let i = self.index(of: convoID) else { return }
@@ -11693,9 +12117,10 @@ extension AppModel {
     /// Group mailboxes a lane reads, with where each was read up to.
     func groupCursors(for lane: Lane) -> [(key: Data, after: UInt64, convo: UUID, epoch: Int)] {
         guard lane.relay == nil else { return [] }
+        let count = liveGroups.count
         var out: [(key: Data, after: UInt64, convo: UUID, epoch: Int)] = []
         for convo in data.conversations {
-            guard let shared = convo.shared, !shared.gone, (convo.persona?.uuidString ?? "main") == lane.name else { continue }
+            guard let shared = convo.shared, !shared.gone, groupLane(convo, among: count) == lane.name else { continue }
             for epoch in shared.readable {
                 out.append((epoch.receiveKey, shared.cursors[String(epoch.number)] ?? 0, convo.id, epoch.number))
             }
@@ -11907,11 +12332,17 @@ extension AppModel {
             let id = data.conversations[i].id
             let tries = groupRetries[id] ?? 0
             // Backs off to every ten minutes, and keeps going until the removal sticks.
-            if staff, let target = shared.settings.members.first(where: { shared.wantRemoved[$0.signingKey.hex] != nil })?.signingKey,
+            // Everyone still to go that this device's role lets it take out goes in one new epoch.
+            func mayGo(_ key: Data) -> Bool {
+                let s = shared.settings
+                return s.isAdmin(key) ? s.owner == keys.publicKey : !s.mods.contains(key) || s.isAdmin(keys.publicKey)
+            }
+            let targets = shared.settings.members.map(\.signingKey).filter { shared.wantRemoved[$0.hex] != nil && mayGo($0) }
+            if staff, !targets.isEmpty,
                now.timeIntervalSince(lastGroupRetry[id] ?? .distantPast) > min(600, 5 * pow(2, Double(min(tries, 10)))) {
                 lastGroupRetry[id] = now
                 groupRetries[id] = tries + 1
-                startEpoch(at: i, without: [target])
+                startEpoch(at: i, without: Set(targets))
                 continue
             }
             if shared.wantRemoved.isEmpty { groupRetries[id] = nil }
@@ -11997,6 +12428,18 @@ extension AppModel {
             }
             return
         }
+        // From a key whose place this device saw moved: a late copy of another move of that place is what's looked for.
+        if !shared.settings.isMember(outer.sender), outer.isDirect, shared.renewals?.contains(where: { $0.old == outer.sender }) == true {
+            data.conversations[i].shared = shared
+            if outer.inner.count <= GroupSeal.maxPadded, case let .groupSettings(next)? = try? Payload.fromWire(outer.inner),
+               next.signer == outer.sender { checkMovedPlace(next, at: i) }
+            return
+        }
+        // Keys two devices fought over: nothing they post is read until an admin adds them again.
+        if shared.disputed?.contains(outer.sender) == true {
+            data.conversations[i].shared = shared
+            return
+        }
         // The staff mailbox carries rosters and nothing else, and rosters are read nowhere else.
         if number == 0 {
             guard shared.settings.isAdmin(outer.sender) || ours else { return }
@@ -12045,7 +12488,19 @@ extension AppModel {
         case let .key(key):
             messageKey = key
         }
-        guard let payload = unchained ?? GroupSeal.inner(outer, messageKey: messageKey).flatMap({ try? Payload.fromWire($0) }) else {
+        let inner = unchained == nil ? GroupSeal.inner(outer, messageKey: messageKey) : nil
+        if unchained == nil {
+            if inner == nil, shared.reader.dropUnproven(epoch: number, sender: outer.sender, device: outer.device) {
+                // The chain it was read with was passed on and isn't this device's: dropped, the post held, and the
+                // chain asked for again.
+                hold(mail, epoch: number, from: outer.sender, device: outer.device, chain: true, in: &shared)
+                data.conversations[i].shared = shared
+                chainAsksDue.insert(id)
+                return
+            }
+            if inner != nil { shared.reader.proved(epoch: number, sender: outer.sender, device: outer.device) }
+        }
+        guard let payload = unchained ?? inner.flatMap({ try? Payload.fromWire($0) }) else {
             data.conversations[i].shared = shared
             return
         }
@@ -12135,7 +12590,8 @@ extension AppModel {
             guard !ours, wire.conversation == gid, let sender = contact(fp, in: persona) else { return }
             deliver(wire, from: sender)
         case let .typing(conversation):
-            guard !ours, conversation == gid else { return }
+            // Group mail stays for days: typing read long after it was posted (coming back to a group) means nothing.
+            guard !ours, conversation == gid, Self.isFreshSignal(deposited: mail.deposited) else { return }
             handle(payload, from: fp, persona: persona, device: outer.device)
         case .reaction, .unsend, .clipBlob:
             guard !ours else { return }
@@ -12216,12 +12672,48 @@ extension AppModel {
         let renewed = renewedKeys(at: i)
         func listed(_ s: GroupSettings) -> Bool { s.isMember(keys.publicKey) || renewed.map { s.isMember($0.publicKey) } == true }
         let held = shared.settings
+        // Nothing a key two devices fought over signs is taken (`disputeRenewal`).
+        if shared.disputed?.contains(next.signer) == true { return }
         let competing = next.version == held.version && next != held
         if competing {
-            guard let previous = shared.previous, previous.accepts(next) || previous.acceptsJump(next),
-                  next.winsOver(held) else { return }
+            guard let previous = shared.previous, previous.accepts(next) || previous.acceptsJump(next) else { return }
+            switch next.contest(held, base: previous) {
+            case .wins: break
+            case .loses: return
+            case let .dispute(old, disputed):
+                disputeRenewal(old: old, keys: disputed, at: i)
+                return
+            }
         } else {
-            guard next.version > held.version, held.accepts(next) || held.acceptsJump(next) else { return }
+            guard next.version > held.version else {
+                checkMovedPlace(next, at: i)
+                return
+            }
+            guard held.accepts(next) || held.acceptsJump(next) else { return }
+        }
+        let base = competing ? shared.previous : held
+        // This device's own move to new keys lost to a change made at the same moment: back to the keys the group still
+        // lists, and moved again later (`tendGroupSecret`).
+        if let from = shared.renewing, let me = me(data.conversations[i].persona), !next.isMember(keys.publicKey) {
+            let before = GroupMemberKeys(seed: me.seed, group: data.conversations[i].wireID, secret: from)
+            if next.isMember(before.publicKey) {
+                shared.memberSecret = from
+                shared.renewing = nil
+                shared.peers = nil
+                shared.chainAsked = nil
+                keys = before
+            }
+        }
+        // This account's own place moved to keys this device can't make (yet): another of its devices may have moved it
+        // with a group secret that hasn't reached this one, or a device holding the account's old keys (one taken, or
+        // unlinked) did. Held, and settled in `tendGroupSecret`.
+        if let (old, new) = base?.renewal(to: next), old == keys.publicKey, new != renewed?.publicKey {
+            if shared.foreignMove?.version != next.version {
+                shared.foreignMove = next
+                shared.foreignMoveAt = Date()
+            }
+            data.conversations[i].shared = shared
+            return
         }
         // The epoch it names: held already, or a candidate whose check matches.
         if shared.epoch(next.epoch)?.check != next.epochCheck {
@@ -12242,6 +12734,7 @@ extension AppModel {
             install(key, in: &shared)
         }
         if !competing { shared.previous = held }
+        if let base { shared.noteAdded(from: base, to: next) }
         shared.settings = next
         if let renewed, next.isMember(renewed.publicKey) {
             // The sessions were opened under the old keys: new ones are opened under the new.
@@ -12251,7 +12744,8 @@ extension AppModel {
             keys = renewed
         }
         // A member who moved to new keys is known by them from now on.
-        if let (old, new) = held.renewal(to: next) {
+        if let (old, new) = base?.renewal(to: next) {
+            shared.renewals = Array(((shared.renewals ?? []) + [RenewalMark(old: old, new: new, version: next.version)]).suffix(RenewalMark.kept))
             let oldFP = Identity.fingerprint(of: old), newFP = Identity.fingerprint(of: new)
             for (account, fp) in shared.knownAs where fp == oldFP { shared.knownAs[account] = newFP }
             if let at = shared.wantRemoved[old.hex] {
@@ -12274,56 +12768,100 @@ extension AppModel {
         }
         shared.pendingSettings = nil
         shared.missedKey = false
+        // Someone an admin added anew is no longer held back by a dispute over their keys.
+        shared.disputed?.removeAll { next.isMember($0) && !held.isMember($0) }
+        if shared.renewing != nil, next.version > held.version, !competing, next.isMember(keys.publicKey) { shared.renewing = nil }
         data.conversations[i].shared = shared
         if !next.isMember(keys.publicKey) && !shared.joining && next.kind != .channel {
-            leftShared(at: i, note: "You were removed from this group")
+            // This account's own keys moved to keys this device can't make: another device holding them did it.
+            if let (old, _) = base?.renewal(to: next), old == keys.publicKey {
+                leftShared(at: i, note: "Another device signed in to your account moved your place in this group to keys this one can't make. "
+                           + "If it isn't one of yours, unlink it in Devices.")
+            } else {
+                leftShared(at: i, note: "You were removed from this group")
+            }
             return
         }
         applySharedSettings(at: i)
-        syncConversation(data.conversations[i].id)
         rereadHeldMail(at: i)
         // The owner's device signs every change someone else made over again, so a member who missed versions can
         // catch up on the newest (only owner-signed versions may skip).
         if next.owner == keys.publicKey, next.signer != keys.publicKey { publishSettings(next, at: i) }
     }
 
-    /// A shared group as another of your devices has it.
-    private func adoptSharedGroup(persona: UUID?, settings: GroupSettings, epochs: [GroupEpoch]) {
-        guard settings.kind == .group || settings.kind == .channel, settings.signatureIsValid, settings.wellFormed(), !epochs.isEmpty,
-              epochs.allSatisfy(\.isValid), epochs.contains(where: { $0.number == settings.epoch && $0.check == settings.epochCheck }),
-              var keys = memberKeys(persona, group: settings.group) else { return }
-        if let i = groupIndex(settings.group, persona: persona), let renewed = renewedKeys(at: i), settings.isMember(renewed.publicKey),
-           settings.version >= (data.conversations[i].shared?.settings.version ?? 0) {
-            // Moved to keys made with the current group secret on another of this account's devices.
-            data.conversations[i].shared?.memberSecret = nil
-            data.conversations[i].shared?.peers = nil
-            data.conversations[i].shared?.chainAsked = nil
-            keys = renewed
+    /// A version from a key whose place this device already saw moved (`SharedGroup.renewals`), arriving after the group
+    /// moved on: if it gives that place to another key than the one taken, two devices hold that old key.
+    private func checkMovedPlace(_ next: GroupSettings, at i: Int) {
+        guard let shared = data.conversations[i].shared,
+              let mark = shared.renewals?.last(where: { $0.old == next.signer && $0.version == next.version }),
+              let taker = next.movesPlace(of: mark.old, at: mark.version, otherThan: mark.new, from: shared.settings) else { return }
+        disputeRenewal(old: mark.old, keys: [mark.old, mark.new] + (taker.isEmpty ? [] : [taker]), at: i)
+    }
+
+    /// Two devices hold one member's old group keys, and each moved the place to keys of its own: one of them is likely
+    /// a device their account unlinked, and nobody else can tell which. Neither is taken: nothing either key signs or
+    /// posts is read from now on, and the place is cleared. An admin's phone takes whichever key the settings hold out
+    /// (with a new epoch), so the account comes back only when an admin adds them again over a 1:1 chat. If the place is
+    /// the owner's, nobody can take it out, so the group can't go on safely and is closed on this device. If it is this
+    /// account's own place, this device leaves too, and asks to be added again.
+    ///
+    /// Whatever the claimed keys did before the dispute came to light goes with them: everyone a version they signed
+    /// brought in (and whoever those brought in, and any keys any of them moved to since) is held back the same way, and
+    /// an admin's phone takes them out in the same new epoch (`SharedGroup.broughtIn`).
+    private func disputeRenewal(old: Data, keys disputed: [Data], at i: Int) {
+        guard var shared = data.conversations[i].shared, !shared.gone,
+              let mine = memberKeys(data.conversations[i].persona, group: data.conversations[i].wireID) else { return }
+        let suspects = shared.broughtIn(under: disputed.filter { $0 != old })
+        let named = disputed + suspects.filter { !disputed.contains($0) }.sorted { $0.hex < $1.hex }
+        let fresh = named.filter { !$0.isEmpty && !(shared.disputed ?? []).contains($0) }
+        guard !fresh.isEmpty else { return }
+        shared.disputed = Array(((shared.disputed ?? []) + fresh).suffix(GroupSettings.maxMembers + 3 * RenewalMark.kept))
+        data.conversations[i].shared = shared
+        let s = shared.settings
+        // Whoever holds the claimed place now (the key it was moved to, or one that key moved to since).
+        let holder = disputed.map(shared.holder(of:)).first { s.isMember($0) }
+        // Members the claimed keys brought in, oldest card first.
+        let brought = s.members.map(\.signingKey).filter { suspects.contains($0) && $0 != holder }
+        let renewed = renewedKeys(at: i)?.publicKey
+        if disputed.contains(mine.publicKey) || renewed.map(disputed.contains) == true {
+            leftShared(at: i, note: "A device you unlinked tried to keep your place in this group, so the members can't tell which is you. "
+                       + "Ask an admin to add you again.")
+            save()
+            return
         }
-        let joining = !settings.isMember(keys.publicKey)
-        data.groupOffers.removeAll { $0.invite.settings.group == settings.group && $0.persona == persona }
-        if let i = groupIndex(settings.group, persona: persona) {
-            var shared = data.conversations[i].shared ?? SharedGroup(settings: settings, epochs: [], joining: joining)
-            if settings.version >= shared.settings.version || shared.epochs.isEmpty {
-                for epoch in epochs.sorted(by: { $0.number < $1.number }) { install(epoch, in: &shared) }
-                if settings.version > shared.settings.version { shared.previous = shared.settings }
-                shared.settings = settings
-            } else {
-                for epoch in epochs where shared.epoch(epoch.number) == nil { shared.epochs.append(epoch) }
-                shared.epochs.sort { $0.number < $1.number }
-            }
-            shared.joining = !shared.settings.isMember(keys.publicKey)
-            data.conversations[i].shared = shared
-            applySharedSettings(at: i)
-        } else {
-            let place = newGroupPlace(settings.group, persona: persona)
-            var convo = Conversation(id: place.id, kind: settings.kind, title: settings.title, avatar: settings.avatar, members: [])
-            convo.groupID = place.groupID
-            convo.persona = persona
-            convo.shared = SharedGroup(settings: settings, epochs: epochs.sorted { $0.number < $1.number }, joining: joining)
-            withAnimation(.snappy) { data.conversations.insert(convo, at: 0) }
-            if let i = groupIndex(settings.group, persona: persona) { applySharedSettings(at: i) }
+        if suspects.contains(mine.publicKey) || renewed.map(suspects.contains) == true {
+            leftShared(at: i, note: "You were added to this group under keys two devices fought over, so the members no longer read you. "
+                       + "Ask an admin to add you again.")
+            save()
+            return
         }
+        if holder == s.owner || brought.contains(s.owner) {
+            leftShared(at: i, note: "Two devices each claimed the owner's place in this group (one of the owner's devices was likely taken), "
+                       + "so it can't go on safely. Ask the owner to start a new one.")
+            save()
+            return
+        }
+        let name = holder.flatMap { s.card($0)?.name }.flatMap { $0.isEmpty ? nil : $0 } ?? "A member"
+        func mayRemove(_ key: Data) -> Bool { s.isAdmin(mine.publicKey) && (!s.isAdmin(key) || s.owner == mine.publicKey) }
+        let canRemove = holder.map(mayRemove) ?? false
+        let knows = holder.map { h in shared.knownAs.values.contains(Identity.fingerprint(of: h)) || shared.knownAs.values.contains(Identity.fingerprint(of: old)) } ?? false
+        let names = brought.map { s.card($0)?.name ?? "" }.map { $0.isEmpty ? "someone" : $0 }
+        let alsoHeld = brought.isEmpty ? "" : ", nor from \(Self.list(names)), added under the claimed keys,"
+        withAnimation(.snappy) {
+            data.conversations[i].messages.append(Message(
+                sender: "system",
+                text: "Two devices each claimed \(name)'s place in this group (one of their devices was likely taken). Nothing from either is shown"
+                    + alsoHeld + " until an admin adds them again" + (canRemove && knows ? ": add them again from your chat with them." : "."),
+                date: Date()))
+        }
+        // The claimed place and everyone brought in under it go in one new epoch. An admin takes out ordinary members; an
+        // admin brought in (made one by the owner since) only the owner can.
+        let removing = ((holder.map { [$0] } ?? []) + brought).filter(mayRemove)
+        if !removing.isEmpty {
+            for key in removing { data.conversations[i].shared?.wantRemoved[key.hex] = Date() }
+            startEpoch(at: i, without: Set(removing))
+        }
+        save()
     }
 
     /// This device is out of a shared group: it stops reading and posting, and keeps the history.
@@ -12625,7 +13163,9 @@ extension AppModel {
             if let from, k.sender != from.member || k.device != from.device { continue }
             guard k.epoch == 0 ? shared.staffEpoch != nil : shared.epoch(k.epoch) != nil else { continue }
             let id = GroupReader.id(epoch: k.epoch, sender: k.sender, device: k.device)
-            if shared.reader.start(epoch: k.epoch, sender: k.sender, device: k.device, chain: k.chain, wanted: held[id] ?? []) { took = true }
+            // Passed on by someone else (a channel's inviter), it stands only once a post its device signed opens with it.
+            if shared.reader.start(epoch: k.epoch, sender: k.sender, device: k.device, chain: k.chain, wanted: held[id] ?? [],
+                                   proven: from != nil) { took = true }
             shared.chainAsked?[id] = nil
         }
         data.conversations[i].shared = shared
@@ -12741,11 +13281,6 @@ extension AppModel {
                 if let given = body.keys, !given.isEmpty {
                     if takeChainKeys(given, from: (member, device), at: i) {
                         took = true
-                        // Your other devices get the same starting points (see `SyncEvent.groupChains`).
-                        let theirs = given.prefix(GroupDirectBody.maxEach).filter { $0.isValid && $0.sender == member && $0.device == device }
-                        if !theirs.isEmpty, member != keys.publicKey {
-                            sync(.groupChains(persona: data.conversations[i].persona, group: gid, keys: Array(theirs)))
-                        }
                     }
                     if data.conversations[i].shared?.settings.kind == .channel { passOn(given, from: member, device: device, at: i) }
                 }
@@ -13002,14 +13537,6 @@ extension AppModel {
         conversation(id)?.shared.map { link.code(owner: $0.settings.owner) }
     }
 
-    /// Whether this device leads among the account's devices (the lowest device id), so only one of them lets people in
-    /// straight away: they all hold the same key in the group.
-    private func isLeadDevice(_ persona: UUID?) -> Bool {
-        let mine = deviceID(for: persona)
-        guard let me = data.contacts.first(where: { $0.isSelf && $0.persona == persona }) else { return true }
-        return me.devices.allSatisfy { $0.id.isEmpty || mine.hex <= $0.id.hex }
-    }
-
     private func amGroupOwner(at i: Int) -> GroupMemberKeys? {
         guard let keys = amGroupAdmin(at: i), data.conversations[i].shared?.settings.owner == keys.publicKey else { return nil }
         return keys
@@ -13059,6 +13586,8 @@ extension AppModel {
         erasePreview(old)
         data.conversations[i].shared?.previews?[link.uuidString] = nil
         writePreviews(at: i)
+        // A public name opening this link is listed again with its new code.
+        if publicName(id)?.link == link { Task { await refreshPublicName(for: id) } }
     }
 
     func deleteJoinLink(_ link: UUID, in id: Conversation.ID) {
@@ -13068,6 +13597,8 @@ extension AppModel {
         data.conversations[i].shared?.previews?[link.uuidString] = nil
         data.conversations[i].shared?.held?.removeAll { $0.request.link == link }
         save()
+        // The public name that opened it has nothing to open any more.
+        if publicName(id)?.link == link { Task { await removePublicName(for: id) } }
     }
 
     /// Takes someone out and turns down any request of theirs from now on. False if the ban list is full.
@@ -13169,7 +13700,7 @@ extension AppModel {
             // The next version from an admin, any later one from the owner, or a competing one that wins (the owner's first).
             let next1 = next.version == held.version + 1
             let ownerJump = next.signer == owner && next.version > held.version
-            let competing = next.version == held.version && next != held && next.winsOver(held, owner: owner)
+            let competing = next.version == held.version && next != held && next.winsOver(held, settings: shared.settings)
             guard next1 || ownerJump || competing else { return }
             // As the owner: a link that's gone or was reset elsewhere has its old preview erased.
             if let keys, owner == keys.publicKey {
@@ -13235,7 +13766,7 @@ extension AppModel {
     /// a preview only for two weeks after it was made, always find a fresh one). Only the owner signs
     /// previews, and the link names the owner, so nobody who stops being an admin can put out one of their own.
     func writePreviews(at i: Int) {
-        guard let keys = amGroupOwner(at: i), isLeadDevice(data.conversations[i].persona),
+        guard let keys = amGroupOwner(at: i),
               let links = data.conversations[i].shared?.links else { return }
         let now = Date()
         for link in links.links where link.isOpen(at: now) {
@@ -13427,7 +13958,7 @@ extension AppModel {
         if shared.settings.isMember(key) {
             // In already: the answer may have gone astray, so it goes again, but only from the phone that lets people in
             // through this link and not more than once a day per person.
-            if current.creator == keys.publicKey, isLeadDevice(data.conversations[i].persona), let epoch = shared.current {
+            if current.creator == keys.publicKey, let epoch = shared.current {
                 answer(.admitted(GroupInvite(settings: shared.settings, epoch: epoch)), to: request, at: i, every: 86_400)
             }
             return .done
@@ -13458,7 +13989,7 @@ extension AppModel {
         }
         // Only one phone lets them in straight away: the leading device of the admin who made the link. Another of that
         // account's devices, or another admin's, steps in later if it hasn't.
-        let first = current.creator == keys.publicKey && isLeadDevice(data.conversations[i].persona)
+        let first = current.creator == keys.publicKey
         if !first {
             if joinFirstSeen.count > 2_000 { joinFirstSeen = joinFirstSeen.filter { Date().timeIntervalSince($0.value) < 3600 } }
             let seenAt = joinFirstSeen[cacheKey] ?? Date()
@@ -13691,7 +14222,6 @@ extension AppModel {
                 withAnimation(.snappy) { data.conversations[i].messages.append(Message(sender: "system", text: "You joined again", date: Date())) }
             }
             applySharedSettings(at: i)
-            syncConversation(data.conversations[i].id)
         } else {
             let place = newGroupPlace(s.group, persona: persona)
             var convo = Conversation(id: place.id, kind: .group, title: String(s.title.prefix(80)), avatar: s.avatar, members: [])
@@ -13701,7 +14231,6 @@ extension AppModel {
             withAnimation(.snappy) { data.conversations.insert(convo, at: 0) }
             if let i = groupIndex(s.group, persona: persona) {
                 applySharedSettings(at: i)
-                syncConversation(data.conversations[i].id)
             }
         }
         return true
@@ -13765,7 +14294,7 @@ extension AppModel {
         save()
         if data.security.notifications {
             // Names only when notifications may show them: the system keeps this text outside the vault.
-            let words = data.security.notificationContent == .hidden ? "New friend request"
+            let words = data.security.notificationContent == .hidden || persona != activePersona ? "New friend request"
                 : "\(sender?.displayName ?? "Someone") from \(title) wants to be friends"
             Notifier.shared.post(("PULSHADE", words), conversation: group ?? UUID(), sound: data.security.notificationSound)
         }
@@ -13800,11 +14329,11 @@ extension AppModel {
     }
 
     /// You followed this person's channel code: the invite for that code's channel is taken without asking again.
-    private func noteFollowAsked(_ fp: String, persona: UUID?, tag: Data) {
+    private func noteFollowAsked(_ fp: String, persona: UUID?, tag: Data, channel: Data?) {
         pruneFollowsAsked()
         let key = Self.followKey(fp, persona)
         let held = (data.followsAsked[key] ?? []).filter { $0.tag != tag }
-        data.followsAsked[key] = Array((held + [FollowedCode(tag: tag, at: Date())]).suffix(4))
+        data.followsAsked[key] = Array((held + [FollowedCode(tag: tag, at: Date(), channel: channel)]).suffix(4))
     }
 
     /// Lets go of codes followed more than two weeks ago, each by its own time.
@@ -13818,19 +14347,32 @@ extension AppModel {
     enum FollowMatch { case none, matched, untagged }
 
     /// Whether an invite from this person is for a channel whose code you followed lately. `.matched` when it carries
-    /// that code's tag, which uses that follow up. `.untagged` when it carries none (their app is older, so it can't say
-    /// which channel): asked about, and nothing used up, since there's no telling which follow it answers; the follows
-    /// still wait for their own channels' invites, and the offer limits (`GroupOffer.perSender`) bound what such
-    /// invites can do. An invite naming another code, or a tag that isn't one, uses nothing up and isn't taken.
-    private func takeFollowAsked(_ fp: String, persona: UUID?, tag: Data?) -> FollowMatch {
+    /// that code's tag and is for the very channel the code names (`Invite.channelCommit`), which uses that follow up.
+    /// `.untagged` when it carries no tag (their app is older, so it can't say which channel), when the code named no
+    /// channel (a code from an older app), or when it names another channel than the invite is for: asked about, and
+    /// nothing used up, since there's no telling which follow it answers; the follows still wait for their own channels'
+    /// invites, and the offer limits (`GroupOffer.perSender`) bound what such invites can do. An invite naming another
+    /// code, or a tag that isn't one, uses nothing up and isn't taken.
+    private func takeFollowAsked(_ fp: String, persona: UUID?, tag: Data?, group: UUID) -> FollowMatch {
         pruneFollowsAsked()
         let key = Self.followKey(fp, persona)
         guard var held = data.followsAsked[key] else { return .none }
         guard let tag else { return .untagged }
         guard tag.count == 16, let n = held.firstIndex(where: { $0.tag == tag }) else { return .none }
+        guard held[n].channel == Invite.channelCommit(group) else { return .untagged }
         held.remove(at: n)
         data.followsAsked[key] = held.isEmpty ? nil : held
         return .matched
+    }
+
+    /// A channel invite from an app too old to vouch for its sender: said once in the chat with a friend who sent it.
+    private func noteChannelInviteTooOld(from sender: Contact) {
+        guard !sender.hidden, !sender.awaitingAcceptance else { return }
+        let convo = startConversation(kind: .direct, title: "", members: [sender.fingerprint], persona: .some(sender.persona))
+        guard let c = index(of: convo.id) else { return }
+        let text = "\(sender.displayName) invited you to a channel, but their app is too old for it. They need to update PULSHADE."
+        guard data.conversations[c].messages.last?.text != text else { return }
+        data.conversations[c].messages.append(Message(sender: "system", text: text, date: Date()))
     }
 
     /// An invite to a group or channel you aren't in: kept, without joining anything, until you answer.
@@ -13854,7 +14396,9 @@ extension AppModel {
         offerNotices = offerNotices.filter { now.timeIntervalSince($0) < 3600 }
         if isNew, data.security.notifications, offerNotices.count < Self.offerNoticesPerHour {
             offerNotices.append(now)
-            let words = data.security.notificationContent == .hidden ? "New invite"
+            // Names only when notifications may show them, and only for the persona in use: one shown while another is
+            // would tell whoever sees the screen who that persona knows.
+            let words = data.security.notificationContent == .hidden || sender.persona != activePersona ? "New invite"
                 : "\(sender.displayName) invites you to \(s.kind == .channel ? "follow" : "join") \(s.title)"
             Notifier.shared.post(("PULSHADE", String(words.prefix(160))), conversation: s.group, sound: data.security.notificationSound)
         }

@@ -42,6 +42,21 @@ struct BurnOrder: Codable, Equatable {
         var relay: String
     }
 
+    /// One persona's share of the order (or the files', or the backup's), sent to the relay on a connection of its own at
+    /// its own moment, so the relay isn't handed every persona of the account in one request (see docs/burn-order.md).
+    /// Each part's signatures carry their own time.
+    struct Part: Codable, Equatable {
+        var ts: UInt64
+        var backup: Signed?
+        var handles: [Signed] = []
+        var recall: [Data] = []
+        var blobs: [BlobWipe] = []
+        var mailboxes: [Data] = []
+        var done = false
+
+        var isEmpty: Bool { backup == nil && handles.isEmpty && recall.isEmpty && blobs.isEmpty && mailboxes.isEmpty }
+    }
+
     var made = Date()
     /// When the signatures were made. The relay accepts them for 30 days.
     var ts: UInt64
@@ -55,11 +70,25 @@ struct BurnOrder: Codable, Equatable {
     var mailboxes: [Data] = []
     var farewells: [Farewell] = []
     var serverDone = false
+    /// The order in parts, one per persona and one for the files (from build 22). Nil in an order made before, which goes
+    /// in one request as it always did (the fields above).
+    var parts: [Part]?
 
-    var isFinished: Bool { serverDone && farewells.isEmpty }
+    var isFinished: Bool { (parts.map { $0.allSatisfy(\.done) } ?? serverDone) && farewells.isEmpty }
 
     /// The relay stops accepting the signatures after 30 days: after 29 there is no point in trying again.
     var isTooOld: Bool { RelayClock.now.timeIntervalSince1970 - TimeInterval(ts) > 29 * 86_400 }
+
+    /// What goes to `POST /v1/burn` for one part.
+    static func requestBody(_ part: Part) throws -> Data {
+        var one = BurnOrder(ts: part.ts, relay: "")
+        one.backup = part.backup
+        one.handles = part.handles
+        one.recall = part.recall
+        one.blobs = part.blobs
+        one.mailboxes = part.mailboxes
+        return try one.requestBody()
+    }
 
     /// What goes to `POST /v1/burn`.
     func requestBody() throws -> Data {

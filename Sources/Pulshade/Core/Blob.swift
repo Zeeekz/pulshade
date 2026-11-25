@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import UniformTypeIdentifiers
 #if canImport(PulshadeShared)
 import PulshadeShared
 #endif
@@ -33,12 +34,18 @@ struct Attachment: Codable, Equatable {
     var token: Data?
     /// This phone fetched it and the relay has been told: the file is no longer on the relay, and this phone doesn't keep it.
     var collected: Bool?
+    /// What the relay holds, in bytes, when the sender padded the sealed file to a size bucket (`BlobPadding`) so the
+    /// relay can't tell its real size: the sealed file, then random bytes. Receivers fetch it all and keep the sealed
+    /// part. Nil from senders before build 22, whose files are stored as sealed. Apps before build 22 ignore it and still
+    /// open the file: the sealed part comes first, and they only ask for that.
+    var padded: Int?
 
     /// Whether a received attachment is well-formed, so nothing odd gets as far as the network.
     var isValid: Bool {
         id.count == 32 && id.allSatisfy { $0.isHexDigit && !$0.isUppercase } && key.count == 32 && secret.count == 32 && sha256.count == 32
             && (1...BlobCrypto.maxFile).contains(size) && (name?.count ?? 0) <= 255 && (type?.count ?? 0) <= 100
             && (token == nil || token?.count == 32)
+            && (padded.map { (BlobCrypto.sealedSize(of: size)...BlobPadding.relayMax).contains($0) } ?? true)
     }
 
     /// The name to show: no folders, no control, direction-changing or other invisible characters (a name can't be
@@ -53,6 +60,68 @@ struct Attachment: Codable, Equatable {
 
     var sealedSize: Int { BlobCrypto.sealedSize(of: size) }
     var pieceCount: Int { BlobCrypto.pieceCount(of: size) }
+    /// What the relay holds: the sealed file and any padding after it.
+    var storedSize: Int { padded ?? sealedSize }
+    /// The relay's pieces of it, padding included.
+    var storedPieces: Int { max(1, (storedSize + BlobCrypto.sealedPiece - 1) / BlobCrypto.sealedPiece) }
+}
+
+/// The sizes a file is padded to on the relay, so the relay (or anyone who can see its disk) learns only roughly how big a
+/// file is: steps of a quarter up to a mebibyte, from 8 KiB, and above that the same steps rounded up to whole mebibytes.
+/// What a file is padded with costs as much to upload and fetch as the file itself, at most a quarter more (a little
+/// more than that for small files).
+enum BlobPadding {
+    static let smallest = 8 * 1024
+    static let step = 1.25
+    /// The most the relay takes for one file (its `MAX_BLOB`): 100 MiB of file and the sealing's 16 bytes for every MiB.
+    static let relayMax = 104_857_600 + 1_638_400
+
+    /// The size a sealed file of `sealed` bytes is padded to: never less than it, never more than the relay takes.
+    static func padded(_ sealed: Int) -> Int {
+        var bucket = Double(smallest)
+        while bucket < Double(sealed) { bucket *= step }
+        var size = Int(bucket.rounded(.up))
+        let mib = BlobCrypto.sealedPiece
+        if size > mib { size = (size + mib - 1) / mib * mib }
+        return min(max(size, sealed), max(relayMax, sealed))
+    }
+}
+
+/// The list of readers the relay is given for a file (see docs/blob-store.md): one token for each person it went to,
+/// spent by each of their devices once it has the whole file, so the relay can erase it when everyone has. Left as it
+/// was, the list told the relay how many people a file went to and how many devices each has. Now every list has a fixed
+/// shape: at least four entries (a power of two past that), every one good for the same number of uses. The entries
+/// nobody reads are the sender's own (`BlobSpend`), and the sender spends them, and the uses its readers' devices won't,
+/// itself, at random moments, each on a connection of its own. Until it has, the file stays on the relay; if it never
+/// can (the app deleted, say), the file simply expires with its message.
+enum BlobReaders {
+    /// The fewest entries a list has: the relay always takes a list this short, whatever the file's size.
+    static let smallest = 4
+    static let maxUses = 16
+
+    /// How many entries, and how many uses each, a list for readers with these numbers of devices has, for a file of
+    /// `size` bytes on the relay (a longer list must be no bigger than the file, 33 bytes an entry).
+    static func shape(devices: [Int], size: Int) -> (count: Int, uses: Int) {
+        let most = min(maxUses, max(1, devices.max() ?? 1))
+        var uses = 2
+        while uses < most { uses *= 2 }
+        let n = devices.count
+        var count = smallest
+        while count < n { count *= 2 }
+        count = min(count, 1024)
+        if count > smallest, count * 33 > size { count = max(n, min(count, size / 33)) }
+        return (count, min(uses, maxUses))
+    }
+}
+
+/// Uses of a file's reader tokens that its sender spends itself, at `due`, so the relay can erase the file when the real
+/// readers have it (see `BlobReaders`). Kept in the sealed vault until spent; dropped once the file has expired.
+struct BlobSpend: Codable, Equatable {
+    var id: String
+    var token: Data
+    var uses: Int
+    var due: Date
+    var expires: Date
 }
 
 /// Sealing a file piece by piece, so neither end ever holds more than a few pieces at once while sending, and the
@@ -105,21 +174,27 @@ enum BlobError: Error, Equatable {
     case damaged
     /// The file is too big for Pulshade to send or hold.
     case tooLarge
+    /// The file changed on this device after it was picked, so the rest of it can't be sent with the same key.
+    case changed
     /// The relay has no room for it, or the sender has used their allowance for now. Try again later.
     case relayFull
     /// The relay no longer has it: erased by its sender, or expired.
     case gone
     case unreadable
     case cancelled
+    /// A picture whose hidden details (location, camera, time) couldn't be taken out, so it wasn't sent.
+    case notCleaned
 
     var words: String {
         switch self {
         case .damaged: "The file didn't arrive intact."
         case .tooLarge: "That file is too big. Pulshade sends files up to 100 MB."
+        case .changed: "The file changed while it was being sent. Send it again."
         case .relayFull: "The server is full right now. Try again in a little while."
         case .gone: "This file has been deleted or has expired."
         case .unreadable: "Pulshade couldn't read that file."
         case .cancelled: "Cancelled."
+        case .notCleaned: "Pulshade couldn't remove this picture's hidden details (such as where it was taken), so it wasn't sent."
         }
     }
 }
@@ -132,15 +207,25 @@ enum BlobTransfer {
         /// A file on disk (picked by the person), or nil when the bytes are in memory (a clip the app just made).
         var url: URL?
         var memory: Data?
+        /// SHA-256 of each piece of the file as it was read then. Each piece is sealed under the attachment's key with its
+        /// position as the nonce, so it may only ever be sealed with these bytes: a file changed on disk before an upload
+        /// is tried again (or resumed) would otherwise put two different pieces under one key and nonce. A piece that no
+        /// longer matches stops the upload (`BlobError.changed`).
+        var pieceHashes: [Data] = []
     }
 
     /// A clip or picture already in memory: its size and hash, key and secret. For media the app makes itself.
     static func prepare(data: Data, kind: Attachment.Kind, lifetime: TimeInterval = 7 * 24 * 3600) throws -> Prepared {
         guard !data.isEmpty else { throw BlobError.unreadable }
         guard data.count <= BlobCrypto.maxFile else { throw BlobError.tooLarge }
-        let attachment = Attachment(id: Data.random(16).hex, key: .random(32), size: data.count, kind: kind, name: nil, type: nil,
+        var attachment = Attachment(id: Data.random(16).hex, key: .random(32), size: data.count, kind: kind, name: nil, type: nil,
                                     sha256: Data(SHA256.hash(data: data)), secret: .random(32), expires: RelayClock.now.addingTimeInterval(lifetime))
-        return Prepared(attachment: attachment, url: nil, memory: data)
+        attachment.padded = BlobPadding.padded(attachment.sealedSize)
+        let pieces = (0..<attachment.pieceCount).map { index -> Data in
+            let start = index * BlobCrypto.plainPiece
+            return Data(SHA256.hash(data: data.subdata(in: start..<min(start + BlobCrypto.plainPiece, data.count))))
+        }
+        return Prepared(attachment: attachment, url: nil, memory: data, pieceHashes: pieces)
     }
 
     /// Reads the file once to find its size and hash, and makes its key and secret. Never holds more than a piece.
@@ -151,24 +236,55 @@ enum BlobTransfer {
         defer { try? handle.close() }
         var hash = SHA256()
         var size = 0
+        var pieces: [Data] = []
         while let piece = try? handle.read(upToCount: BlobCrypto.plainPiece), !piece.isEmpty {
             hash.update(data: piece)
+            pieces.append(Data(SHA256.hash(data: piece)))
             size += piece.count
             if size > BlobCrypto.maxFile { throw BlobError.tooLarge }
         }
         guard size > 0 else { throw BlobError.unreadable }
         let type = (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType?.preferredMIMEType
-        let attachment = Attachment(id: Data.random(16).hex, key: .random(32), size: size, kind: kind, name: url.lastPathComponent,
+        var attachment = Attachment(id: Data.random(16).hex, key: .random(32), size: size, kind: kind, name: url.lastPathComponent,
                                     type: type, sha256: Data(hash.finalize()), secret: .random(32),
                                     expires: RelayClock.now.addingTimeInterval(lifetime))
-        return Prepared(attachment: attachment, url: url, memory: nil)
+        attachment.padded = BlobPadding.padded(attachment.sealedSize)
+        // `read(upToCount:)` can hand back less than asked for, which would put the hashes out of step with the pieces.
+        guard pieces.count == attachment.pieceCount else { throw BlobError.unreadable }
+        return Prepared(attachment: attachment, url: url, memory: nil, pieceHashes: pieces)
     }
+
+    /// A file picked to send: a picture with its hidden details taken out (`FileScrub`, done in memory), anything else as
+    /// it is, and either way under a neutral name unless `keepName`. A picture whose details can't be taken out isn't sent.
+    static func prepareForSending(_ url: URL, keepName: Bool, lifetime: TimeInterval) throws -> Prepared {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        let values = try? url.resourceValues(forKeys: [.contentTypeKey, .fileSizeKey])
+        let type = values?.contentType ?? UTType(filenameExtension: url.pathExtension)
+        var prepared: Prepared
+        if let type, FileScrub.kind(of: type) == .image {
+            if let size = values?.fileSize, size > maxFileRead { throw BlobError.tooLarge }
+            guard let original = try? Data(contentsOf: url) else { throw BlobError.unreadable }
+            guard let clean = FileScrub.stripImage(original, type: type) else { throw BlobError.notCleaned }
+            prepared = try prepare(data: clean, kind: .file, lifetime: lifetime)
+            prepared.attachment.type = type.preferredMIMEType
+        } else {
+            prepared = try prepare(url, kind: .file, lifetime: lifetime)
+        }
+        prepared.attachment.name = keepName ? url.lastPathComponent : FileScrub.neutralName(for: url, type: type)
+        return prepared
+    }
+    /// A picture is read whole to be cleaned, so only one that can be sent at all is.
+    private static let maxFileRead = BlobCrypto.maxFile
 
     /// Seals and uploads the file, a few pieces at a time, trying a refused or failed piece again after a pause. Where
     /// the relay already holds some pieces (an upload that was interrupted), only the missing ones go. `progress` is 0...1.
     static func upload(_ prepared: Prepared, to client: RelayClient, progress: @escaping @Sendable (Double) -> Void) async throws {
         let a = prepared.attachment
-        let count = a.pieceCount
+        let real = a.pieceCount
+        // The relay's pieces: the sealed file's, then the padding's (`BlobPadding`).
+        let count = a.storedPieces
+        guard prepared.pieceHashes.count == real, a.storedSize >= a.sealedSize else { throw BlobError.unreadable }
         let scoped = prepared.url?.startAccessingSecurityScopedResource() ?? false
         defer { if scoped { prepared.url?.stopAccessingSecurityScopedResource() } }
         let handle: FileHandle? = try prepared.url.map { url in
@@ -189,7 +305,7 @@ enum BlobTransfer {
         progress(Double(done) / Double(count))
         var next = 0
         var running = 0
-        let first = BlobStart(size: a.sealedSize, secretHash: Data(SHA256.hash(data: a.secret)).hex,
+        let first = BlobStart(size: a.storedSize, secretHash: Data(SHA256.hash(data: a.secret)).hex,
                               days: max(1, min(30, Int((a.expires.timeIntervalSince(RelayClock.now) / 86_400).rounded(.up)))))
 
         try await withThrowingTaskGroup(of: Int.self) { group in
@@ -198,9 +314,18 @@ enum BlobTransfer {
                 guard next < count else { return false }
                 let index = next
                 next += 1
-                let plain = try readPiece(index)
-                guard !plain.isEmpty else { throw BlobError.unreadable }
-                let sealed = try BlobCrypto.seal(plain, key: a.key, id: a.id, index: index, last: index == count - 1)
+                // How long this piece is on the relay: a whole one, or what's left of the stored size.
+                let length = min(BlobCrypto.sealedPiece, a.storedSize - index * BlobCrypto.sealedPiece)
+                var sealed = Data()
+                if index < real {
+                    let plain = try readPiece(index)
+                    guard !plain.isEmpty else { throw BlobError.unreadable }
+                    // Only the bytes this piece had when the file was read first: never other bytes under the same nonce.
+                    guard Data(SHA256.hash(data: plain)) == prepared.pieceHashes[index] else { throw BlobError.changed }
+                    sealed = try BlobCrypto.seal(plain, key: a.key, id: a.id, index: index, last: index == real - 1)
+                }
+                // The padding: random bytes, which nobody opens, after the sealed file's last piece and in the pieces after it.
+                if sealed.count < length { sealed += Data.random(length - sealed.count) }
                 running += 1
                 group.addTask { try await put(client, a.id, index, sealed, first: first); return index }
                 return true
@@ -241,7 +366,9 @@ enum BlobTransfer {
     /// to disk; the bytes are the caller's to show, and to save if the person asks.
     static func download(_ a: Attachment, from client: RelayClient, progress: @escaping @Sendable (Double) -> Void) async throws -> Data {
         guard a.isValid else { throw BlobError.damaged }
-        let count = a.pieceCount
+        let real = a.pieceCount
+        // A padded file is fetched to its end, padding and all, so the relay doesn't learn the real size from what's asked for.
+        let count = a.storedPieces
         var plain = Data(capacity: a.size)
         var index = 0
         let batch = 4
@@ -249,13 +376,14 @@ enum BlobTransfer {
             try Task.checkCancellation()
             let upto = min(index + batch, count)
             let low = index * BlobCrypto.sealedPiece
-            let high = min(upto * BlobCrypto.sealedPiece, a.sealedSize) - 1
+            let high = min(upto * BlobCrypto.sealedPiece, a.storedSize) - 1
             let sealed = try await getWithRetry(client, a.id, low...high)
             guard sealed.count == high - low + 1 else { throw BlobError.damaged }
-            for piece in index..<upto {
+            for piece in index..<min(upto, real) {
                 let start = piece * BlobCrypto.sealedPiece - low
-                let end = min(start + BlobCrypto.sealedPiece, sealed.count)
-                plain.append(try BlobCrypto.open(sealed.subdata(in: start..<end), key: a.key, id: a.id, index: piece, last: piece == count - 1))
+                // The sealed file ends at `sealedSize`; what follows in the last piece is padding.
+                let end = min(start + BlobCrypto.sealedPiece, a.sealedSize - low)
+                plain.append(try BlobCrypto.open(sealed.subdata(in: start..<end), key: a.key, id: a.id, index: piece, last: piece == real - 1))
             }
             index = upto
             progress(Double(index) / Double(count))

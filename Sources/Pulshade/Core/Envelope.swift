@@ -62,12 +62,17 @@ enum Envelope {
     /// payload's big fields raw, without the base64 that makes a big message nearly twice its size. Anything but a ratchet
     /// message is signed with ML-DSA as well, and `introduce` puts this account's post-quantum keys in the envelope for a
     /// recipient that hasn't got them.
+    ///
+    /// A friend request's note is left out of what the ML-DSA signature covers (`Payload.requestWire`): the signature
+    /// binds the card and the ask, which is what key setup needs, while the note is authenticated only by the inner seal,
+    /// as a chat message is, so the recipient can't show it to anyone as signed by the sender.
     static func seal(_ payload: Payload, from me: Identity, device: Data = Data(), to recipient: EnvelopeRecipient, framed: Bool = false,
                      introduce: Bool = false) throws -> Data {
-        try EnvelopeCore.sealPQ(body: try payload.wire(framed: framed), signing: me.signingKey, agreement: me.agreementKey, pq: me.pq,
-                                sign: !payload.isRatchet, introduce: introduce, device: device, caps: reads,
-                                ratchet: RatchetHeader.version, at: RelayClock.now,
-                                to: recipient)
+        let request = try payload.requestWire()
+        return try EnvelopeCore.sealPQ(body: try request?.body ?? payload.wire(framed: framed), signing: me.signingKey,
+                                       agreement: me.agreementKey, pq: me.pq, sign: !payload.isRatchet, unsignedTail: request?.note ?? 0,
+                                       introduce: introduce, device: device, caps: reads, ratchet: RatchetHeader.version,
+                                       at: RelayClock.now, to: recipient)
     }
 
     /// Seals to someone whose post-quantum keys aren't known yet, the one way left to a classical envelope: only for the
@@ -95,6 +100,11 @@ enum Envelope {
             let opened = try EnvelopeCore.openPQ(blob, agreement: me.agreementKey, pq: me.pq, known: known)
             let payload = try Payload.fromWire(opened.header.body)
             guard payload.isRatchet || opened.signed else { throw EnvelopeError.badSignature }
+            // Only a friend request's note may be left out of the signature, and then exactly the note.
+            if opened.unsignedTail > 0 {
+                guard case let .request(_, _, note) = payload, Data(note.utf8).count == opened.unsignedTail,
+                      Frame.split(opened.header.body)?.tail.count == opened.unsignedTail else { throw EnvelopeError.badSignature }
+            }
             let h = opened.header
             return Opened(payload: payload, signer: h.signer, agreement: h.agreement, device: h.device, sentAt: h.sentAt, caps: h.caps,
                           ratchet: h.ratchet, introduced: opened.introduced, postQuantum: true)

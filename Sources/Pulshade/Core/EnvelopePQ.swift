@@ -104,6 +104,7 @@ extension EnvelopeCore {
     private static let outerInfoPQ = Data("pulshade.envelope.v3.outer".utf8)
     private static let innerInfoPQ = Data("pulshade.envelope.v3.inner".utf8)
     private static let sigLabel = Data("pulshade.envelope.v3.sig".utf8)
+    private static let sigLabelPart = Data("pulshade.envelope.v3.sig.part".utf8)
     static let kemCiphertextSize = 1_088
 
     private struct InnerPQ: Codable {
@@ -118,6 +119,9 @@ extension EnvelopeCore {
         var card: PQCard?
         /// The sender's ratchet header version (see `EnvelopeCore.Inner.rv`).
         var rv: UInt8?
+        /// How many bytes at the end of the payload the ML-DSA signature leaves out (a friend request's note, see
+        /// `Envelope.seal`). Nil: it covers all of it.
+        var ut: Int?
     }
 
     struct HeaderPQ {
@@ -126,11 +130,14 @@ extension EnvelopeCore {
         var signed: Bool
         /// The sender's keys, when they weren't known and the envelope's card (both signatures verified) introduced them.
         var introduced: PQPin?
+        /// How many bytes at the end of the payload the signature left out (0: none).
+        var unsignedTail = 0
     }
 
     static func sealPQ(body: Data, signing: Curve25519.Signing.PrivateKey, agreement: Curve25519.KeyAgreement.PrivateKey,
-                       pq: PQKeys, sign: Bool, introduce: Bool, device: Data, caps: UInt8, ratchet: UInt8? = nil,
+                       pq: PQKeys, sign: Bool, unsignedTail: Int = 0, introduce: Bool, device: Data, caps: UInt8, ratchet: UInt8? = nil,
                        at: Date, to recipient: EnvelopeRecipient) throws -> Data {
+        guard (0...body.count).contains(unsignedTail), sign || unsignedTail == 0 else { throw EnvelopeError.malformed }
         let theirs = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: recipient.agreement)
         let encapsulation = try MLKEM768.PublicKey(rawRepresentation: recipient.pq.kem).encapsulate()
         let kemSecret = encapsulation.sharedSecret.withUnsafeBytes { Data($0) }
@@ -143,12 +150,13 @@ extension EnvelopeCore {
         var tail = Data()
         if sign {
             let transcript = signedTranscript(ephemeral: ephemeralRaw, kemCiphertext: kemCiphertext, recipient: recipient.agreement,
-                                              sender: sender, at: stamp, device: device, body: body)
+                                              sender: sender, at: stamp, device: device, body: body, unsignedTail: unsignedTail)
             tail = try pq.sig.signature(for: transcript)
         }
         let inner = InnerPQ(from: signing.publicKey.rawRepresentation, bind: try signing.signature(for: bindLabel + sender),
                             device: device.isEmpty ? nil : device, at: stamp, caps: caps, signed: sign ? true : nil,
-                            card: introduce ? try PQCard.make(signing: signing, agreement: sender, keys: pq) : nil, rv: ratchet)
+                            card: introduce ? try PQCard.make(signing: signing, agreement: sender, keys: pq) : nil, rv: ratchet,
+                            ut: unsignedTail > 0 ? unsignedTail : nil)
         let innerPlain = Frame.join(try JSONEncoder().encode(inner), tail + body)
 
         let outerSecret = try ephemeral.sharedSecretFromKeyAgreement(with: theirs)
@@ -194,10 +202,13 @@ extension EnvelopeCore {
         var body = tail
         var signed = false
         var introduced: PQPin?
+        let unsignedTail = inner.ut ?? 0
+        guard unsignedTail == 0 || (inner.signed == true && unsignedTail > 0) else { throw EnvelopeError.malformed }
         if inner.signed == true {
             guard tail.count >= PQCard.sigSize else { throw EnvelopeError.malformed }
             let signature = Data(tail.prefix(PQCard.sigSize))
             body = Data(tail.dropFirst(PQCard.sigSize))
+            guard unsignedTail <= body.count else { throw EnvelopeError.malformed }
             let pinned = known(inner.from)
             var pin = pinned
             if let card = inner.card {
@@ -210,7 +221,8 @@ extension EnvelopeCore {
             guard let key = try? MLDSA65.PublicKey(rawRepresentation: pin.dsa),
                   key.isValidSignature(signature, for: signedTranscript(ephemeral: Data(ephemeralRaw), kemCiphertext: kemCiphertext,
                                                                        recipient: mine, sender: sender, at: inner.at,
-                                                                       device: inner.device ?? Data(), body: body))
+                                                                       device: inner.device ?? Data(), body: body,
+                                                                       unsignedTail: unsignedTail))
             else { throw EnvelopeError.badSignature }
             signed = true
         } else if let card = inner.card {
@@ -220,15 +232,20 @@ extension EnvelopeCore {
         return HeaderPQ(header: Header(signer: inner.from, agreement: sender, device: inner.device ?? Data(),
                                        sentAt: Date(timeIntervalSince1970: TimeInterval(inner.at)), caps: inner.caps ?? 0, body: body,
                                        ratchet: inner.rv ?? 0),
-                        signed: signed, introduced: introduced)
+                        signed: signed, introduced: introduced, unsignedTail: unsignedTail)
     }
 
-    private static func signedTranscript(ephemeral: Data, kemCiphertext: Data, recipient: Data, sender: Data, at: UInt64,
-                                         device: Data, body: Data) -> Data {
-        var out = sigLabel + ephemeral + Data(SHA256.hash(data: kemCiphertext)) + recipient + sender
+    /// With `unsignedTail`, the payload's hash leaves out that many bytes at its end, under a label of its own, so a
+    /// signature over a whole payload can't stand for one over part of one, or the other way. The count itself isn't
+    /// signed, so the signature says nothing about the note, not even its length: what is signed (a frame, whose header
+    /// says its own length) ends where it ends, and a count that moved that end would leave a hash the signature doesn't
+    /// match.
+    static func signedTranscript(ephemeral: Data, kemCiphertext: Data, recipient: Data, sender: Data, at: UInt64,
+                                         device: Data, body: Data, unsignedTail: Int = 0) -> Data {
+        var out = (unsignedTail > 0 ? sigLabelPart : sigLabel) + ephemeral + Data(SHA256.hash(data: kemCiphertext)) + recipient + sender
         withUnsafeBytes(of: at.bigEndian) { out.append(contentsOf: $0) }
         withUnsafeBytes(of: UInt32(device.count).bigEndian) { out.append(contentsOf: $0) }
-        return out + device + Data(SHA256.hash(data: body))
+        return out + device + Data(SHA256.hash(data: body.dropLast(unsignedTail)))
     }
 
     private static func raw(_ secret: SharedSecret) -> Data { secret.withUnsafeBytes { Data($0) } }

@@ -180,12 +180,36 @@ struct MediaPoolTests {
         pool.wipeSoon()
         #expect(!FileManager.default.fileExists(atPath: pool.mediaDirectory.path))
         #expect(pool.fileCount == 0)
+        // Nothing beside the vault's files says a wipe happened: the pool went into the always-present work folder under a
+        // random name, and is gone from there once overwritten.
+        let names = try FileManager.default.contentsOfDirectory(atPath: pool.directory.path)
+        #expect(!names.contains { $0.hasPrefix(".") || $0.contains("media") || $0.contains("gone") })
+        let work = Vault.workURL(in: pool.directory)
         for _ in 0..<50 {
-            let left = try FileManager.default.contentsOfDirectory(atPath: pool.directory.path).filter { $0.hasPrefix(".media-gone-") }
-            if left.isEmpty { break }
+            if ((try? FileManager.default.contentsOfDirectory(atPath: work.path)) ?? []).isEmpty { break }
             try await Task.sleep(for: .milliseconds(100))
         }
-        #expect(try FileManager.default.contentsOfDirectory(atPath: pool.directory.path).filter { $0.hasPrefix(".media-gone-") }.isEmpty)
+        #expect(((try? FileManager.default.contentsOfDirectory(atPath: work.path)) ?? []).isEmpty)
+    }
+
+    /// Whatever the app was closed before overwriting (and a `.media-gone-` folder an older build left) is finished at
+    /// the next launch, not only the next time the pool is used.
+    @Test @MainActor func aWipeLeftPartWayIsFinishedAtLaunch() async throws {
+        let directory = testDirectory("pulshade-media-leftover")
+        let vault = Vault(directory: directory)
+        let leftover = vault.workURL.appendingPathComponent(Data.random(16).hex, isDirectory: true)
+        try FileManager.default.createDirectory(at: leftover, withIntermediateDirectories: true)
+        try Data.random(4096).write(to: leftover.appendingPathComponent("a"))
+        let older = directory.appendingPathComponent(".media-gone-0011223344556677", isDirectory: true)
+        try FileManager.default.createDirectory(at: older, withIntermediateDirectories: true)
+        try Data.random(4096).write(to: older.appendingPathComponent("b"))
+        _ = AppModel(vault: Vault(directory: directory), watchSystem: false)
+        for _ in 0..<50 {
+            if !FileManager.default.fileExists(atPath: leftover.path), !FileManager.default.fileExists(atPath: older.path) { break }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        #expect(!FileManager.default.fileExists(atPath: leftover.path) && !FileManager.default.fileExists(atPath: older.path))
+        #expect(FileManager.default.fileExists(atPath: vault.workURL.path), "the work folder itself stays, so it says nothing")
     }
 
     /// Storing into a pool that already exists never grows it there and then (the app does that on the main thread, for

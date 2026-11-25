@@ -17,7 +17,7 @@ designs. Until a third party has reviewed it, don't rely on it where your safety
 | Mutation fuzzer | the same parsers, under AddressSanitizer, for a chosen duration | `./scripts/fuzz.sh 60` |
 | Address + undefined sanitizers | memory errors and integer/UB traps | `swift test --sanitize=address --sanitize=undefined` |
 | Thread sanitizer | data races in shared and async paths | `swift test --sanitize=thread` |
-| Release gates | relay, pin and admin keys must be present | `project.yml`, `scripts/build-app.sh` |
+| Release gates | relay, pin and admin keys must be present | `project.yml` |
 | Name scan | no home folder or account name in a release build | `scripts/testflight.sh` |
 
 `scripts/verify.sh` runs the suite and both sanitizer passes. Tests that need a relay live in the complete tree;
@@ -39,5 +39,5 @@ if they are absent, the script says so and will not report a non-relay run as co
 - **A physical device.** The vault, Keychain, Secure Enclave and panic/decoy timing need device tests.
 - **Coverage-guided fuzzing.** The fuzzer is deterministic mutation with ASan, not libFuzzer: Swift's compiler
   driver here does not accept `-sanitize=fuzzer`. A clang harness over the same parsers is the next step.
-- **iOS.** The commands above run the macOS build.
+- **iOS.** The commands above run the tests on macOS, not on an iPhone.
 - **The relay's own implementation.** The server is not published.

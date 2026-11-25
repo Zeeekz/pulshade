@@ -145,7 +145,7 @@ struct GroupLinksSection: View {
             }
         }
         .sheet(isPresented: $making) { NewJoinLinkSheet(id: id) }
-        .sheet(item: $showing) { LinkCodeSheet(link: $0, text: model.linkCode($0, in: id)?.link ?? "") }
+        .sheet(item: $showing) { LinkCodeSheet(link: $0, target: model.linkCode($0, in: id)?.text ?? "") }
         .confirmationDialog(confirm?.title ?? "", isPresented: Binding(get: { confirm != nil }, set: { if !$0 { confirm = nil } }),
                             titleVisibility: .visible) {
             Button("Continue", role: .destructive) { confirm?.action(); confirm = nil }
@@ -184,13 +184,11 @@ struct GroupLinksSection: View {
                 Text(summary(link)).font(.system(size: 11)).foregroundStyle(link.isOpen() ? Ink.dim : Ink.faint)
             }
             Spacer()
-            Button {
-                copyToClipboard(model.linkCode(link, in: id)?.link ?? "")
-                withAnimation(.snappy) { copied = link.id }
-            } label: {
+            let target = model.linkCode(link, in: id)?.text ?? ""
+            CopyLinkButton(target: target) { withAnimation(.snappy) { copied = link.id } } label: {
                 Image(systemName: copied == link.id ? "checkmark" : "doc.on.doc").font(.system(size: 12))
             }
-            .buttonStyle(.plain).foregroundStyle(theme.accent)
+            .foregroundStyle(theme.accent)
             .accessibilityLabel("Copy link")
             Menu {
                 Button("Show QR code") { showing = link }
@@ -278,26 +276,157 @@ private struct NewJoinLinkSheet: View {
 
 /// A link as a QR code, to be scanned from another phone.
 private struct LinkCodeSheet: View {
+    @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     let link: JoinLink
-    /// The link as text (it names the group's owner).
-    let text: String
+    /// The link's code (it names the group's owner).
+    let target: String
     @State private var copied = false
+
 
     var body: some View {
         SheetBody(width: 380) {
             VStack(spacing: 16) {
                 SheetHeader(symbol: "qrcode", title: link.label.isEmpty ? "Join link" : link.label)
-                QRCode(text: text, size: 220)
-                Button {
-                    copyToClipboard(text)
-                    withAnimation(.snappy) { copied = true }
-                } label: {
+                QRCode(text: WebLinks.long(target), size: 220)
+                CopyLinkButton(target: target) { withAnimation(.snappy) { copied = true } } label: {
                     Label(copied ? "Copied" : "Copy link", systemImage: copied ? "checkmark" : "link").font(.system(size: 13, weight: .semibold))
                 }
-                .buttonStyle(.plain)
                 .foregroundStyle(theme.accent)
             }
+        }
+    }
+}
+
+/// A group's or channel's public name: claimed here by a group's owner or a channel's admin, from the same pool of
+/// names as @usernames. Anyone can look it up or open its link.
+struct PublicNameSection: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.theme) private var theme
+    let id: Conversation.ID
+    let kind: ConversationKind
+
+    @State private var editing = false
+    @State private var text = ""
+    @State private var approval = true
+    @State private var busy = false
+    @State private var problem: String?
+    @State private var copied = false
+    @State private var confirmRemove = false
+
+    private var noun: String { kind == .channel ? "channel" : "group" }
+
+    var body: some View {
+        let name = model.publicName(id)
+        Card(title: "Public name", footer: footer(name)) {
+            if let name, !editing {
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("@" + name.handle).font(.system(size: 14, weight: .semibold)).foregroundStyle(Ink.text)
+                        if let link = WebLinks.name(name.handle) {
+                            Text(link.replacingOccurrences(of: "https://", with: "")).font(.system(size: 11)).foregroundStyle(Ink.dim)
+                        }
+                    }
+                    Spacer()
+                    if let link = WebLinks.name(name.handle) {
+                        Button {
+                            copyToClipboard(link)
+                            withAnimation(.snappy) { copied = true }
+                        } label: {
+                            Image(systemName: copied ? "checkmark" : "doc.on.doc").font(.system(size: 12))
+                        }
+                        .buttonStyle(.plain).foregroundStyle(theme.accent)
+                        .accessibilityLabel("Copy link")
+                    }
+                    Menu {
+                        Button("Change name") { text = name.handle; editing = true }
+                        Button("Remove name", role: .destructive) { confirmRemove = true }
+                    } label: {
+                        Image(systemName: "ellipsis").font(.system(size: 12)).foregroundStyle(Ink.faint).frame(width: 30, height: 30).contentShape(.rect)
+                    }
+                    .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+                    .accessibilityLabel("More for the public name")
+                }
+            } else if editing {
+                HStack(spacing: 6) {
+                    Text("@").font(.system(size: 14)).foregroundStyle(Ink.faint)
+                    TextField("name", text: $text)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 14))
+                        #if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        #endif
+                        .onSubmit(claim)
+                        .onChange(of: text) { _, new in if new.count > 24 { text = String(new.prefix(24)) } }
+                }
+                .padding(10)
+                .background(Ink.raised, in: .rect(cornerRadius: 8))
+                if kind == .group && name == nil {
+                    Toggle("Admins approve each request", isOn: $approval).font(.system(size: 13))
+                }
+                if let problem {
+                    Text(problem).font(.system(size: 12)).foregroundStyle(.red)
+                }
+                HStack {
+                    Button("Cancel") { editing = false; problem = nil }
+                        .buttonStyle(.plain).font(.system(size: 13, weight: .semibold)).foregroundStyle(Ink.dim)
+                    Spacer()
+                    if busy { ProgressView().controlSize(.small) }
+                    Button(name == nil ? "Claim" : "Save", action: claim)
+                        .buttonStyle(.plain).font(.system(size: 13, weight: .semibold)).foregroundStyle(theme.accent)
+                        .disabled(busy || DirectoryProfile.validHandle(text) == nil)
+                }
+            } else {
+                Button { text = ""; editing = true } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: "at").font(.system(size: 12, weight: .semibold))
+                            .frame(width: 28, height: 28).background(theme.wash, in: .circle)
+                            .foregroundStyle(theme.accent)
+                        Text("Give this \(noun) a public name").font(.system(size: 13, weight: .medium)).foregroundStyle(theme.accent)
+                        Spacer()
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .confirmationDialog("Remove the public name? Its link stops working, and the name is held for you for three months.",
+                            isPresented: $confirmRemove, titleVisibility: .visible) {
+            Button("Remove", role: .destructive) { Task { await model.removePublicName(for: id) } }
+        }
+    }
+
+    private func footer(_ name: PublicName?) -> String {
+        kind == .channel
+            ? "Anyone can find the channel by its name and follow it, and can see it's run from your account, as its invite link already shows. Names come from the same pool as @usernames."
+            : "Anyone can find the group by its name, see its name, picture, description and size, and ask to join. Resetting its link doesn't stop that: remove the name. Names come from the same pool as @usernames."
+    }
+
+    private func claim() {
+        guard !busy, DirectoryProfile.validHandle(text) != nil else { return }
+        busy = true
+        problem = nil
+        Task {
+            do {
+                try await model.setPublicName(text, for: id, approval: approval)
+                editing = false
+            } catch AppModel.PublicNameError.taken {
+                problem = "That name is taken"
+            } catch AppModel.PublicNameError.reserved {
+                problem = "That name can't be used"
+            } catch AppModel.PublicNameError.held {
+                problem = "That name was let go of lately and is still held for its last owner"
+            } catch AppModel.PublicNameError.invalidHandle {
+                problem = "Names are letters, numbers or _"
+            } catch AppModel.PublicNameError.unreachable {
+                problem = "Can't reach the relay"
+            } catch AppModel.PublicNameError.notAllowed {
+                problem = kind == .channel ? "Only the channel's admins can name it" : "Only the group's owner can name it"
+            } catch {
+                problem = "That didn't work. Try again."
+            }
+            busy = false
         }
     }
 }

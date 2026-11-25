@@ -426,7 +426,7 @@ enum StoryVideo {
             let current = look?.value ?? fixed
             let media = current.media(request.sourceImage)
             var image = StoryCanvas.compose(media, framing: framing?.value ?? .fill, backdrop: current.backdrop, size: size)
-            // Digital zoom recorded where the camera couldn't zoom for real (the Mac).
+            // Digital zoom recorded where the camera couldn't zoom for real.
             let z = zoom.value(at: request.compositionTime.seconds)
             if z > 1.001 {
                 let c = CGPoint(x: size.width / 2, y: size.height / 2)
@@ -710,8 +710,8 @@ enum ZoomMath {
 /// Clips used to be written to the temporary folder. They stay in memory now (see `MemoryClip`); this overwrites and
 /// deletes whatever an older version, a crash or a system file hand-over left there. Runs when Pulshade starts.
 enum TempFiles {
-    /// Whether a file in the temporary folder is one Pulshade made: only these exact names, since the Mac's
-    /// temporary folder is shared with other apps.
+    /// Whether a file in the temporary folder is one Pulshade made: only these exact names, since on macOS (the
+    /// test build) the temporary folder is shared with other apps.
     static func isOurs(_ name: String) -> Bool {
         name.range(of: "^story-((rec|pick|play)-)?[0-9A-Fa-f-]{36}\\.(mov|mp4)$", options: .regularExpression) != nil
     }

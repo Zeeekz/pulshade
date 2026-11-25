@@ -4,7 +4,7 @@ import AVFoundation
 @testable import Pulshade
 
 struct VoiceTests {
-    /// Two seconds of a tone, the way a Mac or iPhone microphone hands it over.
+    /// Two seconds of a tone, the way an iPhone microphone hands it over.
     private func tone(seconds: Double, rate: Double, channels: AVAudioChannelCount) throws -> [AVAudioPCMBuffer] {
         let format = try #require(AVAudioFormat(standardFormatWithSampleRate: rate, channels: channels))
         let chunk: AVAudioFrameCount = 2048

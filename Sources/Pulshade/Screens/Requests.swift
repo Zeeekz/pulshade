@@ -61,7 +61,7 @@ struct ContactsView: View {
                 contactsSection
             }
             .padding(.horizontal, 16)
-            .padding(.top, Platform.isPhone ? 12 : 40)
+            .padding(.top, 12)
             .padding(.bottom, 24)
             .frame(maxWidth: 600)
             .frame(maxWidth: .infinity)
@@ -195,6 +195,16 @@ struct ContactsView: View {
                 problem = "Usernames are letters, numbers or _"
             } catch AppModel.DirectoryError.unreachable {
                 problem = "Can't reach the relay"
+            } catch AppModel.DirectoryError.publicName {
+                found = nil; notFound = false
+                if let check = linkCheck, check.handle == handle {
+                    // A profile link made for a person, but the name is a group's or channel's now.
+                    problem = "This link was for a different account than the one using @\(handle) now"
+                } else {
+                    // A group's or channel's name: its join screen.
+                    problem = nil
+                    model.openFoundPublicName(handle)
+                }
             } catch {
                 problem = "That profile didn't check out"
             }
@@ -293,7 +303,7 @@ struct ContactsView: View {
 /// What removing a contact does, in plain words.
 enum RemoveContact {
     static func title(_ contact: Contact) -> String { "Remove \(contact.displayName)?" }
-    static let detail = "They're taken out of your contacts on all your devices, and your chat is deleted for both of you. "
+    static let detail = "They're taken out of your contacts, and your chat is deleted for both of you. "
         + "They can only reach you again with a new invite or request."
 }
 

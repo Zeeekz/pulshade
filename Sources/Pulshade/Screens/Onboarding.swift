@@ -1,11 +1,10 @@
 import SwiftUI
 
 struct WelcomeView: View {
-    enum Route { case connection, privacy, home, create, restore, link }
+    enum Route { case connection, privacy, home, create, restore }
     /// With no account on the device, it asks how to connect before it connects to anything, then how private to be.
     @State private var route: Route = Tor.needsChoice ? .connection : (PendingPrivacy.asked ? .home : .privacy)
     @State private var appeared = false
-    @State private var signingIn = false
 
     var body: some View {
         ZStack {
@@ -22,7 +21,6 @@ struct WelcomeView: View {
             case .home: home.transition(.opacity)
             case .create: CreateFlow(back: { go(.home) }).transition(.push(from: .trailing))
             case .restore: RestoreFlow(back: { go(.home) }).transition(.push(from: .trailing))
-            case .link: LinkLoginFlow(back: { go(.home) }).transition(.push(from: .trailing))
             }
         }
         .onAppear { withAnimation(.smooth(duration: 1.0).delay(0.1)) { appeared = true } }
@@ -32,8 +30,8 @@ struct WelcomeView: View {
         VStack(spacing: 0) {
             Spacer(minLength: 40)
             VStack(spacing: 22) {
-                PulseMark(size: Platform.isPhone ? 92 : 104, animated: true)
-                Wordmark(size: Platform.isPhone ? 20 : 22)
+                PulseMark(size: 92, animated: true)
+                Wordmark(size: 20)
             }
             Spacer(minLength: 40)
             actions
@@ -45,59 +43,52 @@ struct WelcomeView: View {
 
     private var actions: some View {
         VStack(spacing: 12) {
-            if signingIn {
-                Button { go(.link) } label: { Label("Log in with QR code", systemImage: "qrcode") }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-                Button { go(.restore) } label: { Label("Use recovery code", systemImage: "key.horizontal") }
-                    .buttonStyle(SecondaryButtonStyle())
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-                Button("Back") { withAnimation(.smooth(duration: 0.35)) { signingIn = false } }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(Ink.dim)
-                    .padding(.top, 4)
-            } else {
-                Button("Log in") { withAnimation(.smooth(duration: 0.35)) { signingIn = true } }
-                    .buttonStyle(PrimaryButtonStyle())
-                    .transition(.opacity)
-                Button("Create account") { go(.create) }
-                    .buttonStyle(SecondaryButtonStyle())
-                    .transition(.opacity)
-            }
+            Button { go(.restore) } label: { Label("Log in with recovery code", systemImage: "key.horizontal") }
+                .buttonStyle(PrimaryButtonStyle())
+            Button("Create account") { go(.create) }
+                .buttonStyle(SecondaryButtonStyle())
         }
-        .padding(.bottom, Platform.isPhone ? 8 : 0)
+        .padding(.bottom, 8)
     }
 
     private func go(_ r: Route) { withAnimation(.smooth(duration: 0.45)) { route = r } }
 }
 
-/// The first thing a fresh install asks, before it connects to anything: through Tor, or straight to the server.
+/// The first thing a fresh install asks, before it connects to anything: through Tor, or straight to the server. Tor is
+/// chosen already; Fast is there for anyone who wants it, with what it gives away said plainly.
 struct ConnectionChoice: View {
     var chosen: (_ tor: Bool) -> Void
+    @State private var tor = true
 
     var body: some View {
         OnboardingPage(title: "How should PULSHADE connect?",
-                       subtitle: "Fast is much quicker. Tor hides your IP address. You can change it later in Settings.", back: nil) {
+                       subtitle: "Tor is the private choice and is set for you. You can change it later in Settings.", back: nil) {
             VStack(spacing: 14) {
-                option(symbol: "bolt.fill", title: "Fast",
-                       detail: "Fast. The server and your network see your IP address, never what you say.",
-                       tor: false)
-                option(symbol: "lock.shield.fill", title: "Private, through Tor",
-                       detail: "Hides your IP address through Tor. Slower: messages can arrive late on some networks.",
+                option(symbol: "lock.shield.fill", title: "Private, through Tor (recommended)",
+                       detail: "The server never sees your IP address, and your personas, chats and files reach it over separate routes, so they are much harder to tie together. Slower: messages can arrive late on some networks.",
                        tor: true)
+                option(symbol: "bolt.fill", title: "Fast",
+                       detail: "Quicker, but the server sees your IP address on everything you do: it can tell your personas, chats, files and calls all come from one place, and roughly where you are. Your network can see you use PULSHADE. It never sees what you say.",
+                       tor: false)
             }
         } actions: {
-            EmptyView()
+            Button("Continue") { chosen(tor) }
+                .buttonStyle(PrimaryButtonStyle())
         }
     }
 
-    private func option(symbol: String, title: String, detail: String, tor: Bool) -> some View {
-        Button { chosen(tor) } label: {
+    private func option(symbol: String, title: String, detail: String, tor value: Bool) -> some View {
+        let selected = tor == value
+        return Button { withAnimation(.snappy(duration: 0.2)) { tor = value } } label: {
             VStack(alignment: .leading, spacing: 8) {
-                Label(title, systemImage: symbol)
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(Ink.text)
+                HStack(alignment: .firstTextBaseline) {
+                    Label(title, systemImage: symbol)
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(Ink.text)
+                    Spacer(minLength: 8)
+                    Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(selected ? Ink.text : Ink.dim)
+                }
                 Text(branded: detail)
                     .font(.system(size: 14))
                     .foregroundStyle(Ink.dim)
@@ -107,12 +98,13 @@ struct ConnectionChoice: View {
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Ink.raised, in: .rect(cornerRadius: 14))
-            .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Ink.line))
+            .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(selected ? Ink.text : Ink.line, lineWidth: selected ? 2 : 1))
             .contentShape(.rect(cornerRadius: 14))
         }
         .buttonStyle(.plain)
         .accessibilityLabel(title)
         .accessibilityHint(detail)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 
@@ -168,11 +160,11 @@ struct OnboardingPage<Content: View, Actions: View>: View {
 }
 
 extension View {
-    /// A narrow centred column: the full screen on iPhone, a calm panel in the middle of the Mac window.
+    /// A narrow centred column, the full height of the screen.
     func onboardingColumn() -> some View {
         padding(.horizontal, 24)
-            .padding(.vertical, Platform.isPhone ? 8 : 36)
-            .frame(maxWidth: 420, maxHeight: Platform.isPhone ? .infinity : 660)
+            .padding(.vertical, 8)
+            .frame(maxWidth: 420, maxHeight: .infinity)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
@@ -197,7 +189,7 @@ struct CreateFlow: View {
     @State private var step: Step = .profile
     @State private var identity = Identity.generate()
     @State private var profile = Profile()
-    @State private var style = LockStyle.remembered.forChoosing
+    @State private var style = LockStyle.passcode
     @State private var passcode = ""
     @State private var confirm = ""
     @State private var problem: String?
@@ -295,7 +287,7 @@ struct CreateFlow: View {
     private func finish() {
         working = true
         Task {
-            LockStyle.remembered = style
+            model.lockStyle = style
             do {
                 try await model.create(identity: identity, profile: profile, passcode: passcode)
             } catch {
@@ -324,7 +316,7 @@ struct RestoreFlow: View {
     var back: () -> Void
 
     @State private var code = ""
-    @State private var style = LockStyle.remembered.forChoosing
+    @State private var style = LockStyle.passcode
     @State private var passcode = ""
     @State private var pinConfirm = ""
     @State private var shake = 0
@@ -336,6 +328,8 @@ struct RestoreFlow: View {
     /// Asking the relay for the account, so it can be cancelled.
     @State private var lookup: Task<Void, Never>?
     @State private var startedAt = Date()
+    /// The backup the relay gave, waiting for a yes once its date has been shown.
+    @State private var found: AppData?
 
     /// How long to wait for the relay before saying so. Over Tor, a relay that has just moved networks can take a
     /// few minutes to be reachable again; better to say that than to spin.
@@ -352,6 +346,25 @@ struct RestoreFlow: View {
             }
         }
         .animation(.smooth(duration: 0.35), value: choices.isEmpty)
+        .alert("Restore this backup?", isPresented: Binding(get: { found != nil }, set: { if !$0 { found = nil } })) {
+            Button("Restore") {
+                let backup = found
+                found = nil
+                if let backup { finish(keeping: nil, backup: backup) }
+            }
+            Button("Cancel", role: .cancel) {
+                found = nil
+                working = false
+            }
+        } message: {
+            Text(Self.backupDate(found?.backupStamp?.madeAt))
+        }
+    }
+
+    /// What the restore screen says about a backup's age, so a copy older than expected is noticed before it is used.
+    static func backupDate(_ date: Date?) -> String {
+        guard let date else { return "This backup was saved by an older version of Pulshade, so it doesn't say when it was made." }
+        return "Backup from \(date.formatted(date: .abbreviated, time: .shortened)). If you expected a newer one, cancel and try again later."
     }
 
     private var entry: some View {
@@ -474,8 +487,19 @@ struct RestoreFlow: View {
             guard !Task.isCancelled else { return }
             switch result {
             case let .found(backup):
+                // Its date is shown first, and nothing is restored without a yes.
                 lookup = nil
-                finish(keeping: nil, backup: backup)
+                found = backup
+                return
+            case let .older(date):
+                // The relay handed back a copy older than one this device already had: never restored.
+                lookup = nil
+                working = false
+                withAnimation(.snappy) {
+                    problem = "The relay gave an older backup than the one this device last had"
+                        + (date.map { " (it's from \($0.formatted(date: .abbreviated, time: .shortened)))" } ?? "")
+                        + ", so it wasn't restored. Try again later."
+                }
                 return
             case .unreachable:
                 // Restoring without it would start the account over, so it waits until the relay answers.
@@ -519,7 +543,7 @@ struct RestoreFlow: View {
         let others = choices
         Task {
             do {
-                LockStyle.remembered = style
+                model.lockStyle = style
                 try await model.restore(seed: seed, passcode: passcode, from: backup)
             } catch {
                 working = false
@@ -565,7 +589,8 @@ struct UnlockView: View {
     @State private var passcode = ""
     /// A PIN pad first when that's what was chosen; "Use passcode instead" opens the full keyboard, which a
     /// decoy or panic passcode may need.
-    @State private var style = LockStyle.remembered
+    @State private var usePasscode = false
+    private var style: LockStyle { usePasscode ? .passcode : model.lockStyle }
     @State private var shake = 0
     @State private var working = false
     @State private var leaving = false
@@ -612,15 +637,6 @@ struct UnlockView: View {
         .task { model.warmUp() }
         .onAppear { if model.biometricsOn { unlockWithTouchID() } }
         .sheet(isPresented: $leaving) { LockedLeaveSheet() }
-        #if os(macOS)
-        .focusable()
-        .focusEffectDisabled()
-        .onKeyPress { _ in
-            guard !opened else { return .ignored }
-            open()
-            return .handled
-        }
-        #endif
     }
 
     private func open() {
@@ -646,7 +662,9 @@ struct UnlockView: View {
                 .padding(.top, 6)
             Group {
                 if let length = style.length {
-                    PinPad(length: length, text: $passcode, disabled: working, onFull: unlock)
+                    // The keypad's length is only a hint: a shorter secret (a decoy or panic PIN from before PINs had to be
+                    // 6 digits, say) goes in with Enter, so none visibly can't be typed.
+                    PinPad(length: length, text: $passcode, disabled: working, onFull: unlock, onEnter: unlock)
                 } else {
                     PasscodeField(placeholder: "Passcode", text: $passcode, onSubmit: unlock)
                 }
@@ -672,7 +690,7 @@ struct UnlockView: View {
             }
             Spacer()
             VStack(spacing: 12) {
-                // A PIN unlocks by itself on its last digit.
+                // A PIN unlocks by itself on its last digit, or with the keypad's Enter key.
                 if !style.isPIN {
                     Button(action: unlock) { WorkingLabel(title: "Unlock", working: working) }
                         .buttonStyle(PrimaryButtonStyle())
@@ -687,10 +705,10 @@ struct UnlockView: View {
                     .disabled(working)
                 }
             }
-            if LockStyle.remembered.isPIN {
+            if model.lockStyle.isPIN {
                 Button(style.isPIN ? "Use passcode instead" : "Use PIN instead") {
                     passcode = ""
-                    style = style.isPIN ? .passcode : LockStyle.remembered
+                    usePasscode = style.isPIN
                 }
                 .buttonStyle(.plain)
                 .font(.system(size: 13, weight: .medium))
@@ -758,18 +776,20 @@ struct PasscodeField: View {
     }
 }
 
-/// A number pad with a dot for each digit. Taps and (on a Mac, or with a keyboard attached) typed digits both work.
-/// Calls `onFull` as the last digit goes in.
+/// A number pad with a dot for each digit. Taps and (with a keyboard attached) typed digits both work.
+/// Calls `onFull` as the last digit goes in. With `onEnter`, an Enter key (and Return) hands over however many digits
+/// there are.
 struct PinPad: View {
     @Environment(\.theme) private var theme
     var length: Int
     @Binding var text: String
     var disabled = false
     var onFull: () -> Void
+    var onEnter: (() -> Void)?
     @FocusState private var focused: Bool
 
     var body: some View {
-        VStack(spacing: Platform.isPhone ? 30 : 24) {
+        VStack(spacing: 30) {
             HStack(spacing: 16) {
                 ForEach(0..<length, id: \.self) { i in
                     Circle()
@@ -784,7 +804,17 @@ struct PinPad: View {
                     GridRow { ForEach(1...3, id: \.self) { col in digit(String(row * 3 + col)) } }
                 }
                 GridRow {
-                    Color.clear.frame(width: 74, height: 74)
+                    if let onEnter {
+                        Button { if !text.isEmpty { onEnter() } } label: {
+                            Image(systemName: "return").font(.system(size: 22, weight: .medium))
+                                .foregroundStyle(Ink.dim).frame(width: 74, height: 74).contentShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Enter")
+                        .opacity(text.isEmpty ? 0.35 : 1)
+                    } else {
+                        Color.clear.frame(width: 74, height: 74)
+                    }
                     digit("0")
                     Button { remove() } label: {
                         Image(systemName: "delete.left").font(.system(size: 22, weight: .medium))
@@ -806,6 +836,11 @@ struct PinPad: View {
             return .handled
         }
         .onKeyPress(.delete) { remove(); return .handled }
+        .onKeyPress(.return) {
+            guard let onEnter, !disabled, !text.isEmpty else { return .ignored }
+            onEnter()
+            return .handled
+        }
         .sensoryFeedback(.impact(weight: .light), trigger: text.count)
     }
 
@@ -959,7 +994,7 @@ struct RecoveryCodeGrid: View {
     var code: String
     var body: some View {
         let groups = code.split(separator: " ").map(String.init)
-        LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: 60, maximum: 78), spacing: 10), count: Platform.isPhone ? 4 : 5), spacing: 10) {
+        LazyVGrid(columns: Array(repeating: GridItem(.flexible(minimum: 60, maximum: 78), spacing: 10), count: 4), spacing: 10) {
             ForEach(Array(groups.enumerated()), id: \.offset) { i, g in
                 Text(g)
                     .font(.system(size: 15, weight: .semibold, design: .monospaced))
@@ -1076,9 +1111,8 @@ struct PrivacyChoice: View {
                 toggle("Sealed backup", $s.keepBackup, "A sealed copy of your profile, contacts, groups and chat keys (never messages) that only your recovery code opens.")
             }
             group("Notifications") {
-                toggle("Notifications", $s.notifications, Platform.isPhone
-                       ? "Banners for new messages and friend requests, even while your iPhone is locked: Apple wakes it, learning when, never what for."
-                       : "Banners for new messages.")
+                toggle("Notifications", $s.notifications,
+                       "Banners for new messages and friend requests, even while your iPhone is locked: Apple wakes it, learning when, never what for.")
                 choice("On the lock screen", $s.notificationContent, NotificationContent.allCases.map { ($0, $0.label) },
                        "How much a notification shows: nothing, who it's from, or the message.")
             }
@@ -1086,7 +1120,7 @@ struct PrivacyChoice: View {
                 choice("Auto-lock", $s.autoLockMinutes, [(1, "1 min"), (5, "5 min"), (15, "15 min"), (0, "Never")],
                        "Locks PULSHADE after this long, so a borrowed or stolen phone shows nothing.")
                 toggle("Block screenshots & recording", $s.blockCapture, "Keeps chats out of screenshots and screen recordings.")
-                toggle(Platform.isPhone ? "Hide in app switcher" : "Blur when in background", $s.blurWhenInactive,
+                toggle("Hide in app switcher", $s.blurWhenInactive,
                        "Blurs your chats whenever PULSHADE isn't in front.")
             }
         }

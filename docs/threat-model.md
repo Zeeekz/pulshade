@@ -27,7 +27,7 @@ claim that every mechanism has been independently verified.
 
 ## Assumptions
 
-- The device's OS and Secure Enclave are not compromised; iOS/macOS Data Protection and the Keychain work.
+- The device's OS and Secure Enclave are not compromised; iOS Data Protection and the Keychain work.
 - Apple's push service (APNs) is honest but *does* see push metadata (see "Out of scope").
 - Tor is not broken in real time; Arti is used correctly as built.
 - The user's contacts are not all colluding to reconstruct a conversation by comparing what they received.
@@ -41,11 +41,11 @@ claim that every mechanism has been independently verified.
 | No sender identity on the wire | Sealed envelopes; sender bound inside the AEAD, not in the outer header | `EnvelopeCore.swift`, `EnvelopePQ.swift` |
 | The relay can't tell who is talking to whom | Random mailbox names, one circuit per persona/inbox, padded envelope sizes | `Relay.swift`, `Tor.swift` |
 | The relay can't read profiles, backups or files | Client-side sealing; files sealed with a key that travels only in the E2EE message | `Envelope*.swift`, `Blob.swift` |
-| A copied lock file can't be guessed offline | PBKDF2 + Secure Enclave binding on slots; the whole file re-sealed with a rotating Keychain key | `Vault.swift` |
+| A copied lock file can't be guessed off the device | Argon2id (64 MiB) per guess, then each slot's key needs the Secure Enclave's answer for that passcode (an OPRF-style point multiplication), so every guess needs this device's chip; the whole file re-sealed with a rotating Keychain key. Without a Secure Enclave, Argon2id alone. Code running on the unlocked device can still guess at the chip's speed | `Vault.swift` |
 | Decoy and panic passcodes are indistinguishable | Three same-shaped slots, all decrypted on every attempt; filler data files | `Vault.swift` |
 | Old messages don't open after a compromise | Forward secrecy via the ratchet and removal of skipped keys | `Ratchet.swift` |
 | Out-of-order, duplicated and lost mail is survivable | Skipped-key cache, replay rejection, chunked PQ exchange | `Ratchet.swift`, `DeliveryChaosTests.swift` |
-| Crafted codes, links and files can't crash the app | Bounds-checked parsers; fuzz-style tests | `ParserFuzzTests.swift`, `Wire.swift`, `Linking.swift` |
+| Crafted codes, links and files can't crash the app | Bounds-checked parsers; fuzz-style tests | `ParserFuzzTests.swift`, `Wire.swift`, `ChatLinks.swift` |
 | Nothing is logged | No logging calls in the app; sealed storage only | whole tree |
 
 ## Out of scope (and why)

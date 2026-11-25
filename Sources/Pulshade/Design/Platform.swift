@@ -2,6 +2,7 @@ import SwiftUI
 import ImageIO
 import UniformTypeIdentifiers
 #if os(macOS)
+// macOS: test build only.
 import AppKit
 typealias PlatformImage = NSImage
 #else
@@ -84,68 +85,41 @@ enum DecodedImages {
     static func forget() { cache.removeAllObjects() }
 }
 
-/// The few things that differ between the Mac and iPhone apps, kept in one place.
+/// The few system services the screens use, kept in one place. On macOS (the test build only) they do nothing.
 enum Platform {
     /// Whether the person asked the system for less movement. Looping animations stay still when they did.
     @MainActor static var reduceMotion: Bool {
         #if os(iOS)
         UIAccessibility.isReduceMotionEnabled
         #else
-        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        #endif
-    }
-
-    static var isPhone: Bool {
-        #if os(iOS)
-        true
-        #else
         false
         #endif
     }
 
     @MainActor static var isActive: Bool {
-        #if os(macOS)
-        NSApp?.isActive ?? false
-        #else
+        #if os(iOS)
         UIApplication.shared.applicationState == .active
+        #else
+        false
         #endif
     }
 
     @MainActor static func open(_ url: URL) {
-        #if os(macOS)
-        NSWorkspace.shared.open(url)
-        #else
+        #if os(iOS)
         UIApplication.shared.open(url)
         #endif
     }
 
     @MainActor static func setBadge(_ count: Int) {
-        #if os(macOS)
-        NSApp?.dockTile.badgeLabel = count > 0 ? "\(count)" : nil
-        #else
+        #if os(iOS)
         UNUserNotificationCenter.current().setBadgeCount(count)
-        #endif
-    }
-
-    /// The Mac's emoji palette. On iPhone the keyboard already has emoji.
-    @MainActor static func showEmojiPicker() {
-        #if os(macOS)
-        NSApp.orderFrontCharacterPalette(nil)
         #endif
     }
 
     /// Copies a picture, staying on this device (no Universal Clipboard), and asks clipboard managers not to keep it.
     @MainActor static func copyImage(_ jpeg: Data) {
-        #if os(macOS)
-        let board = NSPasteboard.general
-        board.prepareForNewContents(with: .currentHostOnly)
-        board.setData(jpeg, forType: NSPasteboard.PasteboardType(UTType.jpeg.identifier))
-        board.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
-        board.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.TransientType"))
+        #if os(iOS)
         // A picture isn't left on the clipboard for good, any more than text is.
-        let count = board.changeCount
-        DispatchQueue.main.asyncAfter(deadline: .now() + 120) { if board.changeCount == count { board.clearContents() } }
-        #else
         UIPasteboard.general.setItems([[UTType.jpeg.identifier: jpeg]],
                                       options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(120)])
         #endif
@@ -155,18 +129,7 @@ enum Platform {
     /// device (no Universal Clipboard), and clipboard managers are asked not to keep it. Two minutes unless a
     /// shorter or longer time is given.
     @MainActor static func copy(_ text: String, clearAfter seconds: Double? = 120) {
-        #if os(macOS)
-        let board = NSPasteboard.general
-        board.prepareForNewContents(with: .currentHostOnly)
-        board.setString(text, forType: .string)
-        board.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType"))
-        board.setString("", forType: NSPasteboard.PasteboardType("org.nspasteboard.TransientType"))
-        guard let seconds else { return }
-        let count = board.changeCount
-        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
-            if board.changeCount == count { board.clearContents() }
-        }
-        #else
+        #if os(iOS)
         let board = UIPasteboard.general
         if let seconds {
             board.setItems([[UTType.plainText.identifier: text]],
@@ -244,8 +207,8 @@ func cleanJPEG(_ image: PlatformImage, maxSide: CGFloat) -> Data? {
     return data as Data
 }
 
-/// Picks a photo and hands back a cleaned JPEG: a file panel on the Mac, the photo picker on iPhone. With a
-/// crop frame, the picture is framed first (zoom and move), as on Instagram.
+/// Picks a photo with the photo picker and hands back a cleaned JPEG. With a crop frame, the picture is framed
+/// first (zoom and move), as on Instagram.
 struct ImagePickButton<Label: View>: View {
     var maxSide: CGFloat
     var crop: CropFrame? = nil
@@ -313,35 +276,18 @@ struct ImagePickButton<Label: View>: View {
     }
 
     private func choose() {
-        #if os(macOS)
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.image]
-        panel.allowsMultipleSelection = pickedMany != nil
-        guard panel.runModal() == .OK else { return }
-        if let pickedMany {
-            let all = panel.urls.prefix(10).compactMap { NSImage(contentsOf: $0) }.compactMap { cleanJPEG($0, maxSide: maxSide) }
-            if !all.isEmpty { pickedMany(all) }
-            return
-        }
-        guard let url = panel.url, let image = NSImage(contentsOf: url) else { return }
-        use(image)
-        #else
+        #if os(iOS)
         if pickedMany != nil { choosingMany = true } else { choosing = true }
         #endif
     }
 }
 
-/// Hosts a CALayer-backed view, such as a camera preview, on either platform.
+/// Hosts a CALayer-backed view, such as a camera preview.
 #if os(macOS)
-struct LayerView: NSViewRepresentable {
+// macOS: test build only.
+struct LayerView: View {
     let layer: CALayer
-    func makeNSView(context: Context) -> NSView {
-        let view = NSView()
-        view.layer = layer
-        view.wantsLayer = true
-        return view
-    }
-    func updateNSView(_ view: NSView, context: Context) {}
+    var body: some View { EmptyView() }
 }
 #else
 struct LayerView: UIViewRepresentable {

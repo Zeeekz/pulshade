@@ -16,8 +16,9 @@ import CryptoKit
 /// (an exchange between your identity keys), this device's id and whose spare it is. Every read and write is
 /// signed with that key, as for a backup, and the card is sealed with another key from the same secret and padded
 /// to one size. The relay can't open it or tell whose it is; each slot is read and written on its own connection,
-/// so it can't easily tie one device's slots together either. The friend who takes it erases it. Nothing on the
-/// relay had to change.
+/// so it can't easily tie one device's slots together either. A one-time spare is taken: the relay hands it over and
+/// erases it in the same step (`pulshade.backup.take.v1`), so two of a friend's devices asking at once can't both start
+/// from it, as with Signal's one-time prekeys. (A relay from before that is read, and the spare erased afterwards.)
 enum SpareSlot {
     struct Keys {
         /// Signs every read, write and removal of the slot. Its public half names the slot.
@@ -36,8 +37,8 @@ enum SpareSlot {
     private static let salt = Data("pulshade.spare.v1".utf8)
 
     /// Each device leaves a friend up to three spares, each in its own slot:
-    /// - `first` and `second` are used once each: the friend who takes one erases it, and its maker leaves a new one.
-    ///   Two, so a couple of repairs in a row, or a friend's phone and Mac at once, each find one.
+    /// - `first` and `second` are used once each: the relay erases one as the friend takes it, and its maker leaves a new one.
+    ///   Two, so a couple of repairs in a row, or two of a friend's phones at once, each find one.
     /// - `lastResort` is only taken when both of those are gone, and isn't erased: it stays until its maker replaces it,
     ///   a week or so later, so there is always something to start from, even with the friend's app closed for days.
     ///   The trade (the same one Signal makes with its signed prekey): a session started on it shares that ask with any

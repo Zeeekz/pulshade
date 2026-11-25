@@ -304,17 +304,55 @@ struct GroupSettings: Codable, Equatable {
     /// envelope; `fitsInMailbox` has the last word.
     static let maxMembers = 1_000
 
-    /// Orders two versions with the same number that compete (two admins changed the group at once): every member
-    /// keeps the one with the lower hash, so they all end up on the same one.
+    /// Orders two versions with the same number and the same signer (two of one account's devices changed the group at
+    /// once): the lower hash. Only ever between versions one key signed, so nobody gains by trying again for a lower one.
     var tieBreak: Data { Data(SHA256.hash(data: signable())) }
 
-    /// Which of two competing versions with the same number every member keeps: one the owner signed beats one anyone
-    /// else signed (so an admin can't overturn the owner by trying until their hash comes out lower); otherwise the
-    /// lower hash.
-    func winsOver(_ other: GroupSettings) -> Bool {
-        let mine = signer == owner, theirs = other.signer == other.owner
-        if mine != theirs { return mine }
-        return tieBreak.lexicographicallyPrecedes(other.tieBreak)
+    /// Where a member stands in these settings when two versions made from them compete: the owner first, then the admins
+    /// in the order the owner listed them, then the mods, then everyone else in the order of their cards. Signing again
+    /// changes nothing here, so nobody can try until they win.
+    func seniority(of key: Data) -> Int {
+        if key == owner { return 0 }
+        if let i = admins.firstIndex(of: key) { return 1 + i }
+        if let i = mods.firstIndex(of: key) { return 1 + admins.count + i }
+        if let i = members.firstIndex(where: { $0.signingKey == key }) { return 1 + admins.count + mods.count + i }
+        return Int.max
+    }
+
+    /// How two competing versions with the same number, both made from `base`, are settled.
+    enum Contest: Equatable {
+        case wins, loses
+        /// Both move the same member to new keys, but to different ones: two devices hold that member's old keys and
+        /// each claims the place (one is likely a device their account unlinked). Neither is taken.
+        case dispute(old: Data, keys: [Data])
+    }
+
+    /// Which of this version and `other` (same number, both made from `base`) every member keeps. The signer who stands
+    /// higher in `base` wins (`seniority`). Between two versions one key signed: a move to new keys beats any other
+    /// change (so a device that still holds the old keys can't hold the account back on them), two moves to the same new
+    /// key are the same account's devices and the lower hash wins, and two moves to different new keys are a dispute.
+    func contest(_ other: GroupSettings, base: GroupSettings) -> Contest {
+        guard signer == other.signer else {
+            return base.seniority(of: signer) < base.seniority(of: other.signer) ? .wins : .loses
+        }
+        switch (base.renewal(to: self), base.renewal(to: other)) {
+        case let (mine?, theirs?) where mine.new != theirs.new:
+            return .dispute(old: mine.old, keys: [mine.old, mine.new, theirs.new])
+        case (.some, nil): return .wins
+        case (nil, .some): return .loses
+        default: return tieBreak.lexicographicallyPrecedes(other.tieBreak) ? .wins : .loses
+        }
+    }
+
+    /// The key this version gives `old`'s place to, when that isn't `taken`, judged without the version it was made from:
+    /// signed by `old`, numbered `version`, with neither `old` nor `taken` in it, and genuine. Used against a move of
+    /// `old`'s place to `taken` already seen (`SharedGroup.renewals`): the other key it names, or an empty key when it
+    /// names none this device can tell apart. Nil when it isn't such a version (the same move again included).
+    func movesPlace(of old: Data, at version: Int, otherThan taken: Data, from held: GroupSettings) -> Data? {
+        guard signer == old, self.version == version, group == held.group, !isMember(old), !isMember(taken),
+              signatureIsValid, wellFormed() else { return nil }
+        let added = members.map(\.signingKey).filter { !held.isMember($0) }
+        return added.count == 1 ? added[0] : Data()
     }
 
     /// Whether these settings, posted to the mailbox, fit the relay's largest group envelope once sealed and padded.
@@ -710,6 +748,11 @@ struct GroupReader: Codable, Equatable {
     /// "epoch|sender hex|device hex" → the first position this device was given: a post from before it was never
     /// readable here (ask for it), one from after it and before the chain's position has been read (or skipped).
     var starts: [String: UInt32]? = [:]
+    /// Chains passed on by someone other than the device they belong to (a channel's follower gets staff chains from the
+    /// staff member who invited it), until a post that device signed opens with one: only then is it known to be that
+    /// device's. One that doesn't open such a post is dropped (`dropUnproven`) and asked for again, so nobody passing
+    /// chains on can plant one of their own making that keeps the real one out.
+    var unproven: Set<String>?
 
     static let maxSkip: UInt32 = 2_000
     /// Most keys kept for one sender's skipped messages, and in all.
@@ -755,11 +798,15 @@ struct GroupReader: Codable, Equatable {
     /// starts there. One followed already gains only keys for `wanted` (posts held here, unread) from before its position;
     /// nothing else is kept, so no key of a post already read is ever made again. True if anything was taken.
     @discardableResult
-    mutating func start(epoch: Int, sender: Data, device: Data, chain given: SenderChain, wanted: [UInt32] = []) -> Bool {
+    mutating func start(epoch: Int, sender: Data, device: Data, chain given: SenderChain, wanted: [UInt32] = [], proven: Bool = true) -> Bool {
         guard given.key.count == 32, given.index < GroupSeal.directIndex else { return false }
         let id = Self.id(epoch: epoch, sender: sender, device: device)
         if starts == nil { starts = [:] }
+        // A chain from its own device replaces one passed on that no post has proved yet.
+        if proven, unproven?.contains(id) == true { drop(id) }
         if let held = chains[id] {
+            // Nothing proved is extended from a source that proves nothing either.
+            if !proven, unproven?.contains(id) == true { return false }
             // Far further on than this device could step to: the chain goes on from there (what lies between is lost).
             if given.index > held.index, given.index - held.index > Self.maxSkip {
                 chains[id] = given
@@ -783,7 +830,32 @@ struct GroupReader: Codable, Equatable {
         if chains.keys.count(where: { $0.hasPrefix("\(epoch)|") }) >= Self.maxChainsPerEpoch { return false }
         chains[id] = given
         starts?[id] = given.index
+        if !proven { unproven = (unproven ?? []).union([id]) }
         return true
+    }
+
+    /// A post from this sender device opened: its chain is that device's.
+    mutating func proved(epoch: Int, sender: Data, device: Data) {
+        guard unproven?.isEmpty == false else { return }
+        unproven?.remove(Self.id(epoch: epoch, sender: sender, device: device))
+        if unproven?.isEmpty == true { unproven = nil }
+    }
+
+    /// A post this sender device signed didn't open with a chain that was passed on and not yet proved: the chain isn't
+    /// that device's, and goes (with its skipped keys), so the real one can be taken. True if it went.
+    mutating func dropUnproven(epoch: Int, sender: Data, device: Data) -> Bool {
+        let id = Self.id(epoch: epoch, sender: sender, device: device)
+        guard unproven?.contains(id) == true else { return false }
+        drop(id)
+        return true
+    }
+
+    private mutating func drop(_ id: String) {
+        chains[id] = nil
+        starts?[id] = nil
+        skipped = skipped.filter { !$0.key.hasPrefix(id + "|") }
+        unproven?.remove(id)
+        if unproven?.isEmpty == true { unproven = nil }
     }
 
     /// A sender who skips a lot only pushes out their own oldest gaps, never anyone else's. Only looked at when this
@@ -803,6 +875,7 @@ struct GroupReader: Codable, Equatable {
         chains = chains.filter { !$0.key.hasPrefix("\(epoch)|") }
         skipped = skipped.filter { !$0.key.hasPrefix("\(epoch)|") }
         starts = starts?.filter { !$0.key.hasPrefix("\(epoch)|") }
+        unproven = unproven?.filter { !$0.hasPrefix("\(epoch)|") }
     }
 
     /// Forgets everything about epochs before `epoch`. Only for epochs no longer read: while one is, what was opened in
@@ -812,6 +885,7 @@ struct GroupReader: Codable, Equatable {
         chains = chains.filter { keep($0.key) }
         skipped = skipped.filter { keep($0.key) }
         starts = starts?.filter { keep($0.key) }
+        unproven = unproven?.filter(keep)
     }
 }
 
@@ -988,6 +1062,33 @@ struct GroupInvite: Codable, Equatable {
     /// this invite is for the channel that code was for, and not another of the same person's. Nil from apps before it,
     /// and from staff whose device doesn't hold the code; such an invite waits for a yes. Apps from before ignore it.
     var code: Data?
+    /// In a channel: the staff member's word that the account sending this invite is theirs (`StaffVouch`). A channel
+    /// this account doesn't follow yet is only taken from an invite that carries one naming its sender, so nobody but staff
+    /// becomes the account the channel is followed through. Apps from before send none, and their invites are refused.
+    var vouch: StaffVouch?
+}
+
+/// A staff member's signature, with their group key in the channel, over the channel and the signing key of the account
+/// sending an invite: that account is the staff member. Someone who forwards an invite they were sent can't make one that
+/// names their own account, and one naming the staff member's account doesn't match who sent it.
+struct StaffVouch: Codable, Equatable {
+    var key: Data
+    var signature: Data
+
+    private static func message(group: UUID, account: Data) -> Data {
+        Data("pulshade.channel.vouch.v1".utf8) + bytes(group) + account
+    }
+
+    static func make(_ keys: GroupMemberKeys, group: UUID, account: Data) -> StaffVouch? {
+        guard let signature = try? keys.signing.signature(for: message(group: group, account: account)) else { return nil }
+        return StaffVouch(key: keys.publicKey, signature: signature)
+    }
+
+    /// Made by someone the settings name as staff, for this channel and this account.
+    func checks(_ settings: GroupSettings, account: Data) -> Bool {
+        guard settings.isAdmin(key), let pub = try? Curve25519.Signing.PublicKey(rawRepresentation: key) else { return false }
+        return pub.isValidSignature(signature, for: Self.message(group: settings.group, account: account))
+    }
 }
 
 /// A post waiting to go into a group's mailbox, already sealed (its chain has moved on, so it must go as it is).
@@ -1194,6 +1295,59 @@ struct SharedGroup: Codable, Equatable {
     /// Set when this device was away longer than the relay keeps mail: the time it last read, to ask members for what it missed.
     var catchUpSince: Date?
     var catchUpAsked: Date?
+    /// Moves to new keys this device took (`GroupSettings.renewal`): whose old key, the key it moved to, and in which
+    /// version. A later version from the same old key that gives the place to another key shows that two devices hold
+    /// those old keys (`disputed`). The newest `RenewalMark.kept`.
+    var renewals: [RenewalMark]?
+    /// Member keys two devices fought over (one member's old key and both new keys it was moved to): nothing they sign
+    /// or post is taken until an admin adds them again (a version from someone else that brings the key in anew).
+    var disputed: [Data]?
+    /// The group secret this device's own move to new keys was made from, kept until the group has settled on it: if a
+    /// competing change wins instead, this device goes back to the keys the group still lists, and moves again later.
+    var renewing: Data?
+    /// Settings that move this account's own place to keys this device can't make, and when they came (see
+    /// `AppModel.settleForeignMoves`).
+    var foreignMove: GroupSettings?
+    var foreignMoveAt: Date?
+    /// Who brought each member in, by their group key (in hex): the signer of the version this device took that added
+    /// them, or, for a member who moved to new keys, whoever brought in the key they moved from. Kept for those still
+    /// listed. A dispute over a member's keys holds back everyone those keys brought in too (`broughtIn`).
+    var addedBy: [String: Data]?
+
+    /// Notes who `next`, taken in place of `base`, brought in.
+    mutating func noteAdded(from base: GroupSettings, to next: GroupSettings) {
+        var by = addedBy ?? [:]
+        if let (old, new) = base.renewal(to: next) {
+            by[new.hex] = by[old.hex]
+        } else {
+            for card in next.members where !base.isMember(card.signingKey) { by[card.signingKey.hex] = next.signer }
+        }
+        let listed = Set(next.members.map(\.signingKey.hex))
+        by = by.filter { listed.contains($0.key) }
+        addedBy = by.isEmpty ? nil : by
+    }
+
+    /// `keys`, every key they moved to since (`renewals`), and every member any of those brought in, and so on: all that
+    /// came in under keys nobody can vouch for.
+    func broughtIn(under keys: [Data]) -> Set<Data> {
+        var found = Set(keys.filter { !$0.isEmpty })
+        while true {
+            let before = found.count
+            for mark in renewals ?? [] where found.contains(mark.old) { found.insert(mark.new) }
+            for card in settings.members where addedBy?[card.signingKey.hex].map(found.contains) == true { found.insert(card.signingKey) }
+            if found.count == before { return found }
+        }
+    }
+
+    /// The key holding `key`'s place now: `key` itself, or the newest key it moved to (`renewals`).
+    func holder(of key: Data) -> Data {
+        var key = key
+        for _ in 0..<RenewalMark.kept {
+            guard let mark = renewals?.last(where: { $0.old == key }), mark.new != key else { break }
+            key = mark.new
+        }
+        return key
+    }
 
     /// The epoch the settings name (the one everything is posted in).
     var current: GroupEpoch? { epochs.last { $0.number == settings.epoch && $0.check == settings.epochCheck } ?? epochs.last }
@@ -1213,4 +1367,13 @@ struct SharedGroup: Codable, Equatable {
         let cutoff = Date().addingTimeInterval(-8 * 86_400)
         return epochs.indices.filter { i in i == epochs.count - 1 || epochs[i + 1].started > cutoff }.map { epochs[$0] }
     }
+}
+
+/// A member's move to new keys, as one device took it (`SharedGroup.renewals`).
+struct RenewalMark: Codable, Equatable {
+    var old: Data
+    var new: Data
+    var version: Int
+
+    static let kept = 64
 }

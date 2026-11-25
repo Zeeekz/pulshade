@@ -62,7 +62,6 @@ struct QuickSendSheet: View {
             }
             .scrollIndicators(.never)
         }
-        .frame(width: Platform.isPhone ? nil : 420, height: Platform.isPhone ? nil : 520)
         .background(Ink.base)
         .preferredColorScheme(Ink.scheme)
         .confirmationDialog(sharing.map { "Let \($0.name) read “\($0.note.title)”?" } ?? "", isPresented: Binding(get: { sharing != nil },

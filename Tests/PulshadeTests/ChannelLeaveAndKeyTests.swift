@@ -61,7 +61,6 @@ struct ChannelLeaveAndKeyTests {
     private func channelWithTwoFollowers(allThree: Bool = false) async throws -> (alice: AppModel, bob: AppModel, cara: AppModel, dave: AppModel, bobFP: String, channel: UUID) {
         AppModel.leaveRekeyWindow = 0
         AppModel.rekeyRetry = 30
-        AppModel.channelAdmitsPerHour = 60
         let (alice, others, fps) = try await people(["Bob", "Cara", "Dave"])
         let (bob, cara, dave) = (others[0], others[1], others[2])
         let channel = alice.startConversation(kind: .channel, title: "Drops", members: allThree ? fps : [fps[0], fps[1]])
@@ -281,7 +280,6 @@ struct ChannelLeaveAndKeyTests {
     private func codeChannel() async throws -> (alice: AppModel, bob: AppModel, cara: AppModel, id: UUID) {
         AppModel.leaveRekeyWindow = 0
         AppModel.rekeyRetry = 30
-        AppModel.channelAdmitsPerHour = 60
         let alice = try await makeUser("Alice"), bob = try await makeUser("Bob"), cara = try await makeUser("Cara")
         let channel = alice.startConversation(kind: .channel, title: "Drops", members: [])
         let code = alice.makeInviteCode(channel: channel.id)
@@ -436,9 +434,8 @@ struct ChannelLeaveAndKeyTests {
     }
 
     @Test func codeJoinsPastTheHourlyLimitWaitAndAreLetInAsRoomComes() async throws {
-        AppModel.channelAdmitsPerHour = 1
-        defer { AppModel.channelAdmitsPerHour = 60 }
         let alice = try await makeUser("Alice"), bob = try await makeUser("Bob"), cara = try await makeUser("Cara")
+        alice.channelAdmitsPerHour = 1
         defer { for m in [alice, bob, cara] { m.lock() } }
         let channel = alice.startConversation(kind: .channel, title: "Drops", members: [])
         let code = alice.makeInviteCode(channel: channel.id)
@@ -507,8 +504,8 @@ struct ChannelLeaveAndKeyTests {
     @Test func aFloodOfWaitingJoinersCantHoldOthersOut() async throws {
         let (alice, bob, cara, dave, _, id) = try await channelWithTwoFollowers()
         defer { for m in [alice, bob, cara, dave] { m.lock() } }
-        // This hour's places already used, in this channel only (the hourly limit is shared with tests running beside this).
-        let full = Array(repeating: Date(), count: AppModel.channelAdmitsPerHour)
+        // This hour's places already used, in this channel only (the hourly limit is this device's own).
+        let full = Array(repeating: Date(), count: alice.channelAdmitsPerHour)
         alice.channelAdmits[id] = full
         let fps = (0..<1_600).map { "flood-\($0)" }
         alice.admitFromCodeForTests(Array(fps[0..<100]), in: id)

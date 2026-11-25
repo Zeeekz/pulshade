@@ -13,7 +13,7 @@ see the [Privacy Policy](privacy-policy.md).
 ## General
 
 **What is Pulshade?**
-An anonymous, end-to-end encrypted messenger for Mac and iPhone. There is no phone number, email address or username
+An anonymous, end-to-end encrypted messenger for iPhone. There is no phone number, email address or username
 to sign up with. The first time you open it you choose how it connects: privately through Tor, built in, or Fast.
 
 **Who is it for?**
@@ -21,7 +21,7 @@ Anyone who wants to talk without handing over who they are. It has not had an in
 please don't rely on it where your safety depends on it.
 
 **What do I need to run it?**
-macOS 26 or later, or iOS 26 or later.
+An iPhone with iOS 26 or later.
 
 **Is it free? Do you show ads?**
 No ads, no analytics and no tracking, in the app or on the server. We don't sell or share your information.
@@ -43,7 +43,7 @@ The only way back into your account if you lose the device or forget the passcod
 recover it for you, so keep it somewhere safe and private. It is never offered for copying inside the app.
 
 **What is the passcode for?**
-It seals your account on the device. You can also use Touch ID, except while a decoy or panic passcode is set.
+It seals your account on the device. You can also use Face ID or Touch ID, except while a decoy or panic passcode is set.
 
 **Can I try it without committing?**
 Yes. One-time chats use a throwaway identity for both sides and end after the time you choose, and personas can be
@@ -101,8 +101,8 @@ No. Without one, only people you give your code or link to can reach you, and ev
 chats, groups, calls and stories. A username only adds a way to be found by people who know it.
 
 **How do I know I'm talking to the right person?**
-Use Pulse check. Both of you see the same ten emoji, 30 digits, colours and QR code, derived from both your keys.
-Scan their screen, or check all 30 digits match: then nobody is in the middle. The emoji are only a quick look.
+Use Pulse check. Both of you see the same 60 digits (30 worked out from each person's own keys), ten emoji, colours and
+QR code. Scan their screen, or check all 60 digits match: then nobody is in the middle. The emoji are only a quick look.
 
 **What are disappearing messages?**
 A chat can have a timer; when it ends, each message disappears from every device. It works only as far as the other
@@ -167,8 +167,8 @@ videos and calls. Both are encrypted on your phone first, and camera frames are 
 **What are Lock, Detach and Burn?**
 All three are on the Burn tab.
 - **Lock** closes the vault. Everything stays on the device, encrypted.
-- **Detach** wipes this device at once. Your other devices keep the account, and your profile, contacts and groups come
-  back with the recovery code. Chats on this device are gone for good.
+- **Detach** wipes this device at once. Your profile, contacts and groups come back with the recovery code. Chats on
+  this device are gone for good.
 - **Burn** deletes the account everywhere, as if it had never existed. It can't be undone.
 
 **What are decoy and panic passcodes?**
@@ -183,7 +183,7 @@ tells you.
 
 **I lost my phone. What now?**
 Install Pulshade on a new device and use your recovery code. Your profile, handles, contacts, groups, personas and
-settings come back from the sealed backup. Chats don't: they never leave your devices.
+settings come back from the sealed backup. Chats don't: they never leave your phone.
 
 **What is the sealed backup?**
 A copy of your profile, contacts, groups, personas and settings (never the messages or any chat keys), encrypted
@@ -192,9 +192,11 @@ sent while you were logged out can't be opened. We can't open it or link it to y
 or 180 days after its last save.
 
 **Can I use Pulshade on several devices?**
-Yes, linked devices share one account. The new device shows a QR code; scan it from a device that's already logged in.
+No. An account lives on one iPhone at a time. To move it to a new phone, use your recovery code there: your profile,
+contacts and groups come back, but not your chats. If you linked devices on an older build, one of those used in the
+last month keeps the account once they've updated, and the others are signed out and wiped.
 
-**What happens to my chats if I Detach the only device?**
+**What happens to my chats if I Detach?**
 The people you chat with are told to clear their one-to-one chat with you (they keep you as a contact). If you are
 offline, they are told when the account is next recovered.
 
@@ -222,7 +224,7 @@ Settings → Network → Anonymity Report shows the address the server sees for 
 ## Notifications
 
 **Why don't I get messages when the app is closed?**
-On iPhone, while notifications are on (the default), the server wakes your locked phone through Apple for new
+While notifications are on (the default), the server wakes your locked phone through Apple for new
 messages and friend requests; turn notifications off in Settings → Notifications and messages arrive only while the
 app is open. Apple learns your phone was woken, and when, though never what was said. Turn notifications off if you
 need the strongest anonymity.

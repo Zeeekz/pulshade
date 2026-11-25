@@ -26,12 +26,14 @@ extension View {
 }
 
 private struct LinkTapGate: ViewModifier {
+    @Environment(AppModel.self) private var model
     @State private var asking: URL?
 
     func body(content: Content) -> some View {
         content
             .environment(\.openURL, OpenURLAction { url in
-                asking = url
+                // Pulshade's own links stay in Pulshade: a name or invite opens its screen, which asks before anything.
+                if WebLinks.parse(url) != nil { model.open(url) } else { asking = url }
                 return .handled
             })
             .confirmsExternalLink($asking)

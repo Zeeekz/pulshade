@@ -5,7 +5,7 @@ import Security
 /// has already confirmed, and the inbox it keeps short mail in until Pulshade reads it. Keychain items in a group only
 /// the app and its helper share, readable after the phone's first unlock since it was switched on (the helper runs
 /// while it's locked), kept on this device and never synced or backed up: iOS keeps them encrypted, and Burn and
-/// Detach remove every one. Nothing on the Mac, which has no helper (tests there use memory instead).
+/// Detach remove every one. The macOS test build has no helper; its tests use memory instead.
 enum HelperStore {
     private static let service = "app.pulshade.helper"
     private static let inboxService = "app.pulshade.inbox"
@@ -99,7 +99,7 @@ enum HelperStore {
     // MARK: Keychain
 
     #if DEBUG && os(macOS)
-    /// The Mac has no helper; its tests keep these in memory, by service and name.
+    /// The macOS test build has no helper; its tests keep these in memory, by service and name.
     nonisolated(unsafe) private static var memoryItems: [String: [String: Data]] = [:]
     private static let memoryLock = NSLock()
     #endif

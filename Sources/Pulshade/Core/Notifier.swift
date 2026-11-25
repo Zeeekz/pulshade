@@ -1,9 +1,9 @@
 import Foundation
 import UserNotifications
 
-/// Mac notifications for new messages.
+/// Notifications for new messages.
 ///
-/// macOS stores notification text in its own database, outside Pulshade's encryption, so by
+/// The system stores notification text in its own database, outside Pulshade's encryption, so by
 /// default a notification only says "New message". One notification per chat is kept and
 /// replaced, and all of them are cleared when Pulshade locks.
 @MainActor

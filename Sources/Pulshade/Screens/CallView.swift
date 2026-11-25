@@ -31,7 +31,7 @@ struct CallView: View {
                     }
                     Spacer(minLength: 40)
                     controls(call)
-                        .padding(.bottom, Platform.isPhone ? 24 : 48)
+                        .padding(.bottom, 24)
                 }
                 .padding(.horizontal, 24)
             }
@@ -66,10 +66,8 @@ struct CallView: View {
                 round(call.muted ? "mic.slash.fill" : "mic.fill", call.muted ? "Unmute" : "Mute",
                       tint: call.muted ? .white : nil) { model.toggleMute() }
                 round("phone.down.fill", "End", tint: .red) { model.hangUp() }
-                if Platform.isPhone {
-                    round("speaker.wave.2.fill", "Speaker",
-                          tint: call.speaker ? .white : nil) { model.toggleSpeaker() }
-                }
+                round("speaker.wave.2.fill", "Speaker",
+                      tint: call.speaker ? .white : nil) { model.toggleSpeaker() }
             }
         }
     }

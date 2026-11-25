@@ -85,6 +85,38 @@ struct DeviceKeyCard: Codable, Equatable {
     }
 }
 
+/// One device of an account vouching for another of the same account, with its own keys: "device `device`, with keys
+/// `pin`, is one of ours; I am device `by`". The device that approves a new one makes it when it sends the account
+/// (`LinkBundle.vouch`), and the new device shows it whenever it introduces itself (`DeviceCard.vouch`). A contact whose
+/// account has unlinked a device takes a new device of theirs without asking only with a vouch from a device it still
+/// trusts: a device that was unlinked still holds the account's keys and can sign a card for any keys it likes, but not
+/// a vouch from a device the contact hasn't dropped.
+struct DeviceVouch: Codable, Equatable {
+    var by: Data
+    /// The vouching device's keys, signed by the account for `by`.
+    var card: DeviceKeyCard
+    var sig: DeviceSignature
+
+    static func message(account: Data, by: Data, device: Data, pin: Data) -> Data {
+        var out = Data("pulshade.device.vouch.v1".utf8) + account
+        for part in [by, device] {
+            withUnsafeBytes(of: UInt32(part.count).bigEndian) { out.append(contentsOf: $0) }
+            out += part
+        }
+        return out + pin
+    }
+
+    static func make(key: DeviceKey, card: DeviceKeyCard, account: Data, by: Data, device: Data, pin: Data) throws -> DeviceVouch {
+        DeviceVouch(by: by, card: card, sig: try key.sign(message(account: account, by: by, device: device, pin: pin)))
+    }
+
+    /// Made by device `by` of this account, with keys the account signed for it, for this device and these keys.
+    func checks(account: Data, accountPQ: PQPin, device: Data, pin: Data) -> Bool {
+        guard !by.isEmpty, by != device, pin.count == 32, card.isSigned(by: account, accountPQ: accountPQ, device: by) else { return false }
+        return card.checks(sig, for: Self.message(account: account, by: by, device: device, pin: pin))
+    }
+}
+
 /// A device's signature with both its keys.
 struct DeviceSignature: Codable, Equatable {
     var ed: Data

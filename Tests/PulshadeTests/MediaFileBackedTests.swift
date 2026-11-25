@@ -148,20 +148,6 @@ import Foundation
         #expect(!FileManager.default.fileExists(atPath: media.path), "an empty account beside a full pool would give it away")
     }
 
-    @Test func historyForAnotherDeviceCarriesBytesNotFileReferences() async throws {
-        let model = try await makeModel()
-        defer { model.lock() }
-        let them = makeContact()
-        model.data.contacts = [them]
-        let photo = StoryMediaTests.photo()
-        model.deliver(WireMessage(id: UUID(), conversation: nil, kind: .direct, text: "", image: photo, date: Date()), from: them)
-        let carried = model.historyForTests().flatMap { event -> [Message] in
-            if case let .history(_, messages) = event { messages } else { [] }
-        }
-        let message = try #require(carried.last)
-        #expect(message.imageFile == nil && message.image == photo)
-    }
-
     @Test func aNameThePoolNeverMadeIsNeverOpenedOrOverwritten() throws {
         let dir = testDirectory("pulshade-media-names")
         let pool = MediaPool(directory: dir)

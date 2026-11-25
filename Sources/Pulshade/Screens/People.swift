@@ -40,13 +40,13 @@ struct PeopleView: View {
             else if scrolls { ScrollView { content }.scrollIndicators(.never) } else { content }
         }
             .onAppear { if invite.isEmpty { invite = model.makeInviteCode() } }
-            .sheet(isPresented: $scanning) { ScanSheet(allowsDevices: false) }
+            .sheet(isPresented: $scanning) { ScanSheet() }
     }
 
     private var content: some View {
             VStack(alignment: .leading, spacing: 20) {
                 Heading(title: "Add a friend")
-                    .padding(.top, Platform.isPhone ? 12 : 38)
+                    .padding(.top, 12)
                 ViewThatFits(in: .horizontal) {
                     HStack(alignment: .top, spacing: 20) {
                         mine.frame(width: 360)
@@ -58,9 +58,9 @@ struct PeopleView: View {
                     }
                 }
             }
-            .padding(.horizontal, Platform.isPhone ? 16 : 30)
+            .padding(.horizontal, 16)
             .padding(.bottom, 24)
-            .frame(maxWidth: Platform.isPhone ? .infinity : 840, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .frame(maxWidth: .infinity)
     }
 
@@ -69,7 +69,8 @@ struct PeopleView: View {
     private var mine: some View {
         panel {
             VStack(spacing: 18) {
-                QRCode(text: Invite.link(invite), size: 188)
+                // The QR code carries the whole link: a camera reads it at any length, and it puts nothing on the relay.
+                QRCode(text: WebLinks.long(invite), size: 188)
                     .overlay {
                         Avatar(image: model.activeProfile.avatar, seed: model.fingerprint, size: 40)
                             .overlay(Circle().strokeBorder(Ink.text, lineWidth: 3))
@@ -83,17 +84,15 @@ struct PeopleView: View {
                         .font(.system(size: 13)).foregroundStyle(model.activeProfile.handle == nil ? Ink.faint : theme.accent)
                 }
                 HStack(spacing: 10) {
-                    Button {
-                        copyToClipboard(Invite.link(invite), clearAfter: 120)
+                    SharedLinkButtons(target: invite, onCopied: {
                         withAnimation(.snappy) { copied = true }
                         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { withAnimation { copied = false } }
-                    } label: {
+                    }, copyLabel: {
                         Label(copied ? "Copied" : "Copy link", systemImage: copied ? "checkmark" : "doc.on.doc")
                             .contentTransition(.symbolEffect(.replace))
-                    }
-                    .buttonStyle(PanelButtonStyle())
-                    ShareLink(item: Invite.link(invite)) { Label("Share", systemImage: "square.and.arrow.up") }
-                        .buttonStyle(PanelButtonStyle())
+                    }, shareLabel: {
+                        Label("Share", systemImage: "square.and.arrow.up")
+                    }, copyStyle: AnyButtonStyle(PanelButtonStyle()), shareStyle: AnyButtonStyle(PanelButtonStyle()))
                     Button { withAnimation(.snappy) { invite = model.makeInviteCode() } } label: {
                         Image(systemName: "arrow.clockwise")
                     }

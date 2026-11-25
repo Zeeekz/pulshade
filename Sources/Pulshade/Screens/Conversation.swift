@@ -1,11 +1,8 @@
 import SwiftUI
+import UniformTypeIdentifiers
 #if canImport(PulshadeShared)
 import PulshadeShared
 #endif
-#if os(macOS)
-import AppKit
-#endif
-
 struct ConversationView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
@@ -24,6 +21,8 @@ struct ConversationView: View {
     /// What was left out of a pick from the library (a second video, one that wouldn't load), said once.
     @State private var mediaNote: String?
     @State private var choosingFile = false
+    /// A file picked to send, waiting for "send" or "send with its name" (see `FileScrub`).
+    @State private var pickedFile: URL?
     @State private var quickSending = false
     @State private var showInfo = false
     @State private var verifying = false
@@ -46,7 +45,6 @@ struct ConversationView: View {
     @State private var scrollTrack = ScrollTrack()
     @State private var showJumpDown = false
     @State private var unreadBelow = 0
-    @State private var hovered: UUID?
     @State private var swipe: (id: UUID, dx: CGFloat)?
     /// A message held on the phone, lifted over the chat with its reactions and actions.
     @State private var lifted: LiftedMessage?
@@ -54,9 +52,6 @@ struct ConversationView: View {
     @State private var saveNotice: (text: String, symbol: String)?
     /// A video from the hold menu, waiting on the warning about saving it out of Pulshade.
     @State private var videoToSave: Data?
-    #if os(macOS)
-    @State private var scrollMonitor: Any?
-    #endif
     @FocusState private var focused: Bool
 
     /// How far a swipe has to travel before letting go starts a reply.
@@ -89,16 +84,13 @@ struct ConversationView: View {
             // Fills the whole screen, keyboard or not, so the background doesn't jump when it opens.
             .background { ChatBackdrop(background: model.data.chatBackground, theme: model.theme).equatable().ignoresSafeArea() }
             .onAppear {
-                focused = !Platform.isPhone
                 model.openConversation = id
                 model.markRead(id)
                 #if DEBUG
                 // Screenshots: PULSHADE_DEMO_INFO=1 opens the chat's details.
                 if AppModel.demoRequested, ProcessInfo.processInfo.environment["PULSHADE_DEMO_INFO"] != nil { showInfo = true }
                 #endif
-                #if os(macOS)
-                startSwipeMonitor()
-                #else
+                #if os(iOS)
                 KeyboardDismisser.shared.enabled = false
                 #endif
             }
@@ -106,9 +98,7 @@ struct ConversationView: View {
                 if model.openConversation == id { model.openConversation = nil }
                 recorder.cancel()
                 previewTask?.cancel()
-                #if os(macOS)
-                if let scrollMonitor { NSEvent.removeMonitor(scrollMonitor) }
-                #else
+                #if os(iOS)
                 KeyboardDismisser.shared.enabled = true
                 #endif
             }
@@ -127,8 +117,7 @@ struct ConversationView: View {
     // MARK: Header
 
     private func header(_ c: Conversation) -> some View {
-        let phone = Platform.isPhone
-        return ZStack {
+        ZStack {
             // The name sits in the middle of the bar, whatever is on either side.
             Button { showInfo = true } label: {
                 VStack(spacing: 2) {
@@ -164,26 +153,24 @@ struct ConversationView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .padding(.horizontal, phone ? 96 : 300)
+            .padding(.horizontal, 96)
             .accessibilityLabel("\(c.title), details")
 
             HStack(spacing: 8) {
-                if phone {
-                    Button { dismiss() } label: { Image(systemName: "chevron.left") }
-                        .buttonStyle(BarButtonStyle())
-                        .accessibilityLabel("Back")
-                    // Their picture beside the back button: an unwatched story opens first (the picture does that itself),
-                    // otherwise their profile. A group's or channel's own picture still opens full size.
-                    let picture = c.avatar ?? (c.kind == .direct ? model.contact(c.members.first ?? "", in: c.persona)?.avatar : nil)
-                    Button {
-                        if c.kind != .direct, let picture { headerPicture = picture } else { showInfo = true }
-                    } label: {
-                        Avatar(image: picture, seed: c.kind == .direct ? (c.members.first ?? "") : c.id.uuidString,
-                               size: 34, symbol: c.kind == .direct ? nil : c.kind.symbol)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(c.kind != .direct && picture != nil ? "\(c.title), picture" : "\(c.title), profile")
+                Button { dismiss() } label: { Image(systemName: "chevron.left") }
+                    .buttonStyle(BarButtonStyle())
+                    .accessibilityLabel("Back")
+                // Their picture beside the back button: an unwatched story opens first (the picture does that itself),
+                // otherwise their profile. A group's or channel's own picture still opens full size.
+                let picture = c.avatar ?? (c.kind == .direct ? model.contact(c.members.first ?? "", in: c.persona)?.avatar : nil)
+                Button {
+                    if c.kind != .direct, let picture { headerPicture = picture } else { showInfo = true }
+                } label: {
+                    Avatar(image: picture, seed: c.kind == .direct ? (c.members.first ?? "") : c.id.uuidString,
+                           size: 34, symbol: c.kind == .direct ? nil : c.kind.symbol)
                 }
+                .buttonStyle(.plain)
+                .accessibilityLabel(c.kind != .direct && picture != nil ? "\(c.title), picture" : "\(c.title), profile")
                 Spacer(minLength: 0)
                 if let burner = model.burner(c.persona), let at = burner.burnsAt {
                     HStack(spacing: 5) {
@@ -204,18 +191,12 @@ struct ConversationView: View {
                         .accessibilityLabel("Call")
                 }
                 if c.kind == .direct || (c.kind == .group && !c.isOldFormat) { TimerMenu(conversation: c) }
-                // On the phone the relay indicator only speaks up when something is wrong.
-                if !phone || model.link != .online { LinkBadge() }
-                if !phone {
-                    Button { showInfo = true } label: { Image(systemName: "sidebar.right") }
-                        .buttonStyle(IconButtonStyle(size: 28))
-                        .help("Details")
-                        .accessibilityLabel("Details")
-                }
+                // The relay indicator only speaks up when something is wrong.
+                if model.link != .online { LinkBadge() }
             }
         }
-        .padding(.horizontal, phone ? 12 : 18)
-        .padding(.top, phone ? 6 : 30)
+        .padding(.horizontal, 12)
+        .padding(.top, 6)
         .padding(.bottom, 10)
         .background(Ink.base)
         .overlay(alignment: .bottom) { Rectangle().fill(Ink.line).frame(height: 1) }
@@ -230,7 +211,7 @@ struct ConversationView: View {
         if c.kind == .direct, let fp = c.members.first, model.heldDevices(of: fp, persona: c.persona) > 0 {
             // A device their account added while "ask before new devices" is on: your messages wait for it until you say.
             HStack(spacing: 10) {
-                Image(systemName: "laptopcomputer.and.iphone").foregroundStyle(Color.orange)
+                Image(systemName: "iphone.gen3").foregroundStyle(Color.orange)
                 Text("\(model.displayName(fp))'s account added a new device. Nothing goes to it, and none of its messages are shown, until you allow it. Not sure? Ask them another way first, in person or by call.")
                     .font(.system(size: 13))
                     .foregroundStyle(Ink.text)
@@ -309,14 +290,13 @@ struct ConversationView: View {
                getMedia: { model.getMediaAnyway(messageID: m.id, in: id) },
                unsend: { model.unsend(m.id, in: id) },
                jump: { target in if let proxy { jump(to: target, proxy: proxy) } },
-               hover: { inside in if inside { hovered = m.id } else if hovered == m.id { hovered = nil } },
                notSent: unsent.contains(m.id),
                retry: { model.retrySend(m.id, in: id) },
                canForward: model.canForward(m, in: c),
                canCopy: model.canCopy(m),
                forward: { forwarding = m },
                openSender: { profileOf = MemberRef(fingerprint: m.sender) },
-               lift: copy || !Platform.isPhone ? nil : { frame in
+               lift: copy ? nil : { frame in
                    guard lifted == nil, swipe == nil else { return }
                    lifted = LiftedMessage(id: m.id, frame: frame)
                },
@@ -408,14 +388,14 @@ struct ConversationView: View {
                             }
                         }
                         .id(m.id)
-                        .modifier(PhoneSwipe(enabled: Platform.isPhone && !m.isSystem, gesture: swipeGesture(for: m)))
+                        .modifier(PhoneSwipe(enabled: !m.isSystem, gesture: swipeGesture(for: m)))
                         .transition(messageTransition)
                     }
                 }
-                .padding(.horizontal, Platform.isPhone ? 10 : 20)
+                .padding(.horizontal, 10)
                 .padding(.vertical, 16)
                 TypingDots(names: model.typers(in: id).map(model.displayName))
-                    .padding(.horizontal, Platform.isPhone ? 10 : 20)
+                    .padding(.horizontal, 10)
                     .padding(.bottom, 8)
                     .id("typing")
                 Color.clear.frame(height: 1).id("end")
@@ -506,7 +486,7 @@ struct ConversationView: View {
                         }
                     }
                     .buttonStyle(.plain)
-                    .padding(.trailing, Platform.isPhone ? 14 : 22).padding(.bottom, 12)
+                    .padding(.trailing, 14).padding(.bottom, 12)
                     .transition(.scale(scale: 0.6).combined(with: .opacity))
                     .accessibilityLabel(unreadBelow > 0 ? "Scroll to latest, \(unreadBelow) new" : "Scroll to latest")
                 }
@@ -540,35 +520,6 @@ struct ConversationView: View {
                 withAnimation(.snappy(duration: 0.3)) { swipe = nil }
             }
     }
-
-    #if os(macOS)
-    /// Two-finger trackpad swipe sideways on a message starts a reply. Vertical scrolling passes through.
-    private func startSwipeMonitor() {
-        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
-            guard event.hasPreciseScrollingDeltas else { return event }
-            if event.phase == .began {
-                swipe = nil
-            }
-            if event.phase == .changed || event.phase == .began, let target = hovered {
-                let horizontal = abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY) * 1.4
-                if swipe?.id == target || (swipe == nil && horizontal) {
-                    let total = (swipe?.dx ?? 0) + event.scrollingDeltaX
-                    swipe = (target, max(-110, min(110, total)))
-                    return nil
-                }
-            }
-            if event.phase == .ended || event.phase == .cancelled || event.momentumPhase == .began, let current = swipe {
-                if abs(current.dx) >= replyThreshold,
-                   let message = model.conversation(id)?.messages.first(where: { $0.id == current.id }), !message.isSystem {
-                    startReply(message)
-                }
-                withAnimation(.snappy(duration: 0.3)) { swipe = nil }
-                return nil
-            }
-            return swipe == nil ? event : nil
-        }
-    }
-    #endif
 
     // MARK: Composer
 
@@ -691,7 +642,7 @@ struct ConversationView: View {
                         .autocorrectionDisabled()
                         .focused($focused)
                         .padding(.leading, 16)
-                        .padding(.trailing, Platform.isPhone ? 16 : 34)
+                        .padding(.trailing, 16)
                         .padding(.vertical, 9)
                         .frame(minHeight: Self.barHeight)
                         // Round ends, like other messengers: a pill on one line, softly rounded as it grows.
@@ -709,20 +660,6 @@ struct ConversationView: View {
                         .onChange(of: draft) { old, new in
                             if !new.isEmpty { model.noteTyping(in: id) }
                             refreshPreview(for: new, pasted: new.count - old.count >= 8)
-                        }
-                        .overlay(alignment: .bottomTrailing) {
-                            if !Platform.isPhone {
-                                Button {
-                                    focused = true
-                                    Platform.showEmojiPicker()
-                                } label: { Image(systemName: "face.smiling") }
-                                    .buttonStyle(.plain)
-                                    .font(.system(size: 15))
-                                    .foregroundStyle(Ink.faint)
-                                    .padding(.trailing, 12)
-                                    .padding(.bottom, 11)
-                                    .accessibilityLabel("Emoji")
-                            }
                         }
 
                     if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty && videoDraft == nil {
@@ -745,9 +682,9 @@ struct ConversationView: View {
                 .animation(.snappy(duration: 0.2), value: draft.isEmpty && attachments.isEmpty && videoDraft == nil)
             }
         }
-        .padding(.horizontal, Platform.isPhone ? 10 : 18)
+        .padding(.horizontal, 10)
         .padding(.top, 10)
-        .padding(.bottom, Platform.isPhone ? 8 : 14)
+        .padding(.bottom, 8)
         .background(Ink.base)
         .overlay(alignment: .top) { Rectangle().fill(Ink.line).frame(height: 1) }
         .chatCamera(isPresented: $takingPhoto) { photos in
@@ -756,7 +693,15 @@ struct ConversationView: View {
             prepareVideo(clip, zoom)
         }
         .fileImporter(isPresented: $choosingFile, allowedContentTypes: [.item]) { result in
-            if case let .success(url) = result { model.sendFile(url, replyTo: replyingTo, in: id); replyingTo = nil }
+            if case let .success(url) = result { pickedFile = url }
+        }
+        .confirmationDialog("Send file", isPresented: Binding(get: { pickedFile != nil }, set: { if !$0 { pickedFile = nil } }),
+                            titleVisibility: .visible, presenting: pickedFile) { url in
+            Button("Send as \"\(FileScrub.neutralName(for: url, type: Self.fileType(url)))\"") { sendPicked(url, keepName: false) }
+            Button("Send as \"\(url.lastPathComponent)\"") { sendPicked(url, keepName: true) }
+            Button("Cancel", role: .cancel) { pickedFile = nil }
+        } message: { url in
+            Text(Self.fileNote(url))
         }
         .alert("Some of it wasn't added", isPresented: Binding(get: { mediaNote != nil }, set: { if !$0 { mediaNote = nil } })) {
             Button("OK", role: .cancel) {}
@@ -769,6 +714,29 @@ struct ConversationView: View {
         .animation(.snappy(duration: 0.25), value: attachments.count)
         .animation(.snappy(duration: 0.25), value: replyingTo?.id)
         .animation(.snappy(duration: 0.25), value: draftPreview)
+    }
+
+    private func sendPicked(_ url: URL, keepName: Bool) {
+        model.sendFile(url, keepName: keepName, replyTo: replyingTo, in: id)
+        replyingTo = nil
+        pickedFile = nil
+    }
+
+    static func fileType(_ url: URL) -> UTType? {
+        (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType ?? UTType(filenameExtension: url.pathExtension)
+    }
+
+    /// What a picked file gives away besides what's in it, said before it goes.
+    static func fileNote(_ url: URL) -> String {
+        let name = "Its own name stays on this device unless you choose to send it."
+        switch FileScrub.kind(of: fileType(url)) {
+        case .image:
+            return "Pulshade takes out the picture's hidden details (where and when it was taken, the camera or phone) before it goes. " + name
+        case .mayCarryDetails:
+            return "Documents, videos and other files can carry hidden details of their own, such as an author, edit history or a location, which Pulshade can't take out. Remove them first if they matter. " + name
+        case .plain:
+            return name
+        }
     }
 
     /// The height of the text box on one line, and of the round buttons beside it.
@@ -1009,7 +977,7 @@ fileprivate struct Bubble: View, Equatable {
     var last: Bool
     var canReact: Bool
     var highlighted: Bool
-    /// How far a trackpad swipe has pulled this message sideways.
+    /// How far a swipe has pulled this message sideways.
     var swipe: CGFloat
     var react: (String) -> Void
     var reply: () -> Void
@@ -1017,7 +985,6 @@ fileprivate struct Bubble: View, Equatable {
     var getMedia: () -> Void = {}
     var unsend: () -> Void
     var jump: (UUID) -> Void
-    var hover: (Bool) -> Void
     /// It never reached the relay: said under the bubble, with a tap to send it again.
     var notSent = false
     var retry: () -> Void = {}
@@ -1028,14 +995,12 @@ fileprivate struct Bubble: View, Equatable {
     /// Opens the sender's profile (their name was tapped).
     var openSender: () -> Void = {}
     /// On the phone, holding the message lifts it into `MessageFocus`, given where its row is on screen. Nil keeps the
-    /// system menu (the Mac, and the lifted copy itself).
+    /// system menu (the lifted copy itself).
     var lift: ((CGRect) -> Void)? = nil
     /// Lifted right now: the copy over the blur stands in for it.
     var isLifted = false
     /// Where the row is on screen, kept out of view state: it changes with every scroll frame.
     @State private var rowBox = RowBox()
-    @State private var hovering = false
-    @State private var picking = false
     @State private var viewingImage = false
     /// Where an opened photo grows out of, and shrinks back into.
     @Namespace private var zoomSpace
@@ -1055,7 +1020,7 @@ fileprivate struct Bubble: View, Equatable {
     }
 
     /// Message text: a size up from before, so chats read easily at a glance.
-    static let textSize: CGFloat = Platform.isPhone ? 17 : 15.5
+    static let textSize: CGFloat = 17
 
     static let quick = ["❤️", "😂", "🔥", "😮", "😢", "👍"]
 
@@ -1079,7 +1044,7 @@ fileprivate struct Bubble: View, Equatable {
     var body: some View {
         let mine = message.isMine
         HStack(alignment: .bottom, spacing: 8) {
-            if mine { Spacer(minLength: Platform.isPhone ? 44 : 160) }
+            if mine { Spacer(minLength: 44) }
             if showsSender {
                 // An unwatched story opens first (the picture does that itself); otherwise their profile.
                 Avatar(image: senderAvatar, seed: message.sender, size: 26).opacity(last ? 1 : 0)
@@ -1088,7 +1053,6 @@ fileprivate struct Bubble: View, Equatable {
                     .accessibilityAddTraits(last ? .isButton : [])
                     .accessibilityHint(last ? "Shows their profile" : "")
             }
-            if mine && !Platform.isPhone { actions }
             VStack(alignment: mine ? .trailing : .leading, spacing: -5) {
                 bubble
                     .overlay { if canReact { HeartBurst(trigger: hearts) } }
@@ -1129,8 +1093,7 @@ fileprivate struct Bubble: View, Equatable {
                     .offset(x: swipe < 0 ? (mine ? -36 : 36) : (mine ? -36 : 36))
                     .allowsHitTesting(false)
             }
-            if !mine && !Platform.isPhone { actions }
-            if !mine { Spacer(minLength: Platform.isPhone ? 44 : 160) }
+            if !mine { Spacer(minLength: 44) }
         }
         .padding(.top, first ? 8 : 0)
         .padding(.bottom, message.reactions.isEmpty ? 0 : 8)
@@ -1139,16 +1102,12 @@ fileprivate struct Bubble: View, Equatable {
                 .fill(theme.accent.opacity(highlighted ? 0.12 : 0))
                 .padding(.horizontal, -8)
         }
-        .onHover { h in
-            withAnimation(.easeOut(duration: 0.12)) { hovering = h }
-            hover(h)
-        }
         .opacity(isLifted ? 0 : 1)
         .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { rowBox.rect = $0 }
         .modifier(HoldToLift(lift: lift.map { lift in { lift(rowBox.rect) } }, menu: AnyView(menuItems)))
     }
 
-    /// The Mac's right-click menu; the reactions sit in one submenu instead of a line each.
+    /// The message's context menu; the reactions sit in one submenu instead of a line each.
     @ViewBuilder private var menuItems: some View {
         let mine = message.isMine
         if notSent && mine { Button("Try sending again", action: retry) }
@@ -1380,7 +1339,7 @@ fileprivate struct Bubble: View, Equatable {
             }
             media(size)
                 .overlay(alignment: .bottomTrailing) {
-                    if !below && (last || hovering) {
+                    if !below && last {
                         timeLine
                             .foregroundStyle(.white)
                             .padding(.horizontal, 7).padding(.vertical, 3)
@@ -1394,7 +1353,7 @@ fileprivate struct Bubble: View, Equatable {
                 VStack(alignment: .leading, spacing: 6) {
                     if caption { words.frame(maxWidth: .infinity, alignment: .leading) }
                     if let preview = message.preview { PreviewCard(preview: preview, mine: mine) }
-                    if last || hovering {
+                    if last {
                         timeLine
                             .foregroundStyle(mine ? Ink.onAccent.opacity(0.5) : Ink.faint)
                             .frame(maxWidth: .infinity, alignment: .trailing)
@@ -1508,7 +1467,7 @@ fileprivate struct Bubble: View, Equatable {
             if let preview = message.preview {
                 PreviewCard(preview: preview, mine: mine)
             }
-            if last || hovering {
+            if last {
                 timeLine
                     .foregroundStyle(mine && !bare ? Ink.onAccent.opacity(0.5) : Ink.faint)
                     .transition(.opacity)
@@ -1545,36 +1504,6 @@ fileprivate struct Bubble: View, Equatable {
             .overlay {
                 if !mine { corners.strokeBorder(tint.opacity(0.22)) }
             }
-    }
-
-    /// Hover tools beside the bubble: reply and react.
-    private var actions: some View {
-        HStack(spacing: 2) {
-            Button(action: reply) { Image(systemName: "arrowshape.turn.up.left") }
-                .buttonStyle(IconButtonStyle(size: 24))
-                .help("Reply")
-                .accessibilityLabel("Reply")
-            if canReact {
-                Button { picking.toggle() } label: { Image(systemName: "face.smiling") }
-                    .buttonStyle(IconButtonStyle(size: 24))
-                    .help("React")
-                    .accessibilityLabel("React")
-                    .popover(isPresented: $picking, arrowEdge: .top) {
-                        HStack(spacing: 4) {
-                            ForEach(Self.quick, id: \.self) { e in
-                                Button {
-                                    react(e)
-                                    picking = false
-                                } label: { if e == "❤️" { PulseHeart(size: 22) } else { Text(e).font(.system(size: 20)) } }
-                                    .buttonStyle(EmojiButtonStyle(selected: message.reactions["me"] == e))
-                            }
-                        }
-                        .padding(6)
-                    }
-            }
-        }
-        .opacity((hovering || picking) && swipe == 0 ? 1 : 0)
-        .padding(.bottom, 4)
     }
 }
 
@@ -1711,7 +1640,7 @@ private struct PreviewCard: View {
             VStack(alignment: .leading, spacing: 0) {
                 if let image = preview.image, let ns = DecodedImages.image(image, fit: 900) {
                     Image(platformImage: ns).resizable().scaledToFill()
-                        .frame(width: Platform.isPhone ? 250 : 300, height: Platform.isPhone ? 125 : 150).clipped()
+                        .frame(width: 250, height: 125).clipped()
                 }
                 VStack(alignment: .leading, spacing: 3) {
                     if let title = preview.title {
@@ -1725,7 +1654,7 @@ private struct PreviewCard: View {
                         .lineLimit(1)
                 }
                 .padding(10)
-                .frame(width: Platform.isPhone ? 250 : 300, alignment: .leading)
+                .frame(width: 250, alignment: .leading)
             }
             .background(mine ? Ink.onAccent.opacity(0.1) : Ink.surface)
             .clipShape(.rect(cornerRadius: 10))
@@ -2012,7 +1941,7 @@ struct LinkBadge: View {
         .padding(.horizontal, 11).frame(height: 30)
         .glass(15)
         .animation(.smooth, value: online)
-        .help(online ? "Connected to the relay" : "Relay unreachable. Messages wait, sealed, on this \(Platform.isPhone ? "iPhone" : "Mac").")
+        .help(online ? "Connected to the relay" : "Relay unreachable. Messages wait, sealed, on this iPhone.")
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(online ? "Connected to the relay" : "Relay unreachable")
     }
@@ -2089,7 +2018,6 @@ private struct ConversationInfo: View {
                 }
                 .scrollIndicators(.never)
             }
-            .frame(width: Platform.isPhone ? nil : 440, height: Platform.isPhone ? nil : 640)
             .background(Ink.base)
             .preferredColorScheme(Ink.scheme)
             .onAppear {
@@ -2264,6 +2192,8 @@ private struct ConversationInfo: View {
         }
         .onDisappear { if c.amAdmin && (about != (c.about ?? "") || title != c.title) { commitDetails(c) } }
 
+        if model.canNamePublicly(c.id) { PublicNameSection(id: c.id, kind: c.kind) }
+
         if c.kind == .channel && c.amAdmin && !c.isOldFormat { inviteSection(c) }
 
         Card(title: "Permissions") {
@@ -2343,17 +2273,13 @@ private struct ConversationInfo: View {
         let code = model.makeInviteCode(channel: c.id)
         return Card(title: "Invite link") {
             HStack(spacing: 14) {
-                QRCode(text: Invite.link(code), size: 74)
+                QRCode(text: WebLinks.long(code), size: 74)
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Anyone with this link can follow.").font(.system(size: 12)).foregroundStyle(Ink.dim)
-                    Button {
-                        copyToClipboard(code)
-                        withAnimation(.snappy) { copied = true }
-                    } label: {
+                    CopyLinkButton(target: code) { withAnimation(.snappy) { copied = true } } label: {
                         Label(copied ? "Copied" : "Copy link", systemImage: copied ? "checkmark" : "link")
                             .font(.system(size: 12, weight: .semibold))
                     }
-                    .buttonStyle(.plain)
                     .foregroundStyle(theme.accent)
                 }
                 Spacer()
@@ -2707,7 +2633,7 @@ private struct LiftedMessage: Equatable {
     var frame: CGRect
 }
 
-/// Adds the swipe-to-reply drag on iPhone only; on the Mac a drag would fight with selecting text.
+/// Adds the swipe-to-reply drag, except on system messages.
 private struct PhoneSwipe<G: Gesture>: ViewModifier {
     var enabled: Bool
     var gesture: G
@@ -2818,8 +2744,5 @@ struct ForwardSheet: View {
             }
         }
         .background(Ink.base)
-        #if os(macOS)
-        .frame(width: 380, height: 480)
-        #endif
     }
 }

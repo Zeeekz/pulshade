@@ -580,12 +580,8 @@ struct FoundProfileSheet: View {
             .onPreferenceChange(SheetHeightKey.self) { contentHeight = $0 }
         }
         .background(Ink.base)
-        #if os(macOS)
-        .frame(width: 440, height: 640)
-        #else
         .presentationDetents([.height(max(320, contentHeight + 56)), .large])
         .presentationDragIndicator(.visible)
-        #endif
     }
 }
 

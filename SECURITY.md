@@ -30,6 +30,17 @@ Anything that breaks a promise the README makes, for example:
 - the relay learning more than it should, accepting admin actions it shouldn't, or losing other people's messages
 - recovering anything after Lock, Detach or Burn that should be gone
 
+## Known limits
+
+- A passcode can still be guessed on the device itself by someone who can run code on it while it is unlocked: every
+  guess needs the device's Secure Enclave and an Argon2id run, but nothing in the chip limits how many it answers, and
+  the app's own wait and wipe count don't bind such an attacker. A 6-digit PIN would likely fall to that within hours to days (an estimate, not measured). Where
+  there is no Secure Enclave, a copied lock file is protected by Argon2id alone.
+- An automatic lock keeps the account's keys in memory, so messages still arrive, unless "Close everything when it
+  locks" is on. A lock you press always clears them.
+- A decoy or panic passcode set before build 22 stays in the older form (PBKDF2) until it is set again.
+- A Burn the server hasn't confirmed leaves a sealed order on the phone for up to 30 days, which shows a burn happened.
+
 ## What doesn't
 
 - what every end-to-end messenger shares, such as someone watching both ends of the network lining up timing

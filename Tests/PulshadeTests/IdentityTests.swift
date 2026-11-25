@@ -66,9 +66,11 @@ import Foundation
 
     @Test func theSafetyCodeCoversBothAgreementKeys() {
         let ka = Data(repeating: 1, count: 32), kb = Data(repeating: 2, count: 32), kc = Data(repeating: 3, count: 32)
-        let base = SafetyCode(mine: "aaa", mineAgreement: ka, minePQ: Data(), theirs: "bbb", theirsAgreement: kb, theirsPQ: Data())
-        #expect(SafetyCode(mine: "aaa", mineAgreement: ka, minePQ: Data(), theirs: "bbb", theirsAgreement: kc, theirsPQ: Data()) != base, "their agreement key")
-        #expect(SafetyCode(mine: "aaa", mineAgreement: kc, minePQ: Data(), theirs: "bbb", theirsAgreement: kb, theirsPQ: Data()) != base, "my agreement key")
+        let s = Data(repeating: 9, count: 32)
+        func party(_ account: String, _ agreement: Data) -> SafetyCode.Party { .init(account: account, signing: s, agreement: agreement, pq: nil) }
+        let base = SafetyCode(mine: party("aaa", ka), theirs: party("bbb", kb))
+        #expect(SafetyCode(mine: party("aaa", ka), theirs: party("bbb", kc)) != base, "their agreement key")
+        #expect(SafetyCode(mine: party("aaa", kc), theirs: party("bbb", kb)) != base, "my agreement key")
     }
 
     /// SEC-205: the invite commits to the maker's post-quantum keys, inside what its signature covers.
@@ -93,14 +95,18 @@ import Foundation
     }
 
     /// SEC-205: the safety code covers both sides' post-quantum keys.
-    @Test func theSafetyCodeCoversBothPostQuantumCommitments() {
-        let k = Data(repeating: 1, count: 32), a = Data(repeating: 7, count: 16), b = Data(repeating: 8, count: 16)
-        let base = SafetyCode(mine: "aaa", mineAgreement: k, minePQ: a, theirs: "bbb", theirsAgreement: k, theirsPQ: b)
-        #expect(SafetyCode(mine: "aaa", mineAgreement: k, minePQ: a, theirs: "bbb", theirsAgreement: k, theirsPQ: a) != base, "their keys")
-        #expect(SafetyCode(mine: "aaa", mineAgreement: k, minePQ: b, theirs: "bbb", theirsAgreement: k, theirsPQ: b) != base, "my keys")
-        #expect(SafetyCode(mine: "bbb", mineAgreement: k, minePQ: b, theirs: "aaa", theirsAgreement: k, theirsPQ: a) == base, "the same on both screens")
-        #expect(SafetyCode(mine: "aaa", mineAgreement: k, minePQ: a, theirs: "bbb", theirsAgreement: k, theirsPQ: Data()) != base, "unknown keys never match")
-        #expect(base.scanText.hasPrefix("pshv3:"))
+    @Test func theSafetyCodeCoversBothPostQuantumKeys() {
+        let alice = Identity.generate(), bob = Identity.generate()
+        func party(_ id: Identity, pq: PQPin?) -> SafetyCode.Party {
+            .init(account: id.fingerprint, signing: id.card.signing, agreement: id.card.agreement, pq: pq)
+        }
+        let a = party(alice, pq: alice.pq.pin), b = party(bob, pq: bob.pq.pin)
+        let base = SafetyCode(mine: a, theirs: b)
+        #expect(SafetyCode(mine: a, theirs: party(bob, pq: alice.pq.pin)).digits != base.digits, "their keys")
+        #expect(SafetyCode(mine: party(alice, pq: bob.pq.pin), theirs: b).digits != base.digits, "my keys")
+        #expect(SafetyCode(mine: b, theirs: a).digits == base.digits, "the same on both screens")
+        #expect(SafetyCode(mine: a, theirs: party(bob, pq: nil)).digits != base.digits, "unknown keys never match")
+        #expect(base.scanText.hasPrefix("pshv4:"))
     }
 
     @Test func sendIDDoesNotRevealReceiveKey() {
@@ -133,8 +139,6 @@ import Foundation
         #expect(try #require(invite(AppData.defaultRelay)).relay == AppData.defaultRelay)
         #expect(Invite.allowedRelay(AppData.defaultRelay + "/") != nil)
         #expect(Invite.allowedRelay("http://192.168.1.20:7878") == nil, "Not even one on your own network")
-        let link = LinkCode(secret: Data(count: 32), sendID: Data(count: 32), relay: "https://relay.crew.example")
-        #expect(LinkCode(link.text) == nil, "Linking codes too")
     }
 
     /// With a direct address, Pulshade's relay is reached by onion over Tor and directly with Tor off;
@@ -163,12 +167,14 @@ import Foundation
     }
 
     @Test func safetyCodeMatchesOnBothSides() {
-        let ka = Data(repeating: 1, count: 32), kb = Data(repeating: 2, count: 32)
-        let a = SafetyCode(mine: "aaa", mineAgreement: ka, minePQ: Data(), theirs: "bbb", theirsAgreement: kb, theirsPQ: Data())
-        let b = SafetyCode(mine: "bbb", mineAgreement: kb, minePQ: Data(), theirs: "aaa", theirsAgreement: ka, theirsPQ: Data())
-        #expect(a == b)
-        #expect(a.emoji.count == 10 && a.scanText.hasPrefix("pshv3:"))
-        #expect(SafetyCode(mine: "aaa", mineAgreement: ka, minePQ: Data(), theirs: "ccc", theirsAgreement: kb, theirsPQ: Data()) != a)
+        let ka = Data(repeating: 1, count: 32), kb = Data(repeating: 2, count: 32), s = Data(repeating: 9, count: 32)
+        let pa = SafetyCode.Party(account: "aaa", signing: s, agreement: ka), pb = SafetyCode.Party(account: "bbb", signing: s, agreement: kb)
+        let a = SafetyCode(mine: pa, theirs: pb)
+        let b = SafetyCode(mine: pb, theirs: pa)
+        #expect(a.digits == b.digits && a.emoji == b.emoji && a.digits.count == 12)
+        #expect(a.emoji.count == 10 && a.scanText.hasPrefix("pshv4:"))
+        #expect(a.check(scanned: b.scanText) == .match && b.check(scanned: a.scanText) == .match)
+        #expect(SafetyCode(mine: pa, theirs: .init(account: "ccc", signing: s, agreement: kb)).digits != a.digits)
     }
 
     @Test func shortAndBrandHandlesAreReserved() {

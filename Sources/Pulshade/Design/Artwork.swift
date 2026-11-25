@@ -59,7 +59,7 @@ struct Aurora: View {
 struct LockWallpaper: View {
     @Environment(\.theme) private var theme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    /// Taps on the hint, for a Mac or VoiceOver where sliding is awkward.
+    /// Taps on the hint, for VoiceOver where sliding is awkward.
     var onOpen: () -> Void = {}
 
     var body: some View {

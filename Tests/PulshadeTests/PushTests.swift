@@ -103,14 +103,56 @@ struct PushTests {
         #expect(model.phase == .locked && model.identity == nil, "a lock pressed by hand always closes it")
     }
 
-    /// With a decoy passcode set, an automatic lock still closes everything: the passcode has to pick the account.
-    @MainActor @Test func aDecoyStillMakesAutoLockCloseEverything() async throws {
+    /// With a decoy passcode set, an automatic lock behaves exactly as without one (it covers), so locking gives no decoy
+    /// away; the decoy passcode typed at the covered screen closes the real account and opens the decoy.
+    @MainActor @Test func aDecoyChangesNothingAboutAutoLock() async throws {
         let model = testModel("pulshade-cover-decoy")
         defer { model.lock() }
-        try await model.create(identity: .generate(), profile: Profile(name: "D"), passcode: "test-passcode")
+        let real = Identity.generate()
+        try await model.create(identity: real, profile: Profile(name: "D"), passcode: "test-passcode")
         try await model.setDecoy(passcode: "decoy-passcode")
         model.lock(keepingKeys: true)
+        #expect(model.phase == .unlocked && model.covered && model.identity?.fingerprint == real.fingerprint)
+        #expect(await model.unlock(passcode: "decoy-passcode"))
+        #expect(model.isOpen && !model.isPrimary && model.identity?.fingerprint != real.fingerprint)
+        #expect(model.data.decoySeed == nil, "nothing of the real account is left open")
+        // The decoy covers too, and the real passcode at its covered screen opens the real account.
+        model.lock(keepingKeys: true)
+        #expect(model.covered && !model.isPrimary)
+        #expect(await model.unlock(passcode: "test-passcode"))
+        #expect(model.isOpen && model.isPrimary && model.identity?.fingerprint == real.fingerprint && model.hasDecoy)
+    }
+
+    /// "Close everything" makes an automatic lock a full one: keys and chats leave memory, decoy or not.
+    @MainActor @Test func closeEverythingMakesAutoLockAFullLock() async throws {
+        let model = testModel("pulshade-cover-full")
+        defer { model.lock() }
+        try await model.create(identity: .generate(), profile: Profile(name: "F"), passcode: "test-passcode")
+        model.updateSecurity { $0.fullLock = true }
+        model.lock(keepingKeys: true)
         #expect(model.phase == .locked && !model.covered && model.identity == nil)
+        #expect(await model.unlock(passcode: "test-passcode"))
+        #expect(model.isOpen && model.data.security.fullLock)
+    }
+
+    /// "Immediately" locks the moment the app is left, and the iPhone locking locks it unless auto-lock is never.
+    @MainActor @Test func immediatelyAndTheDeviceLockingLockTheApp() async throws {
+        let model = testModel("pulshade-lock-now")
+        defer { model.lock() }
+        try await model.create(identity: .generate(), profile: Profile(name: "I"), passcode: "test-passcode")
+        model.leftApp()
+        #expect(model.isOpen, "not without Immediately")
+        model.updateSecurity { $0.lockImmediately = true; $0.autoLockMinutes = 1 }
+        model.didEnterBackground()
+        #expect(model.covered)
+        #expect(await model.unlock(passcode: "test-passcode"))
+        model.updateSecurity { $0.lockImmediately = false; $0.autoLockMinutes = 5 }
+        model.deviceLocked()
+        #expect(model.covered, "the device locking locks it")
+        #expect(await model.unlock(passcode: "test-passcode"))
+        model.updateSecurity { $0.autoLockMinutes = 0 }
+        model.deviceLocked()
+        #expect(model.isOpen, "auto-lock set to never leaves it open")
     }
 
     /// What was chosen on the sign-up screen goes to the account made next, and nowhere else.

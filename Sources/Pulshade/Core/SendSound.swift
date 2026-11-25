@@ -81,7 +81,7 @@ enum SendSound {
     /// registered with the system.
     @MainActor static func play() {
         if soundID == nil {
-            // On the Mac the caches folder is shared by every app, so this one keeps to its own.
+            // Kept in a folder of its own inside the caches folder.
             let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
                 .appendingPathComponent(Bundle.main.bundleIdentifier ?? "app.pulshade", isDirectory: true)
             let url = dir.appendingPathComponent("send-taps-v6.wav")

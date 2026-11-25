@@ -42,34 +42,6 @@ import PulshadeShared
 
     // MARK: SEC-202: confirming a linked account
 
-    @Test func theTwoDevicesLinkDigitsMatchOnlyForTheRightExchange() throws {
-        let secret = Data.random(32)
-        let newDevice = Curve25519.KeyAgreement.PrivateKey()
-        let approver = Curve25519.KeyAgreement.PrivateKey()
-        let theirs = try approver.sharedSecretFromKeyAgreement(with: newDevice.publicKey)
-        let mine = try newDevice.sharedSecretFromKeyAgreement(with: approver.publicKey)
-        let code = LinkCrypto.confirmCode(mine, secret: secret)
-        #expect(code == LinkCrypto.confirmCode(theirs, secret: secret))
-        #expect(code.count == 9 && code.contains(" "))
-        // Someone who saw the code's secret but answers with their own key gets other digits.
-        let intruder = Curve25519.KeyAgreement.PrivateKey()
-        let forged = try intruder.sharedSecretFromKeyAgreement(with: newDevice.publicKey)
-        #expect(LinkCrypto.confirmCode(forged, secret: secret) != code)
-        // And the secret is part of it.
-        #expect(LinkCrypto.confirmCode(mine, secret: Data.random(32)) != code)
-    }
-
-    @Test func aBundleFromABuildWithoutDigitsStillReads() throws {
-        var bundle = LinkBundle(seed: .random(32), profile: Profile(), personas: [], contacts: [], conversations: [], theme: "dark",
-                                relay: "http://127.0.0.1:1", inviteRelay: nil, security: SecuritySettings(), blocked: [], siblings: [])
-        #expect(bundle.confirms == nil)
-        let old = try JSONEncoder.pulshade.encode(bundle)
-        #expect(try JSONDecoder.pulshade.decode(LinkBundle.self, from: old).confirms == nil, "no digits: the new device says so")
-        bundle.confirms = true
-        let new = try JSONEncoder.pulshade.encode(bundle)
-        #expect(try JSONDecoder.pulshade.decode(LinkBundle.self, from: new).confirms == true)
-    }
-
     // MARK: SEC-201: the backup header
 
     @Test @MainActor func theBackupAlwaysCarriesAForgetHashThatLooksTheSame() throws {
@@ -86,7 +58,7 @@ import PulshadeShared
 
     // MARK: SEC-206
 
-    @Test func theRememberedLockStyleMovesUnderThePulshadePrefix() {
+    @Test @MainActor func theRememberedLockStyleMovesFromPreferencesIntoTheLockFile() async throws {
         let defaults = UserDefaults.standard
         let saved = (defaults.string(forKey: LockStyle.key), defaults.string(forKey: LockStyle.legacyKey))
         defer {
@@ -94,14 +66,16 @@ import PulshadeShared
                 if let value { defaults.set(value, forKey: key) } else { defaults.removeObject(forKey: key) }
             }
         }
+        let model = testModel("pulshade-style-move")
+        try model.vault.create(.generate(), passcode: "test-passcode", settings: Vault.LockSettings())
+        try model.vault.updateLockSettings { $0 = Vault.LockSettings() }
         defaults.removeObject(forKey: LockStyle.key)
         defaults.set(LockStyle.pin6.rawValue, forKey: LockStyle.legacyKey)
-        #expect(LockStyle.remembered == .pin6, "an upgrade keeps the setting")
-        #expect(defaults.string(forKey: LockStyle.legacyKey) == nil)
-        #expect(defaults.string(forKey: LockStyle.key) == LockStyle.pin6.rawValue)
-        #expect(LockStyle.key.hasPrefix("pulshade."), "so a wipe's sweep of that prefix removes it")
-        LockStyle.remembered = .pin4
-        #expect(LockStyle.remembered == .pin4)
+        model.moveLockSettingsIntoVault()
+        #expect(model.lockStyle == .pin6, "an upgrade keeps the setting")
+        #expect(defaults.string(forKey: LockStyle.legacyKey) == nil && defaults.string(forKey: LockStyle.key) == nil)
+        model.lockStyle = .pin4
+        #expect(model.lockStyle == .pin4 && model.vault.lockSettings?.style == "pin4")
     }
 
     // MARK: SEC-203
@@ -226,19 +200,6 @@ import PulshadeShared
 
     // MARK: SEC-210
 
-    @Test @MainActor func aLinkCodeStopsWorkingAfterFifteenMinutes() async throws {
-        let model = testModel("pulshade-linkexpiry")
-        try await model.create(identity: .generate(), profile: Profile(name: "Ada"), passcode: "test-passcode")
-        let request = LinkRequest(deviceID: .random(16), name: "Phone", ephemeral: Curve25519.KeyAgreement.PrivateKey().publicKey.rawRepresentation,
-                                  bundleSendID: .random(32), selfSendID: .random(32), keyPin: .random(32))
-        #expect(model.acceptJoinCode(JoinCode(secret: .random(32), request: request, relay: AppData.defaultRelay).text))
-        #expect(model.pendingLink != nil)
-        model.data.linkOffers[0].createdAt = Date().addingTimeInterval(-AppModel.linkOfferLife - 60)
-        #expect(model.pendingLink == nil, "an answered code is not approvable after it has run out")
-        model.pruneLinkOffers()
-        #expect(model.data.linkOffers.isEmpty)
-    }
-
     /// A Burn cut short between keeping its order and wiping (the app killed, the battery gone) is wiped at the next
     /// launch, before the lock screen can open the burned account.
     @Test @MainActor func aBurnCutShortIsWipedAtTheNextLaunch() async throws {
@@ -253,5 +214,29 @@ import PulshadeShared
         #expect(!relaunched.vault.exists && relaunched.phase == .welcome)
         #expect(!FileManager.default.fileExists(atPath: AppModel.wipeDueFile(relaunched.burnStore).path), "the mark goes with the wipe")
         #expect(await relaunched.unlock(passcode: "test-passcode") == false)
+    }
+
+    /// Detach marks the wipe before it talks to the relay; killed while it waits, the next launch wipes the device (keeping
+    /// what a device of several needs to reach the relay, as Detach does). A Detach that fails on the network takes its
+    /// mark back, and leaves the account as it was.
+    @Test @MainActor func aDetachCutShortIsWipedAtTheNextLaunchAndAFailedOneTakesItsMarkBack() async throws {
+        let model = testModel("pulshade-detach-cutshort")
+        let directory = model.vault.directory
+        let me = Identity.generate()
+        try await model.create(identity: me, profile: Profile(name: "Ada"), passcode: "test-passcode")
+        // No relay in reach: the backup can't be left, so nothing is wiped and nothing stays marked.
+        model.data.relay = "http://127.0.0.1:9"
+        await #expect(throws: (any Error).self) { try await model.detach(recoveryCode: me.recoveryCode) }
+        #expect(model.vault.exists && model.isOpen)
+        #expect(!FileManager.default.fileExists(atPath: AppModel.wipeDueFile(model.burnStore).path))
+        model.lock()
+
+        #expect(AppModel.markWipeDue(model.burnStore, keepingSettings: true))
+        UserDefaults.standard.set(true, forKey: "pulshade.cutshort-probe")
+        defer { UserDefaults.standard.removeObject(forKey: "pulshade.cutshort-probe") }
+        let relaunched = AppModel(vault: Vault(directory: directory), watchSystem: false)
+        #expect(!relaunched.vault.exists && relaunched.phase == .welcome)
+        #expect(!FileManager.default.fileExists(atPath: AppModel.wipeDueFile(relaunched.burnStore).path))
+        #expect(UserDefaults.standard.bool(forKey: "pulshade.cutshort-probe"), "a Detach of one device keeps the settings it needs")
     }
 }

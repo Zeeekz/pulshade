@@ -1,16 +1,12 @@
 import SwiftUI
-import LocalAuthentication
 
-/// The camera on the chat list. It reads a new device's code to link it, or a friend's invite to add them.
+/// The camera on the chat list. It reads a friend's invite to add them, or a one-time chat link.
 /// Also opens with a code the system Camera handed over through a pulshade:// link.
 struct ScanSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
     var initial: String?
-    /// Whether a code for linking a new device is taken. Off when the scanner was opened to add a friend: a stranger's
-    /// "add me" code must never be able to turn out to be a request for the whole account.
-    var allowsDevices = true
 
     @State private var scanner = QRScanner()
     @State private var scanning = false
@@ -23,9 +19,7 @@ struct ScanSheet: View {
         SheetBody(width: 420) {
             VStack(spacing: 16) {
                 SheetHeader(symbol: "qrcode.viewfinder", title: "Scan a code")
-                if model.pendingLink != nil || model.linkConfirmation != nil {
-                    LinkApproval()
-                } else if let pending {
+                if let pending {
                     confirmation(pending.preview)
                 } else if let added {
                     VStack(spacing: 10) {
@@ -53,16 +47,13 @@ struct ScanSheet: View {
                         ProblemText(problem)
                             .multilineTextAlignment(.center)
                     }
-                    Text(allowsDevices ? "Point it at the code on a new device you're logging in to, or at a friend's invite."
-                         : "Point it at your friend's invite code.")
+                    Text("Point it at your friend's invite code.")
                         .font(.system(size: 12)).foregroundStyle(Ink.dim).multilineTextAlignment(.center)
                     if !scanning {
                         Button("Try again") { start() }.buttonStyle(PrimaryButtonStyle())
                     }
                 }
             }
-            .animation(.snappy, value: model.pendingLink?.request.deviceID)
-            .onDisappear { model.linkConfirmation = nil }
             .animation(.snappy, value: added?.fingerprint)
             .animation(.snappy, value: pending?.text)
         }
@@ -86,8 +77,31 @@ struct ScanSheet: View {
     }
 
     /// Nothing happens until you say yes, so a link on a web page or a code on a poster can't add anyone, or
-    /// point Pulshade at a relay, behind your back. Device codes only work from the camera.
+    /// point Pulshade at a relay, behind your back.
     private func use(_ text: String) {
+        // A Pulshade web link (a name, or a code after "#"): opened as the pulshade:// link it stands for.
+        if let url = URL(string: text.trimmingCharacters(in: .whitespacesAndNewlines)), let target = WebLinks.parse(url) {
+            switch target {
+            case let .name(handle, check):
+                model.openedKeyCheck = check
+                model.openedHandle = handle
+                dismiss()
+                return
+            case let .group(code):
+                model.openedGroupLink = OpenedGroupLink(code: code)
+                dismiss()
+                return
+            case let .invite(code):
+                // Carries on below as the code itself, which waits for a yes.
+                return use(code)
+            case let .chat(link):
+                return use(link.link)
+            case let .short(code):
+                model.openedShort = code
+                dismiss()
+                return
+            }
+        }
         // A profile link (a website's Pulshade button, as a QR code): its profile, with the request button, in Contacts.
         if let url = URL(string: text.trimmingCharacters(in: .whitespacesAndNewlines)),
            let link = DirectoryProfile.handle(fromLink: url) {
@@ -106,23 +120,12 @@ struct ScanSheet: View {
             problem = Invite.isOutdated(text) ? Invite.outdatedNotice : "That isn't a PULSHADE code."
             return
         }
-        if preview.kind == .device {
-            if !allowsDevices {
-                problem = "That is a code for linking a device, not a friend's invite. Never scan one that isn't on your own new device."
-            } else if initial != nil {
-                problem = "Codes for linking a device only work from the camera, pointed at your own new device."
-            } else {
-                carryOut(text)
-            }
-            return
-        }
         pending = (text, preview)
     }
 
     private func carryOut(_ text: String) {
         pending = nil
-        switch model.useScannedCode(text, fromLink: initial != nil) {
-        case .device: break
+        switch model.useScannedCode(text) {
         case let .contact(contact): added = contact
         case let .chat(id):
             model.requestedConversation = id
@@ -130,7 +133,6 @@ struct ScanSheet: View {
         case .expired: problem = "This chat link has run out, or has already been used."
         case .unknown: problem = "That isn't a PULSHADE code."
         case .outdated: problem = Invite.outdatedNotice
-        case .refused: problem = "Codes for linking a device only work from the camera, pointed at your own new device."
         }
     }
 
@@ -142,7 +144,6 @@ struct ScanSheet: View {
         case .channel: ("megaphone", "Follow this channel?", "Its staff will see your name and picture as \(persona).")
         case let .chat(endsAt): ("timer", "Join this one-time chat?",
                                  "You'll join as a throwaway identity, wiped \(endsAt.formatted(.relative(presentation: .named))).")
-        case .device: ("iphone.gen3", "", "")
         }
         return VStack(spacing: 12) {
             Image(systemName: symbol).font(.system(size: 40, weight: .light)).foregroundStyle(theme.accent)
@@ -168,93 +169,5 @@ struct ScanSheet: View {
             }
         }
         .transition(.opacity)
-    }
-}
-
-/// "Link this device?", for a new device that scanned your code or whose code you scanned.
-struct LinkApproval: View {
-    @Environment(AppModel.self) private var model
-    @Environment(\.theme) private var theme
-    @Environment(\.dismiss) private var dismiss
-    @State private var checkingOwner = false
-    @State private var askNoPasscode = false
-
-    var body: some View {
-        if let digits = model.linkConfirmation, model.pendingLink == nil {
-            VStack(spacing: 14) {
-                Image(systemName: "checkmark.shield")
-                    .font(.system(size: 40, weight: .light)).foregroundStyle(theme.accent)
-                Text("Check the new device")
-                    .font(.system(size: 16, weight: .semibold)).foregroundStyle(Ink.text)
-                Text(digits)
-                    .font(.system(size: 24, weight: .semibold, design: .monospaced)).foregroundStyle(Ink.text)
-                Text("The new device now shows digits. If they are not exactly these, tap Cancel on the new device: someone else answered first. If it shows none, update PULSHADE on it.")
-                    .font(.system(size: 12, weight: .medium)).foregroundStyle(.orange).multilineTextAlignment(.center)
-                Button {
-                    model.linkConfirmation = nil
-                    dismiss()
-                } label: {
-                    Text("Done").font(.system(size: 13, weight: .semibold)).padding(.horizontal, 16)
-                }
-                .buttonStyle(GlowButtonStyle(size: 34))
-            }
-            .transition(.opacity)
-        } else if let pending = model.pendingLink {
-            VStack(spacing: 14) {
-                Image(systemName: Platform.isPhone ? "laptopcomputer.and.iphone" : "iphone.gen3")
-                    .font(.system(size: 40, weight: .light)).foregroundStyle(theme.accent)
-                // The name inside the code is whatever its maker typed, so it is never shown as part of the question.
-                Text("Link a new device to your account?")
-                    .font(.system(size: 16, weight: .semibold)).foregroundStyle(Ink.text)
-                Text("It gets your whole account: contacts, groups and personas. Only do this for a device of your own that you are setting up right now. Nobody adding you as a friend needs it.")
-                    .font(.system(size: 12)).foregroundStyle(Ink.dim).multilineTextAlignment(.center)
-                VStack(spacing: 4) {
-                    Text(pending.request.checkCode)
-                        .font(.system(size: 24, weight: .semibold, design: .monospaced)).foregroundStyle(Ink.text)
-                    Text("Link only if your new device shows these same digits.")
-                        .font(.system(size: 12, weight: .medium)).foregroundStyle(.orange).multilineTextAlignment(.center)
-                }
-                .padding(.vertical, 4)
-                HStack(spacing: 10) {
-                    Button("Cancel") {
-                        model.cancelLink()
-                        model.linkConfirmation = nil
-                        dismiss()
-                    }
-                    .buttonStyle(.plain).foregroundStyle(Ink.dim)
-                    Button {
-                        // The whole account goes to whoever made this code, so the person holding this device proves it's
-                        // theirs first (Face ID, Touch ID or the device passcode): a code someone talked them into
-                        // scanning, or a phone left unlocked, isn't enough on its own. A device with no passcode at all
-                        // gets a second, plain question instead.
-                        guard !checkingOwner else { return }
-                        let context = LAContext()
-                        var problem: NSError?
-                        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &problem) else {
-                            // Only a device with no passcode at all gets the plain question; any other failure is a no.
-                            if problem?.code == LAError.passcodeNotSet.rawValue { askNoPasscode = true }
-                            return
-                        }
-                        checkingOwner = true
-                        context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "Give a new device your whole account") { ok, _ in
-                            Task { @MainActor in
-                                checkingOwner = false
-                                if ok { model.approveLink() }
-                            }
-                        }
-                    } label: {
-                        Text("Link").font(.system(size: 13, weight: .semibold)).padding(.horizontal, 16)
-                    }
-                    .disabled(checkingOwner)
-                    .confirmationDialog("This device has no passcode, so anyone holding it could do this. Give the new device your whole account?",
-                                        isPresented: $askNoPasscode, titleVisibility: .visible) {
-                        Button("Link", role: .destructive) { model.approveLink() }
-                        Button("Cancel", role: .cancel) {}
-                    }
-                    .buttonStyle(GlowButtonStyle(size: 34))
-                }
-            }
-            .transition(.opacity)
-        }
     }
 }

@@ -113,7 +113,7 @@ import PulshadeShared
 
     @Test func aCallPacketNumberedAtTheLimitIsRefusedNotFatal() {
         var crypto = CallCrypto(key: Data(repeating: 9, count: 32), caller: false)
-        let packet = Data([0]) + Data(repeating: 0xFF, count: 8) + Data(repeating: 0, count: 32)
+        let packet = Data([0]) + Data(repeating: 7, count: CallCrypto.saltSize) + Data(repeating: 0xFF, count: 8) + Data(repeating: 0, count: 32)
         #expect(crypto.open(packet) == nil)
     }
 

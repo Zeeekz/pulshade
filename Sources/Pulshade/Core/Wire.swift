@@ -14,6 +14,9 @@ struct DeviceCard: Codable, Equatable {
     var held: Bool? = nil
     /// The pin of the device's own keys (`DeviceLink.keyPin`), as the device sending this card has it.
     var key: Data? = nil
+    /// On a device introducing itself (`Payload.deviceHello`): another device of the same account vouching for it
+    /// (`DeviceVouch`). Apps from before send none and ignore it.
+    var vouch: DeviceVouch? = nil
 }
 
 /// How to reach someone: their public keys and the send id of a mailbox they read.
@@ -104,9 +107,25 @@ extension Payload {
         switch try JSONDecoder.pulshade.decode(Payload.self, from: header) {
         case let .ratchet(message): return .ratchet(RatchetMessage(header: message.header, ciphertext: tail))
         case let .storyPart(id, index, of, _): return .storyPart(id: id, index: index, of: of, bytes: tail)
+        case let .request(card, ask, note) where note.isEmpty:
+            guard tail.count <= Self.maxRequestNoteBytes, let words = String(data: tail, encoding: .utf8) else { throw EnvelopeError.malformed }
+            return .request(card, ask, note: words)
         default: throw EnvelopeError.malformed
         }
     }
+
+    /// A friend request's note as it travels: everything but the note as JSON, then the note's own bytes after it, so the
+    /// envelope's post-quantum signature can cover the key setup and leave the note out (`Envelope.seal`). Nil for
+    /// anything else, and for a request without a note.
+    func requestWire() throws -> (body: Data, note: Int)? {
+        guard case let .request(card, ask, note) = self, !note.isEmpty else { return nil }
+        let words = Data(note.utf8)
+        guard words.count <= Self.maxRequestNoteBytes else { throw EnvelopeError.malformed }
+        return (Frame.join(try JSONEncoder.pulshade.encode(Payload.request(card, ask, note: "")), words), words.count)
+    }
+
+    /// A note is at most 280 characters; this leaves room for any of them in UTF-8.
+    static let maxRequestNoteBytes = 280 * 4
 }
 
 enum Payload: Codable, Equatable {
@@ -212,6 +231,10 @@ enum Payload: Codable, Equatable {
     case burn
     /// "Request accepted: from now on, write to this mailbox instead of my public one."
     case accepted(sendID: Data)
+    /// "This device reads you on a new mailbox from now on: write here." Sent inside the session with each of your devices,
+    /// so only the device it came from can move. Builds before 22 ignore it and keep writing to the old one, which is read
+    /// for as long as they do (`FormerMailbox`).
+    case mailbox(sendID: Data)
     /// Between your own devices only: keep each other up to date.
     case sync(SyncEvent)
     /// The sender deleted this chat: nil for your direct chat with them. In a group's own mailbox it carries the group's id
@@ -237,8 +260,10 @@ enum Payload: Codable, Equatable {
     /// The sender logged out of the device this came from: stop sending to it.
     case deviceRemoved
     /// The sender unlinked these devices of theirs (ids as this account knows them), said by one of their devices still
-    /// linked, over its own session: drop them and never take them back (`Contact.revoked`).
-    case devicesUnlinked([Data])
+    /// linked, over its own session: drop them and never take them back (`Contact.revoked`). `kept` lists the account's
+    /// devices the sender still has (itself included): any other device of theirs is held until you allow it. Apps from
+    /// before send none and ignore it.
+    case devicesUnlinked([Data], kept: [Data]? = nil)
     /// The sender erased their account: forget them completely, with everything they ever sent.
     case erased
     /// An abuse report, sent only to the operator's report mailbox.
@@ -286,6 +311,12 @@ enum Payload: Codable, Equatable {
         case .typing, .presence, .callOffer, .callAnswer, .callEnd: true
         default: false
         }
+    }
+
+    /// A delivery or read receipt: sent on a connection used for nothing else (see `Lanes`).
+    var isReceipt: Bool {
+        if case .receipt = self { return true }
+        return false
     }
 
     var isEphemeral: Bool {
@@ -427,6 +458,8 @@ struct ContactCard: Codable, Equatable {
     var revoked: [DeviceCard]? = nil
     /// Two of their devices unlinked each other (`Contact.contested`).
     var contested: Bool? = nil
+    /// Their account has unlinked a device (`Contact.unlinked`).
+    var unlinked: Bool? = nil
 }
 
 /// A group, channel or list as your other devices should know it (without its messages).

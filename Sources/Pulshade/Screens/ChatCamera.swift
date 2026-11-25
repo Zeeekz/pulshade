@@ -2,14 +2,14 @@ import SwiftUI
 import AVFoundation
 
 extension View {
-    /// The chat camera: full screen on iPhone, a sheet on the Mac. `taken` gets cleaned JPEGs ready to attach.
+    /// The chat camera, full screen. `taken` gets cleaned JPEGs ready to attach.
     /// `filmed` gets a video, recorded by holding the button or picked from the library, still to be made ready.
     func chatCamera(isPresented: Binding<Bool>, taken: @escaping ([Data]) -> Void,
                     filmed: @escaping (MemoryClip, ZoomTrack) -> Void = { _, _ in }) -> some View {
         #if os(iOS)
         fullScreenCover(isPresented: isPresented) { ChatCamera(taken: taken, filmed: filmed) }
         #else
-        sheet(isPresented: isPresented) { ChatCamera(taken: taken, filmed: filmed).frame(width: 420, height: 640) }
+        sheet(isPresented: isPresented) { ChatCamera(taken: taken, filmed: filmed) } // macOS: test build only
         #endif
     }
 }
@@ -226,18 +226,9 @@ struct ChatCamera: View {
         }
     }
 
-    /// A video from the library: the photo picker on iPhone, a file panel on the Mac. Held in memory, never copied
-    /// to a file of ours.
+    /// A video from the library, with the photo picker. Held in memory, never copied to a file of ours.
     private func pickVideo() {
-        #if os(macOS)
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.movie]
-        panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url,
-              let bytes = try? Data(contentsOf: url, options: .mappedIfSafe) else { return }
-        filmed(MemoryClip(bytes), .none)
-        dismiss()
-        #else
+        #if os(iOS)
         LibraryPicker.present(videosOnly: true) { kind, _ in
             guard case let .clip(clip, track) = kind else { return }
             filmed(clip, track)

@@ -92,7 +92,7 @@ import Foundation
         #expect(Invite.validRelay("https://relay.example.com") != nil)
         #expect(Invite.validRelay("http://192.168.1.20:7878") != nil)
         #expect(Invite.validRelay("http://127.0.0.1:7878") != nil)
-        #expect(Invite.validRelay("http://my-mac.local:7878") != nil)
+        #expect(Invite.validRelay("http://my-computer.local:7878") != nil)
         // Tor encrypts an onion service end to end, so plain http is fine there.
         #expect(Invite.validRelay("http://pulshadexyz.onion") != nil)
         #expect(Invite.validRelay("http://relay.onion.example.com") == nil)

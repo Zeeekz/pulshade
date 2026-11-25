@@ -92,9 +92,9 @@ import Foundation
         #expect(!vault.exists)
     }
 
-    /// With this Mac's real Secure Enclave: an unbound file is bound, its old slots keep opening, and a slot rewritten
+    /// With this machine's real Secure Enclave: an unbound file is bound, its old slots keep opening, and a slot rewritten
     /// afterwards is bound too. Skipped where there's no Secure Enclave, the run switched it off, or it won't make a key
-    /// right now (the Mac is locked, or the run has no login session).
+    /// right now (the machine is locked, or the run has no login session).
     @Test func bindingAnOlderFileKeepsItsDecoyAndPanicOpening() throws {
         Vault.bindingOffForTests = false
         guard Vault.canBindToDevice, Vault.enclaveMakesKeysNow else { return }

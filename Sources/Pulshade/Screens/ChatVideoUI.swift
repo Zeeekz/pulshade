@@ -2,11 +2,9 @@ import SwiftUI
 import AVKit
 #if os(iOS)
 import Photos
-#else
-import UniformTypeIdentifiers
 #endif
 
-/// Before a photo or video leaves Pulshade for Photos (or a file on the Mac): what that means, with Save, Save and
+/// Before a photo or video leaves Pulshade for Photos: what that means, with Save, Save and
 /// don't ask again, and Cancel. Skipped once "Don't ask again" is chosen; Settings › Privacy brings it back.
 struct SaveWarning: ViewModifier {
     @Environment(AppModel.self) private var model
@@ -16,12 +14,8 @@ struct SaveWarning: ViewModifier {
     var save: () -> Void
 
     static func text(_ kind: String) -> (title: String, detail: String) {
-        if Platform.isPhone {
-            return ("Save to Photos?",
-                    "In Pulshade this \(kind) is encrypted and erased when you Burn. Saving puts a copy in your Photos library, outside Pulshade: it isn't encrypted by Pulshade, Burn and Detach can't remove it, and it can sync to iCloud and be seen by anyone or any app that can open your photos.")
-        }
-        return ("Save this \(kind)?",
-                "In Pulshade this \(kind) is encrypted and erased when you Burn. Saving writes an ordinary file wherever you choose, outside Pulshade: it isn't encrypted by Pulshade, Burn and Detach can't remove it, and other apps and backups can read it.")
+        ("Save to Photos?",
+         "In Pulshade this \(kind) is encrypted and erased when you Burn. Saving puts a copy in your Photos library, outside Pulshade: it isn't encrypted by Pulshade, Burn and Detach can't remove it, and it can sync to iCloud and be seen by anyone or any app that can open your photos.")
     }
 
     func body(content: Content) -> some View {
@@ -45,8 +39,8 @@ extension View {
     }
 }
 
-/// Saving a chat video where you choose: Photos on iPhone (only ever added to), a file on the Mac. Pulshade itself
-/// never writes the video to disk: on iPhone the bytes go to Photos straight from memory, and if Photos won't take
+/// Saving a chat video to Photos (only ever added to). Pulshade itself
+/// never writes the video to disk: the bytes go to Photos straight from memory, and if Photos won't take
 /// them that's said, never worked around with a file.
 enum VideoSaver {
     enum Outcome { case saved, notAllowed, refused, failed, cancelled }
@@ -65,18 +59,14 @@ enum VideoSaver {
             return .refused
         }
         #else
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [.mpeg4Movie]
-        panel.nameFieldStringValue = "Video.mp4"
-        guard panel.runModal() == .OK, let url = panel.url else { return .cancelled }
-        do { try clip.write(to: url, options: .atomic); return .saved } catch { return .failed }
+        return .failed // macOS: test build only
         #endif
     }
 
     /// What to say once it's done.
     static func notice(_ outcome: Outcome) -> (text: String, symbol: String)? {
         switch outcome {
-        case .saved: (Platform.isPhone ? "Saved to Photos" : "Saved", "checkmark")
+        case .saved: ("Saved to Photos", "checkmark")
         case .notAllowed: ("Allow saving to Photos in Settings", "lock")
         case .refused: ("This video couldn't be downloaded", "exclamationmark.triangle")
         case .failed: ("This video couldn't be downloaded", "exclamationmark.triangle")
@@ -200,7 +190,7 @@ struct VideoBubble: View {
             }
         }
         .frame(width: fill?.width, height: fill?.height)
-        .frame(maxWidth: fill == nil ? (Platform.isPhone ? 250 : 320) : nil, maxHeight: fill == nil ? 340 : nil)
+        .frame(maxWidth: fill == nil ? 250 : nil, maxHeight: fill == nil ? 340 : nil)
         .clipShape(.rect(cornerRadius: fill == nil ? 10 : 0))
         .contentShape(.rect)
         .onTapGesture { if ready { playing = true } }
@@ -221,13 +211,13 @@ struct VideoPlayerCover: ViewModifier {
         #if os(iOS)
         content.fullScreenCover(isPresented: $isPresented) { ChatVideoPlayer(clip: clip, canSave: canSave) }
         #else
-        content.sheet(isPresented: $isPresented) { ChatVideoPlayer(clip: clip, canSave: canSave).frame(minWidth: 520, minHeight: 620) }
+        content.sheet(isPresented: $isPresented) { ChatVideoPlayer(clip: clip, canSave: canSave) } // macOS: test build only
         #endif
     }
 }
 
 /// Plays a chat video from memory. Nothing is written to disk to play it. Swipe up or down to throw it away; tap to
-/// show or hide the controls. On the Mac it uses the system's own controls.
+/// show or hide the controls.
 private struct ChatVideoPlayer: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(AppModel.self) private var model
@@ -257,8 +247,6 @@ private struct ChatVideoPlayer: View {
                     PlayerSurface(player: player)
                         .contentShape(.rect)
                         .onTapGesture { withAnimation(.easeOut(duration: 0.2)) { controls.toggle() }; scheduleHide() }
-                    #else
-                    VideoPlayer(player: player)
                     #endif
                 } else {
                     ProgressView().tint(.white).frame(maxWidth: .infinity, maxHeight: .infinity)

@@ -180,7 +180,7 @@ extension ProfileNote {
 /// has to be strong: it is checked, and a random one is offered.
 public enum NoteSeal {
     static let version: UInt8 = 1
-    /// scrypt cost: 2^17 blocks of 1 KiB (128 MiB) per guess, about a fifth of a second on a Mac.
+    /// scrypt cost: 2^17 blocks of 1 KiB (128 MiB) per guess, about a fifth of a second on a recent computer.
     public static let logN = 17
     static let r = 8, p = 1
 

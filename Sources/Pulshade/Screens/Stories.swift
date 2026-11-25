@@ -152,7 +152,7 @@ enum StoryImages {
         guard let raw = UIImage(data: data) else { return nil }
         let image = raw.preparingForDisplay() ?? raw
         #else
-        guard let image = NSImage(data: data) else { return nil }
+        guard let image = PlatformImage(data: data) else { return nil } // macOS: test build only
         #endif
         cache.setObject(image, forKey: key)
         return image
@@ -622,7 +622,7 @@ struct StoryComposer: View {
                                        canvas: canvas, media: mediaHandle(canvas: canvas), swipe: swipeAction, add: addText)
                 }
                 .frame(width: canvas.width, height: canvas.height)
-                .clipShape(.rect(cornerRadius: Platform.isPhone ? 0 : 16))
+                .clipShape(.rect(cornerRadius: 0))
 
                 if tool == .adjust {
                     VStack {
@@ -1168,22 +1168,21 @@ struct StoryComposer: View {
 }
 
 extension View {
-    /// The story viewer: full screen on the phone, so the picture reaches the top and bottom of the screen, and a
-    /// sheet on the Mac.
+    /// The story viewer: full screen, so the picture reaches the top and bottom of the screen.
     func viewerCover<Item: Identifiable, Content: View>(item: Binding<Item?>, @ViewBuilder content: @escaping (Item) -> Content) -> some View {
         #if os(iOS)
         fullScreenCover(item: item) { content($0) }
         #else
-        sheet(item: item) { content($0) }
+        sheet(item: item) { content($0) } // macOS: test build only
         #endif
     }
 
-    /// The story editor: full screen on the phone, a sheet the size of a story on the Mac.
+    /// The story editor, full screen.
     func composerCover<Item: Identifiable, Content: View>(item: Binding<Item?>, @ViewBuilder content: @escaping (Item) -> Content) -> some View {
         #if os(iOS)
         fullScreenCover(item: item) { content($0) }
         #else
-        sheet(item: item) { content($0).frame(width: 420, height: 740) }
+        sheet(item: item) { content($0) } // macOS: test build only
         #endif
     }
 
@@ -1191,7 +1190,7 @@ extension View {
         #if os(iOS)
         fullScreenCover(isPresented: isPresented, content: content)
         #else
-        sheet(isPresented: isPresented) { content().frame(width: 420, height: 740) }
+        sheet(isPresented: isPresented) { content() } // macOS: test build only
         #endif
     }
 }
@@ -1421,12 +1420,12 @@ struct StoryViewers: View {
 // MARK: - Camera
 
 extension View {
-    /// The story camera: full screen on iPhone, a sheet on the Mac.
+    /// The story camera, full screen.
     func storyCamera(isPresented: Binding<Bool>) -> some View {
         #if os(iOS)
         fullScreenCover(isPresented: isPresented) { StoryCamera() }
         #else
-        sheet(isPresented: isPresented) { StoryCamera().frame(width: 420, height: 720) }
+        sheet(isPresented: isPresented) { StoryCamera() } // macOS: test build only
         #endif
     }
 }
@@ -1474,8 +1473,6 @@ struct StoryCamera: View {
     // Pinching to zoom.
     @State private var pinchBase: CGFloat?
     @State private var pinching = false
-    @State private var zoomShown = false
-    @State private var zoomToken = UUID()
     // Tap to focus: where, and a token so the ring fades by itself.
     @State private var focusAt: CGPoint?
     @State private var focusToken = UUID()
@@ -1524,9 +1521,6 @@ struct StoryCamera: View {
                             camera.setZoom((pinchBase ?? 1) * value.magnification)
                         }
                         .onEnded { _ in pinchBase = nil; pinching = false })
-                    #if os(macOS)
-                    .background(ScrollZoom { dy in camera.setZoom(camera.zoom * exp(dy * 0.03)) })
-                    #endif
                     .accessibilityLabel("Camera preview")
             } else if ready == false {
                 VStack(spacing: 10) {
@@ -1535,18 +1529,7 @@ struct StoryCamera: View {
                     Text("Choose a photo or video, or write a text story.").font(.system(size: 13)).foregroundStyle(Ink.dim)
                 }
             }
-            if zoomShown {
-                Text(ZoomMath.label(camera.zoom))
-                    .font(.system(size: 14, weight: .semibold).monospacedDigit())
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 12).frame(height: 30)
-                    .background(.black.opacity(0.45), in: .capsule)
-                    .frame(maxHeight: .infinity, alignment: .bottom)
-                    .padding(.bottom, 190)
-                    .allowsHitTesting(false)
-                    .transition(.opacity)
-                    .accessibilityHidden(true)
-            }
+            ZoomBadge(camera: camera)
             VStack {
                 HStack {
                     control("xmark", label: "Close") { leave() }
@@ -1570,7 +1553,7 @@ struct StoryCamera: View {
                     }
                 }
                 Spacer()
-                if camera.lensStops.count > 1 && ready == true { lensPills.padding(.bottom, 10) }
+                if camera.lensStops.count > 1 && ready == true { LensPills(camera: camera).padding(.bottom, 10) }
                 FilterStrip(filter: $filter).padding(.bottom, 10)
                     .opacity(camera.recording ? 0 : 1)
                     .allowsHitTesting(!camera.recording)
@@ -1629,21 +1612,12 @@ struct StoryCamera: View {
         }
         .onChange(of: scenePhase) { _, phase in if phase != .active, pressStart != nil { shutterCancelled() } }
         .onChange(of: filter) { _, new in camera.filter = new }
-        .onChange(of: camera.zoom) { _, _ in
-            withAnimation(.easeOut(duration: 0.15)) { zoomShown = true }
-            zoomToken = UUID()
-        }
         .onChange(of: camera.recording) { _, now in if !now { holdRecording = false } }
         .task(id: focusToken) {
             guard focusAt != nil else { return }
             try? await Task.sleep(for: .seconds(1.2))
             guard !Task.isCancelled else { return }
             withAnimation(.easeOut(duration: 0.3)) { focusAt = nil }
-        }
-        .task(id: zoomToken) {
-            try? await Task.sleep(for: .seconds(1.2))
-            guard !Task.isCancelled else { return }
-            withAnimation(.easeOut(duration: 0.3)) { zoomShown = false }
         }
         .cropper($pending, frame: .story, onDismiss: {
             if let cropped { self.cropped = nil; cover = .framed(cropped) }
@@ -1681,28 +1655,6 @@ struct StoryCamera: View {
         camera.focus(at: point, in: size)
         withAnimation(.spring(duration: 0.25)) { focusAt = point }
         focusToken = UUID()
-    }
-
-    /// Jumps between the lenses, as 0.5 · 1 · 3 above the shutter.
-    private var lensPills: some View {
-        HStack(spacing: 6) {
-            ForEach(camera.lensStops, id: \.self) { stop in
-                let on = abs(camera.zoom - stop) < 0.08
-                Button { camera.setZoom(stop) } label: {
-                    Text(on ? ZoomMath.label(stop) : String(format: "%g", Double(stop)))
-                        .font(.system(size: on ? 13 : 12, weight: .semibold).monospacedDigit())
-                        .foregroundStyle(on ? Color.yellow : .white)
-                        .frame(width: on ? 40 : 32, height: on ? 40 : 32)
-                        .background(.black.opacity(0.4), in: .circle)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Zoom \(String(format: "%g", Double(stop))) times")
-                .accessibilityAddTraits(on ? .isSelected : [])
-            }
-        }
-        .padding(4)
-        .background(.black.opacity(0.25), in: .capsule)
-        .animation(reduceMotion ? nil : .snappy, value: camera.zoom)
     }
 
     // MARK: Shutter
@@ -2014,9 +1966,6 @@ struct StoryViewer: View {
         .clipped()
         .scaleEffect(SwipeAway.scale(dragOffset))
         .offset(dragOffset)
-        // A video has no size of its own, so on the Mac the window is given the story's shape outright.
-        .frame(minWidth: Platform.isPhone ? nil : 400, maxWidth: Platform.isPhone ? .infinity : 400,
-               minHeight: Platform.isPhone ? nil : 680, maxHeight: Platform.isPhone ? .infinity : 680)
         .background(Color.black.opacity(1 - Double(SwipeAway.progress(dragOffset)) * 0.95).ignoresSafeArea())
         #if os(iOS)
         // What's behind shows through as the story is pulled away.
@@ -2395,5 +2344,66 @@ extension AnyTransition {
         let way = forward ? 1.0 : -1.0
         return .asymmetric(insertion: .modifier(active: PageTurn(turn: way), identity: PageTurn(turn: 0)),
                            removal: .modifier(active: PageTurn(turn: -way), identity: PageTurn(turn: 0)))
+    }
+}
+
+/// Jumps between the lenses, as 0.5 · 1 · 3 above the shutter. Its own view, so a pinch redraws only this and the
+/// zoom badge, not the whole camera screen.
+private struct LensPills: View {
+    let camera: Camera
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(camera.lensStops, id: \.self) { stop in
+                let on = abs(camera.zoom - stop) < 0.08
+                Button { camera.setZoom(stop, smooth: true) } label: {
+                    Text(on ? ZoomMath.label(stop) : String(format: "%g", Double(stop)))
+                        .font(.system(size: on ? 13 : 12, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(on ? Color.yellow : .white)
+                        .frame(width: on ? 40 : 32, height: on ? 40 : 32)
+                        .background(.black.opacity(0.4), in: .circle)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Zoom \(String(format: "%g", Double(stop))) times")
+                .accessibilityAddTraits(on ? .isSelected : [])
+            }
+        }
+        .padding(4)
+        .background(.black.opacity(0.25), in: .capsule)
+        .animation(reduceMotion ? nil : .snappy, value: camera.zoom)
+    }
+}
+
+/// The zoom, such as "2.4×", shown while it changes and for a moment after.
+private struct ZoomBadge: View {
+    let camera: Camera
+    @State private var shown = false
+    @State private var token = UUID()
+
+    var body: some View {
+        ZStack {
+            if shown {
+                Text(ZoomMath.label(camera.zoom))
+                    .font(.system(size: 14, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12).frame(height: 30)
+                    .background(.black.opacity(0.45), in: .capsule)
+                    .frame(maxHeight: .infinity, alignment: .bottom)
+                    .padding(.bottom, 190)
+                    .transition(.opacity)
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+        .onChange(of: camera.zoom) { _, _ in
+            if !shown { withAnimation(.easeOut(duration: 0.15)) { shown = true } }
+            token = UUID()
+        }
+        .task(id: token) {
+            try? await Task.sleep(for: .seconds(1.2))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.3)) { shown = false }
+        }
     }
 }

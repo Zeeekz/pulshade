@@ -37,6 +37,8 @@ func testDirectory(_ prefix: String) -> URL {
     model.callAudio = false
     model.trafficShaping = false
     model.cutOffOnLock = false
+    // Unlocks answer at once; the timing itself is tested on its own (`LockTimingTests`).
+    model.unlockSettle = .zero
     // Invites to groups and channels wait for a yes; tests about other things say yes at once (LinkAuditFixTests don't).
     model.acceptsInvitesForTests = true
     return model

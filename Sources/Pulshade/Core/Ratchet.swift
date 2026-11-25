@@ -91,11 +91,18 @@ struct Ratchet: Codable {
     private var sendMix: UInt32?
     /// When a post-quantum secret last went into the root.
     private var pqAt: Date?
+    /// Messages this side has sent since then, and when it last sent one. Nil in a session saved before they were kept,
+    /// which starts counting now.
+    private var sentSincePQ: UInt32?
+    private var lastSentAt: Date?
 
     private struct Skipped: Codable {
         var dh: Data
         var n: UInt32
         var key: Data
+        /// When the key was kept. Nil for one kept by a build before it was said: the first tidy-up stamps it, so it goes
+        /// `skippedLifetime` after that.
+        var at: Date?
     }
 
     private struct Part: Codable {
@@ -130,6 +137,19 @@ struct Ratchet: Codable {
 
     static let maxSkip: UInt32 = 1000
     private static let maxStoredSkipped = 2000
+    /// A key kept for a message that never came is dropped after this long, so a message held back somewhere (by the
+    /// relay, say) can't be opened with a device seized long after it was sent.
+    static let skippedLifetime: TimeInterval = 30 * 86_400
+    /// Keys are kept for the receiving chains of at most this many of the other side's ratchet keys, the newest: a late
+    /// message on any older chain can't be read. As libsignal keeps a handful of old receiving chains.
+    static let maxSkippedChains = 5
+    /// The post-quantum ratchet counts as stalled once this side has sent `pqStallMessages` messages without a new
+    /// post-quantum secret going into the root, or `pqStallSoonMessages` of them with the newest sent `pqStallAge` or more
+    /// after the last secret went in (see `postQuantumStalled`). In a working chat a secret goes in every few messages
+    /// each way, so either means the exchange is stuck; a chat that was only quiet for a while is not.
+    static let pqStallMessages: UInt32 = 200
+    static let pqStallSoonMessages: UInt32 = 20
+    static let pqStallAge: TimeInterval = 7 * 86_400
     /// Tests move the clock.
     #if DEBUG
     /// Tests set this; a shipped build reads the clock directly and holds no mutable global here.
@@ -146,6 +166,7 @@ struct Ratchet: Codable {
         self.ad = ad
         // The handshake itself was post-quantum.
         pqAt = Self.now()
+        sentSincePQ = 0
     }
 
     /// The side that already knows the other's ratchet key, and so can send first.
@@ -166,6 +187,33 @@ struct Ratchet: Codable {
     var postQuantumEpochs: (offered: UInt32, answered: UInt32) {
         let q = pq ?? PQState()
         return (q.offerEpoch - 1, q.takeEpoch - 1)
+    }
+
+    /// Whether the sparse post-quantum ratchet has stopped moving while this side keeps sending (see `pqStallMessages`).
+    /// The app then opens a fresh handshake, whose root is post-quantum again (see `AppModel.refreshStalledPostQuantum`),
+    /// as SPQR starts over when its epochs stop moving. A session nobody writes on never counts as stalled.
+    var postQuantumStalled: Bool {
+        let sent = sentSincePQ ?? 0
+        if sent >= Self.pqStallMessages { return true }
+        guard sent >= Self.pqStallSoonMessages, let at = pqAt, let last = lastSentAt else { return false }
+        return last.timeIntervalSince(at) >= Self.pqStallAge
+    }
+
+    /// Keys for skipped messages, for tests.
+    var skippedCount: Int { skipped.count }
+
+    /// Whether any kept key for a skipped message is due to go (or has no time yet), so a caller only writes when
+    /// `dropExpiredSkipped` would change something.
+    func hasExpiredSkipped(now: Date = Ratchet.now()) -> Bool {
+        skipped.contains { $0.at.map { now.timeIntervalSince($0) >= Self.skippedLifetime } ?? true }
+    }
+
+    /// Drops the kept keys of skipped messages older than `skippedLifetime`, and gives a time to any kept before times
+    /// were noted.
+    mutating func dropExpiredSkipped(now: Date = Ratchet.now()) {
+        guard !skipped.isEmpty else { return }
+        for k in skipped.indices where skipped[k].at == nil { skipped[k].at = now }
+        skipped.removeAll { now.timeIntervalSince($0.at ?? now) >= Self.skippedLifetime }
     }
 
     /// Encrypts the next message. `fit`, when given, says for a message how big its envelope will be and how many bytes
@@ -209,6 +257,10 @@ struct Ratchet: Codable {
         cks = next
         pq = q
         ns += 1
+        if pqAt == nil { pqAt = Self.now() }
+        sentSincePQ = (sentSincePQ ?? 0) &+ 1
+        lastSentAt = Self.now()
+        dropExpiredSkipped()
         return message
     }
 
@@ -217,6 +269,7 @@ struct Ratchet: Codable {
         guard message.header.dh.count == 32 else { throw RatchetError.malformed }
         guard message.header.v == RatchetHeader.version else { throw RatchetError.peerTooOld }
         var s = self
+        s.dropExpiredSkipped()
         if let plain = try s.openSkipped(message) {
             s.absorbChunks(message.header)
             self = s
@@ -252,14 +305,23 @@ struct Ratchet: Codable {
         // Subtracting rather than adding to an attacker-influenced counter, so a huge `n` can't overflow.
         if n > nr, n - nr > Self.maxSkip { throw RatchetError.tooManySkipped }
         var ck = start
+        let now = Self.now()
         while nr < n {
             let (next, mk) = Self.kdfChain(ck)
-            skipped.append(Skipped(dh: dhr ?? Data(), n: nr, key: mk))
+            skipped.append(Skipped(dh: dhr ?? Data(), n: nr, key: mk, at: now))
             ck = next
             nr += 1
         }
         ckr = ck
         if skipped.count > Self.maxStoredSkipped { skipped.removeFirst(skipped.count - Self.maxStoredSkipped) }
+        // Only the newest few chains keep keys: entries are in the order they were kept, so the chains whose last key
+        // was kept longest ago go first.
+        var chains: [Data] = []
+        for entry in skipped.reversed() where !chains.contains(entry.dh) { chains.append(entry.dh) }
+        if chains.count > Self.maxSkippedChains {
+            let kept = Set(chains.prefix(Self.maxSkippedChains))
+            skipped.removeAll { !kept.contains($0.dh) }
+        }
     }
 
     /// A new ratchet key from the other side: derive a fresh receiving chain, and make a fresh key for the sending chain,
@@ -290,6 +352,7 @@ struct Ratchet: Codable {
             q.takeTranscript = nil
             q.takeKey = nil
             pqAt = Self.now()
+            sentSincePQ = 0
         }
         (rk, ckr) = Self.kdfRoot(rk, receiving)
         pq = q
@@ -314,6 +377,7 @@ struct Ratchet: Codable {
             q.offerSecret = nil
             q.offerTranscript = nil
             pqAt = Self.now()
+            sentSincePQ = 0
         }
         pq = q
         (rk, cks) = Self.kdfRoot(rk, sending)

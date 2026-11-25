@@ -533,7 +533,7 @@ final class LibraryPicker: NSObject, PHPickerViewControllerDelegate {
 }
 #endif
 
-/// Pick a photo or a video from the library: the photo picker on iPhone, a file panel on the Mac. A photo goes
+/// Pick a photo or a video from the library with the photo picker. A photo goes
 /// straight into the editor, where it's cropped, placed and turned.
 struct StoryMediaPicker<Label: View>: View {
     var picked: (StoryPick.Kind) -> Void
@@ -552,63 +552,10 @@ struct StoryMediaPicker<Label: View>: View {
     }
 
     private func choose() {
-        #if os(macOS)
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.image, .movie]
-        panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        // A locally picked file still can't be allowed to exhaust memory: cap it like one received.
-        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
-        guard size > 0, size <= 100 * 1024 * 1024 else { return }
-        if let type = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType, type.conforms(to: .movie) {
-            // Read in place and held in memory: no copy is made on disk.
-            if let bytes = try? Data(contentsOf: url, options: .mappedIfSafe) { picked(.clip(MemoryClip(bytes), .none)) }
-        } else if let bytes = try? Data(contentsOf: url, options: .mappedIfSafe),
-                  ImageLimits.isReasonable(bytes), let image = NSImage(data: bytes) {
-            use(image)
-        }
-        #else
+        #if os(iOS)
         LibraryPicker.present { kind, image in
             if let kind { picked(kind) } else if let image { use(image) }
         }
         #endif
     }
 }
-
-#if os(macOS)
-/// Scroll wheel and trackpad scrolling over a view, reported as a vertical amount (up is positive). It lets clicks
-/// through to what's underneath.
-struct ScrollZoom: NSViewRepresentable {
-    var onScroll: (CGFloat) -> Void
-
-    final class Catcher: NSView {
-        var onScroll: (CGFloat) -> Void = { _ in }
-        private var monitor: Any?
-
-        override func hitTest(_ point: NSPoint) -> NSView? { nil }
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            if let monitor { NSEvent.removeMonitor(monitor) }
-            monitor = nil
-            guard window != nil else { return }
-            monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
-                guard let self, event.window == self.window else { return event }
-                let point = self.convert(event.locationInWindow, from: nil)
-                if self.bounds.contains(point) { self.onScroll(event.scrollingDeltaY) }
-                return event
-            }
-        }
-
-        deinit { if let monitor { NSEvent.removeMonitor(monitor) } }
-    }
-
-    func makeNSView(context: Context) -> Catcher {
-        let view = Catcher()
-        view.onScroll = onScroll
-        return view
-    }
-
-    func updateNSView(_ view: Catcher, context: Context) { view.onScroll = onScroll }
-}
-#endif

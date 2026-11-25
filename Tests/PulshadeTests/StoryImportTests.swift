@@ -82,7 +82,7 @@ struct StoryImportTests {
                 "the picture is still split left and right: left \(left) right \(right)")
     }
 
-    /// A real library-style clip with a picture and sound track. macOS ships one; when it isn't there, there is
+    /// A real library-style clip with a picture and sound track. This machine may have one; when it isn't there, there is
     /// nothing to read and the test has nothing to say.
     @Test func aLibraryClipWithSoundExports() async throws {
         let path = "/System/Library/PrivateFrameworks/SiriSetup.framework/Versions/A/Resources/Speak to Siri - 480 x 250 (Dark).mp4"

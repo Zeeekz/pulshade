@@ -40,8 +40,8 @@ extension Haptics {
     }
 }
 
-/// A clear surface that reports taps and one combined move, pinch and twist. On the iPhone a single UIKit recogniser
-/// tracks the fingers itself, so the three never fight; on the Mac the mouse moves and the trackpad pinches and turns.
+/// A clear surface that reports taps and one combined move, pinch and twist. A single UIKit recogniser tracks the
+/// fingers itself, so the three never fight.
 struct TransformSurface: View {
     var began: (TransformValue) -> Void
     var changed: (TransformValue) -> Void
@@ -52,7 +52,7 @@ struct TransformSurface: View {
         #if os(iOS)
         TouchSurface(began: began, changed: changed, ended: ended, tapped: tapped)
         #else
-        MouseSurface(began: began, changed: changed, ended: ended, tapped: tapped)
+        Color.clear // macOS: test build only
         #endif
     }
 }
@@ -203,62 +203,5 @@ private struct TouchSurface: UIViewRepresentable {
     }
 
     func updateUIView(_ view: UIView, context: Context) { context.coordinator.parent = self }
-}
-#else
-
-/// The Mac: drag with the mouse to move, pinch and turn on the trackpad. A click that hardly moved is a tap.
-private struct MouseSurface: View {
-    var began: (TransformValue) -> Void
-    var changed: (TransformValue) -> Void
-    var ended: (TransformValue) -> Void
-    var tapped: (CGPoint) -> Void
-    @State private var value = TransformValue()
-    @State private var dragging = false
-    @State private var pinching = false
-    @State private var turning = false
-    @State private var live = false
-
-    private func update(_ change: (inout TransformValue) -> Void) {
-        change(&value)
-        if live { changed(value) } else { live = true; began(value) }
-    }
-
-    private func finishIfIdle() {
-        guard !dragging, !pinching, !turning else { return }
-        if live { ended(value) }
-        live = false
-        value = TransformValue()
-    }
-
-    var body: some View {
-        Color.clear
-            .contentShape(.rect)
-            .gesture(DragGesture(minimumDistance: 0)
-                .onChanged { drag in
-                    guard dragging || hypot(drag.translation.width, drag.translation.height) > 4 else { return }
-                    if !live { value.startLocation = drag.startLocation }
-                    dragging = true
-                    update { $0.translation = drag.translation; $0.location = drag.location }
-                }
-                .onEnded { drag in
-                    if !dragging, !live { tapped(drag.startLocation); return }
-                    dragging = false
-                    finishIfIdle()
-                })
-            .simultaneousGesture(MagnifyGesture()
-                .onChanged { pinch in
-                    if !live { value.startLocation = pinch.startLocation; value.location = pinch.startLocation; value.fingers = 2 }
-                    pinching = true
-                    update { $0.scale = pinch.magnification }
-                }
-                .onEnded { _ in pinching = false; finishIfIdle() })
-            .simultaneousGesture(RotateGesture()
-                .onChanged { turn in
-                    if !live { value.fingers = 2 }
-                    turning = true
-                    update { $0.rotation = turn.rotation.radians }
-                }
-                .onEnded { _ in turning = false; finishIfIdle() })
-    }
 }
 #endif

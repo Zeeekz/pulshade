@@ -6,7 +6,7 @@ import PulshadeShared
 import BackgroundTasks
 #endif
 
-/// Announcements while Pulshade is locked or closed: the Mac checks while locked, and on iPhone iOS wakes the app now
+/// Announcements while Pulshade is locked or closed: iOS wakes the app now
 /// and then (Background App Refresh). Announcements are public, so this needs no vault: it asks the relay on a lane of
 /// its own with no account attached, checks each one against the admin key, and raises a notification the way the
 /// last unlocked account's settings say. They reach the Announcements chat itself at the next unlock, as before.

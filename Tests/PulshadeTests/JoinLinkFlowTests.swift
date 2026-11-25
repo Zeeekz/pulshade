@@ -96,6 +96,96 @@ struct JoinLinkFlowTests {
         #expect(dana.conversation(group.id)?.messages.contains { $0.text == "welcome" } == true)
     }
 
+    @Test func aGroupsPublicNameOpensItsJoinScreen() async throws {
+        let (alice, bob, dana, group) = try await group()
+        defer { for m in [alice, bob, dana] { m.lock() } }
+        let name = "owls_" + String(UUID().uuidString.prefix(8)).lowercased()
+
+        await #expect(throws: AppModel.PublicNameError.self, "only the owner names a group") {
+            try await bob.setPublicName(name, for: group.id)
+        }
+        try await alice.setPublicName(name, for: group.id, approval: false)
+        let claimed = try #require(alice.publicName(group.id))
+        let linkID = try #require(claimed.link)
+        let link = try #require(alice.joinLinks(group.id)?.link(linkID))
+        #expect(!link.approval && link.label == "Public name")
+
+        // Looking the name up opens nothing by itself (a contact's handle is checked in the background too); Contacts
+        // and chat search then open the group's join screen.
+        await #expect(throws: AppModel.DirectoryError.publicName) { _ = try await dana.findProfile(name) }
+        #expect(dana.openedGroupLink == nil && dana.openedCode == nil)
+        #expect(dana.openFoundPublicName(name))
+        let opened = try #require(dana.openedGroupLink)
+        #expect(opened.code == code(alice, link, group))
+        let seen = try #require(await preview(dana, opened.code))
+        #expect(seen.title == "Night owls")
+        dana.askToJoin(seen, persona: nil)
+        await until([alice, bob, dana]) { dana.conversation(group.id)?.shared?.joining == false }
+        #expect(dana.conversation(group.id)?.title == "Night owls")
+
+        // Reset its link: the name follows the new code.
+        alice.resetJoinLink(link.id, in: group.id)
+        let fresh = try #require(alice.joinLinks(group.id)?.link(link.id))
+        for _ in 0..<40 {
+            dana.openedGroupLink = nil
+            _ = try? await dana.findProfile(name)
+            dana.openFoundPublicName(name)
+            if dana.openedGroupLink?.code == code(alice, fresh, group) { break }
+            try? await Task.sleep(for: .milliseconds(150))
+        }
+        #expect(dana.openedGroupLink?.code == code(alice, fresh, group))
+
+        // Let go of: nobody finds it, and its link is gone with it.
+        await alice.removePublicName(for: group.id)
+        #expect(alice.publicName(group.id) == nil && alice.joinLinks(group.id)?.link(link.id) == nil)
+        #expect(alice.data.namesToRelease.isEmpty, "the relay let go of it")
+        dana.openedGroupLink = nil
+        #expect(try await dana.findProfile(name) == nil && dana.openedGroupLink == nil)
+    }
+
+    @Test func deletingANamedGroupLetsItsNameGo() async throws {
+        let (alice, bob, dana, group) = try await group()
+        defer { for m in [alice, bob, dana] { m.lock() } }
+        let name = "gone_" + String(UUID().uuidString.prefix(8)).lowercased()
+        try await alice.setPublicName(name, for: group.id)
+        await #expect(throws: AppModel.DirectoryError.publicName) { _ = try await dana.findProfile(name) }
+        alice.delete(group.id)
+        for _ in 0..<40 where !alice.data.namesToRelease.isEmpty { try? await Task.sleep(for: .milliseconds(150)) }
+        #expect(alice.data.namesToRelease.isEmpty && alice.data.publicNames.isEmpty)
+        #expect(try await dana.findProfile(name) == nil)
+    }
+
+    @Test func aShortLinkOpensTheGroupLinkAndOnlyItsMakerCanChangeIt() async throws {
+        let (alice, bob, dana, group) = try await group()
+        defer { for m in [alice, bob, dana] { m.lock() } }
+        WebLinks.domainOverride = "pul.sh"
+        defer { WebLinks.domainOverride = nil }
+        let link = try #require(alice.makeJoinLink(in: group.id, label: "Short", approval: false))
+        let target = code(alice, link, group).text
+        #expect(alice.sharedLink(target) == nil, "nothing to share until it's on the relay")
+        await alice.prepareShortLink(target)
+        let shared = try #require(alice.sharedLink(target))
+        #expect(shared.count < 45)
+        guard case let .short(short) = try #require(WebLinks.parse(URL(string: shared)!)) else { Issue.record("not short"); return }
+
+        // Dana opens it: it stands for the group's link.
+        #expect(try await dana.resolveShortLink(short) == .group(code(alice, link, group)))
+
+        // Dana, who has the letters, can't point it somewhere else.
+        let danas = Curve25519.Signing.PrivateKey()
+        let invite = dana.makeInviteCode()
+        let hijack = try #require(short.entry(.init(target: invite), key: danas, updated: alice.directoryStamp(short.listing) + 600_000))
+        let client = try #require(dana.client(nil, lane: "test-hijack"))
+        await #expect(throws: RelayClient.DirectoryError.self) { try await client.claim(short.listing, hijack) }
+        #expect(try await dana.resolveShortLink(short) == .group(code(alice, link, group)))
+
+        // The link reset: the short link says it no longer works.
+        alice.resetJoinLink(link.id, in: group.id)
+        await alice.tendShortLinks()
+        await #expect(throws: AppModel.ShortLinkError.gone) { _ = try await dana.resolveShortLink(short) }
+        #expect(alice.data.shortLinks.allSatisfy { $0.target != target }, "done with once the relay has the note")
+    }
+
     @Test func aLinkThatNeedsApprovalWaitsForAnAdmin() async throws {
         let (alice, bob, dana, group) = try await group()
         let erin = try await makeUser("Erin")
@@ -313,11 +403,21 @@ struct JoinLinkTests {
         let group = UUID()
         let owner = GroupMemberKeys(seed: .random(32), group: group)
         let admin = GroupMemberKeys(seed: .random(32), group: group)
+        let second = GroupMemberKeys(seed: .random(32), group: group)
+        let settings = GroupSettings(group: group, kind: .group, version: 1, epoch: 1, title: "Crew", owner: owner.publicKey,
+                                     admins: [admin.publicKey, second.publicKey],
+                                     members: [owner, admin, second].map { MemberCard.make($0, group: group, name: "m", avatar: nil, color: nil) })
         var mine = GroupLinks(group: group, version: 4)
         mine.sign(with: owner)
         var theirs = GroupLinks(group: group, version: 4, bans: [Data.random(32)])
         theirs.sign(with: admin)
-        #expect(mine.winsOver(theirs, owner: owner.publicKey) && !theirs.winsOver(mine, owner: owner.publicKey))
+        #expect(mine.winsOver(theirs, settings: settings) && !theirs.winsOver(mine, settings: settings))
+        // Between two admins, the one the owner listed first, however often the other signs again.
+        for n in 0..<20 {
+            var retry = GroupLinks(group: group, version: 4, bans: [Data(repeating: UInt8(n), count: 32)])
+            retry.sign(with: second)
+            #expect(theirs.winsOver(retry, settings: settings) && !retry.winsOver(theirs, settings: settings))
+        }
         var tooFar = GroupLinks(group: group, version: GroupLinks.maxVersion + 1)
         tooFar.sign(with: admin)
         #expect(!tooFar.wellFormed, "no jumping to the end of the range")

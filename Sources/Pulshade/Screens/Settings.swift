@@ -5,7 +5,7 @@ import PulshadeShared
 
 /// The pages Settings opens, each from a row on the main list.
 enum SettingsPage: String, Hashable {
-    case profile, invite, handles, pinned, privacy, privacyLock, privacyMessages, privacyPasscodes, privacyBackup, blocked, notifications, appearance, devices, storage, network, networkWaiting, anonymity, account, updates
+    case profile, invite, handles, pinned, privacy, privacyLock, privacyMessages, privacyPasscodes, privacyBackup, blocked, notifications, appearance, storage, network, networkWaiting, anonymity, account
 }
 
 /// Settings, laid out like a phone's own: your profile on top, then a short list of rows,
@@ -29,11 +29,9 @@ struct SettingsView: View {
                     SettingsGroup {
                         MenuRow(page: .profile, symbol: "person.crop.circle.fill", color: .hex(0x3D8BFF), title: "Profile",
                                 value: model.activeProfile.handle.map { "@\($0)" } ?? "No username")
-                        if Platform.isPhone {
-                            RowDivider(inset: 54)
-                            MenuRow(page: .invite, symbol: "person.badge.plus", color: .hex(0x30D158), title: "Add a friend",
-                                    value: "Code, link or @username")
-                        }
+                        RowDivider(inset: 54)
+                        MenuRow(page: .invite, symbol: "person.badge.plus", color: .hex(0x30D158), title: "Add a friend",
+                                value: "Code, link or @username")
                     }
                     SettingsGroup {
                         MenuRow(page: .privacy, symbol: "lock.fill", color: .hex(0x8E8E93), title: "Privacy & Security")
@@ -44,9 +42,6 @@ struct SettingsView: View {
                         MenuRow(page: .appearance, symbol: "paintpalette.fill", color: .hex(0x30B0FF), title: "Appearance",
                                 value: model.theme.name)
                         RowDivider(inset: 54)
-                        MenuRow(page: .devices, symbol: "laptopcomputer.and.iphone", color: .hex(0xFF9F0A), title: "Devices",
-                                value: "\(model.linkedDevices.count + 1)")
-                        RowDivider(inset: 54)
                         MenuRow(page: .storage, symbol: "internaldrive.fill", color: .hex(0x8E8E93), title: "Storage",
                                 value: ByteCountFormatter.string(fromByteCount: Int64(model.receivedMediaBytes), countStyle: .file))
                     }
@@ -56,14 +51,6 @@ struct SettingsView: View {
                         RowDivider(inset: 54)
                         MenuRow(page: .account, symbol: "key.fill", color: .hex(0xBF5AF2), title: "Account & Recovery")
                     }
-                    #if os(macOS)
-                    if Updater.enabled {
-                        SettingsGroup {
-                            MenuRow(page: .updates, symbol: "arrow.down.circle.fill", color: .hex(0x2EC4A0), title: "Updates",
-                                    value: Updater.shared.ready ? "Update ready" : "Version \(Updater.version)")
-                        }
-                    }
-                    #endif
                     HStack(spacing: 8) {
                         PulseMark(size: 18)
                         Wordmark(size: 9, color: Ink.faint)
@@ -71,7 +58,7 @@ struct SettingsView: View {
                     .padding(.vertical, 6)
                 }
                 .padding(.horizontal, 16)
-                .padding(.top, Platform.isPhone ? 12 : 40)
+                .padding(.top, 12)
                 .padding(.bottom, 24)
                 .frame(maxWidth: 560)
                 .frame(maxWidth: .infinity)
@@ -96,18 +83,11 @@ struct SettingsView: View {
                     case .blocked: BlockedSettings()
                     case .notifications: NotificationSettings()
                     case .appearance: AppearanceSettings()
-                    case .devices: DevicesSettings()
                     case .storage: StorageSettings()
                     case .network: NetworkSettings()
                     case .networkWaiting: WaitingToSendView()
                     case .anonymity: AnonymityReport()
                     case .account: AccountSettings()
-                    case .updates:
-                        #if os(macOS)
-                        UpdateSettings()
-                        #else
-                        EmptyView()
-                        #endif
                     }
                 }
                 #if os(iOS)
@@ -453,7 +433,7 @@ struct SettingsScreen<Content: View>: View {
             }
             .padding(.horizontal, 16)
             .frame(height: 44)
-            .padding(.top, Platform.isPhone ? 0 : 30)
+            .padding(.top, 0)
             ScrollView {
                 VStack(spacing: 20) { content }
                     .padding(.horizontal, 16)
@@ -465,9 +445,6 @@ struct SettingsScreen<Content: View>: View {
             .scrollIndicators(.never)
         }
         .background(Ink.base)
-        #if os(macOS)
-        .navigationBarBackButtonHidden()
-        #endif
     }
 }
 
@@ -773,7 +750,7 @@ struct HandlesEditor: View {
             if let me = model.me(model.activePersona) {
                 // Carries a check of your key, so it can never open someone else's profile.
                 Button {
-                    copyToClipboard(DirectoryProfile.link(handle, key: me.card.signing))
+                    copyToClipboard(WebLinks.profile(handle, key: me.card.signing))
                     withAnimation(.snappy) { copied = handle }
                 } label: { Image(systemName: copied == handle ? "checkmark" : "link") }
                     .buttonStyle(IconButtonStyle(size: 28))
@@ -885,6 +862,7 @@ private struct PrivacySettings: View {
             SettingsGroup {
                 MenuRow(page: .privacyLock, symbol: "lock.fill", color: .hex(0x8E8E93), title: "Lock & screen",
                         value: model.hasShortPIN ? "Change your 4-digit PIN"
+                            : model.data.security.lockImmediately ? "Immediately"
                             : model.data.security.autoLockMinutes == 0 ? "No auto-lock" : "\(model.data.security.autoLockMinutes) min")
                 RowDivider(inset: 54)
                 MenuRow(page: .privacyMessages, symbol: "bubble.left.and.bubble.right.fill", color: .hex(0x3D8BFF), title: "What others see")
@@ -913,7 +891,17 @@ private struct LockSettings: View {
         let backup = model.data.security.keepBackup
             ? "Your recovery code brings back your profile, contacts and groups from the sealed backup, but never your chats."
             : "Sealed backup is off, so nothing at all can be brought back, not even with your recovery code."
-        return "Off by default. After this many wrong guesses in a row, this device is wiped at once, the same as Detach, and the count survives closing the app. \(backup) A child or a friend fiddling with your phone can set it off."
+        return "After this many wrong guesses in a row, this device is wiped at once, the same as Detach, and the count survives closing the app. New accounts start at 10. \(backup) A child or a friend fiddling with your phone can set it off."
+    }
+
+    private var lockFooter: String {
+        let device = "your iPhone"
+        let when = model.data.security.autoLockMinutes == 0 && !model.data.security.lockImmediately
+            ? "Never auto-locks, not even when \(device) locks."
+            : "Also locks when \(device) locks."
+        return model.data.security.fullLock
+            ? "\(when) An automatic lock closes everything, like Lock: your keys leave memory, and nothing comes in and no delivery ticks go out until you unlock."
+            : "\(when) An automatic lock hides everything but keeps receiving, so friends still get their delivery ticks; your keys stay in memory until you press Lock or turn on Close everything."
     }
 
     var body: some View {
@@ -947,24 +935,33 @@ private struct LockSettings: View {
                     }
                     RowDivider()
                 }
-                MenuChoiceRow(title: "Auto-lock", values: [1, 5, 15, 0], selected: model.data.security.autoLockMinutes,
-                              label: { $0 == 0 ? "Never" : $0 == 1 ? "1 minute" : "\($0) minutes" }) { m in
-                    model.updateSecurity { $0.autoLockMinutes = m }
+                // -1 is "Immediately": saved as a minute of idling plus locking the moment you leave.
+                MenuChoiceRow(title: "Auto-lock", values: [-1, 1, 5, 15, 0],
+                              selected: model.data.security.lockImmediately ? -1 : model.data.security.autoLockMinutes,
+                              label: { $0 < 0 ? "Immediately" : $0 == 0 ? "Never" : $0 == 1 ? "1 minute" : "\($0) minutes" }) { m in
+                    model.updateSecurity {
+                        $0.lockImmediately = m < 0
+                        $0.autoLockMinutes = max(m, m < 0 ? 1 : 0)
+                    }
                 }
+                RowDivider()
+                SecurityToggle(title: "Close everything when it locks", key: \.fullLock)
+                Text(lockFooter)
+                    .font(.system(size: 12)).foregroundStyle(Ink.faint)
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             SettingsGroup("Screen", footer: "Keeps chats out of screenshots, screen recordings and the app switcher.") {
-                SecurityToggle(title: Platform.isPhone ? "Hide in app switcher" : "Blur when in background", key: \.blurWhenInactive)
+                SecurityToggle(title: "Hide in app switcher", key: \.blurWhenInactive)
                 RowDivider()
                 SecurityToggle(title: "Block screenshots & recording", key: \.blockCapture)
             }
-            SettingsGroup("Saving", footer: Platform.isPhone
-                          ? "Photos and videos you save go to your Photos library, outside Pulshade's encryption, and Burn can't erase them. On, Pulshade says so each time before saving."
-                          : "Photos and videos you save become ordinary files, outside Pulshade's encryption, and Burn can't erase them. On, Pulshade says so each time before saving.") {
+            SettingsGroup("Saving", footer: "Photos and videos you save go to your Photos library, outside Pulshade's encryption, and Burn can't erase them. On, Pulshade says so each time before saving.") {
                 SecurityToggle(title: "Warn before saving photos and videos", key: \.warnBeforeSaving)
             }
         }
         .onAppear { biometrics = model.biometricsOn }
-        .sheet(isPresented: $changing) { ChangePasscodeSheet() }
+        .sheet(isPresented: $changing) { ChangePasscodeSheet(style: model.lockStyle.forChoosing) }
         .alert("Wipe after \(confirmWipe ?? 0) wrong guesses?", isPresented: Binding(get: { confirmWipe != nil }, set: { if !$0 { confirmWipe = nil } })) {
             Button("Turn on", role: .destructive) { if let n = confirmWipe { model.setWipeAfterAttempts(n) }; confirmWipe = nil }
             Button("Cancel", role: .cancel) { confirmWipe = nil }
@@ -974,27 +971,49 @@ private struct LockSettings: View {
     }
 }
 
-/// Changes the passcode of the real account. Asks for the current one first.
-private struct ChangePasscodeSheet: View {
+/// Changes the passcode of the account that's open (a decoy's changes its own). Asks for the current one first.
+/// `required`: shown at unlock while the lock screen still takes a 4-digit PIN (`AppModel.hasShortPIN`); it can't be
+/// put off, and goes away by itself once the PIN is longer. Then a decoy or panic passcode, if there is one, is chosen
+/// again in the same go (`AppModel.renewDisguises`), so it isn't left on the old keypad; a decoy asks the same for the
+/// ones it pretends to have.
+struct ChangePasscodeSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @State private var current = ""
-    @State private var style = LockStyle.remembered.forChoosing
+    @State private var style: LockStyle
+    var required = false
     @State private var passcode = ""
     @State private var confirm = ""
     @State private var working = false
     @State private var problem: String?
     @State private var shake = 0
+    @State private var decoy = ""
+    @State private var decoyAgain = ""
+    @State private var panic = ""
+    @State private var panicAgain = ""
+    /// The account's own passcode was changed already in this sheet (what's left failed): not changed again.
+    @State private var changed = false
+
+    init(style: LockStyle, required: Bool = false) {
+        _style = State(initialValue: style)
+        self.required = required
+    }
 
     var body: some View {
         SheetBody(width: 420) {
             VStack(spacing: 18) {
-                SheetHeader(symbol: "lock.rotation", title: "Change passcode")
+                SheetHeader(symbol: "lock.rotation", title: required ? "Choose a longer PIN" : "Change passcode")
+                if required {
+                    Text("A 4-digit PIN can be guessed. Choose one of at least 6 digits, or a passcode, to carry on.")
+                        .font(.system(size: 13)).foregroundStyle(Ink.dim).multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 PasscodeField(placeholder: "Current passcode or PIN", text: $current, onSubmit: save)
                 LockStylePicker(style: $style, options: LockStyle.forNewSecret)
-                    .onChange(of: style) { _, _ in passcode = ""; confirm = "" }
+                    .onChange(of: style) { _, _ in passcode = ""; confirm = ""; decoy = ""; decoyAgain = ""; panic = ""; panicAgain = "" }
                 if let length = style.length {
-                    PinSetup(length: length, passcode: $passcode, confirm: $confirm, onDone: save)
+                    // With a decoy or panic passcode still to choose, the button below saves.
+                    PinSetup(length: length, passcode: $passcode, confirm: $confirm, onDone: { if !renewsDecoy && !renewsPanic { save() } })
                 } else {
                     PasscodeField(placeholder: "New passcode", text: $passcode, onSubmit: save)
                     PasscodeField(placeholder: "Again", text: $confirm, onSubmit: save)
@@ -1003,6 +1022,19 @@ private struct ChangePasscodeSheet: View {
                 if let advice = LockStyle.guidance(for: passcode, style: style) {
                     Text(advice).font(.system(size: 12)).foregroundStyle(Ink.faint).multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
+                }
+                if renewsDecoy || renewsPanic {
+                    Text("Choose new \(renewsDecoy && renewsPanic ? "decoy and panic passcodes" : renewsDecoy ? "decoy passcode" : "panic passcode") too, so \(renewsDecoy && renewsPanic ? "they" : "it") can be typed on the new keypad.")
+                        .font(.system(size: 13)).foregroundStyle(Ink.dim).multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if renewsDecoy {
+                    PasscodeField(placeholder: "New decoy \(style.noun)", text: $decoy, style: style, onSubmit: save)
+                    PasscodeField(placeholder: "Decoy \(style.noun) again", text: $decoyAgain, style: style, onSubmit: save)
+                }
+                if renewsPanic {
+                    PasscodeField(placeholder: "New panic \(style.noun)", text: $panic, style: style, onSubmit: save)
+                    PasscodeField(placeholder: "Panic \(style.noun) again", text: $panicAgain, style: style, onSubmit: save)
                 }
                 if let problem { ProblemText(problem) }
                 Button(action: save) {
@@ -1014,17 +1046,34 @@ private struct ChangePasscodeSheet: View {
         }
     }
 
+    private var renewsDecoy: Bool { required && model.hasDecoy }
+    private var renewsPanic: Bool { required && model.hasPanic }
+
     private func save() {
-        guard !current.isEmpty, style.accepts(passcode), passcode == confirm else {
-            problem = style.accepts(passcode) ? "Entries don't match" : style.problem(for: passcode)
+        func refuse(_ text: String) {
+            problem = text
             withAnimation(.default) { shake += 1 }
-            return
         }
+        guard !current.isEmpty, style.accepts(passcode), passcode == confirm else {
+            return refuse(style.accepts(passcode) ? "Entries don't match" : style.problem(for: passcode))
+        }
+        let others = [(renewsDecoy, decoy, decoyAgain, "decoy"), (renewsPanic, panic, panicAgain, "panic")].filter(\.0)
+        for (_, new, again, name) in others {
+            guard style.accepts(new) else { return refuse("The \(name) \(style.noun): " + style.problem(for: new).lowercased()) }
+            guard new == again else { return refuse("The \(name) entries don't match") }
+        }
+        let all = [passcode] + others.map(\.1)
+        guard Set(all).count == all.count else { return refuse("Each passcode must be different") }
         working = true
         Task {
             do {
-                try await model.changePasscode(current: current, to: passcode)
-                LockStyle.remembered = style
+                if !changed {
+                    try await model.changePasscode(current: current, to: passcode)
+                    changed = true
+                }
+                try await model.renewDisguises(decoy: renewsDecoy ? decoy : nil, panic: renewsPanic ? panic : nil)
+                model.lockStyle = style
+                model.openedWithShortSecret = false
                 dismiss()
             } catch AppModel.PasscodeSetupError.wrongCurrent {
                 problem = "The current passcode isn't right"
@@ -1054,7 +1103,7 @@ private struct MessagePrivacySettings: View {
             SettingsGroup("Forwarding", footer: "Off, people can't forward or copy what you send from now on. Forwarded messages never say who wrote them. Nothing can stop a screenshot.") {
                 SecurityToggle(title: "Let people forward my messages", key: \.allowForwarding)
             }
-            SettingsGroup("New devices", footer: "On, when a friend's account adds a phone or computer, nothing goes to it and none of its messages are shown until you allow it in your chat with them. Turn it on on each of your devices. Off, new devices get your messages at once and the chat says so; ones already waiting still need allowing.") {
+            SettingsGroup("New devices", footer: "On, when a friend's account shows up on a new phone, nothing goes to it and none of its messages are shown until you allow it in your chat with them. Off, new devices get your messages at once and the chat says so; ones already waiting still need allowing.") {
                 SecurityToggle(title: "Ask before a friend's new device gets my messages", key: \.holdNewDevices)
             }
             LearnMore(title: "Link previews",
@@ -1151,7 +1200,6 @@ private struct BlockedSettings: View {
 
 private struct NotificationSettings: View {
     @Environment(AppModel.self) private var model
-    @State private var loginItem = false
 
     var body: some View {
         let on = model.data.security.notifications
@@ -1206,23 +1254,7 @@ private struct NotificationSettings: View {
                               + (AppModel.lockedDeliveryAvailable ? " Collect messages when locked lets a small helper take short messages off the server into a sealed inbox on this iPhone, without opening them, so they don't wait on the server until you open PULSHADE. Photos and videos still wait there, and friends also get their second tick. It uses keys kept on this iPhone after you first unlock it." : ""))
             }
             #endif
-            #if os(macOS)
-            SettingsGroup("Mac") {
-                SecurityToggle(title: "Menu bar icon", key: \.menuBarIcon)
-                RowDivider()
-                SettingRow("Open at login") {
-                    Toggle("Open at login", isOn: Binding(get: { loginItem }, set: { on in
-                        LoginItem.set(on)
-                        loginItem = LoginItem.enabled
-                    }))
-                    .toggleStyle(GlowToggleStyle())
-                }
-            }
-            #endif
         }
-        #if os(macOS)
-        .onAppear { loginItem = LoginItem.enabled }
-        #endif
     }
 }
 
@@ -1380,7 +1412,7 @@ private struct StorageSettings: View {
 
     var body: some View {
         SettingsScreen(title: "Storage") {
-            SettingsGroup(footer: "Only received photos, videos, voice notes and story media are counted. Your own messages, text and media from your other devices are never removed.") {
+            SettingsGroup(footer: "Only received photos, videos, voice notes and story media are counted. Your own messages and text are never removed.") {
                 SettingRow("Received media") {
                     Text(size(model.receivedMediaBytes)).font(.system(size: 14)).foregroundStyle(Ink.faint)
                 }
@@ -1416,14 +1448,6 @@ private struct StorageSettings: View {
                     }
                 }
             }
-        }
-    }
-}
-
-private struct DevicesSettings: View {
-    var body: some View {
-        SettingsScreen(title: "Devices") {
-            LinkedDevicesCard()
         }
     }
 }
@@ -1748,80 +1772,6 @@ private struct AccountSettings: View {
         }
     }
 }
-
-#if os(macOS)
-/// The Mac app's version, and its updates from the relay.
-private struct UpdateSettings: View {
-    @Environment(AppModel.self) private var model
-    @Environment(\.theme) private var theme
-    private var updater: Updater { Updater.shared }
-
-    var body: some View {
-        SettingsScreen(title: "Updates") {
-            SettingsGroup(footer: footer) {
-                SettingRow("Version") {
-                    Text("\(Updater.version) (\(String(Updater.build)))").font(.system(size: 14)).foregroundStyle(Ink.faint)
-                }
-                RowDivider()
-                SettingRow("Status") {
-                    Text(status).font(.system(size: 14)).foregroundStyle(updater.ready ? theme.accent : Ink.faint)
-                }
-                if case .downloading = updater.phase {
-                    RowDivider()
-                    ProgressView().progressViewStyle(.linear).tint(theme.accent).padding(16)
-                }
-            }
-            if case .available(let release) = updater.phase {
-                SettingsGroup("What's new in \(release.version)") {
-                    Text(release.notes.isEmpty ? "Fixes and improvements." : release.notes)
-                        .font(.system(size: 14))
-                        .foregroundStyle(Ink.dim)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(16)
-                    RowDivider()
-                    ActionRow(title: "Install and restart") {
-                        guard let client = model.client(nil, lane: "update") else { return }
-                        Task { await updater.install(client) }
-                    }
-                }
-            }
-            SettingsGroup {
-                ActionRow(title: "Check for updates") {
-                    guard let client = model.client(nil, lane: "update") else { return }
-                    Task { await updater.check(client) }
-                }
-                .disabled(busy)
-            }
-        }
-    }
-
-    private var busy: Bool {
-        switch updater.phase {
-        case .checking, .downloading, .installing: true
-        default: false
-        }
-    }
-
-    private var status: String {
-        switch updater.phase {
-        case .idle: "Not checked yet"
-        case .checking: "Checking…"
-        case .upToDate: "Up to date"
-        case .available(let r): "Version \(r.version) is ready"
-        case .downloading: "Downloading…"
-        case .installing: "Installing…"
-        case .failed: "Couldn't update"
-        }
-    }
-
-    private var footer: String {
-        if case .failed(let why) = updater.phase { return why }
-        let checked = updater.lastChecked.map { "Last checked \($0.formatted(date: .omitted, time: .shortened)). " } ?? ""
-        return checked + "Updates come from your relay over the same private connection as your messages, "
-            + "and are only installed if they're signed by PULSHADE."
-    }
-}
-#endif
 
 /// A small picture of a theme: its background, a message each way and its accent, drawn in its own colours.
 private struct ThemeCard: View {

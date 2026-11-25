@@ -90,7 +90,7 @@ Decisions inside it:
    passcode is known, a copy of the index from flash is useless once Kk is replaced. Without the second wrap the shelf
    would be weaker than the vault. Reuse `FileKeys`, whose two-key window already makes rotation crash-safe.
 4. **Index per identity**, so the decoy and panic identities each have their own, as with the vault.
-5. **Files are one per item with random names**, excluded from backups, `0o600`, in a folder `0o700`. On iPhone use
+5. **Files are one per item with random names**, excluded from backups, `0o600`, in a folder `0o700`. Use
    `completeFileProtectionUnlessOpen` so a download can start while locked. This is a second layer, not the protection.
 
 ### 3.3 Delete, and the replaced Keychain key
@@ -148,13 +148,12 @@ iPhone (to measure, not measured). Fine for deletes, not for every save.
 
 ### 3.6 What it does and does not promise
 
-Works on iPhone and Mac the same way, because the protection is the key, not the file system:
+The protection is the key, not the file system:
 
-| | iPhone | Mac |
-| --- | --- | --- |
-| Why deleting works | The item key and the old index wrapper are destroyed. A stray copy of the file or the old index in flash is ciphertext whose key is gone. Needs the new key to be really gone from the Keychain. | Same. FileVault encrypts the volume but is not what we rely on. |
-| What can still leak | Old Keychain database rows left in flash (protected by Apple's class keys, so recovery would still need the device and the passcode). Wear levelling keeps stale ciphertext. | APFS is copy-on-write, so overwrite-in-place does not overwrite. Local snapshots (Time Machine) may hold older copies of our files and of the Keychain. The double wrap exists mainly for this: an old index plus an old Keychain also needs the passcode. |
-| To check before shipping | That `FileKeys` items are in the data-protection keychain on the Mac (`kSecUseDataProtectionKeychain`); I found no use of it in `Sources`. That `isExcludedFromBackup` keeps the folder out of Time Machine snapshots. | |
+- **Why deleting works.** The item key and the old index wrapper are destroyed. A stray copy of the file or the old
+  index in flash is ciphertext whose key is gone. Needs the new key to be really gone from the Keychain.
+- **What can still leak.** Old Keychain database rows left in flash (protected by Apple's class keys, so recovery would
+  still need the device and the passcode). Wear levelling keeps stale ciphertext.
 
 **It does not guarantee:** deletion from flash (the drive decides when blocks are erased; only the key makes it
 unreadable); copies on other people's phones; screenshots and screen recordings (screen protection is a best effort);
@@ -320,7 +319,7 @@ fix these first.
 | **Seized phone, unlocked once since boot** | The Keychain items can be read by someone with the right tools. | The shelf and vault need the identity key (passcode) as well as the Keychain key, because of the double wrap | The vault today does not have that second wrap for its rotation, only the identity key. Section 3.3 adds the Keychain wrapper. |
 | **Coerced passcode** | Everything. | Decoy and panic passcodes | Shelf size gives away a lot (question A). |
 | **Forensic recovery from flash** | Stale ciphertext of deleted files, old index copies, possibly old Keychain rows. | Item keys destroyed; Keychain wrapper replaced after each delete | Needs the passcode plus an old Keychain row plus the old index. Not zero, and not provable. |
-| **Seized or hostile relay host, disk only** | Sealed journal, sealed segments, sealed blobs. Nothing opens: the storage key is not on the disk. | Storage key in a RAM-only folder and on the operator's Mac | Like any disk copy, it shows sizes and times of mail. |
+| **Seized or hostile relay host, disk only** | Sealed journal, sealed segments, sealed blobs. Nothing opens: the storage key is not on the disk. A key that once was (a new server's, until it is moved into memory) is replaced with the relay's re-key command, which seals every file again with a new one; segments and blobs from before that keep their own keys until they expire. | Storage key in a RAM-only folder and on the operator's Mac, in a locked page in the relay; the relay won't run with swap on a disk | Like any disk copy, it shows sizes and times of mail. |
 | **Hostile host, RAM snapshot or live access** | The storage key and all mail in RAM, still end-to-end sealed. They can read metadata: which mailbox, when, how big, and, in Fast mode, IP addresses. | End-to-end encryption; Tor hides addresses | Cannot be fully fixed on a rented server. Say so; the privacy page already does. A host could also copy the sealed group mail for later (a reason not to keep it longer than a week). |
 | **Hostile group member** | Everything they were sent while a member; keys they hold; can post junk; can keep a copy forever. | Removal makes a new epoch they never get; sender chains; signed settings | Cannot be un-sent; a screenshot cannot be stopped; a member who was removed keeps what they had. Hostile admins can disrupt (already in the design). |
 | **Another person's phone** | Everything you sent them. | Nothing technical | Disappearing messages are a request, not a force. |
@@ -363,7 +362,7 @@ and relay-side parts of stages 1 to 5, which are untouched. Not done on purpose:
 "Independent" means someone who did not write it. An in-house security pass is a good first filter but is not that.
 The ratchet and handshake are not yet audited either (`how-it-works.md`, "Known limits"); the shelf's maths is simple
 (standard sealing, standard key derivation) and its risk is in the delete and crash order, so a short, targeted review is
-enough, but it should include running the forensic test on a real iPhone and a real Mac, not only the simulator.
+enough, but it should include running the forensic test on a real iPhone, not only the simulator.
 
 ## 8. What I recommend (the short version)
 
@@ -389,11 +388,9 @@ is folded into the stages in section 7.
 | 6 | Medium | Admin-chosen group life is not enforced by the relay. | Treat it as advisory (section 4). |
 | 7 | Medium | A 2 MiB per-mailbox cap would make video story pieces undeliverable. | Cap at 8 MiB or more (section 5.2). |
 | 8 | Medium | Eviction as an attack: deposits are anonymous and `make_room` evicts the oldest big mail relay-wide, so junk spread over many mailboxes through fresh Tor circuits can push out real mail. Not confirmed how fast; treat as possible. | Add to the threat table. Mitigation: a per-caller-class share of the budget. A bigger cap only slows it. |
-| 9 | Low | On the Mac, `FileKeys` uses the file-based login keychain (no `kSecUseDataProtectionKeychain`). Row deletion there is not secure and snapshots may hold old rows. | Make this a blocker for stage 1. State plainly that the Mac guarantee is weaker than the iPhone one. |
 
 **Threat table gaps** (to add to section 6): crafted media from a malicious contact or member (parser attack surface, disk
-fill); another process running as the same Mac user; plain bytes in memory and in swap (the shelf's read cache; Mac swap
-is protected only by FileVault); Spotlight and QuickLook thumbnails and app-switcher snapshots; file sizes and
+fill); plain bytes in memory and in swap (the shelf's read cache); Spotlight and QuickLook thumbnails and app-switcher snapshots; file sizes and
 modification times on disk; linking of resumed `Range` fetches of one blob id across launches (Fast mode shows the IP
 address); someone deleting or rolling back the index, which loses data. Also: the row "needs the passcode plus an old
 Keychain row plus the old index" is overstated, since anyone with the passcode and the device can already open the
@@ -418,7 +415,7 @@ memory). A code comment in the relay says deposits are refused (507) at the cap,
   1 GiB at 2 GB, with no margin for Tor and the OS), add the counters, and upgrade when the measured peak says so. The 4 GB advice in section 5.3
   is for hundreds or thousands of active users.
 - **E. Library video limit:** the code says 1.5 GB (mapped), not 250 MB (section 1).
-- **F. Moving to a new phone:** accepted. A new phone starts without old media unless linked from a working old one.
+- **F. Moving to a new phone:** accepted. A new phone starts without old media: recovery brings back no chats.
 - **G. Review:** an in-house security check, done (section 8b), and an independent review of
   stages 1 and 2 before they ship, arranged by Zeekz.
 
@@ -436,7 +433,6 @@ memory). A code comment in the relay says deposits are refused (507) at the cap,
 - Burn, Detach and a panic unlock remove the whole pool after its keys are gone. The panic landing account starts empty.
   A panic unlock moves the pool aside under a random name and overwrites it in the background, so the panic passcode
   doesn't open slower than the real one; one left part-way is finished the next time the pool is used.
-- A newly linked device gets the bytes inside the sealed history, never file references.
 - **What still shows:** the pool's file count and total size give a rough idea of how much media one account on the
   device keeps. An empty decoy beside a large pool can't explain it. The inode change time can't be set by an app, so it
   shows when the pool last changed: after every write, every file's is moved to that moment, so it doesn't say which file
@@ -449,10 +445,7 @@ memory). A code comment in the relay says deposits are refused (507) at the cap,
   retried by the next save). An old copy of the data file in free space or a snapshot, still holding a deleted item's
   key, then opens with nothing, passcode included. Filler data files have Keychain keys too, refreshed with them by the
   main account, so the Keychain's item count doesn't say how many accounts are real. A file from before opens once with
-  the storage key alone, only while no Keychain key was ever made for it, and is wrapped by its next save. On the Mac the
-  keys go in the data protection Keychain (this device only) when the build may use it, else the login Keychain, whose
-  deleted rows may survive in snapshots: the Mac's guarantee is weaker than the iPhone's. A build that can't use the data
-  protection Keychain still finds a key the other kind of build left there, and the other way round. Only the key that
+  the storage key alone, only while no Keychain key was ever made for it, and is wrapped by its next save. Only the key that
   opens the file now is kept beside the new one during a save (at most two more if the file can't be read to tell, as on
   a locked iPhone), so the list never collects keys that open old copies. When a device moves from a build without these
   keys, the main account gives every data file its key in one pass (`wrapDataFilesTogether`); filler items are made anew

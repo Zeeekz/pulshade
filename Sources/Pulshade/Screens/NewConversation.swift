@@ -227,7 +227,7 @@ private struct ChatLinkForm: View {
     var body: some View {
         VStack(spacing: 18) {
             if let link {
-                QRCode(text: link.link, size: 170)
+                QRCode(text: WebLinks.chat(link), size: 170)
                     .transition(.scale.combined(with: .opacity))
                 VStack(spacing: 4) {
                     if let code {
@@ -253,15 +253,11 @@ private struct ChatLinkForm: View {
                 Text("Works once. The chat is deleted for both of you \(link.endsAt.formatted(.relative(presentation: .named))).")
                     .font(.system(size: 12)).foregroundStyle(Ink.dim).multilineTextAlignment(.center)
                 HStack(spacing: 10) {
-                    Button {
-                        copyToClipboard(link.link)
-                        withAnimation(.snappy) { copied = true }
-                    } label: {
+                    SharedLinkButtons(target: link.text, onCopied: { withAnimation(.snappy) { copied = true } }, copyLabel: {
                         Label(copied ? "Copied" : "Copy link", systemImage: copied ? "checkmark" : "doc.on.doc")
-                    }
-                    .buttonStyle(SecondaryButtonStyle())
-                    ShareLink(item: link.link) { Label("Share", systemImage: "square.and.arrow.up") }
-                        .buttonStyle(PrimaryButtonStyle())
+                    }, shareLabel: {
+                        Label("Share", systemImage: "square.and.arrow.up")
+                    }, copyStyle: AnyButtonStyle(SecondaryButtonStyle()), shareStyle: AnyButtonStyle(PrimaryButtonStyle()))
                 }
             } else {
                 Text("Anyone with the link can chat with you until it runs out. The chat is deleted for both of you at the end.")

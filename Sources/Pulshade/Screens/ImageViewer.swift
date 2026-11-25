@@ -15,7 +15,7 @@ struct PhotoFile: Transferable {
 /// How big a photo or video sits in a chat bubble: as wide as a bubble gets, as tall as its own shape asks, within
 /// limits. A very tall or very wide one is cropped to fit rather than shrunk to a sliver.
 enum MediaFrame {
-    static var maxWidth: CGFloat { Platform.isPhone ? 264 : 320 }
+    static var maxWidth: CGFloat { 264 }
     static let minWidth: CGFloat = 150
     static let maxHeight: CGFloat = 360
     static let minHeight: CGFloat = 120
@@ -255,7 +255,7 @@ struct ImageViewer: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { withAnimation(.easeOut) { notice = nil } }
     }
 
-    /// Photos on iPhone (only ever added to, never read), a file of your choosing on the Mac.
+    /// Saves to Photos (only ever added to, never read).
     private func save() {
         guard let photo = cleaned else { say("Couldn't read the picture", "exclamationmark.triangle"); return }
         #if os(iOS)
@@ -275,11 +275,7 @@ struct ImageViewer: View {
             }
         }
         #else
-        let panel = NSSavePanel()
-        panel.allowedContentTypes = [.jpeg]
-        panel.nameFieldStringValue = "Photo.jpg"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do { try photo.write(to: url, options: .atomic); say("Saved", "checkmark") } catch { say("Couldn't save", "exclamationmark.triangle") }
+        _ = photo // macOS: test build only
         #endif
     }
 
@@ -292,7 +288,7 @@ struct ImageViewer: View {
 }
 
 /// Opens an `ImageViewer` over the chat: full screen on iPhone, growing out of the bubble it was tapped in when
-/// there is one; a sheet on the Mac.
+/// there is one.
 struct ImageViewerCover: ViewModifier {
     @Binding var isPresented: Bool
     var data: Data
@@ -316,7 +312,7 @@ struct ImageViewerCover: ViewModifier {
             }
         }
         #else
-        content.sheet(isPresented: $isPresented) { ImageViewer(data: data, title: title, date: date, caption: caption) }
+        content.sheet(isPresented: $isPresented) { ImageViewer(data: data, title: title, date: date, caption: caption) } // macOS: test build only
         #endif
     }
 }

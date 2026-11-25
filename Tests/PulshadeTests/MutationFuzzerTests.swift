@@ -43,7 +43,6 @@ import PulshadeShared
             _ = try? Payload.fromWire(bytes)
             _ = Base32.decode(text)
             _ = Invite(code: text)
-            _ = JoinCode(text)
             _ = ChatLink(text)
             _ = Data(hexString: text)
             for kind in ProfileLinkKind.allCases { _ = kind.normalize(text) }

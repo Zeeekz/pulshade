@@ -115,6 +115,13 @@ struct Invite: Equatable {
     let sendID: Data
     /// The relay this invite's mailbox lives on. Nil means "use your default relay"; the official app refuses any but its own.
     let relay: String?
+    /// A channel code's commitment to the channel it is for (`channelCommit`), signed with the rest (`bind`), so the invite
+    /// that answers it is taken without asking only for that channel. Codes from before have none: their invites are
+    /// asked about. Such codes are written with their own kind byte (`namedChannel`), which apps from before don't read.
+    let channel: Data?
+
+    /// The kind byte of a channel code that names its channel.
+    private static let namedChannel: UInt8 = 3
 
     /// "psh3" carries the post-quantum commitment and a signature over it. "psh2" (signed, no commitment) and "psh1" (unsigned),
     /// from apps before it, aren't accepted (see `isOutdated`).
@@ -122,11 +129,18 @@ struct Invite: Equatable {
     private static let oldPrefixes = ["psh1", "psh2"]
 
     var code: String {
-        let tail = relay.map { Data($0.utf8) } ?? Data()
-        return Self.prefix + Base32.encode(Data([kind.rawValue]) + signingKey + agreementKey + bind + pqHash + sendID + tail).lowercased()
+        let tail: Data = relay.map { Data($0.utf8) } ?? Data()
+        var raw = Data([channel == nil ? kind.rawValue : Self.namedChannel])
+        raw += signingKey
+        raw += agreementKey
+        raw += bind
+        raw += pqHash
+        raw += sendID
+        if let channel { raw += channel }
+        return Self.prefix + Base32.encode(raw + tail).lowercased()
     }
 
-    init(kind: Kind, signingKey: Data, agreementKey: Data, bind: Data, pqHash: Data, sendID: Data, relay: String? = nil) {
+    init(kind: Kind, signingKey: Data, agreementKey: Data, bind: Data, pqHash: Data, sendID: Data, relay: String? = nil, channel: Data? = nil) {
         self.kind = kind
         self.signingKey = signingKey
         self.agreementKey = agreementKey
@@ -134,26 +148,36 @@ struct Invite: Equatable {
         self.pqHash = pqHash
         self.sendID = sendID
         self.relay = relay
+        self.channel = kind == .channel ? channel : nil
     }
 
     /// What an invite's signing key signs: the agreement key and the post-quantum commitment, under a label of their own so
-    /// the signature can't be taken from (or used as) the one envelopes carry.
-    static func bindMessage(agreement: Data, pqHash: Data) -> Data {
-        Data("pulshade.invite.bind.v2".utf8) + agreement + pqHash
+    /// the signature can't be taken from (or used as) the one envelopes carry; and, for a channel code that names its
+    /// channel, the commitment to it under a label of its own.
+    static func bindMessage(agreement: Data, pqHash: Data, channel: Data? = nil) -> Data {
+        guard let channel else { return Data("pulshade.invite.bind.v2".utf8) + agreement + pqHash }
+        return Data("pulshade.invite.bind.channel.v1".utf8) + agreement + pqHash + channel
     }
 
-    static func bindIsValid(_ bind: Data, signing: Data, agreement: Data, pqHash: Data) -> Bool {
+    static func bindIsValid(_ bind: Data, signing: Data, agreement: Data, pqHash: Data, channel: Data? = nil) -> Bool {
         guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: signing) else { return false }
-        return key.isValidSignature(bind, for: bindMessage(agreement: agreement, pqHash: pqHash))
+        return key.isValidSignature(bind, for: bindMessage(agreement: agreement, pqHash: pqHash, channel: channel))
     }
 
-    /// An invite from this account, signed.
-    init(kind: Kind, identity: Identity, sendID: Data, relay: String? = nil) throws {
+    /// What a channel code carries to name its channel: a hash of the channel's id under a label of its own, so the code
+    /// says which channel without giving the id away.
+    static func channelCommit(_ group: UUID) -> Data {
+        Data(SHA256.hash(data: Data("pulshade.channel.commit.v1".utf8) + withUnsafeBytes(of: group.uuid) { Data($0) }).prefix(16))
+    }
+
+    /// An invite from this account, signed. A channel code names `channel` when given.
+    init(kind: Kind, identity: Identity, sendID: Data, relay: String? = nil, channel: UUID? = nil) throws {
         let card = identity.card
         let pqHash = identity.pq.pin.commitment
+        let commit = kind == .channel ? channel.map(Self.channelCommit) : nil
         self.init(kind: kind, signingKey: card.signing, agreementKey: card.agreement,
-                  bind: try identity.signingKey.signature(for: Self.bindMessage(agreement: card.agreement, pqHash: pqHash)),
-                  pqHash: pqHash, sendID: sendID, relay: relay)
+                  bind: try identity.signingKey.signature(for: Self.bindMessage(agreement: card.agreement, pqHash: pqHash, channel: commit)),
+                  pqHash: pqHash, sendID: sendID, relay: relay, channel: commit)
     }
 
     /// A code from an app whose invites don't carry the post-quantum commitment: the person who made it needs to update
@@ -179,7 +203,7 @@ struct Invite: Equatable {
 
     /// The official app talks to Pulshade's own relays only, the one it was built for. Anyone can build the code
     /// with a relay of their own, but an invite, profile or code naming one isn't used here. Development builds
-    /// take any valid relay, for tests and a relay on your own Mac.
+    /// take any valid relay, for tests and a relay on your own computer.
     #if DEBUG
     nonisolated(unsafe) static var officialRelaysOnly = false
     #else
@@ -261,23 +285,27 @@ struct Invite: Equatable {
     init?(code: String) {
         let clean = scannedPayload(code).lowercased()
         guard clean.hasPrefix(Self.prefix), let raw = Base32.decode(String(clean.dropFirst(4)).uppercased()),
-              raw.count >= 177, let kind = Kind(rawValue: raw[raw.startIndex]) else { return nil }
+              raw.count >= 177 else { return nil }
+        let named = raw[raw.startIndex] == Self.namedChannel
+        guard let kind = named ? .channel : Kind(rawValue: raw[raw.startIndex]), !named || raw.count >= 193 else { return nil }
         self.kind = kind
         signingKey = Data(raw.dropFirst(1).prefix(32))
         agreementKey = Data(raw.dropFirst(33).prefix(32))
         bind = Data(raw.dropFirst(65).prefix(64))
         pqHash = Data(raw.dropFirst(129).prefix(PQPin.commitmentSize))
         sendID = Data(raw.dropFirst(145).prefix(32))
-        if raw.count > 177 {
+        channel = named ? Data(raw.dropFirst(177).prefix(16)) : nil
+        let end = named ? 193 : 177
+        if raw.count > end {
             // An invite naming a relay that isn't Pulshade's own can't be used.
-            guard let named = Self.allowedRelay(String(data: Data(raw.dropFirst(177)), encoding: .utf8)) else { return nil }
+            guard let named = Self.allowedRelay(String(data: Data(raw.dropFirst(end)), encoding: .utf8)) else { return nil }
             relay = named
         } else {
             relay = nil
         }
         guard (try? Curve25519.Signing.PublicKey(rawRepresentation: signingKey)) != nil,
               (try? Curve25519.KeyAgreement.PublicKey(rawRepresentation: agreementKey)) != nil,
-              Self.bindIsValid(bind, signing: signingKey, agreement: agreementKey, pqHash: pqHash) else { return nil }
+              Self.bindIsValid(bind, signing: signingKey, agreement: agreementKey, pqHash: pqHash, channel: channel) else { return nil }
     }
 
     var fingerprint: String { Identity.fingerprint(of: signingKey) }

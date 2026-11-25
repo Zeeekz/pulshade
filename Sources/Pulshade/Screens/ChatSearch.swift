@@ -158,6 +158,10 @@ struct ChatSearchResults: View {
                 }
             } catch AppModel.DirectoryError.unreachable {
                 found = nil; problem = "Can't reach the relay"
+            } catch AppModel.DirectoryError.publicName {
+                // A group's or channel's name: its join screen.
+                found = nil; problem = nil
+                model.openFoundPublicName(handle)
             } catch {
                 found = nil; problem = "That profile didn't check out"
             }
@@ -197,9 +201,9 @@ struct ChatSearchResults: View {
     }
 }
 
-private var rowAvatar: CGFloat { Platform.isPhone ? 48 : 40 }
-private var rowTitle: CGFloat { Platform.isPhone ? 16 : 14 }
-private var rowLine: CGFloat { Platform.isPhone ? 14 : 12.5 }
+private var rowAvatar: CGFloat { 48 }
+private var rowTitle: CGFloat { 16 }
+private var rowLine: CGFloat { 14 }
 
 /// One person in the results: picture, name and a short line under it.
 private struct PersonRow: View {

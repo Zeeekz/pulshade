@@ -1,8 +1,6 @@
-// Renders the Pulshade app icon: swift scripts/make-icon.swift Resources/AppIcon.icns
+// Renders the Pulshade app icon: swift scripts/make-icon.swift
 import SwiftUI
 import AppKit
-
-let out = CommandLine.arguments.dropFirst().first ?? "Resources/AppIcon.icns"
 
 func c(_ hex: UInt32, _ a: Double = 1) -> Color {
     Color(red: Double((hex >> 16) & 0xFF) / 255, green: Double((hex >> 8) & 0xFF) / 255, blue: Double(hex & 0xFF) / 255, opacity: a)
@@ -81,21 +79,9 @@ struct Icon: View {
 }
 
 MainActor.assumeIsolated {
-    let iconset = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("Pulshade.iconset")
-    try? FileManager.default.removeItem(at: iconset)
-    try! FileManager.default.createDirectory(at: iconset, withIntermediateDirectories: true)
-    for base in [16, 32, 128, 256, 512] {
-        try! render(base).write(to: iconset.appendingPathComponent("icon_\(base)x\(base).png"))
-        try! render(base * 2).write(to: iconset.appendingPathComponent("icon_\(base)x\(base)@2x.png"))
-    }
     try! render(1024).write(to: URL(fileURLWithPath: "Resources/AppIcon.png"))
     let iosIcon = URL(fileURLWithPath: "ios/Assets.xcassets/AppIcon.appiconset/AppIcon.png")
     try? FileManager.default.createDirectory(at: iosIcon.deletingLastPathComponent(), withIntermediateDirectories: true)
     try! render(1024, bleed: true).write(to: iosIcon)
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
-    task.arguments = ["-c", "icns", iconset.path, "-o", out]
-    try! task.run()
-    task.waitUntilExit()
-    print(task.terminationStatus == 0 ? "Wrote \(out)" : "iconutil failed")
+    print("Wrote Resources/AppIcon.png and the iPhone icon")
 }

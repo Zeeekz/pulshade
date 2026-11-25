@@ -44,7 +44,11 @@ final class Camera: NSObject {
     private(set) var lensStops: [CGFloat] = []
     /// What the camera's own zoom factor is at "1×". 2 on an iPhone whose factor 1 is the ultra wide lens.
     @ObservationIgnored private var baseFactor: CGFloat = 1
-    /// Zoom over a clip being recorded, for cameras that only zoom digitally (the Mac).
+    #if os(iOS)
+    /// Puts zoom changes on the camera off the main thread.
+    @ObservationIgnored private let zoomer = ZoomDriver()
+    #endif
+    /// Zoom over a clip being recorded, for cameras that only zoom digitally.
     @ObservationIgnored private var zoomTrack = ZoomTrack()
 
     var filter: StoryFilter = .none {
@@ -175,19 +179,17 @@ final class Camera: NSObject {
         }
     }
 
-    /// Zooms in or out, smoothly, within what the camera can do. On the iPhone this is the camera's own zoom, so
-    /// it's in the photo and the clip as shot; on the Mac it's cropped in digitally, in the preview, the photo and
+    /// Zooms in or out within what the camera can do. On the iPhone this is the camera's own zoom, so it's in the
+    /// photo and the clip as shot; on macOS (the test build) it's cropped in digitally, in the preview, the photo and
     /// (once the clip is prepared) the clip.
-    func setZoom(_ requested: CGFloat) {
+    /// `smooth` glides there (the lens buttons). Pinching and dragging the shutter leave it off, so the picture
+    /// follows the fingers at once: restarting a glide on every finger movement made it lag behind and stutter.
+    func setZoom(_ requested: CGFloat, smooth: Bool = false) {
         let z = ZoomMath.clamp(requested, min: minZoom, max: maxZoom)
         guard z != zoom else { return }
         zoom = z
         #if os(iOS)
-        if let device, (try? device.lockForConfiguration()) != nil {
-            if device.isRampingVideoZoom { device.cancelVideoZoomRamp() }
-            device.ramp(toVideoZoomFactor: min(max(z * baseFactor, device.minAvailableVideoZoomFactor), device.maxAvailableVideoZoomFactor), withRate: 12)
-            device.unlockForConfiguration()
-        }
+        if let device { zoomer.set(z * baseFactor, on: device, smooth: smooth) }
         #else
         framer.zoom = z
         if let start = recordingStart { zoomTrack.add(at: Date().timeIntervalSince(start), zoom: z) }
@@ -362,6 +364,39 @@ extension Camera: AVCapturePhotoCaptureDelegate {
         Task { @MainActor in self.deliver(image) }
     }
 }
+
+#if os(iOS)
+/// Sets the camera's zoom on a queue of its own. Locking the camera to change it can wait on the camera, and doing
+/// that on the main thread for every finger movement of a pinch made the pinch itself stutter. Only the newest zoom
+/// asked for is set: ones that came in while the last was being set are skipped.
+private final class ZoomDriver: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "pulshade.camera.zoom", qos: .userInteractive)
+    private let lock = NSLock()
+    private var next: (factor: CGFloat, device: AVCaptureDevice, smooth: Bool)?
+
+    func set(_ factor: CGFloat, on device: AVCaptureDevice, smooth: Bool) {
+        let idle = lock.withLock { () -> Bool in
+            let idle = next == nil
+            next = (factor, device, smooth)
+            return idle
+        }
+        guard idle else { return }
+        queue.async { self.apply() }
+    }
+
+    private func apply() {
+        guard let (factor, device, smooth) = lock.withLock({ () -> (CGFloat, AVCaptureDevice, Bool)? in
+            defer { next = nil }
+            return next.map { ($0.factor, $0.device, $0.smooth) }
+        }) else { return }
+        guard (try? device.lockForConfiguration()) != nil else { return }
+        let clamped = min(max(factor, device.minAvailableVideoZoomFactor), device.maxAvailableVideoZoomFactor)
+        if device.isRampingVideoZoom { device.cancelVideoZoomRamp() }
+        if smooth { device.ramp(toVideoZoomFactor: clamped, withRate: 8) } else { device.videoZoomFactor = clamped }
+        device.unlockForConfiguration()
+    }
+}
+#endif
 
 /// Colours each camera frame with the chosen look and puts it on the preview layer. While a clip is being made it
 /// also writes the camera's own frames and sound to the clip (the look is put on when it's posted), which is why

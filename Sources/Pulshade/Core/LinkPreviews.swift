@@ -11,7 +11,8 @@ enum LinkPreviews {
     /// Plain http(s) addresses only.
     static func isWebLink(_ text: String) -> Bool {
         guard text.count <= 2_000, let url = URL(string: text), let scheme = url.scheme?.lowercased() else { return false }
-        return (scheme == "http" || scheme == "https") && url.host != nil
+        // Pulshade's own links are opened in Pulshade, never fetched for a preview.
+        return (scheme == "http" || scheme == "https") && url.host != nil && WebLinks.parse(url) == nil
     }
 
     /// The address a tapped link is allowed to open: a plain host name (no look-alike letters, no address, no

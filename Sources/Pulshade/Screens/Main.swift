@@ -25,13 +25,24 @@ struct MainView: View {
             #if os(iOS)
             PhoneMainView()
             #else
-            DesktopMainView()
+            EmptyView() // macOS: test build only
             #endif
         }
         .sheet(isPresented: Binding(get: { model.openedCode != nil }, set: { if !$0 { model.openedCode = nil } })) {
             ScanSheet(initial: model.openedCode)
         }
         .sheet(item: Binding(get: { model.openedGroupLink }, set: { model.openedGroupLink = $0 })) { JoinGroupSheet(code: $0.code) }
+        // A short link: looked up now Pulshade is open, then opened like the link it stands for.
+        .onChange(of: model.openedShort, initial: true) { _, code in
+            guard let code else { return }
+            model.openedShort = nil
+            Task { await model.openShortLink(code) }
+        }
+        .alert("Couldn't open the link", isPresented: Binding(get: { model.linkProblem != nil }, set: { if !$0 { model.linkProblem = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(model.linkProblem ?? "")
+        }
         .alert("Some saved items couldn't be opened",
                isPresented: Binding(get: { model.setAsideNotice != nil }, set: { if !$0 { model.setAsideNotice = nil } })) {
             Button("OK", role: .cancel) {}
@@ -328,170 +339,6 @@ private struct TabHold: UIViewRepresentable {
 }
 #endif
 
-/// Mac: a slim rail, the chat list and the open chat side by side.
-private struct DesktopMainView: View {
-    @Environment(AppModel.self) private var model
-    @State private var section: Section = .chats
-    @State private var selection: Conversation.ID?
-
-    var body: some View {
-        HStack(spacing: 0) {
-            Rail(section: $section)
-            Rectangle().fill(Ink.line).frame(width: 1)
-            Group {
-                switch section {
-                case .chats:
-                    HStack(spacing: 0) {
-                        ChatList(selection: $selection, section: $section)
-                            .frame(width: 330)
-                        Rectangle().fill(Ink.line).frame(width: 1)
-                        if let id = selection, model.conversation(id) != nil {
-                            ConversationView(id: id)
-                                .id(id)
-                                .transition(.opacity.combined(with: .move(edge: .trailing)))
-                        } else {
-                            EmptyChat().frame(maxWidth: .infinity, maxHeight: .infinity)
-                        }
-                    }
-                    .background {
-                        // Esc closes the open chat, back to the empty view.
-                        Button("") { withAnimation(.smooth(duration: 0.3)) { selection = nil } }
-                            .keyboardShortcut(.cancelAction)
-                            .disabled(selection == nil)
-                            .hidden()
-                    }
-                case .contacts: ContactsView(openChat: { id in
-                    selection = id
-                    withAnimation(.smooth) { section = .chats }
-                })
-                case .burn: LeaveView()
-                case .people: PeopleView(openChat: { id in
-                    selection = id
-                    withAnimation(.smooth) { section = .chats }
-                })
-                case .settings: SettingsView()
-                }
-            }
-            .transition(.blurReplace)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-        .background(Ink.base.opacity(0.85))
-        .animation(.smooth(duration: 0.3), value: section)
-        .animation(.smooth(duration: 0.3), value: selection)
-        #if DEBUG
-        .onAppear {
-            // Screenshots: PULSHADE_DEMO_CHAT=Kai opens the chat with that title.
-            if AppModel.demoRequested, let title = ProcessInfo.processInfo.environment["PULSHADE_DEMO_CHAT"],
-               let chat = model.data.conversations.first(where: { $0.title == title }) { selection = chat.id }
-            // PULSHADE_DEMO_SCREEN=settings (or contacts, burn, people) opens that section.
-            if AppModel.demoRequested, let name = ProcessInfo.processInfo.environment["PULSHADE_DEMO_SCREEN"],
-               let wanted = Section(rawValue: name) { section = wanted }
-        }
-        #endif
-        .onChange(of: model.requestedConversation, initial: true) { _, id in
-            guard let id, model.conversation(id) != nil else { return }
-            model.becomeOwner(of: id)
-            withAnimation(.smooth) {
-                section = .chats
-                selection = id
-            }
-            model.markRead(id)
-            model.requestedConversation = nil
-        }
-        // Switching persona closes a chat that belongs to another: what's on screen must always be the persona that
-        // sends.
-        .onChange(of: model.activePersona) {
-            if let open = selection, let c = model.conversation(open), !model.belongsHere(c) { selection = nil }
-        }
-        .onChange(of: model.openedHandle, initial: true) { _, handle in
-            if handle != nil { withAnimation(.smooth) { section = .contacts } }
-        }
-    }
-}
-
-private struct Rail: View {
-    @Environment(AppModel.self) private var model
-    @Environment(\.theme) private var theme
-    @Binding var section: Section
-    @Namespace private var glow
-    @State private var switching = false
-
-    /// Unread messages waiting under personas you're not currently using.
-    private var otherUnread: Int {
-        model.data.conversations.filter { $0.persona != model.activePersona && !model.isBurner($0.persona) && !$0.muted }
-            .reduce(0) { $0 + $1.unread }
-    }
-
-    var body: some View {
-        VStack(spacing: 6) {
-            PulseMark(size: 30).padding(.top, 36).padding(.bottom, 16)
-            ForEach([Section.chats, .contacts, .burn, .people], id: \.self) { s in item(s) }
-            Spacer()
-            item(.settings)
-            Button { model.lock() } label: { Image(systemName: "lock") }
-                .buttonStyle(.plain)
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(Ink.faint)
-                .frame(width: 40, height: 40)
-                .contentShape(Rectangle())
-                .help("Lock  ⇧⌘L")
-                .accessibilityLabel("Lock")
-            Button { switching.toggle() } label: {
-                Avatar(image: model.activeProfile.avatar, seed: model.fingerprint, size: 32)
-                    .overlay(Circle().strokeBorder(model.signature("me"), lineWidth: 1.5).padding(-3))
-                    .overlay(alignment: .topTrailing) {
-                        if otherUnread > 0 { Circle().fill(theme.accent).frame(width: 10, height: 10).offset(x: 3, y: -3) }
-                    }
-            }
-            .buttonStyle(.plain)
-            .padding(.top, 6)
-            .padding(.bottom, 18)
-            .accessibilityLabel("Switch persona")
-            .popover(isPresented: $switching, arrowEdge: .trailing) { PersonaSwitcher(done: { switching = false }) }
-        }
-        .frame(width: 66)
-        .background(Ink.void)
-    }
-
-    private func item(_ s: Section) -> some View {
-        Button { withAnimation(.snappy(duration: 0.4)) { section = s } } label: {
-            ZStack {
-                if section == s {
-                    RoundedRectangle(cornerRadius: 10)
-                        .fill(Ink.raised)
-                        .matchedGeometryEffect(id: "glow", in: glow)
-                }
-                Image(systemName: s.symbol)
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(section == s ? theme.accent : Ink.faint)
-                if s == .contacts, !model.requests.isEmpty || !model.groupOffers.isEmpty {
-                    Text("\(model.requests.count + model.groupOffers.count)")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(Ink.onAccent)
-                        .padding(.horizontal, 4).frame(minWidth: 15, minHeight: 15)
-                        .background(theme.accent, in: .capsule)
-                        .offset(x: 11, y: -11)
-                        .transition(.scale)
-                }
-                #if os(macOS)
-                if s == .settings, Updater.shared.ready {
-                    Circle().fill(theme.accent).frame(width: 8, height: 8).offset(x: 10, y: -10).transition(.scale)
-                }
-                #endif
-            }
-            .frame(width: 40, height: 40)
-            .overlay(alignment: .leading) {
-                if section == s {
-                    Capsule().fill(theme.accent).frame(width: 3, height: 16).offset(x: -13)
-                }
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(s.rawValue.capitalized)
-    }
-}
-
 // MARK: - Chat list
 
 private struct ChatList: View {
@@ -521,10 +368,8 @@ private struct ChatList: View {
     @State private var stripBox = FrameBox()
     /// Showing the archived chats instead of the rest.
     @State private var showingArchive = false
-    /// The chats picked (held on a picture, or Cmd-clicked on the Mac). Empty while not picking.
+    /// The chats picked (held on a picture). Empty while not picking.
     @State private var picked: Set<Conversation.ID> = []
-    /// The last chat picked or let go by a tap, where a Shift-click range starts.
-    @State private var lastPicked: Conversation.ID?
     /// A hold-and-slide over the pictures under way.
     @State private var paint: Paint?
     /// Where each chat row on screen is in the list, for the slide to find the row under the finger. Kept out of view
@@ -600,7 +445,7 @@ private struct ChatList: View {
                     .accessibilityLabel("New chat")
             }
             .padding(.horizontal, 16)
-            .padding(.top, Platform.isPhone ? 12 : 38)
+            .padding(.top, 12)
             .padding(.bottom, 12)
 
             // Search and stories scroll away with the chats, as in Telegram, so the list gets the whole screen;
@@ -620,7 +465,7 @@ private struct ChatList: View {
                     if searching {
                         ChatSearchResults(query: search, submitted: searchSubmitted) { id in
                             selection = id
-                            if Platform.isPhone { search = ""; searchFocused = false }
+                            search = ""; searchFocused = false
                         }
                         .padding(.top, 4)
                     } else {
@@ -666,7 +511,7 @@ private struct ChatList: View {
         .overlay(alignment: .bottom) {
             if picking {
                 pickBar
-                    .padding(.bottom, Platform.isPhone ? 10 : 14)
+                    .padding(.bottom, 10)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
@@ -728,11 +573,11 @@ private struct ChatList: View {
         HStack(spacing: 10) {
             HStack(spacing: 7) {
                 Image(systemName: "magnifyingglass")
-                    .font(.system(size: Platform.isPhone ? 15 : 12, weight: .medium))
+                    .font(.system(size: 15, weight: .medium))
                     .foregroundStyle(Ink.faint)
                 TextField("", text: $search, prompt: Text("Search chats, people or @username").foregroundStyle(Ink.faint))
                     .textFieldStyle(.plain)
-                    .font(.system(size: Platform.isPhone ? 16 : 13))
+                    .font(.system(size: 16))
                     .foregroundStyle(Ink.text)
                     .focused($searchFocused)
                     .submitLabel(.search)
@@ -743,7 +588,7 @@ private struct ChatList: View {
                     .onSubmit { searchSubmitted += 1 }
                 if !search.isEmpty {
                     Button { search = "" } label: {
-                        Image(systemName: "xmark.circle.fill").font(.system(size: Platform.isPhone ? 15 : 12))
+                        Image(systemName: "xmark.circle.fill").font(.system(size: 15))
                             .foregroundStyle(Ink.faint)
                     }
                     .buttonStyle(.plain)
@@ -751,11 +596,11 @@ private struct ChatList: View {
                 }
             }
             .padding(.horizontal, 12)
-            .frame(height: Platform.isPhone ? 38 : 30)
+            .frame(height: 38)
             .background(Ink.raised, in: .capsule)
             .contentShape(.capsule)
             .onTapGesture { searchFocused = true }
-            if Platform.isPhone && (searchFocused || searching) {
+            if searchFocused || searching {
                 Button("Cancel") {
                     withAnimation(.snappy(duration: 0.25)) { search = ""; searchFocused = false }
                 }
@@ -809,7 +654,6 @@ private struct ChatList: View {
             .offset(x: dx)
         }
         .clipShape(.rect(cornerRadius: 10))
-        .modifier(MacRowMenu(menu: Platform.isPhone ? nil : AnyView(rowMenu(c))))
         #if os(iOS)
         .simultaneousGesture(swipeGesture(c), including: picking ? .none : .all)
         #endif
@@ -822,7 +666,7 @@ private struct ChatList: View {
         Button(c.pinned ? "Unpin" : "Pin") { model.togglePin(c.id) }
         Button(c.muted ? "Unmute" : "Mute") { model.toggleMute(c.id) }
         Button(c.archived ? "Unarchive" : "Archive") { model.setArchived([c.id], !c.archived) }
-        Button("Select") { Haptics.tick(); picked = [c.id]; lastPicked = c.id; opened = nil }
+        Button("Select") { Haptics.tick(); picked = [c.id]; opened = nil }
         Divider()
         Button("Delete…", role: .destructive) { confirmDelete = c }
     }
@@ -834,20 +678,6 @@ private struct ChatList: View {
             withAnimation(.snappy(duration: 0.3)) { opened = nil }
             return
         }
-        #if os(macOS)
-        let keys = NSEvent.modifierFlags
-        if keys.contains(.shift), let from = lastPicked.flatMap({ id in items.firstIndex { $0.id == id } }),
-           let to = items.firstIndex(where: { $0.id == c.id }) {
-            picked.formUnion(items[min(from, to)...max(from, to)].map(\.id))
-            return
-        }
-        if keys.contains(.command) {
-            // The chat open now joins the first pick, as in Finder.
-            if !picking, let open = selection, open != c.id, items.contains(where: { $0.id == open }) { picked.insert(open) }
-            toggle(c)
-            return
-        }
-        #endif
         if picking {
             toggle(c)
             return
@@ -859,7 +689,6 @@ private struct ChatList: View {
     private func toggle(_ c: Conversation) {
         Haptics.tick()
         if picked.contains(c.id) { picked.remove(c.id) } else { picked.insert(c.id) }
-        lastPicked = c.id
     }
 
     private func hold(for c: Conversation) -> PickHold {
@@ -869,7 +698,6 @@ private struct ChatList: View {
             opened = nil
             let next = Paint(adding: !picked.contains(c.id), anchor: anchor, before: picked)
             paint = next
-            lastPicked = c.id
             apply(next, upTo: anchor)
         }, moved: { point in
             guard let paint,
@@ -946,7 +774,7 @@ private struct ChatList: View {
                 Text(label).font(.system(size: 9.5, weight: .medium))
             }
             .foregroundStyle(tint ?? Ink.text)
-            .frame(width: Platform.isPhone ? 50 : 54, height: 40)
+            .frame(width: 50, height: 40)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -1029,7 +857,7 @@ private struct ChatList: View {
 
     // MARK: Archived
 
-    private var rowAvatar: CGFloat { Platform.isPhone ? 56 : 46 }
+    private var rowAvatar: CGFloat { 56 }
 
     /// At the top of the chats: the archived ones, folded into one row.
     private func archivedRow(_ archived: [Conversation]) -> some View {
@@ -1045,21 +873,21 @@ private struct ChatList: View {
                     .frame(width: rowAvatar, height: rowAvatar)
                     .background(Ink.raised, in: .circle)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Archived").font(.system(size: Platform.isPhone ? 16.5 : 14.5, weight: .semibold)).foregroundStyle(Ink.text)
+                    Text("Archived").font(.system(size: 16.5, weight: .semibold)).foregroundStyle(Ink.text)
                     Text(archived.prefix(5).map(\.title).joined(separator: ", "))
-                        .font(.system(size: Platform.isPhone ? 15 : 13.5)).foregroundStyle(Ink.dim).lineLimit(1)
+                        .font(.system(size: 15)).foregroundStyle(Ink.dim).lineLimit(1)
                 }
                 Spacer(minLength: 4)
                 if unread + muted > 0 {
                     Text("\(unread + muted)")
-                        .font(.system(size: Platform.isPhone ? 12.5 : 11.5, weight: .semibold))
+                        .font(.system(size: 12.5, weight: .semibold))
                         .foregroundStyle(Ink.onAccent.opacity(0.85))
                         .padding(.horizontal, 7).frame(minWidth: 21, minHeight: 21)
                         .background(unread > 0 ? theme.accent : Ink.faint, in: .capsule)
                 }
             }
             .padding(.horizontal, 10)
-            .padding(.vertical, Platform.isPhone ? 11 : 9)
+            .padding(.vertical, 11)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -1095,14 +923,6 @@ private struct ChatList: View {
 /// Where each chat row is in the list (`ChatList.rowFrames`).
 private final class RowFrames {
     var frames: [Conversation.ID: CGRect] = [:]
-}
-
-/// On the Mac the whole row has the menu; on the phone it's kept off the picture (`ChatRow.menu`).
-private struct MacRowMenu: ViewModifier {
-    var menu: AnyView?
-    func body(content: Content) -> some View {
-        if let menu { content.contextMenu { menu } } else { content }
-    }
 }
 
 /// Like Telegram: the search bar and stories never stop half shown. A scroll that would end part way through them
@@ -1161,14 +981,14 @@ struct ChatRow: View {
     /// Holding the picture starts picking, and sliding up or down picks the rows passed over (`ChatList`). Nil where
     /// rows can't be picked.
     var hold: PickHold? = nil
-    /// The long-press menu. On the phone it's kept off the picture, where holding picks instead.
+    /// The long-press menu, kept off the picture, where holding picks instead.
     var menu: AnyView? = nil
     @State private var hover = false
-    /// Rows are roomier on the phone, like Telegram's and WhatsApp's; the Mac's sidebar is narrower.
-    private var avatarSize: CGFloat { Platform.isPhone ? 56 : 46 }
-    private var titleSize: CGFloat { Platform.isPhone ? 16.5 : 14.5 }
-    private var lineSize: CGFloat { Platform.isPhone ? 15 : 13.5 }
-    private var stampSize: CGFloat { Platform.isPhone ? 12.5 : 11.5 }
+    /// Rows are roomy, like Telegram's and WhatsApp's.
+    private var avatarSize: CGFloat { 56 }
+    private var titleSize: CGFloat { 16.5 }
+    private var lineSize: CGFloat { 15 }
+    private var stampSize: CGFloat { 12.5 }
 
     /// Their live stories, when this is a one-to-one chat with someone who has posted.
     private var stories: [Story] {
@@ -1286,10 +1106,10 @@ struct ChatRow: View {
                 }
             }
             .contentShape(Rectangle())
-            .modifier(PhoneRowMenu(menu: Platform.isPhone ? menu : nil, conversation: c))
+            .modifier(PhoneRowMenu(menu: menu, conversation: c))
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, Platform.isPhone ? 11 : 9)
+        .padding(.vertical, 11)
         .background {
             RoundedRectangle(cornerRadius: 10)
                 .fill(selected ? Ink.raised : (hover ? Ink.surface : .clear))
@@ -1336,21 +1156,6 @@ private struct PhoneRowMenu: ViewModifier {
     }
 }
 
-private struct EmptyChat: View {
-    var body: some View {
-        VStack(spacing: 14) {
-            PulseMark(size: 56).opacity(0.35)
-            Text("Select a conversation").font(.system(size: 13)).foregroundStyle(Ink.faint)
-            HStack(spacing: 5) {
-                Image(systemName: "lock.fill")
-                Text("End-to-end encrypted")
-            }
-            .font(.system(size: 11))
-            .foregroundStyle(Ink.faint.opacity(0.7))
-        }
-    }
-}
-
 /// Switch between your main identity and personas, or make a new one.
 private struct PersonaSwitcher: View {
     @Environment(AppModel.self) private var model
@@ -1392,9 +1197,8 @@ private struct PersonaSwitcher: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(Platform.isPhone ? 20 : 14)
-        .frame(width: Platform.isPhone ? nil : 260)
-        .frame(maxWidth: Platform.isPhone ? .infinity : nil, maxHeight: Platform.isPhone ? .infinity : nil, alignment: .top)
+        .padding(20)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Ink.surface)
         .preferredColorScheme(Ink.scheme)
     }

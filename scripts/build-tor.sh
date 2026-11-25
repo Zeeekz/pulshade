@@ -1,6 +1,6 @@
 #!/bin/zsh
-# Builds Tor (Arti, from tor/) for the Mac, the iPhone and the iPhone simulator, into
-# tor/build/PulshadeTor.xcframework. The Mac app, the tests and the iPhone app all link it.
+# Builds Tor (Arti, from tor/) for the iPhone, the iPhone simulator and the Mac the tests run on, into
+# tor/build/PulshadeTor.xcframework. The iPhone app and the tests link it.
 # The first build takes a few minutes; later ones only redo what changed.
 set -euo pipefail
 cd "$(dirname "$0")/../tor"

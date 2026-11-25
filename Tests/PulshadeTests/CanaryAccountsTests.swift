@@ -3,7 +3,7 @@ import Foundation
 @testable import Pulshade
 
 /// The delivery counter for everything beyond plain one-to-one chats between phones (see `CanaryTests` for those):
-/// shared groups, a second device linked to one account (a Mac beside the phone), a second persona on one phone, and a
+/// shared groups, a second persona on one phone, and a
 /// phone that is detached and recovered from its sealed backup, all while the relay crashes, phones sleep and apps
 /// are closed and opened again. Every message and post is counted on every device that should show it.
 ///
@@ -69,7 +69,7 @@ struct CanaryAccountsTests {
         }
     }
 
-    /// One device: a phone, or the Mac linked to P0's account.
+    /// One device: a phone.
     @MainActor private final class Device {
         let name: String
         var directory: URL
@@ -117,7 +117,7 @@ struct CanaryAccountsTests {
         var abandoned = false     // its sender was detached before it got through: nothing can send it again
     }
 
-    @Test func groupsLinkedDevicesPersonasAndDetachAllDeliver() async throws {
+    @Test func groupsPersonasAndDetachAllDeliver() async throws {
         let minutes = Self.setting("CANARY_MINUTES", 10)
         let drainMinutes = Self.setting("CANARY_DRAIN_MINUTES", 5)
         let sendEvery = Self.setting("CANARY_SEND_SECONDS", 20)
@@ -171,31 +171,6 @@ struct CanaryAccountsTests {
         }
         await settle(60) { (0..<4).allSatisfy { i in (0..<4).allSatisfy { j in i == j || hasKeys("P\(i)", "P\(j)") } } }
 
-        // A Mac linked to P0's account.
-        let linker = DeviceLinker()
-        linker.offer()
-        // The logged-in device scans the code the new one shows.
-        let shownCode = try #require(linker.joinCode)
-        #expect(d("P0").model.acceptJoinCode(shownCode))
-        d("P0").model.approveLink()
-        await d("P0").model.syncOnce()
-        for _ in 0..<40 where linker.stage != .confirming { try await Task.sleep(for: .milliseconds(250)) }
-        linker.confirm()
-        let bundle = try #require(linker.bundle)
-        let macDir = base.appending(path: "L0-0")
-        let mac = open(macDir, tally: tally)
-        try await mac.finishLink(bundle, deviceID: linker.deviceID, deviceKeySeed: linker.deviceKeySeed, selfMailbox: linker.selfMailbox, relay: linker.relay, passcode: "second-device")
-        mac.data.security.autoLockMinutes = 0
-        devices["L0"] = Device(name: "L0", directory: macDir, model: mac, passcode: "second-device")
-        // Friends learn of the new device as they hear from the account.
-        for name in ["P1", "P2", "P3"] {
-            let chat = d("P0").model.startConversation(kind: .direct, title: "", members: [fp(name)])
-            d("P0").model.send("setup from P0 to \(name)", in: chat.id)
-        }
-        await settle(60) {
-            ["P1", "P2", "P3"].allSatisfy { n in (d(n).model.contact(fp("P0"))?.devices.filter { $0.session != nil }.count ?? 0) >= 2 }
-        }
-
         // A second persona on P1, a friend of P2 and P3 only.
         let persona = try #require(d("P1").model.createPersona(name: "P1b"))
         personaFP = try #require(d("P1").model.me(persona.id)).fingerprint
@@ -215,34 +190,32 @@ struct CanaryAccountsTests {
             return c.shared?.joining == false
         }
         await settle(120) {
-            ["P1", "P2", "P3", "L0"].allSatisfy { joined($0, g1) } && ["P1", "P3"].allSatisfy { joined($0, g2) }
+            ["P1", "P2", "P3"].allSatisfy { joined($0, g1) } && ["P1", "P3"].allSatisfy { joined($0, g2) }
         }
         let setupReport = [
-            "P0's friends have both its devices: \(["P1", "P2", "P3"].map { n in "\(n):\(d(n).model.contact(fp("P0"))?.devices.filter { $0.session != nil }.count ?? 0)" }.joined(separator: " "))",
             "persona friends: \(["P2", "P3"].map { n in "\(n):\(d(n).model.contact(personaFP)?.devices.contains { $0.session != nil } == true)" }.joined(separator: " "))",
-            "group Everyone joined: \(["P0", "P1", "P2", "P3", "L0"].map { "\($0):\(joined($0, g1))" }.joined(separator: " "))",
+            "group Everyone joined: \(["P0", "P1", "P2", "P3"].map { "\($0):\(joined($0, g1))" }.joined(separator: " "))",
             "group With the persona joined: \(["P2", "P1", "P3"].map { "\($0):\(joined($0, g2))" }.joined(separator: " "))",
         ]
 
-        // What can be sent, and who should show it. P0's account is on P0 and L0.
+        // What can be sent, and who should show it.
         struct Route { let from: String; let persona: UUID?; let chat: () -> UUID?; let to: [String]; let group: Bool; let label: String }
         func direct(_ from: String, persona: UUID? = nil, to target: String, shows: [String]) -> Route {
             Route(from: from, persona: persona, chat: {
-                let other = target == "P1b" ? personaFP : (target == "P0" || target == "L0" ? fp("P0") : fp(target))
+                let other = target == "P1b" ? personaFP : fp(target)
                 return d(from).model.startConversation(kind: .direct, title: "", members: [other], persona: .some(persona)).id
             }, to: shows, group: false, label: "\(from)\(persona == nil ? "" : "b")->\(target)")
         }
         var routes: [Route] = []
         for a in ["P0", "P1", "P2", "P3"] { for b in ["P0", "P1", "P2", "P3"] where a != b {
-            routes.append(direct(a, to: b, shows: b == "P0" ? ["P0", "L0"] : [b]))
+            routes.append(direct(a, to: b, shows: [b]))
         } }
-        for b in ["P1", "P2", "P3"] { routes.append(direct("L0", to: b, shows: [b])) }
         for b in ["P2", "P3"] {
             routes.append(direct("P1", persona: persona.id, to: b, shows: [b]))
             routes.append(direct(b, to: "P1b", shows: ["P1"]))
         }
-        for from in ["P0", "P1", "P2", "P3", "L0"] {
-            let others = ["P0", "P1", "P2", "P3", "L0"].filter { $0 != from && !(Set([from, $0]) == Set(["P0", "L0"])) }
+        for from in ["P0", "P1", "P2", "P3"] {
+            let others = ["P0", "P1", "P2", "P3"].filter { $0 != from }
             routes.append(Route(from: from, persona: nil, chat: { g1 }, to: others, group: true, label: "\(from)->Everyone"))
         }
         for from in ["P2", "P3", "P1"] {
@@ -287,7 +260,7 @@ struct CanaryAccountsTests {
                     ledger[k].abandoned = true
                 }
                 do {
-                    try await p3.model.detach(.thisDevice, recoveryCode: p3.model.recoveryCode)
+                    try await p3.model.detach(recoveryCode: p3.model.recoveryCode)
                     detaches += 1
                     let dir = base.appending(path: "P3-\(detaches)")
                     let fresh = open(dir, tally: tally)
@@ -356,17 +329,16 @@ struct CanaryAccountsTests {
         func kind(_ s: Sent) -> String {
             if s.group { return "group" }
             if s.tag.contains("b->") || s.tag.contains("P1b") { return "persona" }
-            if s.from == "L0" || s.to.contains("L0") { return "linked device" }
             if s.from == "P3" || s.to.contains("P3") { return "detached phone" }
             return "plain"
         }
-        let kinds = ["plain", "group", "persona", "linked device", "detached phone"]
+        let kinds = ["plain", "group", "persona", "detached phone"]
         let byKind = kinds.map { k in
             let sent = ledger.filter { kind($0) == k }
             return "  \(k): sent \(sent.count), lost \(lost.filter { kind($0.0) == k }.count)"
         }.joined(separator: "\n")
         let report = """
-        CANARY accounts: 4 phones + 1 linked Mac, \(Int(minutes)) min run + \(drainSeconds) s drain
+        CANARY accounts: 4 phones, \(Int(minutes)) min run + \(drainSeconds) s drain
         \(setupReport.map { "  " + $0 }.joined(separator: "\n"))
           relay crashes: \(relay.crashes), app reopens: \(relaunches), detached and recovered: \(restores) of \(detaches)
           sent: \(ledger.count) (\(ledger.filter(\.abandoned).count) from P3 before a Detach, not counted)

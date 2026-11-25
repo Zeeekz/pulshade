@@ -183,10 +183,13 @@ struct GroupKeysTests {
         let fromA = change({ $0.members.removeAll { $0.signingKey == x.publicKey } }, by: a)
         let fromB = change({ $0.members.removeAll { $0.signingKey == y.publicKey } }, by: b)
         #expect(base.accepts(fromA) && base.accepts(fromB))
-        // Whichever arrives first, the lower tie-break wins: the same everywhere.
-        let winner = fromA.tieBreak.lexicographicallyPrecedes(fromB.tieBreak) ? fromA : fromB
-        let loser = winner == fromA ? fromB : fromA
-        #expect(winner.tieBreak.lexicographicallyPrecedes(loser.tieBreak) && !loser.tieBreak.lexicographicallyPrecedes(winner.tieBreak))
+        // Whichever arrives first, the admin the owner listed first wins: the same everywhere, and B can't change that by
+        // signing again until a hash comes out lower.
+        #expect(fromA.contest(fromB, base: base) == .wins && fromB.contest(fromA, base: base) == .loses)
+        for n in 0..<20 {
+            let retry = change({ $0.members.removeAll { $0.signingKey == y.publicKey }; $0.title = "try \(n)" }, by: b)
+            #expect(retry.contest(fromA, base: base) == .loses && fromA.contest(retry, base: base) == .wins, "however often B tries")
+        }
         // Only the owner may skip versions.
         let jump = change({ $0.title = "Later" }, by: owner, version: base.version + 5)
         #expect(base.acceptsJump(jump) && !base.accepts(jump))
@@ -195,6 +198,127 @@ struct GroupKeysTests {
         back.epoch = base.epoch - 1 == 0 ? base.epoch : base.epoch - 1
         back.sign(with: owner)
         #expect(base.acceptsJump(back) == (back.epoch >= base.epoch))
+    }
+
+    /// A member's move to new keys (their account unlinked a device), made from `base` by whoever holds `old`.
+    private func move(_ base: GroupSettings, from old: GroupMemberKeys, to new: GroupMemberKeys, version: Int? = nil) -> GroupSettings {
+        let epoch = GroupEpoch.fresh(number: base.epoch + 1)
+        func swap(_ key: Data) -> Data { key == old.publicKey ? new.publicKey : key }
+        var next = base
+        next.members = base.members.map { $0.signingKey == old.publicKey ? MemberCard.make(new, group: group, name: "m", avatar: nil, color: nil).withoutAvatar : $0 }
+        next.owner = swap(base.owner)
+        next.admins = base.admins.map(swap)
+        next.mods = base.mods.map(swap)
+        next.epoch = epoch.number
+        next.epochCheck = epoch.check
+        next.version = version ?? base.version + 1
+        next.sign(with: old)
+        return next
+    }
+
+    @Test func anUnlinkedDeviceCantWinTheMoveToNewKeysByTryingAgain() {
+        // The owner's account unlinked a device. Its real devices move the owner's place to keys made with the new group
+        // secret; the unlinked device still holds the old keys and moves the place to keys of its own, as often as it likes.
+        let owner = keys(.random(32)), admin = keys(.random(32)), plain = keys(.random(32))
+        let base = settings(owner: owner, members: [admin, plain], admins: [admin])
+        let real = move(base, from: owner, to: keys(.random(32)))
+        #expect(base.accepts(real) && base.renewal(to: real) != nil)
+        for _ in 0..<20 {
+            let stolen = move(base, from: owner, to: keys(.random(32)))
+            #expect(base.accepts(stolen), "on its own it looks like any move")
+            // Two moves of one place to different keys: neither wins, whichever is held.
+            guard case let .dispute(old, keys) = stolen.contest(real, base: base), case .dispute = real.contest(stolen, base: base) else {
+                Issue.record("a second move of the same place must be a dispute")
+                return
+            }
+            #expect(old == owner.publicKey && Set(keys) == [owner.publicKey, real.owner, stolen.owner])
+        }
+        // Any other change the old keys sign at the same number loses to the move, however it's tried.
+        for n in 0..<20 {
+            var other = base
+            other.title = "mine \(n)"
+            other.admins = []
+            other.version += 1
+            other.sign(with: owner)
+            #expect(real.contest(other, base: base) == .wins && other.contest(real, base: base) == .loses)
+        }
+        // Two of the account's own devices moving to the same new key (each with its own epoch) agree either way.
+        let new = keys(.random(32))
+        let one = move(base, from: owner, to: new), two = move(base, from: owner, to: new)
+        #expect(one.contest(two, base: base) != two.contest(one, base: base))
+        #expect([GroupSettings.Contest.wins, .loses].contains(one.contest(two, base: base)), "no dispute")
+        // A plain member's move loses to an admin's change made at the same moment: seniority, not a hash.
+        let plainMove = move(base, from: plain, to: keys(.random(32)))
+        var byAdmin = base
+        byAdmin.title = "Renamed"
+        byAdmin.version += 1
+        byAdmin.sign(with: admin)
+        #expect(base.accepts(byAdmin) && byAdmin.contest(plainMove, base: base) == .wins && plainMove.contest(byAdmin, base: base) == .loses)
+    }
+
+    @Test func aLateSecondMoveOfAPlaceIsSeenAfterTheGroupMovedOn() {
+        let owner = keys(.random(32)), member = keys(.random(32))
+        let base = settings(owner: owner, members: [member])
+        let first = move(base, from: member, to: keys(.random(32)))
+        // The group moves on past the move.
+        var later = first
+        later.title = "Later"
+        later.version += 1
+        later.sign(with: owner)
+        let mark = RenewalMark(old: member.publicKey, new: first.card(first.members[1].signingKey)!.signingKey, version: first.version)
+        let second = move(base, from: member, to: keys(.random(32)))
+        let taker = second.movesPlace(of: mark.old, at: mark.version, otherThan: mark.new, from: later)
+        #expect(taker == second.members[1].signingKey)
+        // The same move again (the relay handing it out twice) is no dispute.
+        #expect(first.movesPlace(of: mark.old, at: mark.version, otherThan: mark.new, from: later) == nil)
+        // Signed by anyone else, or for another number, it says nothing.
+        var forged = second
+        forged.sign(with: owner)
+        #expect(forged.movesPlace(of: mark.old, at: mark.version, otherThan: mark.new, from: later) == nil)
+        #expect(move(base, from: member, to: keys(.random(32)), version: base.version + 2)
+            .movesPlace(of: mark.old, at: mark.version, otherThan: mark.new, from: later) == nil)
+    }
+
+    /// A claimed admin key adds a member, moves on to another key, and adds again; the member it added moves to new keys
+    /// of their own. A dispute over the claimed key reaches all of it, and nobody the owner or the real admin brought in.
+    @Test func aDisputeReachesEverythingTheClaimedKeysBroughtIn() {
+        let owner = keys(.random(32)), admin = keys(.random(32)), plain = keys(.random(32))
+        let base = settings(owner: owner, members: [admin, plain], admins: [admin])
+        var shared = SharedGroup(settings: base, epochs: [])
+        func take(_ next: GroupSettings) {
+            #expect(shared.settings.accepts(next), "every step is one members take")
+            if let (old, new) = shared.settings.renewal(to: next) {
+                shared.renewals = (shared.renewals ?? []) + [RenewalMark(old: old, new: new, version: next.version)]
+            }
+            shared.noteAdded(from: shared.settings, to: next)
+            shared.settings = next
+        }
+        func add(_ who: GroupMemberKeys, by signer: GroupMemberKeys) -> GroupSettings {
+            var next = shared.settings
+            next.members.append(MemberCard.make(who, group: group, name: "m", avatar: nil, color: nil).withoutAvatar)
+            next.version += 1
+            next.sign(with: signer)
+            return next
+        }
+        let claimed = keys(.random(32)), later = keys(.random(32)), m = keys(.random(32)), m2 = keys(.random(32))
+        let n = keys(.random(32)), q = keys(.random(32))
+        take(move(shared.settings, from: admin, to: claimed))
+        take(add(m, by: claimed))
+        take(move(shared.settings, from: claimed, to: later))
+        take(add(n, by: later))
+        take(move(shared.settings, from: m, to: m2))
+        take(add(q, by: owner))
+        #expect(shared.addedBy?[m2.publicKey.hex] == claimed.publicKey, "a move to new keys keeps who brought the member in")
+        let decoy = keys(.random(32)).publicKey
+        let reached = shared.broughtIn(under: [claimed.publicKey, decoy])
+        // (The member's key from before their move is no longer listed, so there's nothing of it left to hold back.)
+        #expect(reached == [claimed.publicKey, decoy, later.publicKey, m2.publicKey, n.publicKey])
+        #expect(!reached.contains(owner.publicKey) && !reached.contains(plain.publicKey) && !reached.contains(q.publicKey))
+        #expect(shared.holder(of: admin.publicKey) == later.publicKey && shared.holder(of: claimed.publicKey) == later.publicKey)
+        #expect(shared.holder(of: plain.publicKey) == plain.publicKey)
+        // Only those still listed are remembered.
+        let remembered = Set((shared.addedBy ?? [:]).keys)
+        #expect(remembered.isSubset(of: Set(shared.settings.members.map(\.signingKey.hex))))
     }
 
     @Test func eachEpochKeyCarriesACheckTheSettingsName() {
@@ -213,7 +337,8 @@ struct GroupKeysTests {
             fromAdmin.title = "try \(n)"
             fromAdmin.version = base.version + 1
             fromAdmin.sign(with: admin)
-            #expect(fromOwner.winsOver(fromAdmin) && !fromAdmin.winsOver(fromOwner), "however often the admin tries")
+            #expect(fromOwner.contest(fromAdmin, base: base) == .wins && fromAdmin.contest(fromOwner, base: base) == .loses,
+                    "however often the admin tries")
         }
         // A mod's removal comes with a new epoch, and is taken.
         let next = GroupEpoch.fresh(number: base.epoch + 1)

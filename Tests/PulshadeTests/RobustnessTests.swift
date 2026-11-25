@@ -105,8 +105,6 @@ struct RobustnessTests {
         for _ in 0..<200 {
             let junk = text(Int.random(in: 0...90, using: &rng), &rng)
             _ = Invite(code: junk)
-            _ = LinkCode(junk)
-            _ = JoinCode(junk)
             _ = ChatLink(junk)
             _ = ChatCode(junk)
             if let url = URL(string: "pulshade://u/\(junk)") { _ = DirectoryProfile.handle(fromLink: url) }
@@ -114,8 +112,6 @@ struct RobustnessTests {
         for junk in ["", "psh1", "pshchat1", "pshlink1", "pshjoin1", "pulshade://"] {
             _ = Invite(code: junk)
             _ = ChatLink(junk)
-            _ = LinkCode(junk)
-            _ = JoinCode(junk)
         }
     }
 

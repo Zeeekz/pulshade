@@ -58,27 +58,11 @@ enum LockStyle: String, CaseIterable, Identifiable {
 
     // MARK: Remembered choice
 
-    /// Which style the unlock screen should offer first. This is only a hint about the keyboard to show:
-    /// every secret is tried against every slot whatever it looks like, so it opens nothing by itself.
-    /// Under the `pulshade.` prefix like the other settings kept outside the vault, so a wipe removes it. Builds
-    /// before this one stored it as `lockStyle`: it is read from there once and moved.
+    /// Which style the unlock screen offers first is kept sealed in the lock file (`AppModel.lockStyle`). Builds before
+    /// that kept it as a plain preference under these names; they're only read once, to move it (`moveLockSettingsIntoVault`),
+    /// and removed.
     static let key = "pulshade.lockStyle"
     static let legacyKey = "lockStyle"
-
-    static var remembered: LockStyle {
-        get {
-            let defaults = UserDefaults.standard
-            if let now = defaults.string(forKey: key) { return LockStyle(rawValue: now) ?? .passcode }
-            guard let old = defaults.string(forKey: legacyKey) else { return .passcode }
-            defaults.removeObject(forKey: legacyKey)
-            if LockStyle(rawValue: old) != nil { defaults.set(old, forKey: key) }
-            return LockStyle(rawValue: old) ?? .passcode
-        }
-        set {
-            UserDefaults.standard.set(newValue.rawValue, forKey: key)
-            UserDefaults.standard.removeObject(forKey: legacyKey)
-        }
-    }
 
     /// What a new secret can be, for the real account as for a decoy or panic passcode: at least 6 long, so a 4-digit
     /// PIN is no longer offered. `.pin4` stays only so the lock screen can show the keypad someone set up earlier.
@@ -108,27 +92,22 @@ enum LockStyle: String, CaseIterable, Identifiable {
     }
 }
 
-/// "Wipe after too many wrong attempts": off unless chosen. Kept outside the vault (it has to be known while locked), in
-/// the settings Pulshade keeps for the lock screen, so Burn and Detach remove it. The count itself is `failedAttempts`,
-/// which lives in the Keychain and so survives the app being closed. It counts every wrong guess against every slot the
-/// same way, so it says nothing about whether a decoy or panic passcode exists, and a right one of any kind starts it again.
+/// "Wipe after too many wrong attempts": on for a new account (after 10), and kept sealed in the lock file
+/// (`Vault.LockSettings`), so it is known while locked but no other app or preference editor can read or turn it off. The
+/// count itself is `failedAttempts`, which lives in the Keychain and so survives the app being closed. It counts every
+/// wrong guess against every slot the same way, so it says nothing about whether a decoy or panic passcode exists, and a
+/// right one of any kind starts it again.
 enum WipeAfterFailures {
+    /// Where builds before the setting was sealed kept it, read once to move it.
     static let key = "pulshade.wipeAfterAttempts"
     /// Off, then how many wrong tries in a row.
     static let choices = [0, 5, 10, 20]
+    /// What a new account starts with.
+    static let newAccountDefault = 10
 
-    static var limit: Int {
-        get { UserDefaults.standard.integer(forKey: key) }
-        set {
-            if newValue <= 0 { UserDefaults.standard.removeObject(forKey: key) }
-            else { UserDefaults.standard.set(newValue, forKey: key) }
-        }
-    }
-
-    /// Whether this many wrong tries in a row is enough to wipe.
-    static func reached(_ attempts: Int) -> Bool {
-        let n = limit
-        return n > 0 && attempts >= n
+    /// Whether this many wrong tries in a row is enough to wipe, with `limit` (0 is off).
+    static func reached(_ attempts: Int, limit: Int) -> Bool {
+        limit > 0 && attempts >= limit
     }
 }
 

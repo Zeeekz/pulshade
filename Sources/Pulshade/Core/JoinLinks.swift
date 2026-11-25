@@ -185,11 +185,12 @@ struct GroupLinks: Codable, Equatable {
 
     var tieBreak: Data { Data(SHA256.hash(data: signable())) }
 
-    /// Which of two versions with the same number everyone keeps: the owner's over anyone else's (so an admin can't undo
-    /// the owner's reset by changing something at the same moment), otherwise the lower hash.
-    func winsOver(_ other: GroupLinks, owner: Data) -> Bool {
-        let mine = signer == owner, theirs = other.signer == owner
-        if mine != theirs { return mine }
+    /// Which of two versions with the same number everyone keeps: the one whose signer stands higher in the group's
+    /// settings (`GroupSettings.seniority`: the owner, then the admins in the owner's order), so an admin can't undo the
+    /// owner's reset, or another admin's change, by signing again until a hash comes out lower. Between two versions one
+    /// key signed (two of one account's devices), the lower hash.
+    func winsOver(_ other: GroupLinks, settings: GroupSettings) -> Bool {
+        if signer != other.signer { return settings.seniority(of: signer) < settings.seniority(of: other.signer) }
         return tieBreak.lexicographicallyPrecedes(other.tieBreak)
     }
 
@@ -270,7 +271,11 @@ struct GroupPreview: Codable, Equatable {
     /// around, and only for a few days after it was made: those apps write it again every three days. Without these, the
     /// tag could simply be taken off a preview to get round it.
     static let untaggedLife: TimeInterval = 4 * 86_400
-    static let untaggedUntil = Date(timeIntervalSince1970: 1_803_859_200) // 2027-03-01
+    /// Builds 19 and 20 write untagged previews. Build 21 (1.0.4), which tags them, went to App Store review on 23
+    /// November 2026 and replaces 1.0.3 there once released; five weeks on leaves time for updates that arrive late. An
+    /// owner still on build 19 or 20 after this (a TestFlight build runs until February) has links that don't open until
+    /// they update.
+    static let untaggedUntil = Date(timeIntervalSince1970: 1_798_761_600) // 2027-01-01
 
     func signable() -> Data {
         var copy = self

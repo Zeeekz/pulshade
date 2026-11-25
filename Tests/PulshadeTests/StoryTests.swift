@@ -297,7 +297,7 @@ struct StoryMediaTests {
         #expect(try await asset.load(.duration).seconds > 3.5)
     }
 
-    @Test func zoomRecordedOnTheMacIsBakedIntoTheClip() async throws {
+    @Test func digitalZoomIsBakedIntoTheClip() async throws {
         let source = try await Self.clip(seconds: 2)
         func frame(_ zoom: ZoomTrack) async throws -> [Double] {
             let data = try await StoryVideo.export(from: source, filter: .none, zoom: zoom)

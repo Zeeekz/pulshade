@@ -25,7 +25,7 @@ struct LeaveView: View {
                 }
             }
             .padding(.horizontal, 16)
-            .padding(.top, Platform.isPhone ? 12 : 40)
+            .padding(.top, 12)
             .padding(.bottom, 24)
             .frame(maxWidth: 600)
             .frame(maxWidth: .infinity)
@@ -39,7 +39,6 @@ struct LeaveView: View {
 
     /// What Detach does here, in one or two short lines.
     private var detachDetail: String {
-        if model.hasOtherDevices { return "Wipe this device now. Your other devices keep the account." }
         return model.data.security.keepBackup
             ? "Wipe this device now. Your recovery code brings back contacts and groups, not chats."
             : "Wipe this device now. Backups are off, so nothing comes back."
@@ -101,11 +100,20 @@ struct BurnSheet: View {
                 Text("Burn wipes this phone at once and keeps erasing on the server until done. Detach leaves the sealed backup on the relay, erased within 180 days.")
                     .font(.system(size: 13)).foregroundStyle(Ink.dim)
                     .fixedSize(horizontal: false, vertical: true)
+                Text(BurnSheet.leftBehind)
+                    .font(.system(size: 13)).foregroundStyle(Ink.dim)
+                    .fixedSize(horizontal: false, vertical: true)
                 Button("Burn this device only") { burn(deviceOnly: true) }
                     .disabled(working || confirm != "BURN")
             }
         }
     }
+
+    /// What Burn can't take with it on an iPhone: Apple's wake-up token belongs to this copy of the app, not the account.
+    static let pushTokenNote = "Apple's wake-up token for this iPhone outlives the account. The relay is told to forget it, but a new account made in this copy of Pulshade would get the same token, which the relay could match to this one. To start completely fresh, delete Pulshade and install it again: that gets a new token."
+
+    /// What a Burn leaves on this device until the server side is done, said plainly (see docs/burn-order.md).
+    static let leftBehind = "Until the server confirms, which can take up to 30 days if it can't be reached, this device keeps a sealed list of what's still to erase there. Someone who examines the device in that time can tell an account was burned here, and see the mailbox codes of the contacts it is still saying goodbye to, though not their names or any messages. It is deleted as soon as the server is done."
 
     private func burn(deviceOnly: Bool = false) {
         working = true
@@ -145,7 +153,6 @@ struct PersonaBurnSheet: View {
                     BurnPoint(symbol: "bubble.left.and.bubble.right", text: "Its chats are deleted for both sides. Groups it owns are deleted for everyone; it leaves the rest.")
                     BurnPoint(symbol: "person.crop.circle.badge.xmark", text: "Its contacts forget it, along with its messages, stories and requests.")
                     BurnPoint(symbol: "at", text: "Its usernames can't be claimed for 3 months, and the relay forgets they were its.")
-                    BurnPoint(symbol: "laptopcomputer.and.iphone", text: "It's removed from every device on your account.")
                 }
                 BurnConfirmField(confirm: $confirm)
                 if let problem {
@@ -289,7 +296,10 @@ private struct BurnPoints: View {
             BurnPoint(symbol: "person.crop.circle.badge.xmark", text: "Your contacts forget you, along with your messages, stories and requests.")
             BurnPoint(symbol: "at", text: "Your usernames can't be claimed for 3 months, and the relay forgets they were yours.")
             BurnPoint(symbol: "server.rack", text: "The relay keeps nothing: no backup, no waiting messages.")
-            BurnPoint(symbol: "laptopcomputer.and.iphone", text: "Every device on the account is wiped, and this one keeps no trace of it.")
+            BurnPoint(symbol: "iphone.gen3", text: "This iPhone is wiped and keeps no trace of it.")
+            #if os(iOS)
+            BurnPoint(symbol: "bell.slash", text: BurnSheet.pushTokenNote)
+            #endif
         }
     }
 }

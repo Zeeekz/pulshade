@@ -2,8 +2,6 @@ import SwiftUI
 import UniformTypeIdentifiers
 #if os(iOS)
 import PhotosUI
-#else
-import AppKit
 #endif
 
 /// Photos and videos from the library for a chat message, straight from the attach menu ("Upload media"): up to ten
@@ -43,47 +41,8 @@ enum ChatMediaPicker {
     static func present(limit: Int, maxSide: CGFloat, done: @escaping (Picked) -> Void) {
         #if os(iOS)
         PhotoLibrarySheet.present(limit: limit, maxSide: maxSide, done: done)
-        #else
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.image, .movie]
-        panel.allowsMultipleSelection = true
-        guard panel.runModal() == .OK else { return }
-        let urls = panel.urls
-        // Read and cleaned off the main thread, so the window doesn't hang over a handful of big photos.
-        Task {
-            let picked = await Task.detached(priority: .userInitiated) { load(urls, limit: limit, maxSide: maxSide) }.value
-            done(picked)
-        }
         #endif
     }
-
-    #if os(macOS)
-    private nonisolated static func load(_ urls: [URL], limit: Int, maxSide: CGFloat) -> Picked {
-        var picked = Picked()
-        for url in urls {
-            let isMovie = (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType?.conforms(to: .movie) == true
-            if isMovie {
-                if picked.clip != nil { picked.extraVideos += 1; continue }
-                let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
-                if size > 0, size <= largestVideo, let bytes = try? Data(contentsOf: url, options: .mappedIfSafe) {
-                    picked.clip = MemoryClip(bytes)
-                } else {
-                    picked.failed += 1
-                }
-            } else if picked.photos.count < limit {
-                if let bytes = try? Data(contentsOf: url, options: .mappedIfSafe), ImageLimits.isReasonable(bytes),
-                   let image = NSImage(data: bytes), let data = cleanJPEG(image, maxSide: maxSide) {
-                    picked.photos.append(data)
-                } else {
-                    picked.failed += 1
-                }
-            } else {
-                picked.dropped += 1
-            }
-        }
-        return picked
-    }
-    #endif
 }
 
 #if os(iOS)

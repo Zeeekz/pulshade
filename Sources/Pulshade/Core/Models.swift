@@ -54,6 +54,17 @@ struct Persona: Codable, Identifiable, Equatable {
     var isBurner: Bool { burnsAt != nil }
 }
 
+/// A mailbox this device read a contact on before it moved to a new one. Still read: until every device of theirs has
+/// written to the new one (`until` nil; a device on a build from before never moves, so the old one is read for as long
+/// as the friendship lasts), then for as long as mail can wait on the relay (`until`).
+struct FormerMailbox: Codable, Equatable {
+    var key: Data
+    var until: Date?
+    /// When the move away from it was last told again to devices of theirs not yet heard on the new one
+    /// (`AppModel.tendMailboxMoves`). Nil: only when it was made.
+    var retold: Date? = nil
+}
+
 /// One of a person's devices, from your side: where to reach it and your encrypted session with it.
 /// An envelope from a device you haven't allowed, kept as it came.
 struct HeldMail: Codable, Equatable {
@@ -225,10 +236,22 @@ struct Contact: Codable, Identifiable {
     /// Two of their devices unlinked each other (a phone that was taken, say, against the one it was taken from): both
     /// were dropped, the safety code counts as unchecked, and any new device of theirs is held until you allow it.
     var contested: Date?
+    /// When their account last unlinked a device (`Payload.devicesUnlinked`, from a device of theirs still linked). From
+    /// then on a new device of theirs is held until you allow it, unless a device of theirs you still trust vouches for it
+    /// (`DeviceVouch`): a device they unlinked still holds the account's keys and could otherwise come back as a new one.
+    var unlinked: Date?
     /// The channel whose code they said hello on, when that's all this device knows them by. Someone who never got in is
     /// let go once their invite has run out (three days), and only so many such strangers are kept for each channel (a flood of throwaway accounts
     /// can't fill the vault).
     var viaCode: UUID?
+    /// When this device started reading them on `receiveKey`. Each week it moves to a fresh mailbox (`AppModel.tendMailboxes`)
+    /// so the relay can't follow one pair of mailboxes for the life of a friendship. Nil until first looked at.
+    var mailboxSince: Date?
+    /// Mailboxes this device read them on before, still read until they're done with (`FormerMailbox`).
+    var formerMailboxes: [FormerMailbox]?
+    /// Their devices heard from on `receiveKey` since the last move: once every one has, the mailbox before is let go
+    /// of when the mail it may still hold has run out.
+    var movedHeard: [Data]?
 
     /// Where a new contact starts: their first device's mailbox.
     var sendID: Data {
@@ -253,8 +276,8 @@ struct Contact: Codable, Identifiable {
 
     private enum CodingKeys: String, CodingKey {
         case fingerprint, name, nickname, avatar, banner, color, bio, links, walletChangedAt, notes, handle, verified, signingKey, agreementKey, devices, receiveKey, relay
-        case hidden, isSelf, awaitingAcceptance, addedAt, persona, wantsMyPresence, toldPresence, spare, oldSpares, moreSpares, departing, pq, pqCommit, pqCardSent, tooOld, revoked, contested
-        case viaCode
+        case hidden, isSelf, awaitingAcceptance, addedAt, persona, wantsMyPresence, toldPresence, spare, oldSpares, moreSpares, departing, pq, pqCommit, pqCardSent, tooOld, revoked, contested, unlinked
+        case viaCode, mailboxSince, formerMailboxes, movedHeard
         // Single-device fields from before linked devices.
         case sendID, session, handshake, pending
     }
@@ -294,7 +317,11 @@ struct Contact: Codable, Identifiable {
         tooOld = try? c.decodeIfPresent(Date.self, forKey: .tooOld)
         revoked = try? c.decodeIfPresent([RevokedDevice].self, forKey: .revoked)
         contested = try? c.decodeIfPresent(Date.self, forKey: .contested)
+        unlinked = try? c.decodeIfPresent(Date.self, forKey: .unlinked)
         viaCode = try? c.decodeIfPresent(UUID.self, forKey: .viaCode)
+        mailboxSince = try? c.decodeIfPresent(Date.self, forKey: .mailboxSince)
+        formerMailboxes = try? c.decodeIfPresent([FormerMailbox].self, forKey: .formerMailboxes)
+        movedHeard = try? c.decodeIfPresent([Data].self, forKey: .movedHeard)
         addedAt = try c.decodeIfPresent(Date.self, forKey: .addedAt) ?? Date()
         // A saved list of devices is taken as it is, even an empty one: your own entry once the last linked device leaves,
         // and the members of a group that shares one mailbox, who are never written to directly. (An empty list used to
@@ -330,6 +357,9 @@ struct Contact: Codable, Identifiable {
         try c.encode(agreementKey, forKey: .agreementKey)
         try c.encode(devices, forKey: .devices)
         try c.encodeIfPresent(receiveKey, forKey: .receiveKey)
+        try c.encodeIfPresent(mailboxSince, forKey: .mailboxSince)
+        try c.encodeIfPresent(formerMailboxes, forKey: .formerMailboxes)
+        try c.encodeIfPresent(movedHeard, forKey: .movedHeard)
         try c.encodeIfPresent(relay, forKey: .relay)
         try c.encode(hidden, forKey: .hidden)
         try c.encode(isSelf, forKey: .isSelf)
@@ -348,6 +378,7 @@ struct Contact: Codable, Identifiable {
         try c.encodeIfPresent(tooOld, forKey: .tooOld)
         try c.encodeIfPresent(revoked, forKey: .revoked)
         try c.encodeIfPresent(contested, forKey: .contested)
+        try c.encodeIfPresent(unlinked, forKey: .unlinked)
         try c.encodeIfPresent(viaCode, forKey: .viaCode)
     }
 
@@ -393,34 +424,6 @@ struct OpenInvite: Codable, Identifiable {
     }
 }
 
-/// A QR link this device is showing, for a new device to scan.
-struct LinkOffer: Codable, Identifiable {
-    var id: Data { receiveKey }
-    /// The mailbox the new device writes its request to.
-    var receiveKey: Data
-    /// Shared with the new device through the QR code only; proves it saw the code.
-    var secret: Data
-    var createdAt = Date()
-    /// A device that answered and is waiting for you to confirm.
-    var request: LinkRequest?
-    /// Where to send the account when the new device's own code was scanned. Nil means your relay.
-    var relay: String?
-}
-
-/// What a new device sends after scanning: who it is and where to send the account.
-struct LinkRequest: Codable, Equatable {
-    var deviceID: Data
-    var name: String
-    /// The new device's temporary key for receiving the account.
-    var ephemeral: Data
-    /// Where to drop the encrypted account bundle.
-    var bundleSendID: Data
-    /// The new device's mailbox for messages from your other devices.
-    var selfSendID: Data
-    /// The pin of the new device's own keys (`DeviceKey`), so the device approving it knows them from the start.
-    var keyPin: Data
-}
-
 /// Someone who found your public profile and wants to talk. Nothing is set up until you accept.
 
 /// What a sealed invite to be friends carries: a one-time invite code for the sender's account, and a note.
@@ -450,10 +453,12 @@ struct GroupFriendInvite: Codable, Identifiable, Equatable {
 
 /// Someone invited you to a group or channel you aren't in. Nothing is joined, no card goes back, and nobody becomes the
 /// one a channel is followed through, until you say yes.
-/// A channel code you followed: its tag (`Invite.codeTag`), which that channel's invite carries, and when.
+/// A channel code you followed: its tag (`Invite.codeTag`), which that channel's invite carries, and when. `channel` is
+/// the code's commitment to its channel (`Invite.channelCommit`); codes from before have none.
 struct FollowedCode: Codable, Equatable {
     var tag: Data
     var at: Date
+    var channel: Data? = nil
 }
 
 struct GroupOffer: Codable, Identifiable, Equatable {
@@ -515,7 +520,7 @@ enum ConversationKind: String, Codable, CaseIterable, Identifiable {
 }
 
 enum MessageStatus: String, Codable {
-    /// Sealed and waiting on this Mac until the relay takes it.
+    /// Sealed and waiting on this iPhone until the relay takes it.
     case queued
     /// The relay has it.
     case sent
@@ -626,7 +631,7 @@ struct ReplyRef: Codable, Equatable {
     static let maxPicture = 48_000
 }
 
-/// A link preview, built on the sender's Mac and sent inside the encrypted message,
+/// A link preview, built on the sender's iPhone and sent inside the encrypted message,
 /// so whoever receives it never contacts the website.
 struct LinkPreview: Codable, Equatable {
     var url: String
@@ -1038,7 +1043,7 @@ struct Conversation: Codable, Identifiable, Equatable {
         switch kind {
         case .direct: ("Delete this chat for both of you?", "It disappears from their side too. This can't be undone.")
         case .group where amOwner: ("Delete this group for everyone?", "Every member loses it. This can't be undone.")
-        case .group: ("Leave this group?", "It's removed from your Mac and the others are told you left.")
+        case .group: ("Leave this group?", "It's removed from your iPhone and the others are told you left.")
         case .channel where amOwner: ("Delete this channel for everyone?", "Every follower loses it. This can't be undone.")
         case .channel where isAnnouncements: ("Delete Announcements?", "It comes back with the next announcement.")
         case .channel where !amAdmin: ("Leave this channel?", "It's removed from this device and its staff are told you left, so you stop getting its key. The channel stays for everyone else.")
@@ -1295,7 +1300,7 @@ struct Outgoing: Codable, Identifiable {
     }
 }
 
-/// How much a notification reveals. macOS keeps notifications outside our encryption, so less is safer.
+/// How much a notification reveals. The system keeps notifications outside our encryption, so less is safer.
 enum NotificationContent: String, Codable, CaseIterable, Identifiable {
     case hidden, name, full
     var id: String { rawValue }
@@ -1327,6 +1332,8 @@ extension SecuritySettings {
         notifications = c.notifications
         notificationContent = c.notificationContent
         autoLockMinutes = c.autoLockMinutes
+        lockImmediately = c.lockImmediately
+        fullLock = c.fullLock
         blockCapture = c.blockCapture
         blurWhenInactive = c.blurWhenInactive
         keepBackup = c.keepBackup
@@ -1345,6 +1352,7 @@ extension SecuritySettings {
         s.notifications = false
         s.notificationContent = .hidden
         s.autoLockMinutes = 1
+        s.lockImmediately = true
         s.blockCapture = true
         s.blurWhenInactive = true
         s.allowForwarding = false
@@ -1357,11 +1365,18 @@ extension SecuritySettings {
 struct SecuritySettings: Codable, Equatable {
     /// Minutes of inactivity before locking. 0 means never.
     var autoLockMinutes = 5
-    /// Auto-lock hides PULSHADE behind the passcode but keeps it running, so a locked phone still takes in messages and
-    /// sends delivery receipts, as other messengers do. Always (from build 19, no longer a choice), except with a decoy
-    /// or panic passcode set, which needs the passcode to pick the account (`AppModel.canCover`). A lock you press
-    /// yourself always closes everything.
-    var keepReceivingLocked: Bool { true }
+    /// "Immediately": also lock the moment you leave Pulshade (the iPhone goes back to the home screen or locks).
+    /// Saved with `autoLockMinutes` at 1, so idling locks after a minute too.
+    var lockImmediately = false
+    /// An automatic lock closes everything, as a lock you press does: the account's keys and chats leave memory, and
+    /// nothing is received until the passcode is typed again (no second ticks for friends, no new messages counted).
+    /// Off, an automatic lock only hides PULSHADE behind the passcode and keeps it running, so a locked phone still takes
+    /// in messages and sends delivery receipts, as other messengers do, while the keys stay in memory. Either way it
+    /// behaves the same whether or not a decoy or panic passcode is set (`AppModel.canCover`).
+    var fullLock = false
+    /// Auto-lock keeps PULSHADE running behind the passcode (see `fullLock`). A lock you press yourself always closes
+    /// everything.
+    var keepReceivingLocked: Bool { !fullLock }
     /// Hide the window from screenshots and screen recording.
     var blockCapture = true
     /// Blur chats whenever Pulshade isn't the front app.
@@ -1388,8 +1403,9 @@ struct SecuritySettings: Codable, Equatable {
     // receipts stay a choice.
     /// Tell people when you've seen their messages, and see when they've seen yours. Never in one-time chats.
     var readReceipts = true
-    /// Show people when you're typing, and see when they are.
-    var typingIndicators = true
+    /// Show people when you're typing, and see when they are. Off for accounts made from build 22: each typing signal is
+    /// a deposit the relay sees, seconds before the message it announces. Accounts from before keep what they had.
+    var typingIndicators = false
     /// Let people forward your messages to other chats. Off, your messages ask their apps not to offer Forward or Copy.
     var allowForwarding = true
     /// When a contact's account adds a device, nothing of yours goes to it until you allow it in their chat (it waits in
@@ -1398,7 +1414,7 @@ struct SecuritySettings: Codable, Equatable {
     /// Show people when you have Pulshade open, and see when they do. Off by default: the relay can tell when
     /// the signals go out, even though it can't read them.
     var onlineStatus = false
-    /// Pulse icon with an unread count in the menu bar.
+    /// Unused; still read so older saved data decodes.
     var menuBarIcon = true
     /// Say what saving a photo or video out of Pulshade means before it's saved (`SaveWarning`), until "Don't ask
     /// again" is chosen.
@@ -1440,6 +1456,8 @@ struct SecuritySettings: Codable, Equatable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = SecuritySettings()
         autoLockMinutes = try c.decodeIfPresent(Int.self, forKey: .autoLockMinutes) ?? d.autoLockMinutes
+        lockImmediately = try c.decodeIfPresent(Bool.self, forKey: .lockImmediately) ?? d.lockImmediately
+        fullLock = try c.decodeIfPresent(Bool.self, forKey: .fullLock) ?? d.fullLock
         lockedDelivery = try? c.decodeIfPresent(Bool.self, forKey: .lockedDelivery)
         blockCapture = try c.decodeIfPresent(Bool.self, forKey: .blockCapture) ?? d.blockCapture
         blurWhenInactive = try c.decodeIfPresent(Bool.self, forKey: .blurWhenInactive) ?? d.blurWhenInactive
@@ -1451,7 +1469,8 @@ struct SecuritySettings: Codable, Equatable {
         menuBarIcon = try c.decodeIfPresent(Bool.self, forKey: .menuBarIcon) ?? d.menuBarIcon
         warnBeforeSaving = try c.decodeIfPresent(Bool.self, forKey: .warnBeforeSaving) ?? d.warnBeforeSaving
         readReceipts = try c.decodeIfPresent(Bool.self, forKey: .readReceipts) ?? d.readReceipts
-        typingIndicators = try c.decodeIfPresent(Bool.self, forKey: .typingIndicators) ?? d.typingIndicators
+        // Saved by every build that had the setting; one missing is from before it existed, when typing was shown.
+        typingIndicators = try c.decodeIfPresent(Bool.self, forKey: .typingIndicators) ?? true
         allowForwarding = try c.decodeIfPresent(Bool.self, forKey: .allowForwarding) ?? d.allowForwarding
         holdNewDevices = try c.decodeIfPresent(Bool.self, forKey: .holdNewDevices) ?? d.holdNewDevices
         onlineStatus = try c.decodeIfPresent(Bool.self, forKey: .onlineStatus) ?? d.onlineStatus
@@ -1512,7 +1531,20 @@ struct AppData: Codable {
     /// 28: invites to groups and channels wait for a yes (`groupOffers`), channel codes followed (`followsAsked`, with the tag channel invites carry), and
     /// the channel a stranger said hello on (`Contact.viaCode`); up to three spare keys per friend, one of them reusable
     /// (`Contact.moreSpares`, `SpareKey.slot`, `SpareKey.answers`).
-    static let currentFormat = 28
+    /// 29: the newest sealed backup this device made or restored (`backupStamp`), which the backup itself carries too;
+    /// a session's kept keys of skipped messages say when they were kept, and it counts messages since its last
+    /// post-quantum secret.
+    /// Also in 29: auto-lock can lock the moment you leave (`SecuritySettings.lockImmediately`), and can close everything
+    /// (`SecuritySettings.fullLock`).
+    /// Also in 29: a contact's account unlinking a device holds their unvouched new devices (`Contact.unlinked`), a linked
+    /// device keeps its approver's vouch (`deviceVouch`), followed channel codes keep the channel they name
+    /// (`FollowedCode.channel`), and shared groups keep moves to new keys and disputes over them (`SharedGroup.renewals`,
+    /// `disputed`, `renewing`, `foreignMove`) and which passed-on chains are unproven (`GroupReader.unproven`).
+    /// Also in 29 (build 22): a contact's mailbox moves every week (`Contact.mailboxSince`, `formerMailboxes`, `movedHeard`);
+    /// reader uses of your files this device still has to spend (`blobSpends`), and a file's padded
+    /// size on the relay (`Attachment.padded`).
+    /// Also in 29: public names for groups and channels (`publicNames`, `namesToRelease`), and short links (`shortLinks`).
+    static let currentFormat = 29
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []
@@ -1533,7 +1565,6 @@ struct AppData: Codable {
     /// (`Vault.sealDeviceSeed`). Never in the backup or anything sent to another device.
     var deviceKey: Data?
     /// Links you're offering to new devices, waiting for them to scan.
-    var linkOffers: [LinkOffer] = []
     /// Chat codes you made whose chats haven't ended yet.
     var chatCodes: [ChatCodeOffer] = []
     var personas: [Persona] = []
@@ -1580,9 +1611,16 @@ struct AppData: Codable {
     /// so an unchanged account isn't uploaded again. Neither is ever in the backup itself.
     var backupSavedAt: Date?
     var backupDigest: Data?
+    /// The newest sealed backup this device made or restored: its count and when it was made. Every backup carries its
+    /// own inside the seal, counting higher than the one before, so a copy older than one this device already had is
+    /// recognised at recovery (`AppModel.backup(of:)`). Nil before the first.
+    var backupStamp: BackupStamp?
     /// Files of yours kept on the relay that still have to be erased there (a message of yours was deleted while the
     /// relay couldn't be reached). Each is tried again until the relay says it's gone, or its time is up.
     var blobWipes: [BlobWipe] = []
+    /// Uses of your files' reader tokens that this device spends itself, so a reader list can have a fixed shape and still
+    /// let the relay erase the file once everyone has it (`BlobReaders`, `BlobSpend`).
+    var blobSpends: [BlobSpend] = []
     /// Your requests to join groups through their links, until each is answered.
     var joinAsks: [JoinAsk] = []
     /// Invites to be friends from people you share a group with, until you answer.
@@ -1592,10 +1630,19 @@ struct AppData: Codable {
     /// "persona|fingerprint" → the codes of that person's channels you followed lately (`FollowedCode`): the invite for
     /// each code's own channel is taken without asking again, for two weeks after you followed it.
     var followsAsked: [String: [FollowedCode]] = [:]
+    /// Public names this device claimed for groups and channels (`PublicName`), to keep them in step and let them go.
+    var publicNames: [PublicName] = []
+    /// Names given up that the relay may still list, tried again until it doesn't (`releasePendingNames`).
+    var namesToRelease: [NameRelease] = []
+    /// Short links this device made (`ShortLinkRecord`), kept to keep them listed and to mark them no longer good.
+    var shortLinks: [ShortLinkRecord] = []
     /// Random bytes every linked device of the account holds, which group keys are made from with the seed
     /// (`GroupMemberKeys`). Replaced when a device is unlinked, and every group then moves to keys made with the new one.
     /// Nil: the seed alone (an account from before; its lead device makes one at unlock).
     var groupSecret: Data?
+    /// The device that approved this one vouching for it (`DeviceVouch`), shown to the main persona's contacts whenever
+    /// this device introduces itself. Nil on a device that made the account, or was linked by a build before.
+    var deviceVouch: DeviceVouch?
     /// When this device may move groups still on an older group secret to the current one: at once on the device that
     /// made it, a while after on the others (so the one that made it goes first).
     var groupRenewAfter: Date?
@@ -1617,8 +1664,8 @@ struct AppData: Codable {
     var mediaFillers: [String]?
     init() {}
 
-    /// The relay new identities use. A build can set `PulshadeRelay` in its Info.plist (the iPhone
-    /// build points at the relay on your Mac); otherwise it's a relay on this machine.
+    /// The relay new identities use. A build can set `PulshadeRelay` in its Info.plist (a development
+    /// build can point at the relay on your computer); otherwise it's a relay on this machine.
     /// The same relay's ordinary https address, used when Tor is off. Nil until the relay has one, and while it
     /// hasn't, Tor can't be switched off: an onion address can only be reached over Tor.
     static var directRelay: String? {
@@ -1640,7 +1687,7 @@ struct AppData: Codable {
         return Invite.validRelay(configured) ?? "http://127.0.0.1:7878"
         #else
         if let relay = Invite.validRelay(configured) { return relay }
-        // A release app bundle with no usable relay would fall back to this Mac and leave Tor off by default: the
+        // A release app bundle with no usable relay would fall back to this machine and leave Tor off by default: the
         // exact anonymity failure this setting exists to prevent. Stop rather than quietly connect direct. (A test
         // run or a command-line binary has no `.app` bundle; it keeps the local fallback.)
         guard Bundle.main.bundleURL.pathExtension != "app" else {
@@ -1691,13 +1738,16 @@ struct AppData: Codable {
         decoySeed = try c.decodeIfPresent(Data.self, forKey: .decoySeed)
         deviceID = try c.decodeIfPresent(Data.self, forKey: .deviceID) ?? .random(16)
         deviceKey = try c.decodeIfPresent(Data.self, forKey: .deviceKey)
-        linkOffers = (try? c.decodeIfPresent([LinkOffer].self, forKey: .linkOffers)) ?? []
         chatCodes = (try? c.decodeIfPresent([ChatCodeOffer].self, forKey: .chatCodes)) ?? []
         blobWipes = (try? c.decodeIfPresent([BlobWipe].self, forKey: .blobWipes)) ?? []
+        blobSpends = (try? c.decodeIfPresent([BlobSpend].self, forKey: .blobSpends)) ?? []
         joinAsks = (try? c.decodeIfPresent([JoinAsk].self, forKey: .joinAsks)) ?? []
         friendInvites = (try? c.decodeIfPresent([GroupFriendInvite].self, forKey: .friendInvites)) ?? []
         groupOffers = (try? c.decodeIfPresent([GroupOffer].self, forKey: .groupOffers)) ?? []
         followsAsked = (try? c.decodeIfPresent([String: [FollowedCode]].self, forKey: .followsAsked)) ?? [:]
+        publicNames = (try? c.decodeIfPresent([PublicName].self, forKey: .publicNames)) ?? []
+        namesToRelease = (try? c.decodeIfPresent([NameRelease].self, forKey: .namesToRelease)) ?? []
+        shortLinks = (try? c.decodeIfPresent([ShortLinkRecord].self, forKey: .shortLinks)) ?? []
         personas = try c.decodeIfPresent([Persona].self, forKey: .personas) ?? []
         requests = (try? c.decodeIfPresent([FriendRequest].self, forKey: .requests)) ?? []
         blocked = try c.decodeIfPresent([String].self, forKey: .blocked) ?? []
@@ -1716,12 +1766,27 @@ struct AppData: Codable {
         bornAt = try? c.decodeIfPresent(Date.self, forKey: .bornAt)
         backupSavedAt = try? c.decodeIfPresent(Date.self, forKey: .backupSavedAt)
         backupDigest = try? c.decodeIfPresent(Data.self, forKey: .backupDigest)
+        backupStamp = try? c.decodeIfPresent(BackupStamp.self, forKey: .backupStamp)
         groupSecret = try c.decodeIfPresent(Data.self, forKey: .groupSecret)
+        deviceVouch = try? c.decodeIfPresent(DeviceVouch.self, forKey: .deviceVouch)
         groupRenewAfter = try? c.decodeIfPresent(Date.self, forKey: .groupRenewAfter)
         partingPosts = (try? c.decodeIfPresent([PartingPost].self, forKey: .partingPosts)) ?? []
         setAside = try? c.decodeIfPresent([String: [Data]].self, forKey: .setAside)
         setAsideUnseen = try? c.decodeIfPresent(Int.self, forKey: .setAsideUnseen)
         mediaFillers = try? c.decodeIfPresent([String].self, forKey: .mediaFillers)
+    }
+}
+
+/// What a sealed backup says about itself, inside the seal, where the relay can't change it: a count that only goes up
+/// (`next`), and when it was made, which is shown before it is restored.
+struct BackupStamp: Codable, Equatable {
+    var counter: UInt64
+    var madeAt: Date
+
+    /// The stamp for the next backup after `last`: one more than it, or the time in seconds if that is more, so backups
+    /// made by an account's different devices still count up roughly in the order they were made.
+    static func next(after last: BackupStamp?, now: Date = Date()) -> BackupStamp {
+        BackupStamp(counter: max((last?.counter ?? 0) &+ 1, UInt64(max(0, now.timeIntervalSince1970))), madeAt: now)
     }
 }
 

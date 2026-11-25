@@ -13,9 +13,9 @@ import Security
 struct FileKeys {
     private static let service = "app.pulshade.filekey"
     let account: String
-    /// On a Mac, kept in the data protection Keychain, the one that honours "this device only": the file-based login
-    /// Keychain ignores it, and goes along in a Migration Assistant move or a Time Machine restore. For the key that seals
-    /// this device's own keys (`device.key`), which must never turn up on another Mac.
+    /// On macOS (the test build), kept in the data protection Keychain, the one that honours "this device only": the
+    /// file-based login Keychain ignores it, and goes along when the machine is moved or restored. For the key that seals
+    /// this device's own keys (`device.key`), which must never turn up on another machine.
     private var dataProtection = false
 
     /// Named by the file's path inside the app's home, not the full path: iOS moves an app's whole folder
@@ -25,9 +25,10 @@ struct FileKeys {
         let home = URL(fileURLWithPath: NSHomeDirectory()).standardizedFileURL.path + "/"
         if path.hasPrefix(home) { path.removeFirst(home.count) }
         account = Data(SHA256.hash(data: Data(path.utf8)).prefix(16)).hex
-        // The data files' keys too: an old copy of one must stop opening when its key goes, and the file-based login
-        // Keychain neither deletes rows securely nor stays off another Mac.
-        dataProtection = file == "device.key" || (file.hasPrefix("data-") && file.hasSuffix(".vault"))
+        // Every file's key: an old copy of one must stop opening when its key goes, and the file-based login Keychain
+        // neither deletes rows securely nor stays off another machine. (Builds before this one kept the lock file's and the
+        // Face ID file's keys there: they're moved over when read.)
+        dataProtection = true
     }
 
     private init(account: String) {
@@ -59,7 +60,7 @@ struct FileKeys {
         }
     }
 
-    /// Keys for this file in either of the Mac's Keychains (on iPhone, the same as `load`): one a build that could use the
+    /// Keys for this file in either of macOS's Keychains (on iPhone, the same as `load`): one a build that could use the
     /// data protection Keychain left there, or one a build that couldn't left in the login Keychain.
     func loadEverywhere() -> [SymmetricKey] {
         #if os(macOS)
@@ -115,19 +116,24 @@ struct FileKeys {
     private static let attemptsAccount = "failed-attempts"
 
     static func savedAttempts() -> Int {
-        guard let raw = read(attemptsAccount), raw.count == 4 else { return 0 }
+        guard let raw = read(attemptsAccount, dataProtection: true), raw.count == 4 else { return 0 }
         return Int(raw.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }.littleEndian)
     }
 
     static func saveAttempts(_ count: Int) {
         if count <= 0 { forgetAttempts(); return }
         var value = UInt32(clamping: count).littleEndian
-        try? write(attemptsAccount, Data(bytes: &value, count: 4))
+        // In the data protection Keychain on macOS, like the file keys, where other software running as the same user
+        // can't quietly delete it to start the count again.
+        try? write(attemptsAccount, Data(bytes: &value, count: 4), dataProtection: true)
     }
 
     static func forgetAttempts() {
         if inMemory { _ = lock.withLock { memory.removeValue(forKey: attemptsAccount) }; return }
         SecItemDelete(query(attemptsAccount) as CFDictionary)
+        #if os(macOS)
+        SecItemDelete(query(attemptsAccount, dataProtection: true) as CFDictionary)
+        #endif
     }
 
     // MARK: Keychain
@@ -143,8 +149,8 @@ struct FileKeys {
         return out
     }
 
-    /// iOS has only the data protection Keychain, so this is about the Mac.
-    private static var macProtected: Bool {
+    /// iOS has only the data protection Keychain, so this is about macOS (the test build).
+    private static var twoKeychains: Bool {
         #if os(macOS)
         true
         #else
@@ -154,7 +160,7 @@ struct FileKeys {
 
     private static func accounts() -> [String] {
         if inMemory { return lock.withLock { Array(memory.keys) } }
-        // Attributes only: the Mac's Keychain won't return every item's data in one call.
+        // Attributes only: macOS's Keychain won't return every item's data in one call.
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
                                     kSecAttrService as String: service,
                                     kSecReturnAttributes as String: true,
@@ -166,10 +172,10 @@ struct FileKeys {
     }
 
     /// `dataProtection`: looked for in the data protection Keychain first. One still in the login Keychain (made before, or
-    /// on a Mac build that can't use the other) is moved over when it can be.
+    /// by a macOS build that can't use the other) is moved over when it can be.
     private static func read(_ account: String, dataProtection: Bool) -> Data? {
         if inMemory { return lock.withLock { memory[account] } }
-        guard dataProtection, macProtected else { return read(account, query: query(account)) }
+        guard dataProtection, twoKeychains else { return read(account, query: query(account)) }
         if let found = read(account, query: query(account, dataProtection: true)) { return found }
         guard let legacy = read(account, query: query(account)) else { return nil }
         if (try? add(account, legacy, query: query(account, dataProtection: true))) != nil {
@@ -189,11 +195,11 @@ struct FileKeys {
         return result as? Data
     }
 
-    /// `dataProtection`: into the data protection Keychain, and out of the login one. A Mac build without the entitlement
+    /// `dataProtection`: into the data protection Keychain, and out of the login one. A macOS build without the entitlement
     /// it takes (errSecMissingEntitlement) keeps using the login Keychain, as before, rather than lose the key.
     private static func write(_ account: String, _ value: Data, dataProtection: Bool = false) throws {
         if inMemory { lock.withLock { memory[account] = value }; return }
-        guard dataProtection, macProtected else { return try write(account, value, query: query(account)) }
+        guard dataProtection, twoKeychains else { return try write(account, value, query: query(account)) }
         do {
             try write(account, value, query: query(account, dataProtection: true))
             SecItemDelete(query(account) as CFDictionary)

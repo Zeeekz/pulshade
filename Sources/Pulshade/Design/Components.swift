@@ -3,6 +3,9 @@ import CoreImage.CIFilterBuiltins
 import UniformTypeIdentifiers
 #if canImport(PulshadeShared)
 import PulshadeShared
+#if os(iOS)
+import UIKit
+#endif
 #endif
 
 /// Tap an avatar to pick a picture; it's resized, re-encoded and stripped of metadata.
@@ -83,6 +86,89 @@ extension View {
 /// a mailbox or group otherwise sit in the clipboard, and in whatever a clipboard manager keeps, indefinitely.
 @MainActor func copyToClipboard(_ text: String, clearAfter seconds: Double? = 120) {
     Platform.copy(text, clearAfter: seconds)
+}
+
+/// Shows the system share sheet for some text.
+@MainActor func presentShareSheet(_ text: String) {
+    #if os(iOS)
+    guard let scene = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first(where: { $0.activationState == .foregroundActive }),
+          var top = scene.keyWindow?.rootViewController else { return }
+    while let next = top.presentedViewController { top = next }
+    let sheet = UIActivityViewController(activityItems: [text], applicationActivities: nil)
+    sheet.popoverPresentationController?.sourceView = top.view
+    top.present(sheet, animated: true)
+    #endif
+}
+
+/// Copy and Share for a code: the short link (pulsh.me/i/…) is put up on the relay only when one is tapped, never just
+/// because a screen opened, and both wait the moment that takes. The long link goes if it can't be put up.
+struct SharedLinkButtons<CopyLabel: View, ShareLabel: View>: View {
+    @Environment(AppModel.self) private var model
+    let target: String
+    var onCopied: () -> Void = {}
+    @ViewBuilder var copyLabel: () -> CopyLabel
+    @ViewBuilder var shareLabel: () -> ShareLabel
+    var copyStyle: AnyButtonStyle? = nil
+    var shareStyle: AnyButtonStyle? = nil
+    @State private var busy = false
+
+    var body: some View {
+        styled(Button { run { copyToClipboard($0); onCopied() } } label: { label(copyLabel()) }, copyStyle)
+            .disabled(busy)
+        styled(Button { run { presentShareSheet($0) } } label: { label(shareLabel()) }, shareStyle)
+            .disabled(busy)
+    }
+
+    @ViewBuilder private func styled(_ button: some View, _ style: AnyButtonStyle?) -> some View {
+        if let style { button.buttonStyle(style) } else { button.buttonStyle(.plain) }
+    }
+
+    private func label(_ inner: some View) -> some View {
+        inner.opacity(busy ? 0.4 : 1).overlay { if busy { ProgressView().controlSize(.small) } }
+    }
+
+    private func run(_ then: @escaping (String) -> Void) {
+        guard !busy else { return }
+        busy = true
+        Task {
+            let link = await model.linkToShare(target)
+            busy = false
+            then(link)
+        }
+    }
+}
+
+/// Copy alone, for a code, the same way: the short link is put up when it's tapped.
+struct CopyLinkButton<Label: View>: View {
+    @Environment(AppModel.self) private var model
+    let target: String
+    var onCopied: () -> Void = {}
+    @ViewBuilder var label: () -> Label
+    @State private var busy = false
+
+    var body: some View {
+        Button {
+            guard !busy else { return }
+            busy = true
+            Task {
+                let link = await model.linkToShare(target)
+                busy = false
+                copyToClipboard(link)
+                onCopied()
+            }
+        } label: {
+            label().opacity(busy ? 0.4 : 1).overlay { if busy { ProgressView().controlSize(.small) } }
+        }
+        .buttonStyle(.plain)
+        .disabled(busy || target.isEmpty)
+    }
+}
+
+/// Lets a stored button style be chosen at run time.
+struct AnyButtonStyle: ButtonStyle {
+    private let make: (Configuration) -> AnyView
+    init<S: ButtonStyle>(_ style: S) { make = { AnyView(style.makeBody(configuration: $0)) } }
+    func makeBody(configuration: Configuration) -> some View { make(configuration) }
 }
 
 struct QRCode: View {

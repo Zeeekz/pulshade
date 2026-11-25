@@ -149,7 +149,6 @@ struct AnonymityReport: View {
         switch name {
         case "main": return persona("main")
         case "send": return "Sending"
-        case "link": return "Linking devices"
         case "reports": return "Reports"
         case "call": return "Call"
         case "preview": return "Link previews"

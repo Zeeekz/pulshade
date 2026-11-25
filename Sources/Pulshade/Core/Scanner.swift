@@ -3,7 +3,7 @@ import AVFoundation
 import Vision
 import SwiftUI
 
-/// Reads QR codes from the Mac's camera. Frames are looked at in memory and never saved.
+/// Reads QR codes from the camera. Frames are looked at in memory and never saved.
 @MainActor
 @Observable
 final class QRScanner: NSObject {

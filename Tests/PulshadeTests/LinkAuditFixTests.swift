@@ -151,10 +151,10 @@ struct LinkAuditFixFlowTests {
         return (bFP, aFP)
     }
 
-    /// SEC-008: a follower forwarding a channel's invite to their own friend doesn't make that friend follow, and doesn't
-    /// become the one the channel is followed through, until the friend says yes. A no leaves nothing behind.
-    @Test func aForwardedChannelInviteWaitsForAYes() async throws {
-        AppModel.channelAdmitsPerHour = 60
+    /// SEC-008: a follower forwarding a channel's invite to their own friend gets nowhere: the invite carries a staff
+    /// member's word for the account that sent it (`StaffVouch`), and a forwarded one names someone else, or nobody. The
+    /// friend joins nothing, is asked nothing, and the follower never becomes the one the channel is followed through.
+    @Test func aForwardedChannelInviteIsRefused() async throws {
         let alice = try await makeUser("Alice"), bob = try await makeUser("Bob"), dave = try await makeUser("Dave")
         defer { for m in [alice, bob, dave] { m.lock() } }
         let channel = alice.startConversation(kind: .channel, title: "Drops", members: [])
@@ -166,20 +166,20 @@ struct LinkAuditFixFlowTests {
         let (_, daveSeesBob) = try await befriend(bob, dave)
         let daveFP = try #require(bob.visibleContacts.first { $0.name == "Dave" })
         let held = try #require(bob.conversation(channel.id)?.shared)
+        // Alice's own word, as her invites carry it, forwarded by Bob: it names Alice's account, not Bob's.
+        let real = try #require(alice.vouchedInviteForTests(channel.id, code: nil))
+        #expect(real.vouch != nil)
+        bob.sendForTests(.groupInvite(real), to: daveFP)
+        // Bob's own word: he isn't staff.
+        var forged = real
+        forged.vouch = StaffVouch.make(try #require(bob.memberKeys(nil, group: channel.id)), group: channel.id,
+                                       account: try #require(bob.me(nil)).card.signing)
+        bob.sendForTests(.groupInvite(forged), to: daveFP)
+        // None at all, as an app from before sends.
         bob.sendForTests(.groupInvite(GroupInvite(settings: held.settings, epoch: try #require(held.current))), to: daveFP)
-        await until([bob, dave]) { !dave.data.groupOffers.isEmpty }
-        #expect(dave.conversation(channel.id) == nil, "nothing joined")
-        let offer = try #require(dave.groupOffers.first)
-        #expect(offer.from == daveSeesBob && offer.title == "Drops")
-
-        dave.declineGroupOffer(offer.id)
-        #expect(dave.data.groupOffers.isEmpty && dave.conversation(channel.id) == nil)
-
-        bob.sendForTests(.groupInvite(GroupInvite(settings: held.settings, epoch: try #require(held.current))), to: daveFP)
-        await until([bob, dave]) { !dave.data.groupOffers.isEmpty }
-        dave.acceptGroupOffer(try #require(dave.groupOffers.first).id)
-        #expect(dave.conversation(channel.id)?.shared?.ownerAccount == daveSeesBob, "followed through the one Dave said yes to")
-        #expect(dave.data.groupOffers.isEmpty)
+        await until([bob, dave]) { dave.data.conversations.contains { $0.messages.contains { $0.text.contains("too old") } } }
+        #expect(dave.conversation(channel.id) == nil && dave.data.groupOffers.isEmpty, "nothing joined, nothing asked")
+        #expect(dave.contact(daveSeesBob, in: nil) != nil)
     }
 
     /// A friend adding you to a group puts it in your invites, not your chats: nothing is joined and no card goes back
@@ -207,7 +207,6 @@ struct LinkAuditFixFlowTests {
     /// Following a friend's own channel leaves the friend as they were: the same devices, the same mailbox and a chat
     /// that still works both ways.
     @Test func followingAFriendsChannelKeepsTheFriendship() async throws {
-        AppModel.channelAdmitsPerHour = 60
         let alice = try await makeUser("Alice"), cara = try await makeUser("Cara")
         defer { for m in [alice, cara] { m.lock() } }
         let (caraFP, aliceFP) = try await befriend(alice, cara)
@@ -240,10 +239,8 @@ struct LinkAuditFixFlowTests {
     /// Past it, the one who said hello first and never got in makes way: throwaway accounts that never answer their
     /// invite can't keep newcomers out.
     @Test func strangersOnAChannelCodeAreCapped() async throws {
-        AppModel.channelAdmitsPerHour = 60
-        AppModel.maxCodeStrangers = 2
-        defer { AppModel.maxCodeStrangers = 1_000 }
         let alice = try await makeUser("Alice")
+        alice.maxCodeStrangers = 2
         var strangers: [AppModel] = []
         defer { for m in [alice] + strangers { m.lock() } }
         let channel = alice.startConversation(kind: .channel, title: "Drops", members: [])
@@ -270,15 +267,13 @@ struct LinkAuditFixFlowTests {
     /// Someone who said hello on your channel's code, and whose own channel you then follow, is someone you depend on:
     /// never let go as a stranger, or their channel would stop opening.
     @Test func aStrangerWhoseChannelYouFollowIsKept() async throws {
-        AppModel.channelAdmitsPerHour = 0
-        defer { AppModel.channelAdmitsPerHour = 60 }
         let alice = try await makeUser("Alice"), bob = try await makeUser("Bob")
+        alice.channelAdmitsPerHour = 0
         defer { for m in [alice, bob] { m.lock() } }
         let mine = alice.startConversation(kind: .channel, title: "Drops", members: [])
         _ = try #require(bob.addContact(code: alice.makeInviteCode(channel: mine.id), nickname: ""))
         await until([alice, bob]) { alice.data.contacts.contains { $0.viaCode == mine.id } }
         let stranger = try #require(alice.data.contacts.first { $0.viaCode == mine.id })
-        AppModel.channelAdmitsPerHour = 60
         let theirs = bob.startConversation(kind: .channel, title: "Bob's", members: [])
         _ = try #require(alice.addContact(code: bob.makeInviteCode(channel: theirs.id), nickname: ""))
         await until([alice, bob]) { alice.conversation(theirs.id)?.shared != nil }
@@ -287,28 +282,35 @@ struct LinkAuditFixFlowTests {
     }
 
     /// Following a code lets in only that code's channel without asking. Another channel of the same person's, sent
-    /// while the follow is fresh, isn't taken; one from an older app, which can't say which code it's for, waits for a
-    /// yes under its own name.
+    /// while the follow is fresh, isn't taken: with another code's tag it isn't even asked about, and with the followed
+    /// code's own tag (the code names Drops, not it) it waits for a yes. A code from an older app names no channel, and an
+    /// invite with no tag can't say which code it's for: both are asked about by the channel's name.
     @Test func aFollowedCodeOnlyLetsItsOwnChannelIn() async throws {
-        AppModel.channelAdmitsPerHour = 60
         let alice = try await makeUser("Alice"), bob = try await makeUser("Bob"), cara = try await makeUser("Cara")
         defer { for m in [alice, bob, cara] { m.lock() } }
         let drops = alice.startConversation(kind: .channel, title: "Drops", members: [])
         let other = alice.startConversation(kind: .channel, title: "Other", members: [])
         let otherCode = try #require(Invite(code: alice.makeInviteCode(channel: other.id)))
-        let aliceOnBob = try #require(bob.addContact(code: alice.makeInviteCode(channel: drops.id), nickname: ""))
+        let dropsCode = try #require(Invite(code: alice.makeInviteCode(channel: drops.id)))
+        #expect(dropsCode.channel == Invite.channelCommit(drops.id) && otherCode.channel == Invite.channelCommit(other.id))
+        let aliceOnBob = try #require(bob.addContact(code: dropsCode.code, nickname: ""))
         #expect(aliceOnBob.hidden)
 
         // Alice's other channel, before her app has even read Bob's hello: not taken, not even asked about.
-        let held = try #require(alice.conversation(other.id)?.shared)
-        bob.acceptGroupInvite(GroupInvite(settings: held.settings, epoch: try #require(held.current), code: otherCode.codeTag), from: aliceOnBob)
+        bob.acceptGroupInvite(try #require(alice.vouchedInviteForTests(other.id, code: otherCode.codeTag)), from: aliceOnBob)
         #expect(bob.conversation(other.id) == nil && bob.data.groupOffers.isEmpty, "not the channel he followed")
+        // Nor with the tag of the code he did follow: that code names Drops. Asked about instead.
+        bob.acceptGroupInvite(try #require(alice.vouchedInviteForTests(other.id, code: dropsCode.codeTag)), from: aliceOnBob)
+        #expect(bob.conversation(other.id) == nil && bob.groupOffers.map(\.title) == ["Other"], "asked, not taken")
+        bob.declineGroupOffer(try #require(bob.groupOffers.first).id)
 
-        // An owner on an older app sends no tag: after a follow, its invite is asked about by the channel's name.
+        // A code from an older app names no channel: its channel's invite, tag and all, is asked about by name.
         let third = cara.startConversation(kind: .channel, title: "Third", members: [])
-        let caraOnBob = try #require(bob.addContact(code: cara.makeInviteCode(channel: third.id), nickname: ""))
-        let thirdHeld = try #require(cara.conversation(third.id)?.shared)
-        bob.acceptGroupInvite(GroupInvite(settings: thirdHeld.settings, epoch: try #require(thirdHeld.current)), from: caraOnBob)
+        let newCode = try #require(Invite(code: cara.makeInviteCode(channel: third.id)))
+        let oldCode = try Invite(kind: .channel, identity: try #require(cara.identity), sendID: newCode.sendID, relay: newCode.relay)
+        #expect(oldCode.channel == nil && Invite(code: oldCode.code)?.channel == nil)
+        let caraOnBob = try #require(bob.addContact(code: oldCode.code, nickname: ""))
+        bob.acceptGroupInvite(try #require(cara.vouchedInviteForTests(third.id, code: oldCode.codeTag)), from: caraOnBob)
         #expect(bob.conversation(third.id) == nil && bob.groupOffers.first?.title == "Third", "asked, by the channel's name")
         bob.acceptGroupOffer(try #require(bob.groupOffers.first).id)
         #expect(bob.conversation(third.id)?.shared != nil, "in, once he said yes")
@@ -319,8 +321,8 @@ struct LinkAuditFixFlowTests {
         #expect(bob.conversation(other.id) == nil, "and only Drops")
     }
 
-    /// Two of one person's codes followed, and one of their devices on an older app: its untagged invite is asked about
-    /// and uses no follow up, so the other code's channel still comes in without asking. A tag that isn't one is ignored.
+    /// Two of one person's codes followed, and an invite that carries no tag: it is asked about and uses no follow up, so
+    /// the other code's channel still comes in without asking. A tag that isn't one is ignored.
     @Test func anUntaggedInviteDoesntUseUpAnotherCodesFollow() async throws {
         let alice = try await makeUser("Alice"), bob = try await makeUser("Bob")
         defer { for m in [alice, bob] { m.lock() } }
@@ -329,21 +331,18 @@ struct LinkAuditFixFlowTests {
         _ = try #require(bob.addContact(code: alice.makeInviteCode(channel: a.id), nickname: ""))
         let codeB = try #require(Invite(code: alice.makeInviteCode(channel: b.id)))
         let aliceOnBob = try #require(bob.addContact(code: codeB.code, nickname: ""))
-        let heldA = try #require(alice.conversation(a.id)?.shared), heldB = try #require(alice.conversation(b.id)?.shared)
 
-        bob.acceptGroupInvite(GroupInvite(settings: heldA.settings, epoch: try #require(heldA.current)), from: aliceOnBob)
+        bob.acceptGroupInvite(try #require(alice.vouchedInviteForTests(a.id, code: nil)), from: aliceOnBob)
         #expect(bob.conversation(a.id) == nil && bob.groupOffers.map(\.title) == ["A"], "asked about")
-        bob.acceptGroupInvite(GroupInvite(settings: heldB.settings, epoch: try #require(heldB.current), code: Data(codeB.codeTag.prefix(8))),
-                              from: aliceOnBob)
+        bob.acceptGroupInvite(try #require(alice.vouchedInviteForTests(b.id, code: Data(codeB.codeTag.prefix(8)))), from: aliceOnBob)
         #expect(bob.conversation(b.id) == nil, "a cut-short tag is no tag of B's")
-        bob.acceptGroupInvite(GroupInvite(settings: heldB.settings, epoch: try #require(heldB.current), code: codeB.codeTag), from: aliceOnBob)
+        bob.acceptGroupInvite(try #require(alice.vouchedInviteForTests(b.id, code: codeB.codeTag)), from: aliceOnBob)
         #expect(bob.conversation(b.id)?.shared != nil, "B's own invite still comes in without asking")
     }
 
     /// Two channels of the same stranger followed through their codes, one after the other: both let you in, and
     /// both keep working.
     @Test func followingTwoCodesOfOneStrangerLetsBothIn() async throws {
-        AppModel.channelAdmitsPerHour = 60
         let alice = try await makeUser("Alice"), bob = try await makeUser("Bob")
         defer { for m in [alice, bob] { m.lock() } }
         let a = alice.startConversation(kind: .channel, title: "A", members: [])
@@ -365,7 +364,6 @@ struct LinkAuditFixFlowTests {
 
     /// The same, with both codes followed before Alice's app has read either hello.
     @Test func followingTwoCodesOfOneStrangerAtOnceLetsBothIn() async throws {
-        AppModel.channelAdmitsPerHour = 60
         let alice = try await makeUser("Alice"), bob = try await makeUser("Bob")
         defer { for m in [alice, bob] { m.lock() } }
         let a = alice.startConversation(kind: .channel, title: "A", members: [])
@@ -379,7 +377,6 @@ struct LinkAuditFixFlowTests {
 
     /// A new channel from someone known only through a channel's code is dropped: no channel, no invite, no banner.
     @Test func aHiddenContactCantSendChannelInvites() async throws {
-        AppModel.channelAdmitsPerHour = 60
         let alice = try await makeUser("Alice"), bob = try await makeUser("Bob")
         defer { for m in [alice, bob] { m.lock() } }
         let channel = alice.startConversation(kind: .channel, title: "Drops", members: [])

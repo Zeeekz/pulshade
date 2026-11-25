@@ -1,10 +1,6 @@
 import SwiftUI
-#if os(macOS)
-import AppKit
-import Darwin
-import ServiceManagement
-#endif
 
+// Pulshade is an iPhone app. The Swift package also builds the code on macOS, but only so `swift test` can run.
 @main
 struct PulshadeApp: App {
     @State private var model: AppModel = {
@@ -19,14 +15,6 @@ struct PulshadeApp: App {
     #endif
 
     init() {
-        #if os(macOS)
-        NSApplication.shared.setActivationPolicy(.regular)
-        // A crash must not write memory (keys, plaintext) to disk as a core dump.
-        var limit = rlimit(rlim_cur: 0, rlim_max: 0)
-        setrlimit(RLIMIT_CORE, &limit)
-        // Don't keep window contents around between launches: they can name chats and contacts.
-        UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
-        #endif
         // Whatever a crash or a quit left of a clip is overwritten and deleted before anything else.
         TempFiles.sweep()
         // Set early so taps on notifications are handled even right after launch.
@@ -38,41 +26,6 @@ struct PulshadeApp: App {
     }
 
     var body: some Scene {
-        #if os(macOS)
-        WindowGroup(id: "main") {
-            RootView()
-                .environment(model)
-                .environment(\.theme, model.theme)
-                .tint(model.theme.accent)
-                .preferredColorScheme(model.theme.scheme)
-                .onChange(of: model.theme.scheme, initial: true) { _, scheme in
-                    NSApplication.shared.appearance = NSAppearance(named: scheme == .light ? .aqua : .darkAqua)
-                }
-                .frame(minWidth: 980, minHeight: 640)
-                .onAppear { NSApplication.shared.activate(ignoringOtherApps: true) }
-                .onOpenURL { model.open($0) }
-                .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
-                    model.save(); model.settleSaves()
-                }
-        }
-        .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 1180, height: 760)
-        .commands {
-            CommandGroup(replacing: .newItem) {}
-            CommandMenu("PULSHADE") {
-                Button("Lock") { model.lock() }
-                    .keyboardShortcut("l", modifiers: [.command, .shift])
-                    .disabled(!model.isOpen)
-            }
-        }
-
-        MenuBarExtra(isInserted: Binding(get: { model.showsMenuBarIcon }, set: { _ in })) {
-            MenuBarContent()
-                .environment(model)
-        } label: {
-            MenuBarLabel(unread: model.isOpen ? model.unreadTotal : 0)
-        }
-        #else
         WindowGroup {
             RootView()
                 .environment(model)
@@ -81,6 +34,13 @@ struct PulshadeApp: App {
                 .preferredColorScheme(model.theme.scheme)
                 // A code scanned with the Camera app. It waits here if Pulshade is locked.
                 .onOpenURL { model.open($0) }
+                // Pulshade's own web links tapped inside Pulshade (in a chat, say) open here, not in the browser.
+                .environment(\.openURL, OpenURLAction { url in
+                    guard WebLinks.parse(url) != nil else { return .systemAction }
+                    model.open(url)
+                    return .handled
+                })
+                #if os(iOS)
                 .onReceive(NotificationCenter.default.publisher(for: .pulshadePushToken)) { _ in model.refreshPush() }
                 .onChange(of: scenePhase) { _, phase in
                     switch phase {
@@ -89,95 +49,13 @@ struct PulshadeApp: App {
                     default: break
                     }
                 }
-        }
-        #endif
-    }
-}
-
-#if os(macOS)
-/// The pulse in the menu bar. A count appears beside it when something's unread.
-private struct MenuBarLabel: View {
-    var unread: Int
-
-    var body: some View {
-        Image(nsImage: Self.pulse)
-        if unread > 0 { Text("\(unread)") }
-    }
-
-    /// The Pulshade heartbeat, drawn as a template so macOS tints it to match the menu bar.
-    static let pulse: NSImage = {
-        let image = NSImage(size: NSSize(width: 20, height: 16), flipped: true) { rect in
-            let path = NSBezierPath()
-            let points: [(CGFloat, CGFloat)] = [(0, 0.5), (0.3, 0.5), (0.42, 0.06), (0.58, 0.94), (0.7, 0.5), (1, 0.5)]
-            for (i, p) in points.enumerated() {
-                let pt = NSPoint(x: rect.minX + 1 + p.0 * (rect.width - 2), y: rect.minY + 1 + p.1 * (rect.height - 2))
-                i == 0 ? path.move(to: pt) : path.line(to: pt)
-            }
-            path.lineWidth = 1.8
-            path.lineCapStyle = .round
-            path.lineJoinStyle = .round
-            NSColor.black.setStroke()
-            path.stroke()
-            return true
-        }
-        image.isTemplate = true
-        return image
-    }()
-}
-
-/// Starting Pulshade when you log in, so the menu bar icon is always there.
-enum LoginItem {
-    static var enabled: Bool { SMAppService.mainApp.status == .enabled }
-
-    @discardableResult
-    static func set(_ on: Bool) -> Bool {
-        do {
-            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
-            return true
-        } catch {
-            return false
+                #endif
         }
     }
 }
-
-private struct MenuBarContent: View {
-    @Environment(AppModel.self) private var model
-    @Environment(\.openWindow) private var openWindow
-
-    var body: some View {
-        if model.isOpen {
-            let unread = model.unreadConversations
-            if unread.isEmpty {
-                Text("No new messages")
-            } else {
-                // Names only appear if notifications are allowed to show them.
-                let showNames = model.data.security.notificationContent != .hidden
-                ForEach(Array(unread.prefix(8))) { c in
-                    Button(showNames ? "\(c.title)  ·  \(c.unread)" : "New message  ·  \(c.unread)") { show(c.id) }
-                }
-            }
-            Divider()
-            Button("Open PULSHADE") { show(nil) }
-            Button("Lock") { model.lock() }
-        } else {
-            Button("Open PULSHADE") { show(nil) }
-        }
-        Divider()
-        Button("Quit PULSHADE") { NSApp.terminate(nil) }
-    }
-
-    private func show(_ id: Conversation.ID?) {
-        if NSApp.windows.first(where: { $0.canBecomeMain && $0.isVisible }) == nil { openWindow(id: "main") }
-        NSApp.activate(ignoringOtherApps: true)
-        if let id { model.open(id) }
-    }
-}
-
-#endif
 
 struct RootView: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.openWindow) private var openWindow
     @Environment(\.scenePhase) private var scenePhase
     @State private var active = true
     /// iPhone: the screen is being recorded, mirrored or shared.
@@ -189,9 +67,6 @@ struct RootView: View {
 
     var body: some View {
         shielded
-            #if os(macOS)
-            .background(WindowConfigurator(blockCapture: model.blockCapture))
-            #endif
             .overlay {
                 // Detach is saying its goodbyes: nothing of the account shows while it does.
                 if model.detaching {
@@ -218,14 +93,7 @@ struct RootView: View {
                 }
             }
             .animation(.smooth(duration: 0.25), value: active)
-            #if os(macOS)
-            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in active = false }
-            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-                active = true
-                model.markOpenConversationRead()
-            }
-            .onAppear { model.openMainWindow = { openWindow(id: "main") } }
-            #else
+            #if os(iOS)
             // In the app switcher iOS shows a snapshot; covering the app first keeps chats out of it.
             .onChange(of: scenePhase, initial: true) { _, phase in
                 active = phase == .active
@@ -284,6 +152,12 @@ struct RootView: View {
                             ConnectionStrip().transition(.move(edge: .top).combined(with: .opacity))
                         }
                         MainView()
+                    }
+                    // A 4-digit PIN from an older build is changed before anything else.
+                    .sheet(isPresented: Binding(get: { model.isOpen && model.hasShortPIN }, set: { _ in })) {
+                        ChangePasscodeSheet(style: .pin6, required: true)
+                            .environment(model)
+                            .interactiveDismissDisabled()
                     }
                     .transition(.blurReplace.combined(with: ScaleTransition(1.03)))
                 }
@@ -378,23 +252,6 @@ private struct CaptureShield: UIViewControllerRepresentable {
             host.addSubview(hosting.view)
             host.setNeedsLayout()
             host.layoutIfNeeded()
-        }
-    }
-}
-#endif
-
-#if os(macOS)
-/// Applies window-level privacy: with capture blocked, screenshots and recordings show nothing.
-private struct WindowConfigurator: NSViewRepresentable {
-    var blockCapture: Bool
-
-    func makeNSView(context: Context) -> NSView { NSView() }
-
-    func updateNSView(_ view: NSView, context: Context) {
-        DispatchQueue.main.async {
-            // A restorable window leaves a snapshot of its contents in Saved Application State.
-            view.window?.isRestorable = false
-            view.window?.sharingType = blockCapture ? .none : .readOnly
         }
     }
 }

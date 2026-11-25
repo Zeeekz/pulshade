@@ -13,36 +13,51 @@ struct CallInvite: Codable, Equatable {
 /// Seals and opens call packets. Each direction has its own key, every packet its own number, and a
 /// packet that's been seen before (or is far too old) is refused. Every packet is padded to the same size,
 /// so how loud or how much someone is talking doesn't show in the sizes.
+///
+/// Each connection also picks a random salt of its own, which goes into its sending key and travels with every packet.
+/// Two of the callee's devices that answer the same call at once start counting from the same number, but with
+/// different salts they never seal under the same key and nonce.
 struct CallCrypto {
     enum Kind: UInt8 { case hello = 0, audio = 1 }
 
     /// Room for any 20 ms Opus packet at the bitrate calls use, plus its length.
     static let bodySize = 256
+    static let saltSize = 16
+    /// Kind, salt and number, in the clear and bound into the seal.
+    static let headerSize = 1 + saltSize + 8
 
+    private let key: SymmetricKey
+    private let caller: Bool
+    private let salt: Data
     private let sendKey: SymmetricKey
-    private let receiveKey: SymmetricKey
+    /// The other side's connections heard from, by their salt: each one's key and what it has sent. A few at most,
+    /// newest last.
+    private var peers: [(salt: Data, key: SymmetricKey, newest: UInt64, seen: Set<UInt64>)] = []
     private var sent: UInt64 = 0
-    private var newest: UInt64 = 0
-    private var seen: Set<UInt64> = []
+    static let maxPeers = 4
 
-    init(key: Data, caller: Bool) {
-        func derive(_ label: String) -> SymmetricKey {
-            HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: key), info: Data(label.utf8), outputByteCount: 32)
-        }
-        let a = derive("pulshade.call.caller"), b = derive("pulshade.call.callee")
-        sendKey = caller ? a : b
-        receiveKey = caller ? b : a
+    init(key: Data, caller: Bool, salt: Data = .random(CallCrypto.saltSize)) {
+        self.key = SymmetricKey(data: key)
+        self.caller = caller
+        self.salt = salt
+        sendKey = Self.derive(self.key, caller: caller, salt: salt)
+    }
+
+    /// One side's key for one connection: the call's key, which side it is, and that connection's salt.
+    private static func derive(_ key: SymmetricKey, caller: Bool, salt: Data) -> SymmetricKey {
+        HKDF<SHA256>.deriveKey(inputKeyMaterial: key, salt: salt, info: Data((caller ? "pulshade.call.caller.v2" : "pulshade.call.callee.v2").utf8),
+                               outputByteCount: 32)
     }
 
     private static func nonce(_ n: UInt64) -> ChaChaPoly.Nonce {
         try! ChaChaPoly.Nonce(data: Data(count: 4) + withUnsafeBytes(of: n.bigEndian) { Data($0) })
     }
 
-    /// `kind | number | sealed`, with the kind and number bound into the seal.
+    /// `kind | salt | number | sealed`, with the kind, salt and number bound into the seal.
     mutating func seal(_ kind: Kind, _ body: Data) -> Data? {
         guard body.count <= Self.bodySize - 2 else { return nil }
         sent += 1
-        let header = Data([kind.rawValue]) + withUnsafeBytes(of: sent.bigEndian) { Data($0) }
+        let header = Data([kind.rawValue]) + salt + withUnsafeBytes(of: sent.bigEndian) { Data($0) }
         var padded = withUnsafeBytes(of: UInt16(body.count).bigEndian) { Data($0) } + body
         padded.append(Data(count: Self.bodySize - padded.count))
         guard let box = try? ChaChaPoly.seal(padded, using: sendKey, nonce: Self.nonce(sent), authenticating: header) else { return nil }
@@ -51,13 +66,20 @@ struct CallCrypto {
 
     mutating func open(_ packet: Data) -> (Kind, Data)? {
         let bytes = Data(packet)
-        guard bytes.count >= 9 + 16, let kind = Kind(rawValue: bytes[0]) else { return nil }
-        let n = bytes[1..<9].reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+        guard bytes.count >= Self.headerSize + 16, let kind = Kind(rawValue: bytes[0]) else { return nil }
+        let theirSalt = Data(bytes[1..<(1 + Self.saltSize)])
+        // Our own packets, sent back to us, are never theirs.
+        guard theirSalt != salt else { return nil }
+        let n = bytes[(1 + Self.saltSize)..<Self.headerSize].reduce(UInt64(0)) { $0 << 8 | UInt64($1) }
+        let known = peers.firstIndex { $0.salt == theirSalt }
+        let peerKey = known.map { peers[$0].key } ?? Self.derive(key, caller: !caller, salt: theirSalt)
+        var newest = known.map { peers[$0].newest } ?? 0
+        var seen = known.map { peers[$0].seen } ?? []
         // Compared without adding to the packet's own number, which could be made large enough to overflow.
         guard n >= newest || newest - n < 100, !seen.contains(n),
-              let box = try? ChaChaPoly.SealedBox(nonce: Self.nonce(n), ciphertext: bytes[9..<(bytes.count - 16)],
+              let box = try? ChaChaPoly.SealedBox(nonce: Self.nonce(n), ciphertext: bytes[Self.headerSize..<(bytes.count - 16)],
                                                    tag: bytes[(bytes.count - 16)...]),
-              let padded = try? ChaChaPoly.open(box, using: receiveKey, authenticating: bytes[0..<9]), padded.count >= 2
+              let padded = try? ChaChaPoly.open(box, using: peerKey, authenticating: bytes[0..<Self.headerSize]), padded.count >= 2
         else { return nil }
         let length = Int(padded[padded.startIndex]) << 8 | Int(padded[padded.startIndex + 1])
         guard length <= padded.count - 2 else { return nil }
@@ -65,6 +87,10 @@ struct CallCrypto {
         seen.insert(n)
         newest = max(newest, n)
         if seen.count > 400 { seen = seen.filter { $0 >= newest || newest - $0 < 200 } }
+        // Only a packet that opened makes a connection known, so a stranger can't fill the list.
+        if let known { peers.remove(at: known) }
+        peers.append((theirSalt, peerKey, newest, seen))
+        if peers.count > Self.maxPeers { peers.removeFirst(peers.count - Self.maxPeers) }
         return (kind, body)
     }
 }
@@ -288,7 +314,7 @@ final class CallAudio: @unchecked Sendable {
         // A call answered on the system's call screen has its session switched on by the system.
         if !CallRinger.answeredOnScreen { try? session.setActive(true) }
         #endif
-        // The speaker side has to be wired up before echo cancelling goes on, or the Mac's output comes up
+        // The speaker side has to be wired up before echo cancelling goes on, or the output can come up
         // with no channels and the engine won't start.
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: pcm)

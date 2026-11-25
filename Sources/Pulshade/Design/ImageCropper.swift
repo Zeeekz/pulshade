@@ -123,7 +123,6 @@ struct ImageCropper: View {
             picture = cleanJPEG(image, maxSide: 2400).flatMap { PlatformImage(data: $0) }?.cgImageValue
             startFitted()
         }
-        .frame(minWidth: Platform.isPhone ? nil : 460, minHeight: Platform.isPhone ? nil : 560)
         .background(Theme.dark.ink.base)
         .preferredColorScheme(.dark)
         // Pulling the picture down moved the sheet too; Cancel closes it instead.

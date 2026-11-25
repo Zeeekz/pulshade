@@ -141,6 +141,8 @@ struct ReportSheet: View {
                 try await model.report(subjectKey: target.key, handle: target.handle, name: target.name,
                                        reason: reason, details: details, includeHandle: includeHandle)
                 withAnimation(.snappy) { sent = true }
+            } catch AppModel.DirectoryError.publicName {
+                problem = "That's a group's or channel's name, not a person's."
             } catch AppModel.ReportError.notSetUp {
                 problem = "Reports aren't set up on this relay yet."
             } catch {

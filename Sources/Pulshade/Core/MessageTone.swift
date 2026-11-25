@@ -1,8 +1,5 @@
 import AudioToolbox
 import Foundation
-#if os(macOS)
-import AppKit
-#endif
 
 /// The sound a new message makes. The tones are made here, not shipped as files, and written to the app's own
 /// Library/Sounds folder: that is where the system looks for a custom notification sound, on a locked iPhone too
@@ -128,11 +125,7 @@ enum MessageTone: String, Codable, CaseIterable, Identifiable {
     /// system's.
     @MainActor func play() {
         guard fileName != nil else {
-            #if os(macOS)
-            NSSound.beep()
-            #else
             AudioServicesPlaySystemSound(1007)
-            #endif
             return
         }
         Self.install()

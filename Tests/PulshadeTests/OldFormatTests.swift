@@ -107,19 +107,6 @@ import PulshadeShared
         #expect(model.conversation(group.id)?.messages.count == 2)
     }
 
-    @Test func aGroupOrChannelIsNeverSyncedInTheOldFormat() async throws {
-        let model = try await makeModel()
-        defer { model.lock() }
-        let card = ConversationCard(id: UUID(), kind: .group, title: "From my other device", avatar: nil, about: nil, owner: "me", admins: [],
-                                    postPolicy: .everyone, version: 1, members: ["x"], persona: nil, disappearAfter: nil)
-        model.applySync(.conversation(card))
-        var channel = card
-        channel.id = UUID()
-        channel.kind = .channel
-        model.applySync(.conversation(channel))
-        #expect(model.data.conversations.isEmpty, "no group is made in a format nothing reads")
-    }
-
     @Test func anOldGroupDoesntHoldBackAGroupThatSharesItsId() async throws {
         let model = try await makeModel()
         defer { model.lock() }
