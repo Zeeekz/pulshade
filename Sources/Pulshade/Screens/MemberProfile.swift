@@ -151,8 +151,9 @@ struct GroupFriendInvitesSection: View {
     }
 }
 
-/// Invites to groups and channels, in Contacts beside the other requests. Nothing is joined until you say yes, and the
-/// one you say yes to is the only person a channel is followed through.
+/// Invites to channels from someone known only through a channel's code, in Contacts beside the other requests (a friend
+/// adding you puts you straight in). Nothing is joined until you say yes, and the one you say yes to is the only person a
+/// channel is followed through.
 struct GroupOffersSection: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme

@@ -61,6 +61,8 @@ final class AppModel {
     /// When a video was last sent again on someone's asking, as "fingerprint|id", so one asking can't make it
     /// go over and over.
     @ObservationIgnored private var clipResent: [String: Date] = [:]
+    /// When each newcomer to a channel was handed its earlier posts with full media, by channel. Memory only.
+    @ObservationIgnored private var historyWithMedia: [Conversation.ID: [Date]] = [:]
     var failedAttempts = FileKeys.savedAttempts() {
         didSet { if failedAttempts != oldValue { FileKeys.saveAttempts(failedAttempts) } }
     }
@@ -2773,7 +2775,14 @@ final class AppModel {
             let message = data.conversations[at.convo].messages[at.message]
             let theirs = message.sender == author
             let mine = message.isMine && contact(author, in: persona)?.isSelf == true
-            guard theirs || mine, data.conversations[at.convo].persona == persona, fillMessage(at, with: clip) else { return false }
+            // In a channel, the staff member this follower follows it through hands over the media of earlier posts.
+            let shared = data.conversations[at.convo].shared
+            let inviter = !message.isMine && shared?.settings.kind == .channel && shared?.ownerAccount == author
+                && shared?.historyWindow.map { w in
+                    w.ids.contains(id) && Date().timeIntervalSince(w.opened) < ChannelHistory.mediaWindow
+                        && shared?.settings.isAdmin(w.inviter) == true
+                } == true
+            guard theirs || mine || inviter, data.conversations[at.convo].persona == persona, fillMessage(at, with: clip) else { return false }
             data.clipParts[key.stored] = nil
             clipActivity[key] = nil
             clipAsks[key] = nil
@@ -8941,6 +8950,9 @@ final class AppModel {
             acceptGroupInvite(invite, from: sender)
         case let .groupJoin(group, card):
             acceptGroupJoin(group, card: card, from: sender)
+        case let .channelHistory(group, posts):
+            guard !sender.isSelf else { break }
+            takeChannelHistory(group, posts: posts, from: sender)
         case let .channelLeave(group):
             // From a follower, over the chat they were invited in; who they are comes from this chat's session.
             guard !sender.isSelf else { break }
@@ -9485,8 +9497,10 @@ final class AppModel {
         min(RelayClock.local(sent), deposited ?? Date(), Date())
     }
 
-    func deliver(_ wire: WireMessage, from sender: Contact) {
-        guard let i = conversationIndex(wire.conversation, from: sender, create: true) else { return }
+    /// `history`: an earlier post of a channel handed to this newcomer (`takeChannelHistory`): put in its place by date,
+    /// with no notification and not counted as unread.
+    func deliver(_ wire: WireMessage, from sender: Contact, history: Bool = false) {
+        guard let i = conversationIndex(wire.conversation, from: sender, create: !history) else { return }
         if wire.conversation != nil, !data.conversations[i].canPost(sender.fingerprint) { return }
         guard !data.conversations[i].messages.contains(where: { $0.id == wire.id }) else {
             // Sent again because the relay may have lost it: say again that it's here, so their tick catches up. Only
@@ -9610,6 +9624,12 @@ final class AppModel {
         }
         // What was counted above assumed both went into the pool; one that stayed inline counts its own length.
         if counted { receivedMediaBytes += Self.mediaBytes(message) - incomingMedia }
+        if history {
+            let at = data.conversations[i].messages.firstIndex { $0.date > message.date } ?? data.conversations[i].messages.endIndex
+            data.conversations[i].messages.insert(message, at: at)
+            if Self.isPending(message) { assembleClip(wire.id, persona: data.conversations[i].persona) }
+            return
+        }
         typing[data.conversations[i].id]?[sender.fingerprint] = nil
         withAnimation(.snappy(duration: 0.4)) { data.conversations[i].messages.append(message) }
         if Self.isPending(message) { assembleClip(wire.id, persona: data.conversations[i].persona) }
@@ -11252,9 +11272,9 @@ extension AppModel {
 
     // MARK: Being invited
 
-    /// An invite over a chat with someone you know. A group or channel this account isn't in yet waits for you to say yes
-    /// (`groupOffers`), unless it's the channel of someone whose channel code you followed: nobody puts you in a group,
-    /// gets your card, or makes themselves the one a channel listens to on this account without you choosing them. Once
+    /// An invite over a chat with someone you know. A friend adding you to a group or channel puts you straight in, with
+    /// nothing to accept; so does the channel of someone whose channel code you followed. Only an invite from someone known
+    /// just through a channel's code that can't say it's for the channel you followed waits for a yes (`groupOffers`). Once
     /// you're in, the card goes back to whoever invited.
     func acceptGroupInvite(_ invite: GroupInvite, from sender: Contact, consented: Bool = false) {
         let s = invite.settings
@@ -11317,7 +11337,9 @@ extension AppModel {
             // their own making. An invite that doesn't say which code it's for (their app is older) comes from someone
             // whose code you followed, so it is asked about, by the channel's name, rather than dropped or taken.
             if s.kind == .channel, sender.hidden, match == .none, !consented { return }
-            if !consented, !acceptsInvitesForTests, !followed {
+            // A friend adding you puts you straight in. Someone known only through a code waits for a yes.
+            if !consented, data.blocked.contains(sender.fingerprint) { return }
+            if !consented, !acceptsInvitesForTests, !followed, sender.hidden || sender.awaitingAcceptance {
                 noteGroupOffer(invite, from: sender, followed: match == .untagged)
                 return
             }
@@ -11328,6 +11350,9 @@ extension AppModel {
             convo.persona = sender.persona
             convo.shared = SharedGroup(settings: s, epochs: [invite.epoch], joining: !s.isMember(keys.publicKey))
             convo.shared?.ownerAccount = sender.fingerprint
+            if s.kind == .channel, !s.isMember(keys.publicKey), let key = invite.vouch?.key {
+                convo.shared?.historyWindow = ChannelHistoryWindow(opened: Date(), inviter: key)
+            }
             withAnimation(.snappy) { data.conversations.insert(convo, at: 0) }
             if let i = groupIndex(s.group, persona: sender.persona) { applySharedSettings(at: i) }
         }
@@ -11433,12 +11458,106 @@ extension AppModel {
                 return
             }
             addFollower(card, replacing: previousKnown, at: i)
+            // Newly in (not the same account coming back under another key): what was said before, so they aren't
+            // looking at an empty channel.
+            if previousKnown == nil { sendChannelHistory(to: sender, at: i) }
             return
         }
         guard !shared.settings.isMember(card.signingKey), shared.settings.members.count < GroupSettings.maxMembers else { save(); return }
         var next = shared.settings
         next.members.append(card.withoutAvatar)
         if publishSettings(next, at: i), let avatar = card.avatar { noteAvatar(avatar, of: card, at: i) }
+    }
+
+    // MARK: A channel's earlier posts, for a newcomer
+
+    /// Hands a follower this device just let in the channel's newest posts (`ChannelHistory.maxPosts`), over their 1:1
+    /// chat, each naming the staff member who posted it. Big photos and voice notes, and videos, follow from the relay.
+    private func sendChannelHistory(to follower: Contact, at i: Int) {
+        let convo = data.conversations[i]
+        guard let shared = convo.shared, shared.settings.kind == .channel, !shared.gone, !follower.isSelf,
+              let keys = memberKeys(convo.persona, group: convo.wireID), shared.settings.isAdmin(keys.publicKey) else { return }
+        let now = Date()
+        let earlier = convo.messages.filter { m in
+            !m.isSystem && m.mediaDropped != true && (m.expiresAt.map { $0 > now } ?? true)
+                && (m.isMine || shared.settings.members.contains { $0.fingerprint == m.sender && shared.settings.isAdmin($0.signingKey) })
+        }.suffix(ChannelHistory.maxPosts)
+        guard !earlier.isEmpty else { return }
+        let hour = (historyWithMedia[convo.id] ?? []).filter { now.timeIntervalSince($0) < 3600 }
+        let withMedia = hour.count < ChannelHistory.withMediaPerHour
+        historyWithMedia[convo.id] = withMedia ? hour + [now] : hour
+        var posts: [ChannelHistoryPost] = []
+        var media: [(bytes: Data, id: UUID, kind: Attachment.Kind)] = []
+        for m in earlier {
+            let author = m.isMine ? keys.publicKey : shared.settings.members.first { $0.fingerprint == m.sender }?.signingKey
+            guard let author else { continue }
+            var wire = wireForResend(m, in: convo)
+            // The time it disappears stays the one it had, counted from when it was posted.
+            wire.expiresIn = m.expiresAt.map { $0.timeIntervalSince(m.date) }
+            if !withMedia {
+                // Words and a small preview only.
+                wire.image = imageData(for: m).flatMap { Self.thumbnail($0, side: 48) }
+                wire.voice = nil
+                guard !wire.text.isEmpty || wire.image != nil || wire.attachment != nil else { continue }
+            } else if m.isVideo {
+                guard let clip = videoData(for: m), !clip.isEmpty else { continue }
+                wire.image = imageData(for: m)
+                wire.clip = ClipInfo(seconds: m.clipSeconds ?? 0)
+                media.append((clip, m.id, .video))
+            } else {
+                wire.image = imageData(for: m)
+                if let audio = voiceAudio(for: m), wire.voice != nil { wire.voice?.audio = audio }
+                if let light = lightened(wire), readsMediaBlobs(follower) {
+                    wire = light.wire
+                    media.append((light.bytes, m.id, light.kind))
+                }
+            }
+            posts.append(ChannelHistoryPost(author: author, wire: wire))
+        }
+        let gid = convo.wireID
+        var batch: [ChannelHistoryPost] = []
+        var bytes = 0
+        func flush() {
+            guard !batch.isEmpty else { return }
+            enqueue(.channelHistory(group: gid, posts: batch), to: follower)
+            batch = []
+            bytes = 0
+        }
+        for post in posts {
+            let size = (try? JSONEncoder.pulshade.encode(post).count) ?? Int.max
+            guard size <= ChannelHistory.bytesPerMessage else { continue }
+            if batch.count >= ChannelHistory.perMessage || bytes + size > ChannelHistory.bytesPerMessage { flush() }
+            batch.append(post)
+            bytes += size
+        }
+        flush()
+        for item in media where posts.contains(where: { $0.wire.id == item.id }) {
+            deliverClip(item.bytes, id: item.id, to: follower, known: nil, kind: item.kind)
+        }
+    }
+
+    /// A channel's earlier posts, from the staff member this account follows it through: each put in its place, quietly,
+    /// if a staff member is named as its author and it isn't here already.
+    private func takeChannelHistory(_ group: UUID, posts: [ChannelHistoryPost], from sender: Contact) {
+        // Only once, just after joining, from an inviter who is still staff, and only posts from before this account came in
+        // (so a copy of a post made since can't get in ahead of the real one).
+        guard let i = groupIndex(group, persona: sender.persona), let shared = data.conversations[i].shared,
+              shared.settings.kind == .channel, !shared.gone, shared.ownerAccount == sender.fingerprint,
+              var window = shared.historyWindow, Date().timeIntervalSince(window.opened) < ChannelHistory.window,
+              shared.settings.isAdmin(window.inviter), window.taken < ChannelHistory.maxPosts else { return }
+        let gid = data.conversations[i].wireID
+        let persona = data.conversations[i].persona
+        for post in posts.prefix(ChannelHistory.perMessage) where post.wire.conversation == gid && post.wire.kind == .channel {
+            guard window.taken < ChannelHistory.maxPosts, RelayClock.local(post.wire.date) < window.opened,
+                  shared.settings.isAdmin(post.author), let author = contact(Identity.fingerprint(of: post.author), in: persona),
+                  data.conversations[i].messages.contains(where: { $0.id == post.wire.id }) == false else { continue }
+            deliver(post.wire, from: author, history: true)
+            guard data.conversations[i].messages.contains(where: { $0.id == post.wire.id }) else { continue }
+            window.taken += 1
+            window.ids.append(post.wire.id)
+        }
+        data.conversations[i].shared?.historyWindow = window
+        save()
     }
 
     // MARK: A follower leaving, or asking for a key it missed

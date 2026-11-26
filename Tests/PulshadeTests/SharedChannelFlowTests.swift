@@ -90,6 +90,45 @@ struct SharedChannelFlowTests {
 
     /// A follower deleting a channel only removes it from their own device (staff take them out of the roster); the owner
     /// deleting it removes it for the followers.
+    /// Someone put into a channel sees what was posted before: the staff member who let them in hands over the newest
+    /// posts, photos too, in their place before anything said after, with nothing counted as unread.
+    @Test func aNewFollowerSeesEarlierPosts() async throws {
+        let (alice, bob, cara, bobFP, caraFP) = try await trio()
+        defer { for m in [alice, bob, cara] { m.lock() } }
+        let channel = alice.startConversation(kind: .channel, title: "Drops", members: [bobFP])
+        await until([alice, bob]) { joined(channel.id, bob) && alice.conversation(channel.id)?.shared?.roster?.live.count == 1 }
+        alice.send("first drop", in: channel.id)
+        let photo = RelayFlowTests.bigPhoto()
+        #expect(photo.count > AppModel.mediaInline)
+        alice.send("sunset", image: photo, in: channel.id)
+        alice.send("second drop", in: channel.id)
+        await until([alice, bob], seconds: 30) { bob.conversation(channel.id)?.messages.last?.text == "second drop" }
+
+        #expect(alice.addMembers(channel.id, [caraFP]).isEmpty)
+        await until([alice, cara], seconds: 30) {
+            let posts = cara.conversation(channel.id)?.messages.filter { !$0.isSystem } ?? []
+            return posts.count == 3 && posts.allSatisfy { !AppModel.isPending($0) }
+        }
+        let posts = try #require(cara.conversation(channel.id)).messages.filter { !$0.isSystem }
+        #expect(posts.map(\.text) == ["first drop", "sunset", "second drop"], "all three, in order")
+        #expect(cara.imageData(for: posts[1]) == photo, "the photo came too")
+        #expect(cara.conversation(channel.id)?.unread == 0, "nothing counted as unread")
+
+        // "History" dated after Cara came in isn't taken: a copy of a later post can't get in ahead of the real one.
+        let caraOnAlice = try #require(alice.contact(caraFP, in: nil))
+        let me = try #require(alice.memberKeys(nil, group: channel.id)).publicKey
+        let late = WireMessage(id: UUID(), conversation: channel.id, kind: .channel, text: "planted", image: nil, voice: nil,
+                               date: RelayClock.relay(Date()), expiresIn: nil, reply: nil, preview: nil)
+        alice.sendForTests(.channelHistory(group: channel.id, posts: [ChannelHistoryPost(author: me, wire: late)]), to: caraOnAlice)
+        await settle(alice, cara)
+        #expect(cara.conversation(channel.id)?.messages.contains { $0.text == "planted" } == false, "nothing from after joining")
+
+        alice.send("third drop", in: channel.id)
+        await until([alice, cara], seconds: 30) { cara.conversation(channel.id)?.messages.last?.text == "third drop" }
+        #expect(cara.conversation(channel.id)?.messages.filter { !$0.isSystem }.map(\.text)
+                == ["first drop", "sunset", "second drop", "third drop"], "and what comes after, below it")
+    }
+
     @Test func aFollowerDeletingKeepsItForOthersAndTheOwnerDeletingRemovesItForAll() async throws {
         let (alice, bob, cara, bobFP, caraFP) = try await trio()
         defer { for m in [alice, bob, cara] { m.lock() } }

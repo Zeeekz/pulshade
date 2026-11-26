@@ -638,6 +638,11 @@ Someone on an older app is refused until they update.
   (kind byte 3; apps from before can't read such a code). After following a code, the channel's invite is taken without
   asking only if it carries that code's tag and is for the channel the code names; otherwise, and after following a code
   from an older app, it waits for a yes.
+- **Earlier posts for a newcomer.** Once a follower's card comes back, the staff member who let them in sends the
+  channel's newest 100 posts over their 1:1 chat (`channelHistory`: group id and up to 20 posts each, every post a
+  `WireMessage` plus its staff author's group key). The follower takes them only from the staff member it follows the
+  channel through, only for staff authors, quietly and in date order. Big media follows as `clipBlob`, which a follower
+  takes for a channel post from that same staff member. Apps from before ignore it.
 - **Chains from the inviter.** Staff chains a follower gets from the staff member who invited it are kept only once a
   post from that staff device opens with them; one that doesn't is dropped and asked for again, so they can't be
   replaced with made-up ones for good.

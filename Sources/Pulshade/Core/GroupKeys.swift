@@ -1221,6 +1221,8 @@ struct SharedGroup: Codable, Equatable {
     var staffKey: Data?
     /// The account the channel's first invite came from: the only one whose later invites may give or change `staffKey`.
     var ownerAccount: String?
+    /// As a follower newly let in: the channel's earlier posts the inviter may still hand over (`takeChannelHistory`).
+    var historyWindow: ChannelHistoryWindow?
     /// After a follower was taken out: the epoch then, until a newer one exists without them (tried again until it does).
     var rekeyAfter: Int?
     var rekeyTried: Date?

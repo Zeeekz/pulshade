@@ -73,6 +73,38 @@ struct WireMessage: Codable, Equatable {
     var mediaFollows: Attachment.Kind? = nil
 }
 
+/// One earlier post of a channel, handed to a newcomer by the staff member who let them in (`Payload.channelHistory`).
+struct ChannelHistoryPost: Codable, Equatable {
+    /// The staff member who posted it, by their group key in the channel.
+    var author: Data
+    var wire: WireMessage
+}
+
+enum ChannelHistory {
+    /// The most earlier posts a newcomer is handed.
+    static let maxPosts = 100
+    /// Posts in one hand-over message, and about how many bytes, so each fits easily in an envelope.
+    static let perMessage = 20
+    static let bytesPerMessage = 300_000
+    /// How long after joining a follower takes earlier posts, and fills in their media.
+    static let window: TimeInterval = 3600
+    static let mediaWindow: TimeInterval = 86_400
+    /// Newcomers per channel an hour whose earlier posts come with full photos, voice notes and videos; past it, words
+    /// and small previews only, so throwaway accounts on a channel code can't make a staff phone upload the same media
+    /// over and over.
+    static let withMediaPerHour = 10
+}
+
+/// As a follower just let into a channel: what the staff member who let them in may still hand over.
+struct ChannelHistoryWindow: Codable, Equatable {
+    var opened: Date
+    /// The inviter's group key in the channel (from their `StaffVouch`): history counts only while it is staff.
+    var inviter: Data
+    var taken: Int = 0
+    /// The posts that came this way: the only ones whose media the inviter may fill in.
+    var ids: [UUID] = []
+}
+
 /// What a message says about the video that follows it.
 struct ClipInfo: Codable, Equatable {
     var seconds: Double
@@ -260,6 +292,11 @@ enum Payload: Codable, Equatable {
     /// Over a 1:1 chat, from the staff member who invited a follower: where staff devices' chains are, so the follower
     /// can read their posts in the channel. Followers never post, so this is how they get every chain.
     case groupChainKeys(group: UUID, keys: [GroupChainKey])
+    /// Over a 1:1 chat, from the staff member who let a follower into a channel: the channel's newest posts from before
+    /// (`ChannelHistory.maxPosts` at most, in a few of these), so a newcomer sees what was said. The follower takes them
+    /// only from the staff member it follows the channel through, and only posts that name a staff author. Big photos,
+    /// voice notes and videos follow as `clipBlob`. Apps from before ignore it.
+    case channelHistory(group: UUID, posts: [ChannelHistoryPost])
     /// The sender logged out of the device this came from: stop sending to it.
     case deviceRemoved
     /// The sender unlinked these devices of theirs (ids as this account knows them), said by one of their devices still

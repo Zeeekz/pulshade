@@ -182,23 +182,20 @@ struct LinkAuditFixFlowTests {
         #expect(dave.contact(daveSeesBob, in: nil) != nil)
     }
 
-    /// A friend adding you to a group puts it in your invites, not your chats: nothing is joined and no card goes back
-    /// until you say yes. Then you're in, as before.
-    @Test func aGroupInviteWaitsForAYes() async throws {
+    /// A friend adding you to a group puts you straight in: nothing to accept, and your card goes back by itself. A
+    /// blocked friend's invite is dropped.
+    @Test func aFriendsGroupInviteJoinsStraightAway() async throws {
         let alice = try await makeUser("Alice"), bob = try await makeUser("Bob")
         defer { for m in [alice, bob] { m.lock() } }
         let (bobFP, aliceFP) = try await befriend(alice, bob)
         let group = alice.startConversation(kind: .group, title: "Crew", members: [bobFP])
-        await until([alice, bob]) { !bob.data.groupOffers.isEmpty }
-        #expect(bob.conversation(group.id) == nil, "nothing joined yet")
-        let offer = try #require(bob.groupOffers.first)
-        #expect(offer.from == aliceFP && offer.title == "Crew")
-        await settle(alice, bob)
-        #expect(alice.conversation(group.id)?.shared?.settings.members.count == 1, "no card went back")
-
-        bob.acceptGroupOffer(offer.id)
-        await until([alice, bob]) { bob.conversation(group.id)?.shared?.joining == false }
-        #expect(bob.conversation(group.id)?.shared?.joining == false, "in, once he said yes")
+        await until([alice, bob]) {
+            bob.conversation(group.id)?.shared?.joining == false && alice.conversation(group.id)?.shared?.settings.members.count == 2
+        }
+        #expect(bob.conversation(group.id)?.shared?.joining == false, "in without being asked")
+        #expect(bob.data.groupOffers.isEmpty, "nothing to accept")
+        #expect(alice.conversation(group.id)?.shared?.settings.members.count == 2, "his card went back")
+        #expect(bob.conversation(group.id)?.shared?.ownerAccount == aliceFP)
         alice.send("welcome", in: group.id)
         await until([alice, bob]) { bob.conversation(group.id)?.messages.contains { $0.text == "welcome" } == true }
         #expect(bob.conversation(group.id)?.messages.contains { $0.text == "welcome" } == true)
@@ -229,10 +226,10 @@ struct LinkAuditFixFlowTests {
         await until([alice, cara]) { alice.conversation(chat.id)?.messages.contains { $0.text == "yes" } == true }
         #expect(alice.conversation(chat.id)?.messages.contains { $0.text == "yes" } == true, "the chat works both ways")
 
-        // Following her code let one channel in without asking; the next one from Alice waits for a yes.
+        // Alice is a friend, so the next channel she adds Cara to comes in straight away too.
         let next = alice.startConversation(kind: .channel, title: "More", members: [caraFP])
-        await until([alice, cara]) { !cara.data.groupOffers.isEmpty }
-        #expect(cara.conversation(next.id) == nil && cara.groupOffers.first?.title == "More")
+        await until([alice, cara]) { cara.conversation(next.id)?.shared != nil }
+        #expect(cara.conversation(next.id)?.shared != nil && cara.data.groupOffers.isEmpty)
     }
 
     /// Strangers saying hello on a channel's code are kept without their pictures, and only up to a limit per channel.
