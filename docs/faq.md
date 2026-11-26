@@ -92,7 +92,9 @@ other person to have a username:
 
 - **In person:** one of you shows the QR code, the other scans it.
 - **From a distance:** send your invite link in any other app, or paste theirs. Each code works for one person.
-- **By username:** if they chose one, type it and send a request, which they accept or decline.
+- **By username:** if they chose one, type it and tap Message. Your chat opens at once; on their phone it waits under
+  Message requests until they reply (or, if they take requests from contacts only, until they accept). Tap Add to
+  contacts instead if you want them in your contacts too.
 
 A one-time chat can also be started with a 20-digit code you read out loud.
 

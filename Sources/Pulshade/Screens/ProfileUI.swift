@@ -793,7 +793,8 @@ private struct ProfileSharedLinks: View {
     }
 }
 
-/// Someone found by @handle: their whole profile, with one button to add them. A note is optional and tucked away.
+/// Someone found by @handle: their whole profile, with a button to message them (no need to be contacts) and one to
+/// add them to your contacts.
 struct FoundProfileView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
@@ -848,6 +849,18 @@ struct FoundProfileView: View {
             ProfilePrimaryButton(title: "Message", symbol: "bubble.left.fill") {
                 let convo = model.startConversation(kind: .direct, title: known.displayName, members: [known.fingerprint])
                 openChat(convo.id)
+            }
+        } else if !requested || model.contact(profile.fingerprint, in: model.activePersona)?.hidden == true {
+            VStack(spacing: 10) {
+                ProfilePrimaryButton(title: "Message", symbol: "bubble.left.fill") {
+                    if let convo = model.startChat(with: profile, addToContacts: false) { Haptics.tick(); openChat(convo.id) }
+                }
+                Button("Add to contacts") {
+                    if let convo = model.startChat(with: profile, addToContacts: true) { Haptics.tick(); openChat(convo.id) }
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(Ink.dim)
             }
         } else if requested {
             VStack(spacing: 10) {

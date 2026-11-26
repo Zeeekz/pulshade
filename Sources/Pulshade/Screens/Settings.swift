@@ -1075,6 +1075,7 @@ struct ChangePasscodeSheet: View {
 }
 
 private struct MessagePrivacySettings: View {
+    @Environment(AppModel.self) private var model
     var body: some View {
         SettingsScreen(title: "What others see", back: "Privacy") {
             SettingsGroup("Messages", footer: "Turn one off and you stop seeing theirs too.") {
@@ -1083,6 +1084,13 @@ private struct MessagePrivacySettings: View {
                 SecurityToggle(title: "Read receipts", key: \.readReceipts)
                 RowDivider()
                 SecurityToggle(title: "Typing indicators", key: \.typingIndicators)
+            }
+            SettingsGroup("Who can message me", footer: model.data.security.messagesFrom == .everyone
+                          ? "Anyone who finds your username can start a chat. It waits under Message requests, with no read receipts or typing, until you reply or add them to your contacts."
+                          : "Someone who finds your username sends a request first, and can write only once you accept it.") {
+                ChoiceRows(values: MessagesFrom.allCases, selected: model.data.security.messagesFrom, label: \.label) { option in
+                    model.updateSecurity { $0.messagesFrom = option }
+                }
             }
             SettingsGroup("Presence", footer: "Off by default. Only contacts who show theirs see yours.") {
                 SecurityToggle(title: "Online status", key: \.onlineStatus)

@@ -61,6 +61,13 @@ final class AppModel {
     /// When a video was last sent again on someone's asking, as "fingerprint|id", so one asking can't make it
     /// go over and over.
     @ObservationIgnored private var clipResent: [String: Date] = [:]
+    /// Groups and channels each friend put this account in without asking, by persona and friend, in the last day. Memory only.
+    @ObservationIgnored private var autoJoins: [String: [Date]] = [:]
+    /// Requests already opened as a chat this run, by persona, sender and handshake. Memory only.
+    @ObservationIgnored private var requestChatsOpened: Set<String> = []
+    /// When chats were opened from requests, by persona, in the last hour. Memory only.
+    @ObservationIgnored private var requestChatTimes: [String: [Date]] = [:]
+    static let autoJoinsPerDay = 10
     /// When each newcomer to a channel was handed its earlier posts with full media, by channel. Memory only.
     @ObservationIgnored private var historyWithMedia: [Conversation.ID: [Date]] = [:]
     var failedAttempts = FileKeys.savedAttempts() {
@@ -1839,6 +1846,11 @@ final class AppModel {
         // Being @-mentioned gets through a muted chat: that's someone asking for you in particular.
         guard data.security.notifications, !convo.muted || message.mentionsMe else { return }
         if appActive && openConversation == convo.id { return }
+        // From someone not in your contacts: said plainly, without their words.
+        if convo.isRequest == true {
+            Notifier.shared.post(("PULSHADE", "New message request"), conversation: convo.id, sound: data.security.notificationSound)
+            return
+        }
         #if os(iOS)
         // Behind the screen with push set up for this account, Apple's banner is the notification: Pulshade's own
         // beside it would be a second one, and one that could name the sender. (Mail for another persona isn't
@@ -2147,6 +2159,8 @@ final class AppModel {
         let now = Date()
         // Replying to a photo carries a small copy of it, so the quote shows what was answered.
         let reply = replyTo.map { ReplyRef(id: $0.id, author: $0.sender, snippet: Self.snippet(of: $0), picture: Self.quotePicture(imageData(for: $0))) } ?? quote
+        // Replying to a message request takes it into your chats.
+        takeRequest(at: i)
         var message = Message(sender: "me", text: trimmed, image: image, voice: voice, date: now,
                               expiresAt: convo.disappearAfter.map { now.addingTimeInterval($0) }, reply: reply,
                               preview: preview)
@@ -2836,6 +2850,8 @@ final class AppModel {
         let now = Date()
         let a = prepared.attachment
         let reply = replyTo.map { ReplyRef(id: $0.id, author: $0.sender, snippet: Self.snippet(of: $0), picture: Self.quotePicture(imageData(for: $0))) }
+        // Replying to a message request takes it into your chats.
+        takeRequest(at: i)
         var message = Message(sender: "me", text: "", date: now, expiresAt: convo.disappearAfter.map { now.addingTimeInterval($0) }, reply: reply)
         message.attachment = a
         message.noForward = noForwardFlag(for: convo)
@@ -3024,6 +3040,8 @@ final class AppModel {
         let now = Date()
         let words = caption.trimmingCharacters(in: .whitespacesAndNewlines)
         let reply = replyTo.map { ReplyRef(id: $0.id, author: $0.sender, snippet: Self.snippet(of: $0), picture: Self.quotePicture(imageData(for: $0))) }
+        // Replying to a message request takes it into your chats.
+        takeRequest(at: i)
         var message = Message(sender: "me", text: words, image: poster, date: now,
                               expiresAt: convo.disappearAfter.map { now.addingTimeInterval($0) }, reply: reply)
         message.video = clip
@@ -3769,7 +3787,8 @@ final class AppModel {
 
     /// Typing signals are throttled to one every few seconds and never stored.
     func noteTyping(in id: Conversation.ID) {
-        guard data.security.typingIndicators, let convo = conversation(id), convo.kind == .direct || convo.kind == .group else { return }
+        guard data.security.typingIndicators, let convo = conversation(id), convo.kind == .direct || convo.kind == .group,
+              convo.isRequest != true else { return }
         if let last = lastTypingSent[id], Date().timeIntervalSince(last) < 3 { return }
         lastTypingSent[id] = Date()
         if postIfShared(.typing(conversation: sharedID(convo)), in: id) { return }
@@ -5417,6 +5436,108 @@ final class AppModel {
     /// Accepts: opens a private mailbox just for them, finishes the handshake and starts a chat.
     func acceptRequest(_ id: FriendRequest.ID) -> Conversation? {
         guard let request = data.requests.first(where: { $0.id == id }) else { return nil }
+        return connect(request, asRequest: false)
+    }
+
+    /// Someone who found your username started a chat: connected, as someone not in your contacts, in a chat kept under
+    /// Message requests. Their note, if any, is its first message. The oldest unanswered requests make way past a limit.
+    private func openRequestChat(_ request: FriendRequest) {
+        requestChatTimes[request.persona?.uuidString ?? "main", default: []].append(Date())
+        guard let convo = connect(request, asRequest: true), let i = index(of: convo.id) else { return }
+        if !request.note.isEmpty, !data.conversations[i].messages.contains(where: { !$0.isSystem }) {
+            data.conversations[i].messages.append(Message(sender: request.fingerprint, text: request.note, date: Date(), status: .delivered))
+            data.conversations[i].unread += 1
+        }
+        save()
+        if data.security.notifications {
+            Notifier.shared.post(("PULSHADE", "New message request"), conversation: convo.id, sound: data.security.notificationSound)
+        }
+    }
+
+    /// Most chats waiting under Message requests for each persona, and most opened in an hour.
+    static let maxMessageRequests = 100
+    static let requestChatsPerHour = 20
+
+    private func roomForRequestChat(_ persona: UUID?) -> Bool {
+        let key = persona?.uuidString ?? "main"
+        let hour = (requestChatTimes[key] ?? []).filter { Date().timeIntervalSince($0) < 3600 }
+        requestChatTimes[key] = hour
+        let waiting = data.conversations.count { $0.isRequest == true && $0.persona == persona }
+        return waiting < Self.maxMessageRequests && hour.count < Self.requestChatsPerHour
+    }
+
+    /// Someone not in your contacts, whose chat you deleted: gone altogether (their mailbox is no longer read or woken
+    /// for), unless they're kept for a group, a channel's code, or a request of yours.
+    private func forgetStranger(_ fingerprint: String, persona: UUID?) {
+        guard let c = contact(fingerprint, in: persona), c.hidden, !c.isSelf, c.viaCode == nil, !c.awaitingAcceptance,
+              !data.conversations.contains(where: { $0.kind != .direct && $0.persona == persona && $0.members.contains(fingerprint) }) else { return }
+        forget(c)
+    }
+
+    /// Opens a chat with someone found by username. Not in your contacts unless `addToContacts`: they get a request their
+    /// app opens as a chat (or, if they take requests from contacts only, one they accept), and what you write waits
+    /// until it's open.
+    @discardableResult
+    func startChat(with profile: DirectoryProfile, addToContacts: Bool) -> Conversation? {
+        let persona = activePersona
+        // Already connected (a chat you had, or one they started): just that chat, without asking again.
+        if let known = contact(profile.fingerprint, in: persona), !known.awaitingAcceptance,
+           !known.hidden || known.devices.contains(where: { $0.session != nil }) {
+            if addToContacts { self.addToContacts(known.fingerprint, persona: persona) }
+            return startConversation(kind: .direct, title: known.displayName, members: [known.fingerprint], persona: .some(persona))
+        }
+        guard let peer = sendRequest(to: profile, note: "", persona: .some(persona)) else { return nil }
+        if let i = contactIndex(peer.fingerprint, persona), data.contacts[i].awaitingAcceptance {
+            data.contacts[i].hidden = !addToContacts
+        }
+        let convo = startConversation(kind: .direct, title: peer.displayName, members: [peer.fingerprint], persona: .some(persona))
+        save()
+        return convo
+    }
+
+    /// Puts someone you chat with in your contacts: they get your stories and profile like any friend.
+    func addToContacts(_ fingerprint: String, persona: UUID?) {
+        guard let i = contactIndex(fingerprint, persona), data.contacts[i].hidden, !data.contacts[i].isSelf else { return }
+        data.contacts[i].hidden = false
+        if let convo = directConversation(with: fingerprint, persona: persona), let c = index(of: convo.id) { takeRequest(at: c) }
+        if !data.contacts[i].awaitingAcceptance { shareStories(with: data.contacts[i]) }
+        save()
+    }
+
+    /// Takes a message request into your chats (replying does this too). They stay out of your contacts.
+    func acceptMessageRequest(_ id: Conversation.ID) {
+        guard let i = index(of: id), data.conversations[i].isRequest == true else { return }
+        takeRequest(at: i)
+        save()
+    }
+
+    /// A message request becomes an ordinary chat: the ticks held back for what they sent go now.
+    private func takeRequest(at i: Int) {
+        guard data.conversations[i].isRequest == true else { return }
+        data.conversations[i].isRequest = nil
+        guard let fp = data.conversations[i].members.first, let sender = contact(fp, in: data.conversations[i].persona) else { return }
+        for m in data.conversations[i].messages where m.sender == fp { queueReceipt(m.id, to: sender) }
+    }
+
+    /// Deletes a message request on this phone only: nothing is sent, so they aren't told.
+    func declineMessageRequest(_ id: Conversation.ID) {
+        guard let convo = conversation(id), convo.isRequest == true else { return }
+        removeLocally(id)
+        if let fp = convo.members.first { forgetStranger(fp, persona: convo.persona) }
+        save()
+    }
+
+    /// The chats waiting under Message requests, for the persona in use.
+    var messageRequests: [Conversation] { sortedConversations.filter { $0.isRequest == true } }
+
+    /// Whether the other person in a one-to-one chat is someone not in your contacts.
+    func isStranger(in convo: Conversation) -> Bool {
+        guard convo.kind == .direct, let fp = convo.members.first, let c = contact(fp, in: convo.persona) else { return false }
+        return c.hidden && !c.isSelf
+    }
+
+    private func connect(_ request: FriendRequest, asRequest: Bool) -> Conversation? {
+        let id = request.id
         let mailbox = Mailbox.make()
         var peer = Contact(fingerprint: request.fingerprint, name: ProfileText.name(request.card.name),
                            avatar: request.card.avatar, signingKey: request.card.signingKey,
@@ -5456,6 +5577,8 @@ final class AppModel {
         peer.pq = request.card.pq?.verified(signer: request.card.signingKey, agreement: request.card.agreementKey)
         if let pin = peer.pq, !pinMatchesInvite(pin, contact: peer) { peer.pq = nil }
         peer.relay = Invite.allowedRelay(request.card.relay)
+        // Someone who just started a chat isn't in your contacts (nor is anyone known only from a group or code).
+        if asRequest { peer.hidden = contact(request.fingerprint, in: request.persona)?.hidden ?? true }
         upsert(peer)
         withAnimation(.snappy) { data.requests.removeAll { $0.id == id } }
         if let i = contactIndex(peer.fingerprint, peer.persona) {
@@ -5465,10 +5588,15 @@ final class AppModel {
             }
         }
         enqueue(.accepted(sendID: mailbox.sendID), to: peer)
-        shareStories(with: peer)
+        if !asRequest { shareStories(with: peer) }
+        let hadChat = directConversation(with: peer.fingerprint, persona: request.persona) != nil
         let convo = startConversation(kind: .direct, title: peer.displayName, members: [peer.fingerprint],
                                       persona: .some(request.persona))
-        noteConnected(convo.id)
+        if asRequest, !hadChat, let c = index(of: convo.id) {
+            data.conversations[c].isRequest = true
+        } else {
+            noteConnected(convo.id)
+        }
         save()
         return convo
     }
@@ -6530,8 +6658,11 @@ final class AppModel {
     #if DEBUG
     /// For tests about other things: invites to groups and channels are taken as if you'd said yes at once.
     @ObservationIgnored var acceptsInvitesForTests = false
+    /// For tests from before message requests: someone found by username sends a request to accept, as then.
+    @ObservationIgnored var requestsFromSearchForTests = false
     #else
     let acceptsInvitesForTests = false
+    let requestsFromSearchForTests = false
     #endif
 
     private func resendIsDue(_ message: Message) -> Bool {
@@ -8534,6 +8665,24 @@ final class AppModel {
             // different every time.
             if data.requests.contains(where: { $0.fingerprint == fp && $0.persona == invite.persona
                 && $0.handshake.ephemeral == request.ephemeral && $0.handshake.kem == request.kem }) { return .handled }
+            // Anyone may start a chat (unless you said contacts only): it opens under Message requests, as someone not
+            // in your contacts.
+            if data.security.messagesFrom == .everyone, !requestsFromSearchForTests, contactIndex(fp, invite.persona).map({ data.contacts[$0].hidden }) ?? true {
+                // The same request again (the relay may have lost our answer's ack, or this phone restarted): one chat,
+                // opened once. A session already opened from this very request says so, whatever happened since.
+                let key = "\(invite.persona?.uuidString ?? "main")|\(fp)|\(request.ephemeral.hex)"
+                let answered = contactIndex(fp, invite.persona).map { k in
+                    data.contacts[k].devices.contains { $0.session != nil && $0.acceptedHello == request.ephemeral }
+                } ?? false
+                if requestChatsOpened.contains(key) || answered { return .handled }
+                // Past the limits (too many waiting, or too many in the last hour) it's an ordinary request to accept:
+                // a flood of throwaway accounts can't push real ones out or make this phone keep mailboxes for them.
+                if roomForRequestChat(invite.persona) {
+                    requestChatsOpened.insert(key)
+                    openRequestChat(incoming)
+                    return .handled
+                }
+            }
             withAnimation(.snappy) {
                 data.requests.removeAll { $0.fingerprint == fp && $0.persona == invite.persona }
                 data.requests.insert(incoming, at: 0)
@@ -9299,7 +9448,7 @@ final class AppModel {
             upsert(sender)
             let convo = startConversation(kind: .direct, title: sender.displayName, members: [fp], persona: .some(persona))
             noteConnected(convo.id)
-            shareStories(with: sender)
+            if !sender.hidden { shareStories(with: sender) }
         }
     }
 
@@ -9479,10 +9628,11 @@ final class AppModel {
                   data.conversations[found].members.contains(sender.fingerprint) else { return nil }
             return found
         }
-        guard !sender.hidden else { return nil }
-        if let found = directConversation(with: sender.fingerprint, persona: sender.persona).flatMap({ index(of: $0.id) }) {
-            return found
-        }
+        let existing = directConversation(with: sender.fingerprint, persona: sender.persona).flatMap { index(of: $0.id) }
+        // Someone not in your contacts writes only into a chat already there (a message request, or one you started):
+        // knowing someone from a group or a channel's code doesn't let them open one.
+        if sender.hidden { return existing }
+        if let found = existing { return found }
         guard create else { return nil }
         _ = startConversation(kind: .direct, title: sender.displayName, members: [sender.fingerprint], persona: .some(sender.persona))
         return directConversation(with: sender.fingerprint, persona: sender.persona).flatMap { index(of: $0.id) }
@@ -9506,7 +9656,7 @@ final class AppModel {
             // Sent again because the relay may have lost it: say again that it's here, so their tick catches up. Only
             // so often (`Lanes.duplicateReceiptGap`), so sending the same message over and over can't be used to find
             // out when this device is running.
-            if wire.conversation == nil { queueReceipt(wire.id, to: sender, duplicate: true) }
+            if wire.conversation == nil, data.conversations[i].isRequest != true { queueReceipt(wire.id, to: sender, duplicate: true) }
             return
         }
         let date = dated(wire.date)
@@ -9638,7 +9788,8 @@ final class AppModel {
         notify(message, at: i)
         // Only a direct chat has ticks (a group's mail is "sent" once it's in the mailbox). Seen straight away when the chat
         // is open in front of you.
-        if wire.conversation == nil {
+        // Not from a message request: a tick for each message would tell a stranger when this phone is online.
+        if wire.conversation == nil, data.conversations[i].isRequest != true {
             let seen = openConversation == data.conversations[i].id && appActive && sendsReadReceipts(data.conversations[i])
             queueReceipt(wire.id, to: sender, read: seen)
         }
@@ -9664,7 +9815,7 @@ final class AppModel {
 
     /// Read receipts go only in direct chats, only with the setting on, and never in a one-time chat.
     private func sendsReadReceipts(_ convo: Conversation) -> Bool {
-        guard data.security.readReceipts, convo.kind == .direct else { return false }
+        guard data.security.readReceipts, convo.kind == .direct, convo.isRequest != true else { return false }
         return data.personas.first(where: { $0.id == convo.persona })?.oneTimeChat != true
     }
 
@@ -11343,6 +11494,15 @@ extension AppModel {
                 noteGroupOffer(invite, from: sender, followed: match == .untagged)
                 return
             }
+            // A friend puts you in a few a day at most without asking; past that, the rest wait for a yes.
+            let joinKey = "\(sender.persona?.uuidString ?? "main")|\(sender.fingerprint)"
+            let recentJoins = (autoJoins[joinKey] ?? []).filter { Date().timeIntervalSince($0) < 86_400 }
+            if !consented, !followed, recentJoins.count >= Self.autoJoinsPerDay {
+                autoJoins[joinKey] = recentJoins
+                noteGroupOffer(invite, from: sender)
+                return
+            }
+            if !consented, !followed { autoJoins[joinKey] = recentJoins + [Date()] }
             data.groupOffers.removeAll { $0.invite.settings.group == s.group && $0.persona == sender.persona }
             let place = newGroupPlace(s.group, persona: sender.persona)
             var convo = Conversation(id: place.id, kind: s.kind, title: String(s.title.prefix(80)), avatar: s.avatar, members: [])
@@ -11350,6 +11510,10 @@ extension AppModel {
             convo.persona = sender.persona
             convo.shared = SharedGroup(settings: s, epochs: [invite.epoch], joining: !s.isMember(keys.publicKey))
             convo.shared?.ownerAccount = sender.fingerprint
+            // Said in the chat, since nobody was asked: who put you here.
+            if !consented, !followed {
+                convo.messages.append(Message(sender: "system", text: "\(String(sender.displayName.prefix(40))) added you", date: Date()))
+            }
             if s.kind == .channel, !s.isMember(keys.publicKey), let key = invite.vouch?.key {
                 convo.shared?.historyWindow = ChannelHistoryWindow(opened: Date(), inviter: key)
             }
@@ -11473,7 +11637,14 @@ extension AppModel {
 
     /// Hands a follower this device just let in the channel's newest posts (`ChannelHistory.maxPosts`), over their 1:1
     /// chat, each naming the staff member who posted it. Big photos and voice notes, and videos, follow from the relay.
+    /// Done a post at a time, letting the screen draw in between: a busy channel's media is read and sealed a piece at once.
     private func sendChannelHistory(to follower: Contact, at i: Int) {
+        let id = data.conversations[i].id
+        Task { @MainActor [weak self] in await self?.sendChannelHistory(to: follower, id: id) }
+    }
+
+    private func sendChannelHistory(to follower: Contact, id: Conversation.ID) async {
+        guard let i = index(of: id) else { return }
         let convo = data.conversations[i]
         guard let shared = convo.shared, shared.settings.kind == .channel, !shared.gone, !follower.isSelf,
               let keys = memberKeys(convo.persona, group: convo.wireID), shared.settings.isAdmin(keys.publicKey) else { return }
@@ -11489,6 +11660,7 @@ extension AppModel {
         var posts: [ChannelHistoryPost] = []
         var media: [(bytes: Data, id: UUID, kind: Attachment.Kind)] = []
         for m in earlier {
+            await Task.yield()
             let author = m.isMine ? keys.publicKey : shared.settings.members.first { $0.fingerprint == m.sender }?.signingKey
             guard let author else { continue }
             var wire = wireForResend(m, in: convo)
@@ -11524,6 +11696,7 @@ extension AppModel {
             bytes = 0
         }
         for post in posts {
+            await Task.yield()
             let size = (try? JSONEncoder.pulshade.encode(post).count) ?? Int.max
             guard size <= ChannelHistory.bytesPerMessage else { continue }
             if batch.count >= ChannelHistory.perMessage || bytes + size > ChannelHistory.bytesPerMessage { flush() }

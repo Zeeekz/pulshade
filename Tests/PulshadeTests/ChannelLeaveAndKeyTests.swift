@@ -100,7 +100,7 @@ struct ChannelLeaveAndKeyTests {
         // A copy of the channel left on his phone could not read it: the new key was never sealed to him.
         bob.data.conversations.append(stashed)
         await settle(alice, bob, cara)
-        #expect(bob.conversation(id)?.messages.map(\.text) == ["first"])
+        #expect(bob.conversation(id)?.messages.filter { !$0.isSystem }.map(\.text) == ["first"])
         #expect(shared(bob, id)?.epochs.map(\.number) == [epoch])
     }
 
@@ -389,8 +389,8 @@ struct ChannelLeaveAndKeyTests {
         bob.data.conversations.append(stashedBob)
         cara.data.conversations.append(stashedCara)
         await settle(alice, bob, cara, dave)
-        #expect(bob.conversation(id)?.messages.map(\.text) == ["first"])
-        #expect(cara.conversation(id)?.messages.map(\.text) == ["first"])
+        #expect(bob.conversation(id)?.messages.filter { !$0.isSystem }.map(\.text) == ["first"])
+        #expect(cara.conversation(id)?.messages.filter { !$0.isSystem }.map(\.text) == ["first"])
         #expect(shared(bob, id)?.epochs.map(\.number) == [epoch] && shared(cara, id)?.epochs.map(\.number) == [epoch])
     }
 

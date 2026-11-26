@@ -72,20 +72,20 @@ struct SharedGroupFlowTests {
         bob.send("hi all", in: group.id)
         await until([alice, bob, cara]) { cara.conversation(group.id)?.messages.contains { $0.text == "hi all" } == true }
         #expect(cara.conversation(group.id)?.messages.filter { !$0.isSystem }.map(\.text) == ["hi all"])
-        #expect(bob.conversation(group.id)?.messages.first?.status == .sent)
+        #expect(bob.conversation(group.id)?.messages.first { !$0.isSystem }?.status == .sent)
         cara.send("hey bob", in: group.id)
-        await until([alice, bob, cara]) { bob.conversation(group.id)?.messages.count == 2 && alice.conversation(group.id)?.messages.count == 2 }
-        #expect(bob.conversation(group.id)?.messages.map(\.text) == ["hi all", "hey bob"])
+        await until([alice, bob, cara]) { bob.conversation(group.id)?.messages.filter { !$0.isSystem }.count == 2 && alice.conversation(group.id)?.messages.filter { !$0.isSystem }.count == 2 }
+        #expect(bob.conversation(group.id)?.messages.filter { !$0.isSystem }.map(\.text) == ["hi all", "hey bob"])
         #expect(alice.conversation(group.id)?.messages.filter { !$0.isSystem }.map(\.text) == ["hi all", "hey bob"])
         // Who said it shows by name.
         let fromCara = try #require(bob.conversation(group.id)?.messages.last)
         #expect(bob.displayName(fromCara.sender) == "Cara")
 
         // Reactions and unsends go through the mailbox too.
-        let first = try #require(cara.conversation(group.id)?.messages.first)
+        let first = try #require(cara.conversation(group.id)?.messages.first { !$0.isSystem })
         cara.react("🔥", to: first.id, in: group.id)
-        await until([alice, bob, cara]) { bob.conversation(group.id)?.messages.first?.reactions.values.contains("🔥") == true }
-        #expect(bob.conversation(group.id)?.messages.first?.reactions.values.contains("🔥") == true)
+        await until([alice, bob, cara]) { bob.conversation(group.id)?.messages.first { !$0.isSystem }?.reactions.values.contains("🔥") == true }
+        #expect(bob.conversation(group.id)?.messages.first { !$0.isSystem }?.reactions.values.contains("🔥") == true)
         let mine = try #require(cara.conversation(group.id)?.messages.last)
         cara.unsend(mine.id, in: group.id)
         await until([alice, bob, cara]) { alice.conversation(group.id)?.messages.count == 1 }
@@ -366,10 +366,10 @@ struct SharedGroupFlowTests {
 
         alice.addMembers(group.id, [caraFP])
         await until([alice, bob, cara]) { cara.conversation(group.id)?.shared?.joining == false && bob.conversation(group.id)?.members.count == 2 }
-        #expect(cara.conversation(group.id)?.messages.isEmpty == true, "nothing from before she joined")
+        #expect(cara.conversation(group.id)?.messages.allSatisfy(\.isSystem) == true, "nothing from before she joined")
         bob.send("welcome", in: group.id)
         await until([alice, bob, cara]) { cara.conversation(group.id)?.messages.contains { $0.text == "welcome" } == true }
-        #expect(cara.conversation(group.id)?.messages.map(\.text) == ["welcome"])
+        #expect(cara.conversation(group.id)?.messages.filter { !$0.isSystem }.map(\.text) == ["welcome"])
 
         // Leaving: the owner's device takes her out with a new epoch.
         let epoch = try #require(alice.conversation(group.id)?.shared?.current?.number)

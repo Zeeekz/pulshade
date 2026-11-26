@@ -41,6 +41,8 @@ func testDirectory(_ prefix: String) -> URL {
     model.unlockSettle = .zero
     // Invites to groups and channels wait for a yes; tests about other things say yes at once (LinkAuditFixTests don't).
     model.acceptsInvitesForTests = true
+    // Someone found by username opens a chat now; tests from before that keep the request to accept (MessageRequestTests don't).
+    model.requestsFromSearchForTests = true
     return model
 }
 

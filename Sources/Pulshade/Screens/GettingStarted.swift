@@ -78,7 +78,7 @@ struct UsernameSheet: View {
         SheetBody(width: 460) {
             VStack(spacing: 18) {
                 SheetHeader(symbol: "at", title: "Username")
-                Text("A username is optional. With one, anyone who knows it can find your profile and send you a request, which you accept or decline. Without one, people add you with your code or link from Add a friend.")
+                Text("A username is optional. With one, anyone who knows it can find your profile and message you; it waits under Message requests until you reply. Without one, people add you with your code or link from Add a friend.")
                     .font(.system(size: 13)).foregroundStyle(Ink.dim)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)

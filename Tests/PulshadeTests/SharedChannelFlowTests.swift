@@ -160,7 +160,7 @@ struct SharedChannelFlowTests {
         await settle(alice, bob, cara)
         #expect(cara.conversation(channel.id)?.messages.last?.text == "after", "the others carry on")
         #expect(cara.conversation(channel.id)?.shared?.settings.epoch == epochBefore + 1)
-        #expect(bob.conversation(channel.id)?.messages.map(\.text) == ["before"], "and he reads nothing more")
+        #expect(bob.conversation(channel.id)?.messages.filter { !$0.isSystem }.map(\.text) == ["before"], "and he reads nothing more")
         #expect(bob.conversation(channel.id)?.shared?.epochs.map(\.number) == [epochBefore], "the new key never reached him")
     }
 

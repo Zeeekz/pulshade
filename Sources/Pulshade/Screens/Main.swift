@@ -379,6 +379,8 @@ private struct ChatList: View {
     @State private var stripBox = FrameBox()
     /// Showing the archived chats instead of the rest.
     @State private var showingArchive = false
+    /// Showing the message requests (chats from people not in your contacts) instead of the rest.
+    @State private var showingRequests = false
     /// The chats picked (held on a picture). Empty while not picking.
     @State private var picked: Set<Conversation.ID> = []
     /// A hold-and-slide over the pictures under way.
@@ -415,7 +417,8 @@ private struct ChatList: View {
 
     private var items: [Conversation] {
         model.sortedConversations.filter { c in
-            (filter == nil || c.kind == filter) && c.archived == showingArchive &&
+            (filter == nil || c.kind == filter) && (c.isRequest == true) == showingRequests
+                && (showingRequests || c.archived == showingArchive) &&
                 (search.isEmpty || c.title.localizedCaseInsensitiveContains(search))
         }
     }
@@ -626,20 +629,24 @@ private struct ChatList: View {
     }
 
     @ViewBuilder private var rows: some View {
-        let archived = model.archivedConversations
+        let archived = model.archivedConversations.filter { $0.isRequest != true }
+        let requests = model.messageRequests
         if model.sortedConversations.isEmpty, filter == nil, search.isEmpty {
             // Nothing here yet: say how to start, with or without a username.
             GettingStartedCard(addFriend: { addingFriend = true }, chooseUsername: { choosingUsername = true })
         } else {
             LazyVStack(spacing: 1) {
-                if showingArchive {
+                if showingRequests {
+                    requestsHeader(count: requests.count)
+                } else if showingArchive {
                     archiveHeader(count: archived.count)
-                } else if filter == nil, search.isEmpty, !archived.isEmpty {
-                    archivedRow(archived)
+                } else if filter == nil, search.isEmpty {
+                    if !requests.isEmpty { requestsRow(requests) }
+                    if !archived.isEmpty { archivedRow(archived) }
                 }
                 if items.isEmpty {
-                    Constellation(symbol: showingArchive ? "archivebox" : (filter?.symbol ?? "bubble.left.and.bubble.right"),
-                                  text: !search.isEmpty ? "No results" : showingArchive ? "Nothing archived" : "No conversations")
+                    Constellation(symbol: showingRequests ? "tray" : showingArchive ? "archivebox" : (filter?.symbol ?? "bubble.left.and.bubble.right"),
+                                  text: !search.isEmpty ? "No results" : showingRequests ? "No message requests" : showingArchive ? "Nothing archived" : "No conversations")
                         .padding(.top, 80)
                 } else {
                     ForEach(items) { c in row(c) }
@@ -904,6 +911,65 @@ private struct ChatList: View {
         .buttonStyle(.plain)
         .accessibilityLabel("Archived, \(archived.count) chats")
         .transition(.opacity)
+    }
+
+    /// At the top of the chats: chats from people not in your contacts, folded into one row.
+    private func requestsRow(_ requests: [Conversation]) -> some View {
+        let unread = requests.reduce(0) { $0 + $1.unread }
+        return Button {
+            withAnimation(.snappy(duration: 0.3)) { showingRequests = true; showingArchive = false; picked = []; opened = nil }
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "tray.fill")
+                    .font(.system(size: rowAvatar * 0.36))
+                    .foregroundStyle(Ink.dim)
+                    .frame(width: rowAvatar, height: rowAvatar)
+                    .background(Ink.raised, in: .circle)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Message requests").font(.system(size: 16.5, weight: .semibold)).foregroundStyle(Ink.text)
+                    Text(requests.prefix(5).map(\.title).joined(separator: ", "))
+                        .font(.system(size: 15)).foregroundStyle(Ink.dim).lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                if unread > 0 {
+                    Text("\(unread)")
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(Ink.onAccent.opacity(0.85))
+                        .padding(.horizontal, 7).frame(minWidth: 21, minHeight: 21)
+                        .background(theme.accent, in: .capsule)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 11)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Message requests, \(requests.count) chats")
+        .transition(.opacity)
+    }
+
+    /// Over the message requests: the way back, and what they are.
+    private func requestsHeader(count: Int) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Button {
+                withAnimation(.snappy(duration: 0.3)) { showingRequests = false; picked = []; opened = nil }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.left").font(.system(size: 13, weight: .semibold))
+                    Text("Message requests").font(.system(size: 15, weight: .semibold))
+                    Text("\(count)").font(.system(size: 13)).foregroundStyle(Ink.faint)
+                    Spacer()
+                }
+                .foregroundStyle(Ink.text)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .keyboardShortcut(picking ? nil : .cancelAction)
+            .accessibilityLabel("Back to chats")
+            Text("From people not in your contacts. They don't see that you've read them until you reply.")
+                .font(.system(size: 11.5)).foregroundStyle(Ink.faint)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 8)
     }
 
     /// Over the archived chats: the way back, and what keeps a chat here.

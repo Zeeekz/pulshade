@@ -917,6 +917,9 @@ struct Conversation: Codable, Identifiable, Equatable {
     /// chosen, so a channel's posts can be copied and passed on whatever your own chats are set to; your account's
     /// "Allow forwarding" is for one-to-one chats and groups. Kept on this device only.
     var protectPosts: Bool?
+    /// A chat someone not in your contacts started after finding your username: kept under Message requests, with no read
+    /// receipts or typing, until you reply or add them.
+    var isRequest: Bool?
 
     init(id: UUID = UUID(), kind: ConversationKind, title: String, avatar: Data? = nil, members: [String],
          messages: [Message] = [], pinned: Bool = false, unread: Int = 0, disappearAfter: TimeInterval? = nil) {
@@ -934,7 +937,7 @@ struct Conversation: Codable, Identifiable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case id, kind, title, avatar, members, messages, createdAt, pinned, muted, archived, unread, disappearAfter, persona
-        case about, owner, admins, mods, postPolicy, version, isOwner, shared, groupID, protectPosts
+        case about, owner, admins, mods, postPolicy, version, isOwner, shared, groupID, protectPosts, isRequest
     }
 
     init(from decoder: Decoder) throws {
@@ -959,6 +962,7 @@ struct Conversation: Codable, Identifiable, Equatable {
         shared = try c.decodeIfPresent(SharedGroup.self, forKey: .shared)
         groupID = try c.decodeIfPresent(UUID.self, forKey: .groupID)
         protectPosts = try? c.decodeIfPresent(Bool.self, forKey: .protectPosts)
+        isRequest = try? c.decodeIfPresent(Bool.self, forKey: .isRequest)
         if let owner = try c.decodeIfPresent(String.self, forKey: .owner) {
             self.owner = owner
             postPolicy = (try? c.decodeIfPresent(PostPolicy.self, forKey: .postPolicy)) ?? .everyone
@@ -994,6 +998,7 @@ struct Conversation: Codable, Identifiable, Equatable {
         try c.encodeIfPresent(shared, forKey: .shared)
         try c.encodeIfPresent(groupID, forKey: .groupID)
         if protectPosts == true { try c.encode(true, forKey: .protectPosts) }
+        if isRequest == true { try c.encode(true, forKey: .isRequest) }
     }
 
     /// The id the group goes by between devices: in every payload, settings and key.
@@ -1433,6 +1438,9 @@ struct SecuritySettings: Codable, Equatable {
     var typingIndicators = false
     /// Let people forward your messages to other chats. Off, your messages ask their apps not to offer Forward or Copy.
     var allowForwarding = true
+    /// Who can start a chat with you after finding your username: everyone (it waits under Message requests), or only
+    /// people you accept as contacts first (a request, as before build 23).
+    var messagesFrom: MessagesFrom = .everyone
     /// When a contact's account adds a device, nothing of yours goes to it until you allow it in their chat (it waits in
     /// the vault meanwhile). Off by default, as in other messengers: the new device is announced and gets messages at once.
     var holdNewDevices = false
@@ -1510,6 +1518,7 @@ struct SecuritySettings: Codable, Equatable {
         // Saved by every build that had the setting; one missing is from before it existed, when typing was shown.
         typingIndicators = try c.decodeIfPresent(Bool.self, forKey: .typingIndicators) ?? true
         allowForwarding = try c.decodeIfPresent(Bool.self, forKey: .allowForwarding) ?? d.allowForwarding
+        messagesFrom = (try? c.decodeIfPresent(MessagesFrom.self, forKey: .messagesFrom)) ?? d.messagesFrom
         holdNewDevices = try c.decodeIfPresent(Bool.self, forKey: .holdNewDevices) ?? d.holdNewDevices
         onlineStatus = try c.decodeIfPresent(Bool.self, forKey: .onlineStatus) ?? d.onlineStatus
         tor = try c.decodeIfPresent(Bool.self, forKey: .tor) ?? d.tor
@@ -1520,6 +1529,18 @@ struct SecuritySettings: Codable, Equatable {
         detachHold = Self.clamp(try c.decodeIfPresent(Double.self, forKey: .detachHold) ?? d.detachHold, to: Self.leaveHoldRange)
         burnHold = Self.clamp(try c.decodeIfPresent(Double.self, forKey: .burnHold) ?? d.burnHold, to: Self.leaveHoldRange)
         holdTimesChosen = try c.decodeIfPresent(Bool.self, forKey: .holdTimesChosen) ?? false
+    }
+}
+
+/// Who can start a chat with you after finding your username (`SecuritySettings.messagesFrom`).
+enum MessagesFrom: String, Codable, CaseIterable {
+    case everyone, contacts
+
+    var label: String {
+        switch self {
+        case .everyone: "Everyone"
+        case .contacts: "Only people I accept"
+        }
     }
 }
 

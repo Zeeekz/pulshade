@@ -219,6 +219,13 @@ no accounts, can't tell who is a child. If you think a child is using Pulshade, 
 If we change this policy we'll update the date above, add a line to the list below and tell people in the app's
 announcements. The code and documentation show what the app does at any time.
 
+- **Build 23 (who can reach you):** someone who finds your @handle can message you without a request you accept first:
+  their chat waits under Message requests, with no read receipts or typing sent until you reply, and they are not added
+  to your contacts unless you choose to. Your phone answers their first message by itself, so they can tell it was
+  online then. Settings → Privacy → What others see → Who can message me → "Only people I accept" keeps the request
+  you accept, as before. A friend who adds you to a group or channel puts you straight in (ten a day from one friend at
+  most; past that they wait for a yes), and your group card goes back to it at once. Someone you put into a channel is
+  sent its newest 100 posts, with their photos, voice notes and videos, by your phone over your chat with them.
 - **Build 22 (one iPhone):** Pulshade is iPhone only and an account works on one device. Linking a second device and
   copying chats or settings between your own devices are gone, so nothing about your account is sent to another device
   of yours. Devices linked on an older build are signed out after the update, and your contacts are told they're gone.

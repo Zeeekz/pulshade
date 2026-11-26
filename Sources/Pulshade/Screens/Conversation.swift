@@ -27,6 +27,7 @@ struct ConversationView: View {
     @State private var showInfo = false
     @State private var verifying = false
     @State private var confirmingAllow = false
+    @State private var confirmingBlock = false
     /// Their picture at full size, opened from the header on the phone.
     @State private var headerPicture: Data?
     @State private var recorder = VoiceRecorder()
@@ -63,6 +64,7 @@ struct ConversationView: View {
         if let c = model.conversation(id), model.belongsHere(c) {
             VStack(spacing: 0) {
                 header(c)
+                strangerBar(c)
                 verifyPrompt(c)
                 messages(c)
                 if model.canPost(in: c) { composer(c) } else { ReadOnlyBar(kind: c.kind, announcements: c.isAnnouncements, oldFormat: c.isOldFormat, needsUpdate: model.peerNeedingUpdate(in: c), reason: model.cantPostReason(in: c)) }
@@ -207,6 +209,53 @@ struct ConversationView: View {
     /// For a friend added in the last two weeks and not verified yet: a short line asking to compare the Pulse check, the
     /// one thing that proves nobody stood in the middle when you connected. Put away until the app is next opened, and gone
     /// for good once verified.
+    /// Someone not in your contacts: a message request to take or turn down, or a chat you started that they haven't
+    /// opened yet, or simply a way to add them.
+    @ViewBuilder private func strangerBar(_ c: Conversation) -> some View {
+        if c.kind == .direct, let fp = c.members.first, let peer = model.contact(fp, in: c.persona), !peer.isSelf,
+           c.isRequest == true || peer.hidden || peer.awaitingAcceptance {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(c.isRequest == true
+                     ? "\(model.displayName(fp)) isn't in your contacts. They won't know you've read this until you reply."
+                     : peer.awaitingAcceptance
+                        ? "What you write goes once \(model.displayName(fp))'s app opens the chat."
+                        : "\(model.displayName(fp)) isn't in your contacts.")
+                    .font(.system(size: 13))
+                    .foregroundStyle(Ink.text)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 18) {
+                    if peer.hidden {
+                        Button("Add to contacts") { withAnimation(.snappy) { model.addToContacts(fp, persona: c.persona) } }
+                            .foregroundStyle(theme.accent)
+                    }
+                    if c.isRequest == true {
+                        Button("Accept") { withAnimation(.snappy) { model.acceptMessageRequest(c.id) } }
+                            .foregroundStyle(theme.accent)
+                        Button("Delete") { model.declineMessageRequest(c.id) }
+                            .foregroundStyle(Ink.dim)
+                    }
+                    if peer.hidden || c.isRequest == true {
+                        Button("Block") { confirmingBlock = true }
+                            .foregroundStyle(Color.red)
+                    }
+                }
+                .font(.system(size: 13, weight: .semibold))
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 14).padding(.vertical, 9)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Ink.raised)
+            .overlay(alignment: .bottom) { Rectangle().fill(Ink.line).frame(height: 1) }
+            .transition(.move(edge: .top).combined(with: .opacity))
+            .confirmationDialog("Block \(model.displayName(fp))?", isPresented: $confirmingBlock, titleVisibility: .visible) {
+                Button("Block", role: .destructive) { model.blockContact(fp, persona: c.persona) }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("They can't reach you again, and this chat goes.")
+            }
+        }
+    }
+
     @ViewBuilder private func verifyPrompt(_ c: Conversation) -> some View {
         if c.kind == .direct, let fp = c.members.first, model.heldDevices(of: fp, persona: c.persona) > 0 {
             // A device their account added while "ask before new devices" is on: your messages wait for it until you say.

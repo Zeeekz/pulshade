@@ -108,7 +108,10 @@ What this gives:
   identity keys later does not reveal the root. "No longer needed" is not immediate in every case. To finish a
   handshake whose answer arrives late, a device keeps the secret half of its current ask and of up to **3 earlier
   unanswered asks** to each friend's device, each for at most **8 days** from when it was made (`AppModel.askLifetime`).
-  An ask for a **friend request** waits up to **32 days** for an answer (`requestAskLifetime`). When a session opens
+  An ask for a **friend request** waits up to **32 days** for an answer (`requestAskLifetime`). Since build 23 a
+  request that arrives on an @handle's mailbox is answered by the receiving phone at once (unless it takes requests from
+  contacts only): the sender becomes a hidden contact and the chat waits under Message requests, with no read receipts
+  or typing, until the receiver replies or adds them; at most 100 such chats per persona, the oldest unanswered going. When a session opens
   from an answer, that ask and every earlier one are deleted at once; only an ask made after it (whose answer may still
   come) stays. A spare key's secret half is kept while the spare is up (**5 to 10 days**, longer only while the app
   doesn't run to replace it) and for **10 days** after it is replaced (`spareGrace`, [section 5](#5-spare-keys)). These

@@ -199,7 +199,7 @@ struct PeopleView: View {
             .animation(.snappy, value: parsed != nil)
             .animation(.snappy, value: added?.fingerprint)
         } footer: {
-            "Someone added by code appears in your contacts once their device answers. Someone found by username gets a request to accept."
+            "Someone added by code appears in your contacts once their device answers. Someone found by username can be messaged straight away, and added to your contacts if you like."
         }
     }
 
