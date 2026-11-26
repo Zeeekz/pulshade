@@ -1437,6 +1437,16 @@ struct SecuritySettings: Codable, Equatable {
     /// Keep a sealed copy of your profile, contacts, groups, handles, settings and chat keys (never messages) on the relay, so Detach
     /// can be an instant wipe and your recovery code still brings them back. The relay can't open it.
     var keepBackup = true
+    /// How long the Burn tab's ring must be held, in seconds, for each action. Lock from instant to 2, Detach and Burn
+    /// from 2 to 5, so the ones that can't be undone always need a deliberate hold.
+    var lockHold: Double = 2
+    var detachHold: Double = 5
+    var burnHold: Double = 5
+    static let lockHoldRange: ClosedRange<Double> = 0...2
+    static let leaveHoldRange: ClosedRange<Double> = 2...5
+    static func clamp(_ value: Double, to range: ClosedRange<Double>) -> Double {
+        value.isFinite ? min(max(value, range.lowerBound), range.upperBound) : range.upperBound
+    }
     /// Let the notification helper take short mail off the relay while this iPhone is locked, and give friends their
     /// second tick when delivery receipts are on (see `LockedDelivery`). Off unless chosen by hand: the helper
     /// keeps this account's signing and agreement keys in the Keychain, which a phone that has been unlocked once
@@ -1486,6 +1496,9 @@ struct SecuritySettings: Codable, Equatable {
         torSince = try c.decodeIfPresent(Date.self, forKey: .torSince)
         torFromStart = try c.decodeIfPresent(Bool.self, forKey: .torFromStart) ?? false
         keepBackup = try c.decodeIfPresent(Bool.self, forKey: .keepBackup) ?? d.keepBackup
+        lockHold = Self.clamp(try c.decodeIfPresent(Double.self, forKey: .lockHold) ?? d.lockHold, to: Self.lockHoldRange)
+        detachHold = Self.clamp(try c.decodeIfPresent(Double.self, forKey: .detachHold) ?? d.detachHold, to: Self.leaveHoldRange)
+        burnHold = Self.clamp(try c.decodeIfPresent(Double.self, forKey: .burnHold) ?? d.burnHold, to: Self.leaveHoldRange)
     }
 }
 
@@ -1555,6 +1568,8 @@ struct AppData: Codable {
     /// 30: collectibles: the copies your identities hold (`collectibles`), the signed list and its pictures in the media
     /// pool (`collectibleList`, `collectiblePictures`), a profile's showcase (`Profile.showcase`, `Contact.showcase`) and
     /// whether friends see your collection (`hideCollection`).
+    /// Also in 30: how long the Burn tab's ring is held for Lock, Detach and Burn (`SecuritySettings.lockHold`,
+    /// `detachHold`, `burnHold`).
     static let currentFormat = 30
     var profile = Profile()
     var contacts: [Contact] = []
