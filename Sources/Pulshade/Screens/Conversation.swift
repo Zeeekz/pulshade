@@ -1950,11 +1950,13 @@ struct LinkBadge: View {
 
 /// Details and management for any chat: a person's nickname and verification, or a group or
 /// channel's name, description, posting rights, admins and members.
-private struct ConversationInfo: View {
+struct ConversationInfo: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     @Environment(\.dismiss) private var dismiss
     let id: Conversation.ID
+    /// Drawn without its scroll view and already faded in, for rendering it in tests.
+    var flat = false
     @State private var nickname = ""
     @State private var title = ""
     @State private var about = ""
@@ -1992,14 +1994,16 @@ private struct ConversationInfo: View {
                     Rectangle().fill(Ink.line).frame(height: 1)
                 }
 
-                ScrollView {
+                scroller {
                     if let person {
                         personProfile(person, in: c)
-                            .opacity(arrived ? 1 : 0)
-                            .offset(y: arrived ? 0 : 18)
+                            .opacity(arrived || flat ? 1 : 0)
+                            .offset(y: arrived || flat ? 0 : 18)
                     }
                     VStack(spacing: 18) {
-                        if person == nil { identity(c) }
+                        if person == nil {
+                            if c.isGroupLike { groupHero(c) } else { identity(c) }
+                        }
                         if let persona = c.persona, model.isBurner(persona) { burnButton(persona) }
                         switch c.kind {
                         case .direct: directSection(c)
@@ -2008,15 +2012,15 @@ private struct ConversationInfo: View {
                         case .broadcast: membersSection(c)
                         }
                         // A person's chat has its own cards under their profile; everything else keeps this one.
-                        if c.kind != .direct || model.contact(c.members.first ?? "", in: c.persona) == nil { actions(c) }
+                        if c.isGroupLike { leaveCard(c) }
+                        else if c.kind != .direct || model.contact(c.members.first ?? "", in: c.persona) == nil { actions(c) }
                     }
                     .padding(20)
                     .confirms($pending)
-                    .opacity(arrived ? 1 : 0)
-                    .offset(y: arrived ? 0 : 18)
-                    .scaleEffect(arrived ? 1 : 0.96, anchor: .top)
+                    .opacity(arrived || flat ? 1 : 0)
+                    .offset(y: arrived || flat ? 0 : 18)
+                    .scaleEffect(arrived || flat ? 1 : 0.96, anchor: .top)
                 }
-                .scrollIndicators(.never)
             }
             .background(Ink.base)
             .preferredColorScheme(Ink.scheme)
@@ -2030,6 +2034,10 @@ private struct ConversationInfo: View {
             .sheet(isPresented: $adding) { AddPeopleSheet(id: id) }
             .sheet(item: $profileOf) { MemberProfileSheet(fingerprint: $0.fingerprint, conversation: id) }
         }
+    }
+
+    @ViewBuilder private func scroller<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        if flat { VStack(spacing: 0) { content() } } else { ScrollView { content() }.scrollIndicators(.never) }
     }
 
     // MARK: Top
@@ -2263,54 +2271,203 @@ private struct ConversationInfo: View {
         }
     }
 
-    @ViewBuilder private func groupSections(_ c: Conversation) -> some View {
-        Card(title: "About") {
-            if c.amAdmin && !c.isOldFormat {
-                TextField("", text: $about, prompt: Text("Describe this \(c.kind == .channel ? "channel" : "group")")
-                    .foregroundStyle(Ink.faint), axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .lineLimit(2...5)
-                    .onSubmit { commitDetails(c) }
-            } else {
-                Text(c.about?.isEmpty == false ? LinkPreviews.linked(c.about!) : AttributedString("No description"))
-                    .foregroundStyle(c.about?.isEmpty == false ? Ink.text : Ink.faint)
-                    .tint(theme.accent)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-        }
-        .onDisappear { if c.amAdmin && (about != (c.about ?? "") || title != c.title) { commitDetails(c) } }
+    // MARK: Group & channel card
 
-        if model.canNamePublicly(c.id) { PublicNameSection(id: c.id, kind: c.kind) }
+    /// A group's or channel's card, like a person's profile: cover, picture and name (editable by admins), what it is and
+    /// your role, its description, a strip of numbers, and Mute, Pin and Add.
+    private func groupHero(_ c: Conversation) -> some View {
+        let editable = c.amAdmin && !c.isOldFormat
+        let shape = RoundedRectangle(cornerRadius: 22, style: .continuous)
+        return VStack(spacing: 0) {
+            ProfileCover().frame(height: 92)
+            Group {
+                if editable {
+                    AvatarPicker(image: Binding(get: { avatar }, set: { avatar = $0; commitDetails(c) }), seed: c.id.uuidString, size: 96)
+                } else {
+                    Avatar(image: c.avatar, seed: c.id.uuidString, size: 96, symbol: c.kind.symbol)
+                }
+            }
+            .padding(4)
+            .background(Ink.surface, in: .circle)
+            .padding(.top, -52)
+            VStack(spacing: 0) {
+                if editable {
+                    TextField("", text: $title, prompt: Text("Name").foregroundStyle(Ink.faint))
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 24, weight: .bold))
+                        .multilineTextAlignment(.center)
+                        .onSubmit { commitDetails(c) }
+                        .padding(.top, 10)
+                } else {
+                    Text(c.title)
+                        .font(.system(size: 24, weight: .bold)).foregroundStyle(Ink.text)
+                        .multilineTextAlignment(.center).lineLimit(2).minimumScaleFactor(0.7)
+                        .padding(.top, 10)
+                }
+                HStack(spacing: 8) {
+                    Label(c.kind.label, systemImage: c.kind.symbol)
+                        .font(.system(size: 12, weight: .semibold)).foregroundStyle(Ink.dim)
+                    Text(roleName(c))
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(theme.accent)
+                        .padding(.horizontal, 8).padding(.vertical, 3)
+                        .background(theme.accent.opacity(0.14), in: .capsule)
+                }
+                .padding(.top, 6)
+                aboutField(c, editable: editable).padding(.top, 12)
+                ProfileFactStrip(facts: groupFacts(c)).padding(.top, 14)
+                HStack(spacing: 8) {
+                    ProfileActionTile(title: c.muted ? "Unmute" : "Mute", symbol: c.muted ? "bell.fill" : "bell.slash.fill") {
+                        model.toggleMute(id)
+                    }
+                    ProfileActionTile(title: c.pinned ? "Unpin" : "Pin", symbol: c.pinned ? "pin.slash.fill" : "pin.fill") {
+                        model.togglePin(id)
+                    }
+                    if c.amAdmin && !c.isOldFormat && c.shared?.gone != true {
+                        ProfileActionTile(title: c.kind == .channel ? "Add followers" : "Add members",
+                                          symbol: "person.badge.plus", prominent: true) { adding = true }
+                    }
+                }
+                .padding(.top, 14)
+            }
+            .padding(.horizontal, 16)
+        }
+        .padding(.bottom, 16)
+        .frame(maxWidth: .infinity)
+        .background(Ink.surface)
+        .clipShape(shape)
+        .overlay(shape.strokeBorder(Ink.line, lineWidth: 1))
+        .onDisappear { if c.amAdmin && (about != (c.about ?? "") || title != c.title) { commitDetails(c) } }
+    }
+
+    @ViewBuilder private func aboutField(_ c: Conversation, editable: Bool) -> some View {
+        if editable {
+            TextField("", text: $about, prompt: Text("Add a description").foregroundStyle(Ink.faint), axis: .vertical)
+                .textFieldStyle(.plain)
+                .font(.system(size: 15))
+                .multilineTextAlignment(.center)
+                .lineLimit(1...6)
+                .onSubmit { commitDetails(c) }
+                .padding(.horizontal, 12).padding(.vertical, 10)
+                .background(Ink.raised.opacity(0.6), in: .rect(cornerRadius: 12, style: .continuous))
+        } else if let text = c.about, !text.isEmpty {
+            Text(LinkPreviews.linked(text))
+                .font(.system(size: 15)).foregroundStyle(Ink.text)
+                .tint(theme.accent)
+                .multilineTextAlignment(.center)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func roleName(_ c: Conversation) -> String {
+        c.amOwner ? "Owner" : c.amAdmin ? "Admin" : c.amMod ? "Mod" : c.kind == .channel ? "Follower" : "Member"
+    }
+
+    /// Members (or followers, for a channel's staff), admins, messages, and when it started.
+    private func groupFacts(_ c: Conversation) -> [ProfileFact] {
+        var facts: [ProfileFact] = []
+        if c.kind == .group {
+            let n = c.members.count + 1
+            facts.append(ProfileFact(value: "\(n)", label: n == 1 ? "Member" : "Members"))
+        } else if c.amAdmin {
+            let n = model.followers(of: c).count
+            facts.append(ProfileFact(value: n.formatted(.number.notation(.compactName)), label: n == 1 ? "Follower" : "Followers"))
+        }
+        let admins = Set([c.owner] + c.admins).count
+        facts.append(ProfileFact(value: "\(admins)", label: admins == 1 ? "Admin" : "Admins"))
+        let posts = c.messages.filter { !$0.isSystem }.count
+        facts.append(ProfileFact(value: posts.formatted(.number.notation(.compactName)),
+                                 label: c.kind == .channel ? (posts == 1 ? "Post" : "Posts") : (posts == 1 ? "Message" : "Messages")))
+        // Three fit the card; when it already has three, when it started is the one left out.
+        if facts.count < 3 {
+            facts.append(ProfileFact(value: c.createdAt.formatted(.dateTime.month(.abbreviated).year()), label: "Since"))
+        }
+        return facts
+    }
+
+    @ViewBuilder private func groupSections(_ c: Conversation) -> some View {
+        mailboxSection(c)
+
+        if model.isFollower(c), c.shared?.missedKey == true { missedKeySection(c) }
 
         if c.kind == .channel && c.amAdmin && !c.isOldFormat { inviteSection(c) }
 
-        Card(title: "Permissions") {
-            Field(label: "Who can post") {
-                if c.amOwner && !c.isOldFormat {
-                    Picker("", selection: Binding(get: { c.postPolicy }, set: { model.setPostPolicy(c.id, $0) })) {
-                        ForEach(c.kind == .channel ? [PostPolicy.admins, .owner] : PostPolicy.allCases) { Text($0.label).tag($0) }
-                    }
-                    .pickerStyle(.menu)
-                    .labelsHidden()
-                    .fixedSize()
-                } else {
-                    Text(c.postPolicy.label).foregroundStyle(Ink.dim)
-                }
-            }
-            Divider().overlay(Ink.line)
-            Field(label: "Your role") {
-                Text(c.amOwner ? "Owner" : c.amAdmin ? "Admin" : c.amMod ? "Mod" : c.kind == .channel ? "Follower" : "Member")
-                    .foregroundStyle(Ink.dim)
-            }
-        }
+        if model.canNamePublicly(c.id) { PublicNameSection(id: c.id, kind: c.kind) }
 
-        if c.kind == .group || c.isOldFormat { mailboxSection(c) }
-
-        if model.isFollower(c), c.shared?.missedKey == true { missedKeySection(c) }
+        settingsCard(c)
 
         if c.kind == .group, let shared = c.shared, !shared.gone, !shared.joining, c.amAdmin { GroupLinksSection(id: c.id) }
 
         membersSection(c)
+    }
+
+    /// Who can post, and for a channel you post in, whether followers can copy what you post.
+    private func settingsCard(_ c: Conversation) -> some View {
+        let noun = c.kind == .channel ? "channel" : "group"
+        return VStack(spacing: 6) {
+            ProfileSectionTitle(title: "Settings")
+            ProfileCard {
+                manageRow("text.bubble", "Who can post") {
+                    if c.amOwner && !c.isOldFormat {
+                        Menu {
+                            Picker("", selection: Binding(get: { c.postPolicy }, set: { model.setPostPolicy(c.id, $0) })) {
+                                ForEach(c.kind == .channel ? [PostPolicy.admins, .owner] : PostPolicy.allCases) { Text($0.label).tag($0) }
+                            }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Text(c.postPolicy.label)
+                                Image(systemName: "chevron.up.chevron.down").font(.system(size: 10, weight: .semibold))
+                            }
+                            .font(.system(size: 14, weight: .medium)).foregroundStyle(theme.accent)
+                        }
+                        .menuIndicator(.hidden)
+                        .fixedSize()
+                    } else {
+                        Text(c.postPolicy.label).font(.system(size: 14)).foregroundStyle(Ink.dim)
+                    }
+                }
+                if c.kind == .channel && c.amAdmin && !c.isOldFormat {
+                    Divider().overlay(Ink.line).padding(.leading, 52)
+                    manageRow("hand.raised", "Protect posts") {
+                        Toggle("", isOn: Binding(get: { c.protectPosts == true }, set: { model.setProtectPosts(c.id, $0) }))
+                            .labelsHidden()
+                            .toggleStyle(GlowToggleStyle())
+                    }
+                }
+            }
+            Text(c.kind == .channel && c.amAdmin
+                 ? "Protect posts asks followers' apps not to offer Copy, Forward or Save on what you post from now on. Anyone can still take a screenshot."
+                 : c.amOwner ? "Only you can change who can post in this \(noun)." : "The owner decides who can post in this \(noun).")
+                .font(.system(size: 11)).foregroundStyle(Ink.faint)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 14)
+        }
+    }
+
+    /// Leave, or delete a group you own, in red at the very bottom.
+    private func leaveCard(_ c: Conversation) -> some View {
+        let deletes = c.amOwner
+        return ProfileCard {
+            Button { confirmDelete = true } label: {
+                manageRow(deletes ? "trash" : "rectangle.portrait.and.arrow.right",
+                          deletes ? "Delete \(c.kind == .channel ? "channel" : "group")" : c.kind == .channel ? "Leave channel" : "Leave group",
+                          tint: .red) { EmptyView() }
+            }
+            .buttonStyle(.plain)
+            .confirmationDialog(c.deleteWarning.title, isPresented: $confirmDelete, titleVisibility: .visible) {
+                Button(deletes ? "Delete" : "Leave", role: .destructive) {
+                    dismiss()
+                    model.delete(id)
+                }
+            } message: {
+                Text(c.deleteWarning.detail + (model.isFollower(c) && !model.canTellInviter(c)
+                     ? " The person who added you can't be reached from here, so the staff won't be told: you leave on this device only, and may keep being sent the channel's keys until they take you out."
+                     : ""))
+            }
+        }
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Color.red.opacity(0.35)))
     }
 
     /// What the group says about itself when it can't be used: joining, left, or saved in an older format.
@@ -2359,18 +2516,28 @@ private struct ConversationInfo: View {
 
     private func inviteSection(_ c: Conversation) -> some View {
         let code = model.makeInviteCode(channel: c.id)
-        return Card(title: "Invite link") {
-            HStack(spacing: 14) {
-                QRCode(text: WebLinks.long(code), size: 74)
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Anyone with this link can follow.").font(.system(size: 12)).foregroundStyle(Ink.dim)
-                    CopyLinkButton(target: code) { withAnimation(.snappy) { copied = true } } label: {
-                        Label(copied ? "Copied" : "Copy link", systemImage: copied ? "checkmark" : "link")
-                            .font(.system(size: 12, weight: .semibold))
+        return VStack(spacing: 6) {
+            ProfileSectionTitle(title: "Invite link")
+            ProfileCard(padded: true) {
+                HStack(spacing: 14) {
+                    QRCode(text: WebLinks.long(code), size: 84)
+                        .padding(6)
+                        .background(Color.white, in: .rect(cornerRadius: 10, style: .continuous))
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Anyone with this link or code can follow.")
+                            .font(.system(size: 13)).foregroundStyle(Ink.dim)
+                            .fixedSize(horizontal: false, vertical: true)
+                        CopyLinkButton(target: code) { withAnimation(.snappy) { copied = true } } label: {
+                            Label(copied ? "Copied" : "Copy link", systemImage: copied ? "checkmark" : "link")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(Ink.onAccent)
+                                .padding(.horizontal, 14).padding(.vertical, 8)
+                                .background(theme.accent.gradient, in: .capsule)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .foregroundStyle(theme.accent)
+                    Spacer(minLength: 0)
                 }
-                Spacer()
             }
         }
     }
@@ -2378,40 +2545,48 @@ private struct ConversationInfo: View {
     private func membersSection(_ c: Conversation) -> some View {
         let people = c.members
         let title = c.kind == .channel ? (c.amAdmin ? "Followers & admins" : "Admins") : "Members"
-        return Card(title: "\(title) · \(people.count + (c.kind == .group ? 1 : 0))") {
-            if c.kind != .broadcast, !c.isOldFormat, c.amAdmin {
-                Button { adding = true } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: "plus").font(.system(size: 12, weight: .semibold))
-                            .frame(width: 28, height: 28).background(theme.wash, in: .circle)
-                            .foregroundStyle(theme.accent)
-                        Text(c.kind == .channel ? "Add followers" : "Add members")
-                            .font(.system(size: 13, weight: .medium)).foregroundStyle(theme.accent)
+        let invited = model.contactsInvited(to: c)
+        return VStack(spacing: 6) {
+            ProfileSectionTitle(title: "\(title) · \(people.count + (c.kind == .group ? 1 : 0))")
+            ProfileCard {
+                // Groups and channels have Add on their card above.
+                if c.kind == .broadcast, c.amAdmin {
+                    Button { adding = true } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "plus").font(.system(size: 14, weight: .semibold))
+                                .frame(width: 34, height: 34).background(theme.wash, in: .circle)
+                                .foregroundStyle(theme.accent)
+                            Text(c.kind == .channel ? "Add followers" : c.kind == .broadcast ? "Add people" : "Add members")
+                                .font(.system(size: 15, weight: .medium)).foregroundStyle(theme.accent)
+                            Spacer()
+                        }
+                        .padding(.horizontal, 14).padding(.vertical, 8)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    Divider().overlay(Ink.line).padding(.leading, 60)
+                }
+                if c.kind == .group {
+                    personRow(name: "\(model.profile(for: c.persona).displayName) (you)", fp: "me", c: c, avatar: model.profile(for: c.persona).avatar,
+                              seed: model.me(c.persona)?.fingerprint ?? "")
+                }
+                ForEach(Array(people.enumerated()), id: \.element) { i, fp in
+                    if i > 0 || c.kind == .group { Divider().overlay(Ink.line).padding(.leading, 60) }
+                    personRow(name: model.displayName(fp), fp: fp, c: c, avatar: model.contact(fp, in: c.persona)?.avatar, seed: fp)
+                }
+                // Added, but their app hasn't answered yet: in the group already as far as you're concerned.
+                ForEach(invited, id: \.self) { fp in
+                    Divider().overlay(Ink.line).padding(.leading, 60)
+                    HStack(spacing: 12) {
+                        Avatar(image: model.contact(fp, in: c.persona)?.avatar, seed: fp, size: 34)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(model.displayName(fp)).font(.system(size: 15)).foregroundStyle(Ink.text).lineLimit(1)
+                            Text("Invited · joins when they open Pulshade").font(.system(size: 11)).foregroundStyle(Ink.faint)
+                        }
                         Spacer()
                     }
-                    .contentShape(Rectangle())
+                    .padding(.horizontal, 14).padding(.vertical, 8)
                 }
-                .buttonStyle(.plain)
-                Divider().overlay(Ink.line)
-            }
-            if c.kind == .group {
-                personRow(name: "\(model.profile(for: c.persona).displayName) (you)", fp: "me", c: c, avatar: model.profile(for: c.persona).avatar,
-                          seed: model.me(c.persona)?.fingerprint ?? "")
-            }
-            ForEach(people, id: \.self) { fp in
-                personRow(name: model.displayName(fp), fp: fp, c: c, avatar: model.contact(fp, in: c.persona)?.avatar, seed: fp)
-            }
-            // Added, but their app hasn't answered yet: in the group already as far as you're concerned.
-            ForEach(model.contactsInvited(to: c), id: \.self) { fp in
-                HStack(spacing: 10) {
-                    Avatar(image: model.contact(fp, in: c.persona)?.avatar, seed: fp, size: 28)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(model.displayName(fp)).font(.system(size: 13)).foregroundStyle(Ink.text).lineLimit(1)
-                        Text("Invited · joins when they open Pulshade").font(.system(size: 10)).foregroundStyle(Ink.faint)
-                    }
-                    Spacer()
-                }
-                .padding(.vertical, 3)
             }
         }
     }
@@ -2419,18 +2594,18 @@ private struct ConversationInfo: View {
     private func personRow(name: String, fp: String, c: Conversation, avatar: Data?, seed: String) -> some View {
         HStack(spacing: 10) {
             Button { if fp != "me" { profileOf = MemberRef(fingerprint: fp) } } label: {
-            HStack(spacing: 10) {
-            Avatar(image: avatar, seed: seed, size: 28)
+            HStack(spacing: 12) {
+            Avatar(image: avatar, seed: seed, size: 34)
             VStack(alignment: .leading, spacing: 1) {
-                Text(name).font(.system(size: 13)).foregroundStyle(Ink.text).lineLimit(1)
+                Text(name).font(.system(size: 15)).foregroundStyle(Ink.text).lineLimit(1)
             }
             Spacer()
             if let role = model.role(of: fp, in: c) {
                 Text(role)
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(theme.accent)
-                    .padding(.horizontal, 6).padding(.vertical, 2)
-                    .background(theme.wash, in: .rect(cornerRadius: 4))
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .background(theme.accent.opacity(0.14), in: .capsule)
             }
             }
             .contentShape(.rect)
@@ -2482,7 +2657,7 @@ private struct ConversationInfo: View {
                 .fixedSize()
             }
         }
-        .padding(.vertical, 3)
+        .padding(.horizontal, 14).padding(.vertical, 8)
     }
 
     // MARK: Bottom
@@ -2586,25 +2761,19 @@ struct Card<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            if let title {
-                Text(title.uppercased())
-                    .font(.system(size: 10, weight: .semibold))
-                    .tracking(0.6)
-                    .foregroundStyle(Ink.faint)
-                    .padding(.leading, 4)
-            }
+            if let title { ProfileSectionTitle(title: title) }
             VStack(alignment: .leading, spacing: 10) { content }
-                .font(.system(size: 13))
+                .font(.system(size: 14))
                 .padding(14)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Ink.surface, in: .rect(cornerRadius: 10))
-                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Ink.line))
+                .background(Ink.surface, in: .rect(cornerRadius: 16, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Ink.line))
             if let footer {
                 Text(footer)
                     .font(.system(size: 11))
                     .foregroundStyle(Ink.faint)
                     .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 4)
+                    .padding(.horizontal, 14)
             }
         }
     }

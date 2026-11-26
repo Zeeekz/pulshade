@@ -904,6 +904,10 @@ struct Conversation: Codable, Identifiable, Equatable {
     /// Set for a group or channel that shares one mailbox on the relay (see docs/groups-design.md). Nil for a direct chat,
     /// a broadcast list, Announcements, and a group saved from before groups shared a mailbox (see `isOldFormat`).
     var shared: SharedGroup?
+    /// A channel you post in: ask followers' apps not to offer Copy, Forward or Save on what you post here. Off unless
+    /// chosen, so a channel's posts can be copied and passed on whatever your own chats are set to; your account's
+    /// "Allow forwarding" is for one-to-one chats and groups. Kept on this device only.
+    var protectPosts: Bool?
 
     init(id: UUID = UUID(), kind: ConversationKind, title: String, avatar: Data? = nil, members: [String],
          messages: [Message] = [], pinned: Bool = false, unread: Int = 0, disappearAfter: TimeInterval? = nil) {
@@ -921,7 +925,7 @@ struct Conversation: Codable, Identifiable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case id, kind, title, avatar, members, messages, createdAt, pinned, muted, archived, unread, disappearAfter, persona
-        case about, owner, admins, mods, postPolicy, version, isOwner, shared, groupID
+        case about, owner, admins, mods, postPolicy, version, isOwner, shared, groupID, protectPosts
     }
 
     init(from decoder: Decoder) throws {
@@ -945,6 +949,7 @@ struct Conversation: Codable, Identifiable, Equatable {
         version = try c.decodeIfPresent(Int.self, forKey: .version) ?? 0
         shared = try c.decodeIfPresent(SharedGroup.self, forKey: .shared)
         groupID = try c.decodeIfPresent(UUID.self, forKey: .groupID)
+        protectPosts = try? c.decodeIfPresent(Bool.self, forKey: .protectPosts)
         if let owner = try c.decodeIfPresent(String.self, forKey: .owner) {
             self.owner = owner
             postPolicy = (try? c.decodeIfPresent(PostPolicy.self, forKey: .postPolicy)) ?? .everyone
@@ -979,6 +984,7 @@ struct Conversation: Codable, Identifiable, Equatable {
         try c.encode(version, forKey: .version)
         try c.encodeIfPresent(shared, forKey: .shared)
         try c.encodeIfPresent(groupID, forKey: .groupID)
+        if protectPosts == true { try c.encode(true, forKey: .protectPosts) }
     }
 
     /// The id the group goes by between devices: in every payload, settings and key.
@@ -1010,6 +1016,8 @@ struct Conversation: Codable, Identifiable, Equatable {
     }
 
     var amOwner: Bool { owner == "me" }
+    /// A group or a channel of people (not Announcements): shown with the group card.
+    var isGroupLike: Bool { kind == .group || (kind == .channel && !isAnnouncements) }
     var amAdmin: Bool { amOwner || admins.contains("me") }
 
     func isAdmin(_ fingerprint: String) -> Bool { owner == fingerprint || admins.contains(fingerprint) }
@@ -1568,7 +1576,7 @@ struct AppData: Codable {
     /// 30: collectibles: the copies your identities hold (`collectibles`), the signed list and its pictures in the media
     /// pool (`collectibleList`, `collectiblePictures`), a profile's showcase (`Profile.showcase`, `Contact.showcase`) and
     /// whether friends see your collection (`hideCollection`).
-    /// Also in 30: how long the Burn tab's ring is held for Lock, Detach and Burn (`SecuritySettings.lockHold`,
+    /// Also in 30: whether a channel you post in protects its posts from copying (`Conversation.protectPosts`), and how long the Burn tab's ring is held for Lock, Detach and Burn (`SecuritySettings.lockHold`,
     /// `detachHold`, `burnHold`).
     static let currentFormat = 30
     var profile = Profile()

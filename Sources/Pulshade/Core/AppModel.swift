@@ -2138,7 +2138,7 @@ final class AppModel {
                               expiresAt: convo.disappearAfter.map { now.addingTimeInterval($0) }, reply: reply,
                               preview: preview)
         message.note = note
-        message.noForward = noForwardFlag
+        message.noForward = noForwardFlag(for: convo)
         message.forwarded = forwarded ? true : nil
         // Only people of this group that are your contacts can be mentioned.
         let allowed = Set(mentionable(in: convo).map(\.fingerprint))
@@ -2187,7 +2187,12 @@ final class AppModel {
     // MARK: Forwarding
 
     /// What goes on a message of yours about forwarding: nil unless you've said no in Privacy & Security.
-    private var noForwardFlag: Bool? { data.security.allowForwarding ? nil : true }
+    /// Whether what you send in `convo` asks others' apps not to offer Copy and Forward: a channel by its own switch
+    /// (`Conversation.protectPosts`), anything else by your account's "Allow forwarding".
+    func noForwardFlag(for convo: Conversation) -> Bool? {
+        if convo.kind == .channel { return convo.protectPosts == true ? true : nil }
+        return data.security.allowForwarding ? nil : true
+    }
 
     /// Whether a message can be forwarded from its chat. Not one its sender asked to keep where it is, not in a chat
     /// with a timer (a copy would outlive it), and not what only means something from its sender (a note of their
@@ -2813,7 +2818,7 @@ final class AppModel {
         let reply = replyTo.map { ReplyRef(id: $0.id, author: $0.sender, snippet: Self.snippet(of: $0), picture: Self.quotePicture(imageData(for: $0))) }
         var message = Message(sender: "me", text: "", date: now, expiresAt: convo.disappearAfter.map { now.addingTimeInterval($0) }, reply: reply)
         message.attachment = a
-        message.noForward = noForwardFlag
+        message.noForward = noForwardFlag(for: convo)
         withAnimation(.snappy(duration: 0.4)) { data.conversations[i].messages.append(message) }
         fileProgress[message.id] = 0
         fileFailed[message.id] = nil
@@ -3003,7 +3008,7 @@ final class AppModel {
                               expiresAt: convo.disappearAfter.map { now.addingTimeInterval($0) }, reply: reply)
         message.video = clip
         message.clipSeconds = seconds
-        message.noForward = noForwardFlag
+        message.noForward = noForwardFlag(for: convo)
         message.forwarded = forwarded ? true : nil
         withAnimation(.snappy(duration: 0.4)) { data.conversations[i].messages.append(message) }
         var wire = WireMessage(id: message.id, conversation: sharedID(convo), kind: convo.kind == .broadcast ? .direct : convo.kind,
@@ -9784,6 +9789,13 @@ final class AppModel {
         data.conversations[i].about = about.isEmpty ? nil : String(about.prefix(500))
         data.conversations[i].avatar = avatar
         publishChange(i)
+    }
+
+    /// A channel you post in: whether what you post from now on asks followers' apps not to offer Copy and Forward.
+    func setProtectPosts(_ id: Conversation.ID, _ on: Bool) {
+        guard let i = index(of: id), data.conversations[i].kind == .channel, data.conversations[i].amAdmin else { return }
+        data.conversations[i].protectPosts = on ? true : nil
+        save()
     }
 
     func setPostPolicy(_ id: Conversation.ID, _ policy: PostPolicy) {
