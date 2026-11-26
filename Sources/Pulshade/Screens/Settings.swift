@@ -5,7 +5,7 @@ import PulshadeShared
 
 /// The pages Settings opens, each from a row on the main list.
 enum SettingsPage: String, Hashable {
-    case profile, myProfile, profilePreview, invite, handles, pinned, privacy, privacyLock, privacyMessages, privacyPasscodes, privacyBackup, blocked, notifications, appearance, storage, network, networkWaiting, anonymity, account
+    case profile, myProfile, profilePreview, invite, handles, pinned, privacy, privacyLock, privacyHolds, privacyMessages, privacyPasscodes, privacyBackup, blocked, notifications, appearance, storage, network, networkWaiting, anonymity, account
 }
 
 /// Settings, laid out like a phone's own: your profile on top, then a short list of rows,
@@ -76,6 +76,7 @@ struct SettingsView: View {
                     case .handles: HandleSettings()
                     case .privacy: PrivacySettings()
                     case .privacyLock: LockSettings()
+                    case .privacyHolds: HoldTimeSettings()
                     case .privacyMessages: MessagePrivacySettings()
                     case .privacyPasscodes: PasscodeSettings()
                     case .privacyBackup: BackupSettings()
@@ -826,6 +827,9 @@ private struct PrivacySettings: View {
                             : model.data.security.lockImmediately ? "Immediately"
                             : model.data.security.autoLockMinutes == 0 ? "No auto-lock" : "\(model.data.security.autoLockMinutes) min")
                 RowDivider(inset: 54)
+                MenuRow(page: .privacyHolds, symbol: "flame.fill", color: .hex(0xFF5A36), title: "Burn hold times",
+                        value: [LeaveMode.lock, .detach, .burn].map { shortHold($0.hold(in: model.data.security)) }.joined(separator: " · "))
+                RowDivider(inset: 54)
                 MenuRow(page: .privacyMessages, symbol: "bubble.left.and.bubble.right.fill", color: .hex(0x3D8BFF), title: "What others see")
                 RowDivider(inset: 54)
                 MenuRow(page: .privacyPasscodes, symbol: "theatermasks.fill", color: .hex(0xFF9F0A), title: "Decoy & panic passcodes",
@@ -838,6 +842,28 @@ private struct PrivacySettings: View {
                 MenuRow(page: .privacyBackup, symbol: "externaldrive.fill.badge.checkmark", color: .hex(0x30D158), title: "Backup",
                         value: model.data.security.keepBackup ? "On" : "Off")
             }
+        }
+    }
+}
+
+/// How long the Burn tab's ring is held for Lock, Detach and Burn. Here rather than on the Burn tab once chosen, so
+/// someone who picks up your phone can't shorten them where the actions are.
+private struct HoldTimeSettings: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        SettingsScreen(title: "Burn hold times", back: "Privacy") {
+            VStack(spacing: 12) {
+                ForEach([LeaveMode.lock, .detach, .burn], id: \.self) { mode in
+                    HoldTimeControl(mode: mode).frame(maxWidth: .infinity)
+                }
+                Text("How long you hold the ring on the Burn tab before it acts. Lock can be instant; Detach and Burn always need at least 2 seconds, since they can't be undone.")
+                    .font(.system(size: 12)).foregroundStyle(Ink.faint)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 4)
+            }
+            .onAppear { if !model.data.security.holdTimesChosen { model.updateSecurity { $0.holdTimesChosen = true } } }
         }
     }
 }

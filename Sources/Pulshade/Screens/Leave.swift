@@ -59,7 +59,12 @@ struct LeaveBody: View {
                         .frame(maxWidth: 320)
                         .contentTransition(.opacity)
                         .animation(.easeInOut(duration: 0.2), value: mode)
-                    HoldTimeControl(mode: mode)
+                    if !model.data.security.holdTimesChosen {
+                        HoldTimeControl(mode: mode, done: {
+                            withAnimation(.snappy) { model.updateSecurity { $0.holdTimesChosen = true } }
+                        })
+                        .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                    }
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 22)
@@ -406,10 +411,12 @@ func holdLabel(_ seconds: Double) -> String {
 }
 
 /// Sets how long the ring is held for the chosen action: a row of times in half seconds, saved as soon as one is tapped.
-private struct HoldTimeControl: View {
+struct HoldTimeControl: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     var mode: LeaveMode
+    /// On the Burn tab before the times are chosen: a Done button that puts the picker away for good.
+    var done: (() -> Void)? = nil
 
     private var steps: [Double] {
         stride(from: mode.holdRange.lowerBound, through: mode.holdRange.upperBound, by: 0.5).map { $0 }
@@ -444,6 +451,21 @@ private struct HoldTimeControl: View {
                     .accessibilityAddTraits(chosen ? .isSelected : [])
                 }
             }
+            if let done {
+                HStack(alignment: .center, spacing: 10) {
+                    Text("Set all three, then Done hides this. Change them later in Me › Privacy & Security.")
+                        .font(.system(size: 11)).foregroundStyle(Ink.faint)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                    Button("Done", action: done)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Ink.onAccent)
+                        .padding(.horizontal, 14).padding(.vertical, 7)
+                        .background(theme.accent.gradient, in: .capsule)
+                        .buttonStyle(.plain)
+                }
+                .padding(.top, 2)
+            }
         }
         .padding(12)
         .background(Ink.raised, in: .rect(cornerRadius: 14))
@@ -451,10 +473,12 @@ private struct HoldTimeControl: View {
         .sensoryFeedback(.selection, trigger: current)
     }
 
-    /// "Now", "0.5s", "2s".
-    private func short(_ seconds: Double) -> String {
-        seconds <= 0 ? "Now" : seconds.formatted(.number.precision(.fractionLength(0...1))) + "s"
-    }
+    private func short(_ seconds: Double) -> String { shortHold(seconds) }
+}
+
+/// "Now", "0.5s", "2s".
+func shortHold(_ seconds: Double) -> String {
+    seconds <= 0 ? "Now" : seconds.formatted(.number.precision(.fractionLength(0...1))) + "s"
 }
 
 private struct BurnRow: View {

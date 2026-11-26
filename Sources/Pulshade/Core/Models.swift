@@ -1450,6 +1450,9 @@ struct SecuritySettings: Codable, Equatable {
     var lockHold: Double = 2
     var detachHold: Double = 5
     var burnHold: Double = 5
+    /// The hold times have been chosen: the Burn tab stops showing the picker, so someone holding your phone can't
+    /// shorten them there. They're changed from Privacy & Security after that.
+    var holdTimesChosen = false
     static let lockHoldRange: ClosedRange<Double> = 0...2
     static let leaveHoldRange: ClosedRange<Double> = 2...5
     static func clamp(_ value: Double, to range: ClosedRange<Double>) -> Double {
@@ -1507,6 +1510,7 @@ struct SecuritySettings: Codable, Equatable {
         lockHold = Self.clamp(try c.decodeIfPresent(Double.self, forKey: .lockHold) ?? d.lockHold, to: Self.lockHoldRange)
         detachHold = Self.clamp(try c.decodeIfPresent(Double.self, forKey: .detachHold) ?? d.detachHold, to: Self.leaveHoldRange)
         burnHold = Self.clamp(try c.decodeIfPresent(Double.self, forKey: .burnHold) ?? d.burnHold, to: Self.leaveHoldRange)
+        holdTimesChosen = try c.decodeIfPresent(Bool.self, forKey: .holdTimesChosen) ?? false
     }
 }
 
@@ -1577,7 +1581,7 @@ struct AppData: Codable {
     /// pool (`collectibleList`, `collectiblePictures`), a profile's showcase (`Profile.showcase`, `Contact.showcase`) and
     /// whether friends see your collection (`hideCollection`).
     /// Also in 30: whether a channel you post in protects its posts from copying (`Conversation.protectPosts`), and how long the Burn tab's ring is held for Lock, Detach and Burn (`SecuritySettings.lockHold`,
-    /// `detachHold`, `burnHold`).
+    /// `detachHold`, `burnHold`) and whether they've been chosen (`holdTimesChosen`).
     static let currentFormat = 30
     var profile = Profile()
     var contacts: [Contact] = []

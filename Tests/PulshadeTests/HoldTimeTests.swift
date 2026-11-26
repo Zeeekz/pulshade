@@ -37,3 +37,14 @@ struct HoldTimeTests {
         #expect(s.burnHold == 2)
     }
 }
+
+/// Once the hold times are chosen the Burn tab stops offering them; older settings haven't chosen yet.
+struct HoldTimesChosenTests {
+    @Test func chosenIsKeptAndStartsOff() throws {
+        #expect(!SecuritySettings().holdTimesChosen)
+        #expect(try !JSONDecoder().decode(SecuritySettings.self, from: Data(#"{"lockHold":1}"#.utf8)).holdTimesChosen)
+        var s = SecuritySettings()
+        s.holdTimesChosen = true
+        #expect(try JSONDecoder().decode(SecuritySettings.self, from: JSONEncoder().encode(s)).holdTimesChosen)
+    }
+}
