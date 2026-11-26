@@ -30,6 +30,7 @@ struct MemberProfileSheet: View {
                     }
                     if !person.hidden {
                         ProfileTabs(links: person.links ?? [], notes: person.notes ?? [],
+                                    collectibles: model.showcase(of: person),
                                     messages: convo.messages.filter { $0.sender == fingerprint },
                                     walletChangedAt: person.walletChangedAt, isMine: person.isSelf)
                     }

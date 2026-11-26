@@ -841,6 +841,51 @@ struct RelayClient {
         return try JSONDecoder().decode([Owned].self, from: data).map { ($0.handle, $0.entry) }
     }
 
+    // MARK: Collectibles
+
+    /// The signed collectibles list, or nil when the relay's is still `etag`, the one this app has (or there's none
+    /// yet). The same for every app, so asking says nothing about who asks.
+    func collectibleList(etag: String?) async throws -> (signed: CollectibleList.Signed, etag: String?)? {
+        var request = URLRequest(url: base.appending(path: "v1/catalog"))
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        if let etag { request.setValue(etag, forHTTPHeaderField: "If-None-Match") }
+        await prove(&request, "catalog")
+        guard let (data, response) = try? await load(request, limit: CollectibleList.maxManifest * 2),
+              let http = response as? HTTPURLResponse else { throw DirectoryError.unreachable }
+        if http.statusCode == 304 || http.statusCode == 404 { return nil }
+        guard http.statusCode == 200 else { throw DirectoryError.unreachable }
+        return (try JSONDecoder().decode(CollectibleList.Signed.self, from: data), http.value(forHTTPHeaderField: "ETag"))
+    }
+
+    /// One picture of the list, by its SHA-256. The caller checks it against the signed list.
+    func collectiblePicture(_ file: CollectibleList.File) async throws -> Data {
+        guard file.sha256.count == 64, file.sha256.allSatisfy({ $0.isHexDigit && !$0.isUppercase }),
+              (1...CollectibleList.maxVideo).contains(file.bytes) else { throw DirectoryError.invalid }
+        var request = URLRequest(url: base.appending(path: "v1/catalog/art/\(file.sha256)"))
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        await prove(&request, "catalog")
+        guard let (data, response) = try? await load(request, limit: file.bytes),
+              (response as? HTTPURLResponse)?.statusCode == 200 else { throw DirectoryError.unreachable }
+        guard CollectibleList.matches(data, file) else { throw DirectoryError.invalid }
+        return data
+    }
+
+    struct HeldCopy: Decodable { var item: String; var serial: UInt32; var owner: Data; var sig: Data; var run: UInt32 }
+
+    /// The copies this key holds. Asking also collects anything an open drop has for it.
+    func collectibles(key: String, sig: String, ts: UInt64) async throws -> [HeldCopy] {
+        struct Proof: Encodable { var key: String; var sig: String; var ts: UInt64 }
+        let (data, _) = try await post("v1/collectibles", JSONEncoder().encode(Proof(key: key, sig: sig, ts: ts)), work: "collectibles")
+        return try JSONDecoder().decode([HeldCopy].self, from: data)
+    }
+
+    /// Lets one of this key's copies go for good: its number goes back into the draw.
+    func releaseCollectible(key: String, sig: String, ts: UInt64, item: String, serial: UInt32) async throws {
+        struct Release: Encodable { var key: String; var sig: String; var ts: UInt64; var item: String; var serial: UInt32 }
+        _ = try await post("v1/collectibles/release", JSONEncoder().encode(Release(key: key, sig: sig, ts: ts, item: item, serial: serial)),
+                           work: "collectibles")
+    }
+
     /// For an account that's burning: its handles stay unclaimable for a while, but no longer point back to its key.
     func retire(key: String, sig: String, ts: UInt64) async throws {
         struct Proof: Encodable { var key: String; var sig: String; var ts: UInt64 }

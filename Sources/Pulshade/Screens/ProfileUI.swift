@@ -195,15 +195,19 @@ struct ProfileTabs: View {
     var info: [ProfileInfoRow] = []
     var links: [ProfileLink] = []
     var notes: [ProfileNote] = []
+    /// The collectibles this profile shows (already checked as genuine).
+    var collectibles: [Collectible] = []
     var groups: [ProfileGroupRef] = []
     /// What this person sent in the chat you share, for the Media, Files and Links tabs.
     var messages: [Message] = []
     var walletChangedAt: Date? = nil
     var isMine = false
+    /// Whether the collectibles list has arrived (your own tab only shows then).
+    var hasCollectibleList = false
     @State private var picked: Kind?
 
     enum Kind: String, Identifiable {
-        case about = "About", media = "Media", files = "Files", links = "Links", notes = "Notes",
+        case about = "About", collectibles = "Collectibles", media = "Media", files = "Files", links = "Links", notes = "Notes",
              groups = "In common"
         var id: String { rawValue }
     }
@@ -221,6 +225,8 @@ struct ProfileTabs: View {
     private var available: [Kind] {
         var out: [Kind] = []
         if !info.isEmpty || !ProfileLink.cleaned(links).isEmpty { out.append(.about) }
+        // Your own tab is there once the list has arrived, so you can pick what to show.
+        if !collectibles.isEmpty || (isMine && hasCollectibleList) { out.append(.collectibles) }
         if !media.isEmpty { out.append(.media) }
         if !files.isEmpty { out.append(.files) }
         if !linkMessages.isEmpty { out.append(.links) }
@@ -275,6 +281,7 @@ struct ProfileTabs: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 case .links: ProfileSharedLinks(messages: linkMessages)
                 case .notes: ProfileNoteList(notes: notes, tint: theme.accent)
+                case .collectibles: CollectibleShowcase(copies: collectibles, isMine: isMine)
                 case .groups:
                     VStack(spacing: 0) {
                         ForEach(Array(groups.enumerated()), id: \.element.id) { i, group in

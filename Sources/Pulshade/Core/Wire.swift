@@ -147,9 +147,10 @@ enum Payload: Codable, Equatable {
 
     /// `handle` is only a claim: the receiver checks it against the directory before showing it.
     /// Apps from before collectibles were removed also send `badge` and `collectibles`: the decoder skips keys it
-    /// doesn't know, so the rest of their profile still arrives.
+    /// doesn't know, so the rest of their profile still arrives. Collectibles came back as `showcase` (format 2 copies,
+    /// signed by the relay's issuer key); older apps skip it in turn.
     case profile(name: String, avatar: Data?, color: Int?, banner: Data? = nil, bio: String? = nil, handle: String? = nil,
-                 links: [ProfileLink]? = nil, notes: [ProfileNote]? = nil)
+                 links: [ProfileLink]? = nil, notes: [ProfileNote]? = nil, showcase: Showcase? = nil)
     case message(WireMessage)
     /// The messages reached the device (`read` nil or false), or were seen in the open chat. Older apps ignore
     /// `read`, so a read receipt still counts as delivered there.

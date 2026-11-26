@@ -186,6 +186,28 @@ anyone who asks, about once a minute, with no account attached, so fetching them
 are. The @announcements handle is reserved, so no account can pass itself off as it. One taken back disappears from the
 apps the next time they check.
 
+**Collectibles.** Numbered items (a Snow Globe, a Padlock, an Eclipse and others), each in a run of a fixed size from
+3 to 500, in six rarities. Pulshade gives them out from Pulshade Admin, to one account or as a drop (everyone who opens
+the app in a window of time gets one, once). A new copy gets a number picked at random from the ones nobody holds, so a
+good number is luck; a number let go of waits a week before it can be drawn again, so it can't be rolled for. The app marks the wanted ones from the number alone: #1, the top
+ten, lucky 7s, repeated digits, runs like 123, round numbers, the top twenty-five and the last of the run.
+
+The list of items (names, a line of words, rarity, run, whether it can be passed on, and each picture's SHA-256) is
+signed by the admin key over its exact bytes, and the app checks that signature and each picture's hash before using
+anything; it refuses a list older than the one it has. Pictures are short transparent videos with a still, fetched from
+the relay the first time they're shown, then sealed in the media pool with a key of their own and wiped on Burn and
+Detach; the video plays from memory and is never written out unsealed. None are built into the app, so new items come
+without an update. The relay keeps one record per copy: the item, its number, the holder's key and the relay's
+signature over all three, made with an issuer key whose public half is named in the signed list. The holder's key is a
+collector key worked out from the identity's seed for this alone, never the signing key contacts know or a @handle
+publishes; friends learn it from a certificate the signing key makes, inside the encrypted profile. Nobody can make a
+copy or show one held by someone else. Each persona holds its own copies under its own collector key and asks for them
+on its own connection, at random times of its own, so nothing ties two personas together. All of a new list's pictures
+are fetched at random moments, so fetching says nothing about whose collectibles you looked at. Passing one to a friend
+isn't there yet: it's to come as a one-time claim passed inside a message, so the relay never sees giver and receiver
+together. You pick up to six to show on your profile, to your friends only (or to nobody); they're not on your public
+listing or on pulsh.me. Letting one go, or Burn, frees its number for someone else.
+
 **One-time chats.** New chat → one-time chat makes a throwaway identity for both sides that ends after the time you
 pick, and works for the first person in. Share it as a QR code, a link, or a 20-digit code to read out or type, so
 nothing has to go through another app. The code's link waits on the server sealed in a mailbox only the digits lead

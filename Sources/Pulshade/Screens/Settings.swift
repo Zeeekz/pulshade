@@ -574,7 +574,9 @@ private struct ProfileSettings: View {
                                                                seed: model.fingerprint, size: 84))) { EmptyView() }
                 sectionNote("This is how people see you. Tap your picture to change it.")
             }
-            ProfileTabs(links: model.activeProfile.links ?? [], notes: model.activeProfile.notes ?? [], isMine: true)
+            ProfileTabs(links: model.activeProfile.links ?? [], notes: model.activeProfile.notes ?? [],
+                        collectibles: model.showcase(for: model.activePersona), isMine: true,
+                        hasCollectibleList: model.collectibleList != nil)
             addPrompts
             SettingsGroup("About you", footer: "Only people you chat with see these.") {
                 fieldRow("Name") {

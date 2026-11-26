@@ -37,6 +37,12 @@ struct Identity {
         try! .init(rawRepresentation: Self.derive(SymmetricKey(data: seed), "pulshade.backup.signing"))
     }
 
+    /// Holds this identity's collectibles on the relay. Not the signing key, which contacts know and a @handle publishes:
+    /// the relay never sees that key ask for anything. Friends learn it from a certificate in the encrypted profile.
+    var collectorKey: Curve25519.Signing.PrivateKey {
+        try! .init(rawRepresentation: Self.derive(SymmetricKey(data: seed), "pulshade.collector.v1"))
+    }
+
     /// Seals the backup left on the relay at log out. Only the recovery code can make it.
     var backupKey: SymmetricKey { SymmetricKey(data: Self.derive(SymmetricKey(data: seed), "pulshade.backup.sealing")) }
 

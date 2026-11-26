@@ -2093,6 +2093,7 @@ private struct ConversationInfo: View {
                 }
             }
             ProfileTabs(info: info, links: peer.links ?? [], notes: peer.notes ?? [],
+                        collectibles: peer.isSelf ? model.showcase(for: c.persona) : model.showcase(of: peer),
                         groups: shared, messages: c.messages, walletChangedAt: peer.walletChangedAt, isMine: peer.isSelf)
         }
         .padding(.horizontal, 16).padding(.top, 16)

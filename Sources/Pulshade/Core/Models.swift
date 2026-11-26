@@ -28,6 +28,9 @@ struct Profile: Codable, Equatable {
     var links: [ProfileLink]?
     /// Text notes on your profile, public or locked with a password.
     var notes: [ProfileNote]?
+    /// The collectibles you show at the top of your profile (`Collectible.id`s, up to `AppModel.showcaseLimit`), from the
+    /// ones this identity holds.
+    var showcase: [String]?
     /// When any of this last changed, so your devices can agree on the newest version.
     var updatedAt: Date?
     /// The `AppData.currentFormat` of the build that last saved this profile. Devices of one account pass profiles
@@ -183,6 +186,9 @@ struct Contact: Codable, Identifiable {
     var walletChangedAt: Date?
     /// Their text notes, checked when they arrived.
     var notes: [ProfileNote]?
+    /// The collectibles they show, as they sent them (checked in shape). Only the copies genuine for their key are ever
+    /// shown (checked when drawn, against the list's issuer key at the time).
+    var showcase: Showcase?
     /// Their public @handle, shown only once the directory confirmed it's signed by their key.
     var handle: String?
     /// You checked their safety code in person.
@@ -275,7 +281,7 @@ struct Contact: Codable, Identifiable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case fingerprint, name, nickname, avatar, banner, color, bio, links, walletChangedAt, notes, handle, verified, signingKey, agreementKey, devices, receiveKey, relay
+        case fingerprint, name, nickname, avatar, banner, color, bio, links, walletChangedAt, notes, showcase, handle, verified, signingKey, agreementKey, devices, receiveKey, relay
         case hidden, isSelf, awaitingAcceptance, addedAt, persona, wantsMyPresence, toldPresence, spare, oldSpares, moreSpares, departing, pq, pqCommit, pqCardSent, tooOld, revoked, contested, unlinked
         case viaCode, mailboxSince, formerMailboxes, movedHeard
         // Single-device fields from before linked devices.
@@ -297,6 +303,7 @@ struct Contact: Codable, Identifiable {
         links = try? c.decodeIfPresent([ProfileLink].self, forKey: .links)
         walletChangedAt = try? c.decodeIfPresent(Date.self, forKey: .walletChangedAt)
         notes = try? c.decodeIfPresent([ProfileNote].self, forKey: .notes)
+        showcase = try? c.decodeIfPresent(Showcase.self, forKey: .showcase)
         handle = try c.decodeIfPresent(String.self, forKey: .handle)
         verified = try c.decodeIfPresent(Bool.self, forKey: .verified) ?? false
         receiveKey = try c.decodeIfPresent(Data.self, forKey: .receiveKey)
@@ -351,6 +358,7 @@ struct Contact: Codable, Identifiable {
         try c.encodeIfPresent(links, forKey: .links)
         try c.encodeIfPresent(walletChangedAt, forKey: .walletChangedAt)
         try c.encodeIfPresent(notes, forKey: .notes)
+        try c.encodeIfPresent(showcase, forKey: .showcase)
         try c.encodeIfPresent(handle, forKey: .handle)
         try c.encode(verified, forKey: .verified)
         try c.encode(signingKey, forKey: .signingKey)
@@ -1544,7 +1552,10 @@ struct AppData: Codable {
     /// reader uses of your files this device still has to spend (`blobSpends`), and a file's padded
     /// size on the relay (`Attachment.padded`).
     /// Also in 29: public names for groups and channels (`publicNames`, `namesToRelease`), and short links (`shortLinks`).
-    static let currentFormat = 29
+    /// 30: collectibles: the copies your identities hold (`collectibles`), the signed list and its pictures in the media
+    /// pool (`collectibleList`, `collectiblePictures`), a profile's showcase (`Profile.showcase`, `Contact.showcase`) and
+    /// whether friends see your collection (`hideCollection`).
+    static let currentFormat = 30
     var profile = Profile()
     var contacts: [Contact] = []
     var invites: [OpenInvite] = []
@@ -1662,6 +1673,16 @@ struct AppData: Codable {
     /// it doesn't know may be another account's on this device, so it never touches them. This device only: not in a
     /// backup.
     var mediaFillers: [String]?
+    /// The collectibles every identity on this account holds (each copy names its holder's key), as the relay last said.
+    /// Not in a backup: they live on the relay under each identity's key and come back from there.
+    var collectibles: [Collectible]?
+    /// The collectibles list as the relay sent it, signed by the Pulshade Admin key, and its tag for asking again.
+    var collectibleList: CollectibleList.Signed?
+    var collectibleListTag: String?
+    /// Collectible pictures fetched so far, sealed in the media pool, by their SHA-256. This device only.
+    var collectiblePictures: [String: MediaFileRef]?
+    /// Friends don't see your collection or showcase.
+    var hideCollection: Bool?
     init() {}
 
     /// The relay new identities use. A build can set `PulshadeRelay` in its Info.plist (a development
@@ -1774,6 +1795,11 @@ struct AppData: Codable {
         setAside = try? c.decodeIfPresent([String: [Data]].self, forKey: .setAside)
         setAsideUnseen = try? c.decodeIfPresent(Int.self, forKey: .setAsideUnseen)
         mediaFillers = try? c.decodeIfPresent([String].self, forKey: .mediaFillers)
+        collectibles = try? c.decodeIfPresent([Collectible].self, forKey: .collectibles)
+        collectibleList = try? c.decodeIfPresent(CollectibleList.Signed.self, forKey: .collectibleList)
+        collectibleListTag = try? c.decodeIfPresent(String.self, forKey: .collectibleListTag)
+        collectiblePictures = try? c.decodeIfPresent([String: MediaFileRef].self, forKey: .collectiblePictures)
+        hideCollection = try? c.decodeIfPresent(Bool.self, forKey: .hideCollection)
     }
 }
 

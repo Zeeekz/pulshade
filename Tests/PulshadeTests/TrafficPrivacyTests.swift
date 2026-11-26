@@ -373,7 +373,10 @@ import UniformTypeIdentifiers
         let parts = try #require(order.parts)
         #expect(parts.count == 3, "the main persona, the other one, and the files")
         #expect(parts.filter { $0.backup != nil }.count == 1)
-        #expect(parts.allSatisfy { $0.handles.count <= 1 && $0.recall.count <= 1 }, "no part names two personas")
+        // A part's handles are one persona's signing key and its collector key (for its collectibles): never two personas.
+        #expect(parts.allSatisfy { $0.handles.count <= 2 && $0.recall.count <= 1 }, "no part names two personas")
+        let mainCollector = identity.collectorKey.publicKey.rawRepresentation
+        #expect(parts.contains { $0.handles.map(\.key) == [identity.card.signing, mainCollector] }, "the collector key is burned too")
         let main = try #require(parts.first { $0.backup != nil })
         #expect(main.mailboxes.count == 2)
         let other = try #require(parts.first { $0.backup == nil && !$0.handles.isEmpty })

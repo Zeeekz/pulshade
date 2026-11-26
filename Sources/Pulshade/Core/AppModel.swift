@@ -1300,6 +1300,8 @@ final class AppModel {
         restartsHandled = relayRestartTotal()
         resendPendingRequests()
         nextAnnouncementCheck = Date().addingTimeInterval(trafficShaping ? 5 : 0)
+        nextCollectibleCheck = Date().addingTimeInterval(trafficShaping ? 20 : 8)
+        nextCopiesCheck = [:]
         vault.dropOldCatalog()
         announcementsVersion = nil
         endLinkedDevicesWhenOnline()
@@ -2055,7 +2057,8 @@ final class AppModel {
         let profile = profile(for: persona)
         return .profile(name: profile.name, avatar: profile.avatar, color: profile.color, banner: profile.banner,
                         bio: profile.bio.flatMap { $0.isEmpty ? nil : $0 }, handle: profile.handle,
-                        links: Self.sharedLinks(profile), notes: Self.sharedNotes(profile, for: contact))
+                        links: Self.sharedLinks(profile), notes: Self.sharedNotes(profile, for: contact),
+                        showcase: sharedShowcase(persona))
     }
 
     /// Someone's signature colour: what they chose, or one picked from their fingerprint.
@@ -3083,6 +3086,7 @@ final class AppModel {
         for story in data.stories {
             if let ref = story.mediaFile { names.insert(ref.name) }
         }
+        for ref in (data.collectiblePictures ?? [:]).values { names.insert(ref.name) }
         return names
     }
 
@@ -3096,6 +3100,7 @@ final class AppModel {
             }
         }
         for story in data.stories { if let ref = story.mediaFile { sizes.append(MediaPool.sealedSize(ofPlain: ref.size)) } }
+        for ref in (data.collectiblePictures ?? [:]).values { sizes.append(MediaPool.sealedSize(ofPlain: ref.size)) }
         return MediaPool(directory: vault.directory, realNames: allMediaNames(), ownFillers: Set(data.mediaFillers ?? []),
                          realSizes: sizes)
     }
@@ -3131,7 +3136,7 @@ final class AppModel {
         data.mediaFillers = fillers.isEmpty ? nil : fillers
     }
 
-    private func loadMedia(_ ref: MediaFileRef?) -> Data? {
+    func loadMedia(_ ref: MediaFileRef?) -> Data? {
         guard let ref else { return nil }
         let key = ref.name as NSString
         if let hit = Self.mediaCache.object(forKey: key) { return hit as Data }
@@ -3140,7 +3145,7 @@ final class AppModel {
         return plain
     }
 
-    private func storeReceivedMedia(_ plain: Data) -> MediaFileRef? {
+    func storeReceivedMedia(_ plain: Data) -> MediaFileRef? {
         guard !plain.isEmpty else { return nil }
         let pool = mediaPool()
         guard let ref = try? pool.store(plain, growLater: true) else { return nil }
@@ -5215,6 +5220,19 @@ final class AppModel {
     /// The next time to ask the relay for announcements: shortly after unlocking, then every minute, and 15 seconds
     /// after a check that didn't get through.
     private var nextAnnouncementCheck = Date.distantFuture
+    /// The next time to ask the relay for the collectibles list (see `Collectibles.swift`).
+    var nextCollectibleCheck = Date.distantFuture
+    /// When each identity next asks for its copies, each on a random schedule of its own, so the relay can't tie two
+    /// together by their asking at the same moment.
+    @ObservationIgnored var nextCopiesCheck: [String: Date] = [:]
+    /// Copies being asked for now, by identity.
+    @ObservationIgnored var askingCopies: Set<String> = []
+    /// Copies that arrived since the collection was last opened (a drop or a gift), for a dot on the tab.
+    var newCollectibles = 0
+    /// One collectibles check at a time.
+    var checkingCollectibles = false
+    /// Pictures being fetched now, by SHA-256, so two views asking for one fetch it once.
+    @ObservationIgnored var fetchingPictures: [String: Task<Data?, Never>] = [:]
     /// One check at a time, so an answer that took long can't land after a newer one and undo it.
     private var checkingAnnouncements = false
     /// The version of the list last applied, so the relay can answer "nothing new" without sending it again.
@@ -5292,7 +5310,7 @@ final class AppModel {
 
 
     /// `label | about | ts`, signed with the identity's key, as the relay asks for to act on its handles.
-    private func ownerProof(_ label: String, about: Data, by me: Identity) throws -> (key: String, sig: String, ts: UInt64) {
+    func ownerProof(_ label: String, about: Data, by me: Identity) throws -> (key: String, sig: String, ts: UInt64) {
         let ts = UInt64(RelayClock.now.timeIntervalSince1970)
         let message = Data(label.utf8) + about + withUnsafeBytes(of: ts.bigEndian) { Data($0) }
         let sig = try me.signingKey.signature(for: message)
@@ -5660,7 +5678,19 @@ final class AppModel {
 
     /// Edits the active persona's profile and tells its contacts once typing settles.
     func updateProfile(_ change: (inout Profile) -> Void) {
-        let persona = activePersona
+        updateProfile(of: activePersona, change)
+    }
+
+    /// Sends `persona`'s profile to its contacts again, unchanged (something sent with it, like the showcase, changed).
+    func resendProfile(_ persona: UUID?) {
+        Task { [weak self] in
+            guard let self else { return }
+            for c in self.contacts(of: persona) { self.enqueue(self.profilePayload(persona, for: c.fingerprint), to: c) }
+            self.save()
+        }
+    }
+
+    func updateProfile(of persona: UUID?, _ change: (inout Profile) -> Void) {
         var profile = self.profile(for: persona)
         let before = profile
         change(&profile)
@@ -7282,6 +7312,11 @@ final class AppModel {
             nextAnnouncementCheck = Date().addingTimeInterval(60)
             Task { await refreshAnnouncements(waiting: false) }
         }
+        if Date() >= nextCollectibleCheck {
+            nextCollectibleCheck = Date().addingTimeInterval(.random(in: 20 * 60...40 * 60))
+            Task { await refreshCollectibleList() }
+        }
+        collectiblesTick()
     }
 
     private func startSync() {
@@ -8912,7 +8947,7 @@ final class AppModel {
         case let .callEnd(id):
             guard call?.invite.id == id, call?.peer == fp, call?.persona == persona else { break }
             endCall(note: call?.phase == .ringing && call?.outgoing == false ? "Missed call" : nil, tell: false)
-        case let .profile(name, avatar, color, banner, bio, handle, links, notes):
+        case let .profile(name, avatar, color, banner, bio, handle, links, notes, showcase):
             sender.name = String(name.prefix(64))
             sender.bio = bio.map { String($0.prefix(160)) }
             // Never trust what arrives: keep only entries that pass the same checks as ours.
@@ -8922,6 +8957,8 @@ final class AppModel {
             if !wallets(sender.links).isEmpty, wallets(sender.links) != wallets(newLinks) { sender.walletChangedAt = Date() }
             sender.links = newLinks
             sender.notes = Optional(ProfileNote.cleaned(notes)).flatMap { $0.isEmpty ? nil : $0 }
+            // Kept only in shape; whether it's theirs and the relay signed it is checked when shown.
+            sender.showcase = Showcase.received(showcase)
             let claimed = handle.flatMap(DirectoryProfile.validHandle)
             if claimed != sender.handle { sender.handle = nil }
             if let claimed, claimed != sender.handle { confirmHandle(claimed, of: sender) }
@@ -10063,7 +10100,9 @@ extension AppModel {
             for start in stride(from: 0, to: max(all.count, 1), by: Self.burnMailboxesPerPart) {
                 var part = BurnOrder.Part(ts: stamp())
                 if let me = owner {
-                    part.handles = [signed("pulshade.burn.retire.v1", key: me.card.signing, by: me.signingKey, ts: part.ts)]
+                    // The collector key too, so the relay lets go of the persona's collectibles.
+                    part.handles = [signed("pulshade.burn.retire.v1", key: me.card.signing, by: me.signingKey, ts: part.ts),
+                                    signed("pulshade.burn.retire.v1", key: me.collectorKey.publicKey.rawRepresentation, by: me.collectorKey, ts: part.ts)]
                 }
                 if start == 0 {
                     if persona == nil {
