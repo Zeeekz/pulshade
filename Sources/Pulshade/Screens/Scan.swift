@@ -117,7 +117,7 @@ struct ScanSheet: View {
             return
         }
         guard let preview = model.inspectCode(text) else {
-            problem = Invite.isOutdated(text) ? Invite.outdatedNotice : "That isn't a PULSHADE code."
+            problem = Invite.problem(with: text)
             return
         }
         pending = (text, preview)
@@ -131,7 +131,7 @@ struct ScanSheet: View {
             model.requestedConversation = id
             dismiss()
         case .expired: problem = "This chat link has run out, or has already been used."
-        case .unknown: problem = "That isn't a PULSHADE code."
+        case .unknown: problem = Invite.problem(with: text)
         case .outdated: problem = Invite.outdatedNotice
         }
     }

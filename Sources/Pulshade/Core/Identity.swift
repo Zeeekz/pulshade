@@ -195,6 +195,24 @@ struct Invite: Equatable {
 
     static let outdatedNotice = "This invite is from an older version of PULSHADE. Ask them to update the app and send you a new one."
 
+    /// A code from a newer app than this one: a later "psh" number, or a kind this version doesn't know (as channel codes
+    /// that name their channel were to apps before them). Updating is the answer, not asking for a new code.
+    static func isFromNewer(_ code: String) -> Bool {
+        let text = scannedPayload(code).lowercased()
+        guard text.hasPrefix("psh"), let digit = text.dropFirst(3).first?.wholeNumberValue else { return false }
+        if digit > 3 { return true }
+        guard text.hasPrefix(prefix), let raw = Base32.decode(String(text.dropFirst(4)).uppercased()), raw.count >= 177,
+              let kind = raw.first else { return false }
+        return Kind(rawValue: kind) == nil && kind != namedChannel
+    }
+
+    static let newerNotice = "This invite needs a newer version of PULSHADE. Update the app from the App Store, then open it again."
+
+    /// What to say about a code that couldn't be used.
+    static func problem(with code: String) -> String {
+        isOutdated(code) ? outdatedNotice : isFromNewer(code) ? newerNotice : "That isn't a PULSHADE code."
+    }
+
     /// Only http(s) addresses, so an invite can't point the app anywhere strange, and plain http only on this
     /// machine or your own network: anywhere else, someone on the way could read the mailbox keys a fetch carries.
     static func validRelay(_ text: String?) -> String? {

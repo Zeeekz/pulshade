@@ -64,6 +64,28 @@ import Foundation
         #expect(!Invite.isOutdated("hello"))
     }
 
+    /// Channel codes that name their channel have their own kind byte, which apps from before read as no code at all.
+    /// One from a newer app than this is met with "update", not "isn't a code"; this version's own codes aren't.
+    @Test func anInviteFromANewerAppSaysToUpdate() throws {
+        let id = Identity.generate()
+        let named = try Invite(kind: .channel, identity: id, sendID: Mailbox.make().sendID, channel: UUID()).code
+        let contact = try Invite(kind: .contact, identity: id, sendID: Mailbox.make().sendID).code
+        #expect(!Invite.isFromNewer(named) && !Invite.isFromNewer(contact) && !Invite.isFromNewer("hello"))
+        // A kind byte this version doesn't know, as kind 3 was to the apps before it.
+        var raw = Base32.decode(String(named.dropFirst(4)).uppercased())!
+        raw[raw.startIndex] = 9
+        let unknownKind = "psh3" + Base32.encode(raw).lowercased()
+        #expect(Invite(code: unknownKind) == nil && Invite.isFromNewer(unknownKind) && Invite.isFromNewer("pulshade://invite/" + unknownKind))
+        #expect(Invite.problem(with: unknownKind) == Invite.newerNotice)
+        // A later format number.
+        #expect(Invite.isFromNewer("psh4" + String(named.dropFirst(4))))
+        #expect(Invite.problem(with: "hello") == "That isn't a PULSHADE code.")
+        #expect(Invite.problem(with: "psh1abc") == Invite.outdatedNotice)
+        // What the pulsh.me page checks to say "update first" (the page's needsUpdate check).
+        let bytes = Base32.decode(String(named.dropFirst(4)).uppercased())!
+        #expect(bytes.first == 3 && bytes.count >= 193)
+    }
+
     @Test func theSafetyCodeCoversBothAgreementKeys() {
         let ka = Data(repeating: 1, count: 32), kb = Data(repeating: 2, count: 32), kc = Data(repeating: 3, count: 32)
         let s = Data(repeating: 9, count: 32)
