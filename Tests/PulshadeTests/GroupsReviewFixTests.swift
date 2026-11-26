@@ -106,6 +106,58 @@ struct GroupsReviewFixTests {
         #expect(reader.chains[GroupReader.id(epoch: 2, sender: sender, device: other)] == real && reader.unproven == nil)
     }
 
+    /// A chain handed over again from further back fills in the held posts from before this device was given it, and only
+    /// those: others from back then can still be asked for, a filled one counts as read once opened, and a post read
+    /// already never gets a key again.
+    @Test func aChainHandedOverAgainFillsOnlyTheHeldPosts() {
+        var reader = GroupReader()
+        let sender = Data.random(32), device = Data.random(8)
+        let start = SenderChain.fresh()
+        var first = start
+        for _ in 0..<5 { first = first.step().next }
+        let r1 = reader.start(epoch: 4, sender: sender, device: device, chain: first)
+        #expect(r1)
+        for index in 5..<8 {
+            guard case .key = reader.messageKey(epoch: 4, sender: sender, device: device, index: UInt32(index)) else {
+                Issue.record("the first messages open")
+                return
+            }
+        }
+        let r2 = reader.messageKey(epoch: 4, sender: sender, device: device, index: 2)
+        #expect(r2 == .missing)
+        let r3 = reader.messageKey(epoch: 4, sender: sender, device: device, index: 3)
+        #expect(r3 == .missing)
+
+        // Handed over from the very start while post 3 is held: just that one is filled in.
+        let r4 = reader.start(epoch: 4, sender: sender, device: device, chain: start, wanted: [3])
+        #expect(r4)
+        let r5 = reader.messageKey(epoch: 4, sender: sender, device: device, index: 3)
+        #expect(r5 == .key(Self.key(start, at: 3)))
+        // Opened once, a copy of it is dropped, and handing the chain over again doesn't make its key a second time.
+        let r6 = reader.messageKey(epoch: 4, sender: sender, device: device, index: 3)
+        #expect(r6 == .used)
+        let r7 = reader.start(epoch: 4, sender: sender, device: device, chain: start, wanted: [3])
+        #expect(!r7)
+        // Post 2 wasn't held then: it still counts as missing, so it can be asked for once it comes.
+        let r8 = reader.messageKey(epoch: 4, sender: sender, device: device, index: 2)
+        #expect(r8 == .missing)
+        let r9 = reader.start(epoch: 4, sender: sender, device: device, chain: start, wanted: [2])
+        #expect(r9)
+        let r10 = reader.messageKey(epoch: 4, sender: sender, device: device, index: 2)
+        #expect(r10 == .key(Self.key(start, at: 2)))
+        // A post read already is never filled in again.
+        let r11 = reader.start(epoch: 4, sender: sender, device: device, chain: start, wanted: [6])
+        #expect(!r11)
+        let r12 = reader.messageKey(epoch: 4, sender: sender, device: device, index: 6)
+        #expect(r12 == .used)
+    }
+
+    private static func key(_ chain: SenderChain, at index: Int) -> Data {
+        var chain = chain
+        for _ in 0..<index { chain = chain.step().next }
+        return chain.step().messageKey
+    }
+
     /// Untagged previews (owners on builds 19 and 20) stop being taken at the start of 2027.
     @Test func untaggedPreviewsEndWithTheYear() {
         let parts = Calendar(identifier: .gregorian).dateComponents(in: TimeZone(identifier: "UTC")!, from: GroupPreview.untaggedUntil)

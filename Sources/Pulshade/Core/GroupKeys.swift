@@ -748,6 +748,10 @@ struct GroupReader: Codable, Equatable {
     /// "epoch|sender hex|device hex" → the first position this device was given: a post from before it was never
     /// readable here (ask for it), one from after it and before the chain's position has been read (or skipped).
     var starts: [String: UInt32]? = [:]
+    /// "epoch|sender hex|device hex" → posts from before `starts` whose keys were filled in later from a chain handed over
+    /// again: each counts as read once used, so a copy posted again isn't opened twice, while the others from back then
+    /// can still be asked for.
+    var filled: [String: Set<UInt32>]?
     /// Chains passed on by someone other than the device they belong to (a channel's follower gets staff chains from the
     /// staff member who invited it), until a post that device signed opens with one: only then is it known to be that
     /// device's. One that doesn't open such a post is dropped (`dropUnproven`) and asked for again, so nobody passing
@@ -781,7 +785,9 @@ struct GroupReader: Codable, Equatable {
         let id = Self.id(epoch: epoch, sender: sender, device: device)
         if let key = skipped.removeValue(forKey: "\(id)|\(index)") { return .key(key) }
         guard var chain = chains[id] else { return .missing }
-        if index < chain.index { return index < (starts?[id] ?? 0) ? .missing : .used }
+        if index < chain.index {
+            return index < (starts?[id] ?? 0) && filled?[id]?.contains(index) != true ? .missing : .used
+        }
         guard index - chain.index <= Self.maxSkip else { return .missing }
         while chain.index < index {
             let (key, next) = chain.step()
@@ -817,12 +823,13 @@ struct GroupReader: Codable, Equatable {
             var chain = given
             var took = false
             for index in Set(wanted).sorted() where index >= given.index && index < held.index && index < floor
-                && index - given.index <= Self.maxSkip && skipped["\(id)|\(index)"] == nil {
+                && index - given.index <= Self.maxSkip && skipped["\(id)|\(index)"] == nil && filled?[id]?.contains(index) != true {
                 while chain.index < index { chain = chain.step().next }
                 skipped["\(id)|\(index)"] = chain.step().messageKey
+                filled = filled ?? [:]
+                filled?[id, default: []].insert(index)
                 took = true
             }
-            if took { starts?[id] = min(floor, given.index) }
             return took
         }
         let senderPrefix = "\(epoch)|\(sender.hex)|"
@@ -853,6 +860,7 @@ struct GroupReader: Codable, Equatable {
     private mutating func drop(_ id: String) {
         chains[id] = nil
         starts?[id] = nil
+        filled?[id] = nil
         skipped = skipped.filter { !$0.key.hasPrefix(id + "|") }
         unproven?.remove(id)
         if unproven?.isEmpty == true { unproven = nil }
@@ -875,6 +883,7 @@ struct GroupReader: Codable, Equatable {
         chains = chains.filter { !$0.key.hasPrefix("\(epoch)|") }
         skipped = skipped.filter { !$0.key.hasPrefix("\(epoch)|") }
         starts = starts?.filter { !$0.key.hasPrefix("\(epoch)|") }
+        filled = filled?.filter { !$0.key.hasPrefix("\(epoch)|") }
         unproven = unproven?.filter { !$0.hasPrefix("\(epoch)|") }
     }
 
@@ -885,6 +894,7 @@ struct GroupReader: Codable, Equatable {
         chains = chains.filter { keep($0.key) }
         skipped = skipped.filter { keep($0.key) }
         starts = starts?.filter { keep($0.key) }
+        filled = filled?.filter { keep($0.key) }
         unproven = unproven?.filter(keep)
     }
 }

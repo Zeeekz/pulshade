@@ -5484,8 +5484,6 @@ final class AppModel {
     }
 
     func declineRequest(_ id: FriendRequest.ID) {
-        if let request = data.requests.first(where: { $0.id == id }) {
-        }
         withAnimation(.snappy) { data.requests.removeAll { $0.id == id } }
         save()
     }
