@@ -87,38 +87,49 @@ public struct Collectible: Codable, Equatable, Hashable, Identifiable, Sendable 
 }
 
 /// What a profile shows of its collectibles, as sent to friends inside the encrypted profile: the identity's collector
-/// key (which holds its copies on the relay), the identity's signing key's signature over it, and the copies.
+/// key (which holds its copies on the relay), the identity's signing key's signature over it, the collector key's
+/// signature back over the identity's signing key, and the copies. Both signatures are needed: with only the first,
+/// anyone who had seen your showcase could vouch for your collector key themselves and pass your copies off as theirs.
 public struct Showcase: Codable, Equatable, Sendable {
     public static let limit = 6
     public var collector: Data
     public var cert: Data
+    /// The collector key's signature over `bindPart(signingKey)`. Optional only so a showcase from an earlier build of
+    /// 23 still decodes; without it nothing is shown.
+    public var bind: Data?
     public var copies: [Collectible]
 
-    public init(collector: Data, cert: Data, copies: [Collectible]) {
-        (self.collector, self.cert, self.copies) = (collector, cert, copies)
+    public init(collector: Data, cert: Data, bind: Data? = nil, copies: [Collectible]) {
+        (self.collector, self.cert, self.bind, self.copies) = (collector, cert, bind, copies)
     }
 
     public static func certPart(_ collector: Data) -> Data { Data("pulshade.collector.cert.v1".utf8) + collector }
+    public static func bindPart(_ signingKey: Data) -> Data { Data("pulshade.collector.bind.v1".utf8) + signingKey }
 
-    public static func make(signing: Curve25519.Signing.PrivateKey, collector: Data, copies: [Collectible]) throws -> Showcase {
-        Showcase(collector: collector, cert: try signing.signature(for: certPart(collector)), copies: copies)
+    public static func make(signing: Curve25519.Signing.PrivateKey, collector: Curve25519.Signing.PrivateKey,
+                            copies: [Collectible]) throws -> Showcase {
+        let collectorKey = collector.publicKey.rawRepresentation
+        return Showcase(collector: collectorKey, cert: try signing.signature(for: certPart(collectorKey)),
+                        bind: try collector.signature(for: bindPart(signing.publicKey.rawRepresentation)), copies: copies)
     }
 
     /// A showcase that arrived, kept only in shape: a 32-byte key, a 64-byte certificate, and at most `limit` copies held by
     /// that key with valid ids and signatures of the right size. Nil if nothing's left.
     public static func received(_ showcase: Showcase?) -> Showcase? {
-        guard let showcase, showcase.collector.count == 32, showcase.cert.count == 64 else { return nil }
+        guard let showcase, showcase.collector.count == 32, showcase.cert.count == 64, showcase.bind?.count == 64 else { return nil }
         let copies = Collectible.unique(showcase.copies.filter {
             $0.owner == showcase.collector && CollectibleList.validID($0.item) && $0.serial > 0 && $0.sig.count == 64
         }, limit: limit)
-        return copies.isEmpty ? nil : Showcase(collector: showcase.collector, cert: showcase.cert, copies: copies)
+        return copies.isEmpty ? nil : Showcase(collector: showcase.collector, cert: showcase.cert, bind: showcase.bind, copies: copies)
     }
 
-    /// The copies that can be shown for the account with `signingKey`: the certificate is theirs, and each copy was
-    /// signed by `issuer` for their collector key.
+    /// The copies that can be shown for the account with `signingKey`: the certificate is theirs, the collector key
+    /// signed their signing key back, and each copy was signed by `issuer` for that collector key.
     public func genuine(for signingKey: Data, issuer: Data?) -> [Collectible] {
         guard let key = try? Curve25519.Signing.PublicKey(rawRepresentation: signingKey),
-              key.isValidSignature(cert, for: Self.certPart(collector)) else { return [] }
+              key.isValidSignature(cert, for: Self.certPart(collector)),
+              let bind, let collectorKey = try? Curve25519.Signing.PublicKey(rawRepresentation: collector),
+              collectorKey.isValidSignature(bind, for: Self.bindPart(signingKey)) else { return [] }
         return Collectible.unique(copies.filter { $0.isGenuine(for: collector, issuer: issuer) }, limit: Self.limit)
     }
 }

@@ -2,6 +2,7 @@ import Testing
 import Foundation
 import CryptoKit
 import PulshadeShared
+@testable import Pulshade
 
 /// The collectibles list and copies, as the app checks them: only Pulshade's list counts, and only a copy the relay
 /// signed for its holder.
@@ -31,6 +32,23 @@ struct CollectibleTests {
         var changed = signed
         changed.manifest = try JSONEncoder().encode(list(version: 9)).base64EncodedString()
         #expect(changed.open(adminKey: admin.publicKey.rawRepresentation) == nil, "a changed list loses its signature")
+    }
+
+    /// A relay can't roll a phone back to an older signed list, or swap two lists that carry the same number.
+    @Test func anOldOrSwappedListIsRefused() throws {
+        let floor = AppModel.minimumListVersion
+        let old = try CollectibleList.Signed.make(list(version: floor - 1), signedBy: admin)
+        let now = try CollectibleList.Signed.make(list(version: floor), signedBy: admin)
+        var other = list(version: floor)
+        other.items[0].name = "Something else"
+        let twin = try CollectibleList.Signed.make(other, signedBy: admin)
+        let next = try CollectibleList.Signed.make(list(version: floor + 1), signedBy: admin)
+        #expect(!AppModel.acceptsList(version: floor - 1, signed: old, current: nil, currentVersion: nil), "older than this build trusts")
+        #expect(AppModel.acceptsList(version: floor, signed: now, current: nil, currentVersion: nil))
+        #expect(AppModel.acceptsList(version: floor, signed: now, current: now, currentVersion: floor), "the same list again")
+        #expect(!AppModel.acceptsList(version: floor, signed: twin, current: now, currentVersion: floor), "a different list, same number")
+        #expect(AppModel.acceptsList(version: floor + 1, signed: next, current: now, currentVersion: floor))
+        #expect(!AppModel.acceptsList(version: floor, signed: now, current: next, currentVersion: floor + 1), "rolled back")
     }
 
     @Test func aBadlyFormedListIsRefusedEvenSigned() throws {
@@ -93,20 +111,40 @@ struct CollectibleTests {
         let collectorKey = collector.publicKey.rawRepresentation
         let sig = try issuer.signature(for: Collectible.signedPart(item: "dice", serial: 4, owner: collectorKey))
         let copy = Collectible(item: "dice", serial: 4, owner: collectorKey, sig: sig)
-        let showcase = try Showcase.make(signing: signing, collector: collectorKey, copies: [copy, copy])
+        let showcase = try Showcase.make(signing: signing, collector: collector, copies: [copy, copy])
         let issuerKey = issuer.publicKey.rawRepresentation
         #expect(showcase.genuine(for: signing.publicKey.rawRepresentation, issuer: issuerKey) == [copy])
         // Someone else sending the same showcase (their own signing key) shows nothing.
         #expect(showcase.genuine(for: Curve25519.Signing.PrivateKey().publicKey.rawRepresentation, issuer: issuerKey).isEmpty)
         // Someone else's collector key vouched for by them doesn't make another's copies theirs.
         let thief = Curve25519.Signing.PrivateKey()
-        let stolen = try Showcase.make(signing: thief, collector: Curve25519.Signing.PrivateKey().publicKey.rawRepresentation, copies: [copy])
+        let stolen = try Showcase.make(signing: thief, collector: Curve25519.Signing.PrivateKey(), copies: [copy])
         #expect(Showcase.received(stolen) == nil, "copies not held by the collector are dropped on arrival")
-        #expect(Showcase.received(Showcase(collector: Data([1]), cert: showcase.cert, copies: [copy])) == nil)
+        #expect(Showcase.received(Showcase(collector: Data([1]), cert: showcase.cert, bind: showcase.bind, copies: [copy])) == nil)
         var odd = copy
         odd.item = String(repeating: "x", count: 5000)
-        #expect(Showcase.received(Showcase(collector: collectorKey, cert: showcase.cert, copies: [odd])) == nil, "bounded on arrival")
+        #expect(Showcase.received(Showcase(collector: collectorKey, cert: showcase.cert, bind: showcase.bind, copies: [odd])) == nil, "bounded on arrival")
         let many = (1...20).map { Collectible(item: "dice", serial: UInt32($0), owner: collectorKey, sig: Data(repeating: 1, count: 64)) }
-        #expect(Showcase.received(Showcase(collector: collectorKey, cert: showcase.cert, copies: many))?.copies.count == Showcase.limit)
+        #expect(Showcase.received(Showcase(collector: collectorKey, cert: showcase.cert, bind: showcase.bind, copies: many))?.copies.count == Showcase.limit)
+    }
+
+    /// A friend who has seen your showcase can vouch for your collector key with their own signing key, but your
+    /// collector key never signed theirs, so your copies don't show on their profile.
+    @Test func aFriendCantPassYourShowcaseOffAsTheirs() throws {
+        let alice = Curve25519.Signing.PrivateKey(), collector = Curve25519.Signing.PrivateKey()
+        let collectorKey = collector.publicKey.rawRepresentation
+        let sig = try issuer.signature(for: Collectible.signedPart(item: "dice", serial: 1, owner: collectorKey))
+        let copy = Collectible(item: "dice", serial: 1, owner: collectorKey, sig: sig)
+        let hers = try Showcase.make(signing: alice, collector: collector, copies: [copy])
+        let issuerKey = issuer.publicKey.rawRepresentation
+
+        let bob = Curve25519.Signing.PrivateKey()
+        let replayed = Showcase(collector: collectorKey, cert: try bob.signature(for: Showcase.certPart(collectorKey)),
+                                bind: hers.bind, copies: hers.copies)
+        #expect(replayed.genuine(for: bob.publicKey.rawRepresentation, issuer: issuerKey).isEmpty)
+        #expect(Showcase(collector: collectorKey, cert: replayed.cert, copies: hers.copies)
+            .genuine(for: bob.publicKey.rawRepresentation, issuer: issuerKey).isEmpty, "no binding, nothing shown")
+        #expect(Showcase.received(Showcase(collector: collectorKey, cert: hers.cert, copies: hers.copies)) == nil)
+        #expect(hers.genuine(for: alice.publicKey.rawRepresentation, issuer: issuerKey) == [copy])
     }
 }

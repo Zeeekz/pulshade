@@ -158,6 +158,9 @@ enum Work {
         return proof
     }
 
+    /// What a collectibles drop's proof is tied to: the collector key asking, so one proof can't serve another key.
+    static func dropBound(_ key: String) -> String { "drop|\(key)" }
+
     static func bound(ofHeader value: String) -> String? { made.withLock { $0.removeValue(forKey: value) } }
 
     static func proof(for bound: String, bits: Int) -> String {
@@ -872,11 +875,15 @@ struct RelayClient {
 
     struct HeldCopy: Decodable { var item: String; var serial: UInt32; var owner: Data; var sig: Data; var run: UInt32 }
 
-    /// The copies this key holds. Asking also collects anything an open drop has for it.
-    func collectibles(key: String, sig: String, ts: UInt64) async throws -> [HeldCopy] {
+    /// The copies this key holds. Asking also collects anything an open drop has for it, when `dropWork` (the drop's
+    /// proof of work for this key, `Work.dropBound`) comes along; without it, `dropBits` says how much work a drop
+    /// that's waiting wants.
+    func collectibles(key: String, sig: String, ts: UInt64, dropWork: String? = nil) async throws -> (copies: [HeldCopy], dropBits: Int?) {
         struct Proof: Encodable { var key: String; var sig: String; var ts: UInt64 }
-        let (data, _) = try await post("v1/collectibles", JSONEncoder().encode(Proof(key: key, sig: sig, ts: ts)), work: "collectibles")
-        return try JSONDecoder().decode([HeldCopy].self, from: data)
+        let (data, response) = try await post("v1/collectibles", JSONEncoder().encode(Proof(key: key, sig: sig, ts: ts)),
+                                              work: "collectibles", headers: dropWork.map { ["X-Pulshade-Drop-Pow": $0] } ?? [:])
+        let bits = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "X-Pulshade-Drop-Pow-Bits").flatMap(Int.init)
+        return (try JSONDecoder().decode([HeldCopy].self, from: data), bits.flatMap { (1...Work.ceiling).contains($0) ? $0 : nil })
     }
 
     /// Lets one of this key's copies go for good: its number goes back into the draw.
@@ -998,9 +1005,11 @@ struct RelayClient {
     }
 
     @discardableResult
-    private func post(_ path: String, _ body: Data, timeout: TimeInterval? = nil, work: String? = nil) async throws -> (Data, URLResponse) {
+    private func post(_ path: String, _ body: Data, timeout: TimeInterval? = nil, work: String? = nil,
+                      headers: [String: String] = [:]) async throws -> (Data, URLResponse) {
         var request = URLRequest(url: base.appending(path: path))
         if let timeout { request.timeoutInterval = timeout }
+        for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
         if let work { await prove(&request, work) }
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")

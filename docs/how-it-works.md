@@ -194,15 +194,20 @@ ten, lucky 7s, repeated digits, runs like 123, round numbers, the top twenty-fiv
 
 The list of items (names, a line of words, rarity, run, whether it can be passed on, and each picture's SHA-256) is
 signed by the admin key over its exact bytes, and the app checks that signature and each picture's hash before using
-anything; it refuses a list older than the one it has. Pictures are short transparent videos with a still, fetched from
+anything; it refuses a list older than the one it has or than the oldest this build trusts, and a different list carrying the same number. Pictures are short transparent videos with a still, fetched from
 the relay the first time they're shown, then sealed in the media pool with a key of their own and wiped on Burn and
 Detach; the video plays from memory and is never written out unsealed. None are built into the app, so new items come
 without an update. The relay keeps one record per copy: the item, its number, the holder's key and the relay's
 signature over all three, made with an issuer key whose public half is named in the signed list. The holder's key is a
 collector key worked out from the identity's seed for this alone, never the signing key contacts know or a @handle
-publishes; friends learn it from a certificate the signing key makes, inside the encrypted profile. Nobody can make a
+publishes; friends learn it from a certificate the signing key makes, inside the encrypted profile, and the collector
+key signs the signing key back, so a showcase counts only for the account both keys vouch for. Nobody can make a
 copy or show one held by someone else. Each persona holds its own copies under its own collector key and asks for them
-on its own connection, at random times of its own, so nothing ties two personas together. All of a new list's pictures
+on a connection (and over Tor, a circuit) of its own, apart from the one its @handle uses, at random times of its own,
+so nothing ties two personas together or a collector key to a @handle. In Fast mode the relay sees your IP address on
+every request, which ties them anyway. A drop gives a key its copy only once the app has done a proof of work tied to
+that key, so making up keys to empty a drop or draw again for a better number costs real work for each one, and drops
+always leave room in the relay's ledger for copies Pulshade gives by hand. All of a new list's pictures
 are fetched at random moments, so fetching says nothing about whose collectibles you looked at. Passing one to a friend
 isn't there yet: it's to come as a one-time claim passed inside a message, so the relay never sees giver and receiver
 together. You pick up to six to show on your profile, to your friends only (or to nobody); they're not on your public

@@ -60,7 +60,7 @@ extension AppModel {
         guard data.hideCollection != true, let me = me(persona) else { return nil }
         let shown = showcase(for: persona)
         guard !shown.isEmpty else { return nil }
-        return try? Showcase.make(signing: me.signingKey, collector: me.collectorKey.publicKey.rawRepresentation, copies: shown)
+        return try? Showcase.make(signing: me.signingKey, collector: me.collectorKey, copies: shown)
     }
 
     /// A contact's showcase as it can be shown: only copies the relay signed for the collector key their own key vouches for.
@@ -90,6 +90,19 @@ extension AppModel {
 
     // MARK: Asking the relay
 
+    /// The oldest list version this build takes, so a relay can't hand a phone with no list yet an old signed one (an
+    /// issuer key since retired, items since removed). Raise it when a newer list is published before a build.
+    nonisolated static let minimumListVersion: UInt64 = 2
+
+    /// Whether a signed list may replace the one kept: never older than `minimumListVersion` or the kept one, and a
+    /// different list must have a higher version, so two lists signed with the same number can't be swapped back and forth.
+    nonisolated static func acceptsList(version: UInt64, signed: CollectibleList.Signed, current: CollectibleList.Signed?,
+                            currentVersion: UInt64?) -> Bool {
+        guard version >= minimumListVersion else { return false }
+        guard let current, let currentVersion else { return true }
+        return version > currentVersion || (version == currentVersion && signed == current)
+    }
+
     /// Asks for the list, if it changed. The same question from every app, with no account attached.
     func refreshCollectibleList() async {
         guard !checkingCollectibles, phase == .unlocked, let client = client(nil, lane: "collectibles-list") else { return }
@@ -97,8 +110,10 @@ extension AppModel {
         defer { checkingCollectibles = false }
         do {
             guard let (signed, tag) = try await client.collectibleList(etag: data.collectibleListTag), phase == .unlocked else { return }
-            // A list that isn't Pulshade's, or is older than the one kept, is ignored.
-            guard let list = signed.open(adminKey: Self.adminKey), list.version >= (collectibleList?.version ?? 0) else { return }
+            // A list that isn't Pulshade's, or would roll back the one kept (or the oldest this build trusts), is ignored.
+            guard let list = signed.open(adminKey: Self.adminKey),
+                  Self.acceptsList(version: list.version, signed: signed, current: data.collectibleList,
+                                   currentVersion: collectibleList?.version) else { return }
             let changed = data.collectibleList != signed
             data.collectibleList = signed
             data.collectibleListTag = tag
@@ -142,19 +157,26 @@ extension AppModel {
     }
 
     /// Asks for one identity's copies (which also collects anything an open drop has for it), on that identity's own
-    /// directory connection.
+    /// collector connection (`collectorLane`), apart from its @handle's.
     func refreshCopies(of persona: UUID?) async {
         let slot = Self.slot(persona)
         guard phase == .unlocked, !askingCopies.contains(slot), let me = me(persona),
-              let client = client(nil, lane: Self.directoryLane(persona)),
+              let client = client(nil, lane: Self.collectorLane(persona)),
               let (k, sig, ts) = collectorProof("pulshade.collect.mine.v2", by: me) else { return }
         askingCopies.insert(slot)
         defer { askingCopies.remove(slot) }
-        guard let answer = try? await client.collectibles(key: k, sig: sig, ts: ts), phase == .unlocked,
+        guard var answer = try? await client.collectibles(key: k, sig: sig, ts: ts) else { return }
+        // A drop is waiting for this key: it gives only once the work tied to the key is done, so made-up keys can't
+        // empty it cheaply. Done here, off the main thread, and only when a drop asks for it.
+        if let bits = answer.dropBits {
+            let work = await Task.detached(priority: .utility) { Work.proof(for: Work.dropBound(k), bits: bits) }.value
+            if let again = try? await client.collectibles(key: k, sig: sig, ts: ts, dropWork: work) { answer = again }
+        }
+        guard phase == .unlocked,
               self.me(persona)?.collectorKey.publicKey.rawRepresentation == me.collectorKey.publicKey.rawRepresentation else { return }
         let key = me.collectorKey.publicKey.rawRepresentation
         // Kept only in shape; whether the relay signed each is checked when shown.
-        let copies = answer.prefix(Self.maxHeld * 2)
+        let copies = answer.copies.prefix(Self.maxHeld * 2)
             .filter { $0.owner == key && CollectibleList.validID($0.item) && $0.serial > 0 && $0.sig.count == 64 }
             .map { Collectible(item: $0.item, serial: $0.serial, owner: $0.owner, sig: $0.sig) }
         let mine = Collectible.unique(Array(copies), limit: Self.maxHeld)
@@ -175,7 +197,7 @@ extension AppModel {
     /// Lets one of your copies go for good: its number goes back into the draw after a while.
     func letGo(_ copy: Collectible) async -> Bool {
         guard let persona = identities.first(where: { me($0)?.collectorKey.publicKey.rawRepresentation == copy.owner }),
-              let me = me(persona), let client = client(nil, lane: Self.directoryLane(persona)) else { return false }
+              let me = me(persona), let client = client(nil, lane: Self.collectorLane(persona)) else { return false }
         let about = Data(copy.item.utf8) + Data([0]) + withUnsafeBytes(of: copy.serial.bigEndian) { Data($0) }
         guard let (k, sig, ts) = collectorProof("pulshade.collect.release.v2", about: about, by: me),
               (try? await client.releaseCollectible(key: k, sig: sig, ts: ts, item: copy.item, serial: copy.serial)) != nil else { return false }

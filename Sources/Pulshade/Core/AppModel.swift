@@ -8059,6 +8059,9 @@ final class AppModel {
     /// The connection for proving a profile's handles are its own. Never the one its mail
     /// is fetched on, so the relay can't tie a handle to a mailbox, or two personas to one account.
     static func directoryLane(_ persona: UUID?) -> String { "dir|" + (persona?.uuidString ?? "main") }
+    /// Each persona's collector key talks to the relay on a lane of its own, never the one its signed @handle requests
+    /// use: a shared connection (and Tor circuit) would let the relay tie the handle to what the collector key holds.
+    static func collectorLane(_ persona: UUID?) -> String { "collect|" + (persona?.uuidString ?? "main") }
 
     func client(_ relay: String?, lane: String = "main") -> RelayClient? {
         guard let address = reachable(relay), let url = URL(string: address) else { return nil }
