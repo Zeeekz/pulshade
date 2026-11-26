@@ -154,6 +154,12 @@ private struct LeaveStatusCard: View {
     @Environment(\.theme) private var theme
 
     private var messageCount: Int { model.data.conversations.reduce(0) { $0 + $1.messages.count } }
+    /// Friends as the Contacts list shows them, across every persona, each person once: not people hidden from the
+    /// list (channel followers, removed friends still being told), requests not yet accepted, or your own devices.
+    private var friendCount: Int {
+        Set(model.data.contacts.filter { !$0.hidden && !$0.awaitingAcceptance && !$0.isSelf && $0.departing == nil }
+            .map(\.fingerprint)).count
+    }
 
     private var autoLock: String {
         let s = model.data.security
@@ -178,7 +184,7 @@ private struct LeaveStatusCard: View {
             HStack(spacing: 0) {
                 stat(model.data.conversations.count, "Chats")
                 divider
-                stat(model.data.contacts.count, "Friends")
+                stat(friendCount, "Friends")
                 divider
                 stat(messageCount, "Messages")
             }

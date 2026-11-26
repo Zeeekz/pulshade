@@ -606,7 +606,7 @@ struct MyProfileView: View {
     /// Friends, groups and notes on this profile.
     private var facts: [ProfileFact] {
         let persona = model.activePersona
-        let friends = model.data.contacts.filter { $0.persona == persona && !$0.isSelf }.count
+        let friends = model.visibleContacts.filter { !$0.isSelf && $0.departing == nil }.count
         let groups = model.data.conversations.filter { $0.kind == .group && $0.persona == persona }.count
         let notes = ProfileNote.cleaned(profile.notes ?? []).count
         return [ProfileFact(value: "\(friends)", label: friends == 1 ? "Friend" : "Friends"),
