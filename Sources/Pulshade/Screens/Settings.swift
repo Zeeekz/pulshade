@@ -94,6 +94,7 @@ struct SettingsView: View {
                 #endif
             }
         }
+        .environment(\.openSettingsPage) { path.append($0) }
         #if DEBUG
         .onAppear {
             // Screenshots: PULSHADE_DEMO_SETTINGS=privacy opens that page.
@@ -1893,4 +1894,10 @@ private struct DisguiseSetup: View {
             working = false
         }
     }
+}
+
+extension EnvironmentValues {
+    /// Pushes a page onto the Me tab's stack, as a `NavigationLink(value:)` would. Pages reached some other way
+    /// (`navigationDestination(isPresented:)`) end up below value-pushed ones, so links on them go astray.
+    @Entry var openSettingsPage: ((SettingsPage) -> Void)? = nil
 }

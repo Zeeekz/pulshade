@@ -599,7 +599,7 @@ struct MyProfileView: View {
     var fromEditor = false
     @Environment(\.dismiss) private var dismiss
     @State private var copiedLink = false
-    @State private var editing = false
+    @Environment(\.openSettingsPage) private var openSettingsPage
 
     private var profile: Profile { model.activeProfile }
 
@@ -660,16 +660,10 @@ struct MyProfileView: View {
                     .padding(.horizontal, 12)
             }
         }
-        .navigationDestination(isPresented: $editing) {
-            ProfileEditScreen()
-                #if os(iOS)
-                .toolbar(.hidden, for: .navigationBar)
-                #endif
-        }
     }
 
     private func edit() {
-        if fromEditor { dismiss() } else { editing = true }
+        if fromEditor { dismiss() } else { openSettingsPage?(.profile) }
     }
 }
 
