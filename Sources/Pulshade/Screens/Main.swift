@@ -225,9 +225,10 @@ private struct PhoneMainView: View {
     }
 }
 
-/// Holding one tab of the tab bar, which SwiftUI has no gesture for. iOS draws the tab buttons in a floating layer of
-/// its own and keeps their touches to themselves, so the long press goes on that tab's button itself, found by its
-/// place along the bar, and is put back whenever iOS rebuilds the buttons.
+/// Holding one tab of the tab bar, which SwiftUI has no gesture for. iOS draws the tab buttons in a layer of its own,
+/// keeps their touches to itself, and rebuilds the buttons whenever the bar redraws (a new picture on the tab, a theme
+/// change), taking any gesture put on them along. So the long press and double tap sit on the window, which sees every
+/// touch, and only take touches that land on this tab's place while the bar is showing.
 private struct TabHold: UIViewRepresentable {
     /// Which tab, counting from the first.
     var tab: Int
@@ -247,7 +248,7 @@ private struct TabHold: UIViewRepresentable {
         context.coordinator.tab = tab
         context.coordinator.action = action
         context.coordinator.doubleTap = doubleTap
-        probe.attachSoon()
+        probe.attach()
     }
 
     final class Probe: UIView {
@@ -255,17 +256,12 @@ private struct TabHold: UIViewRepresentable {
 
         override func didMoveToWindow() {
             super.didMoveToWindow()
-            attachSoon()
+            attach()
         }
 
-        /// The buttons appear a moment after the tab view, and are redrawn when a tab's picture changes.
-        func attachSoon() {
-            for delay in [0.0, 0.5, 1.5, 3.0] {
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                    guard let self, let window = self.window else { return }
-                    self.coordinator?.attach(in: window)
-                }
-            }
+        func attach() {
+            guard let window else { return }
+            coordinator?.attach(to: window)
         }
     }
 
@@ -275,63 +271,78 @@ private struct TabHold: UIViewRepresentable {
         var doubleTap: (() -> Void)?
         static let name = "pulshade.tabhold"
         static let doubleName = "pulshade.tabdouble"
+        /// The tab's place on screen and when it was last looked up: finding it walks every view, so not on each touch.
+        private var cached: (frame: CGRect, at: Date)?
 
-        /// The tab bar's buttons and where each sits on screen.
-        private func tabButtons(in window: UIWindow) -> (buttons: [(view: UIView, frame: CGRect)], target: CGRect)? {
-            var buttons: [(view: UIView, frame: CGRect)] = []
+        /// Where this tab's button sits on screen now, or nil when the tab bar isn't showing.
+        private func target(in window: UIWindow) -> CGRect? {
+            if let cached, Date.now.timeIntervalSince(cached.at) < 1 { return cached.frame.isNull ? nil : cached.frame }
+            var places: [CGRect] = []
+            func showing(_ view: UIView) -> Bool {
+                var v: UIView? = view
+                while let current = v {
+                    if current.isHidden || current.alpha < 0.05 { return false }
+                    v = current.superview
+                }
+                return true
+            }
             func collect(_ view: UIView) {
-                if String(describing: type(of: view)).contains("TabButton"), view.bounds.width > 0 {
-                    buttons.append((view, view.convert(view.bounds, to: window).integral))
+                if String(describing: type(of: view)).contains("TabButton"), view.bounds.width > 0, showing(view) {
+                    let frame = view.convert(view.bounds, to: window).integral
+                    if window.bounds.intersects(frame), !places.contains(frame) { places.append(frame) }
                 }
                 view.subviews.forEach(collect)
             }
             collect(window)
-            var places: [CGRect] = []
-            for b in buttons where !places.contains(b.frame) { places.append(b.frame) }
-            guard places.count > tab else { return nil }
-            let xs = places.map(\.midX), ys = places.map(\.midY)
-            let across = (xs.max()! - xs.min()!) >= (ys.max()! - ys.min()!)
-            return (buttons, places.sorted { across ? $0.minX < $1.minX : $0.minY < $1.minY }[tab])
+            var found: CGRect?
+            if places.count > tab {
+                let xs = places.map(\.midX), ys = places.map(\.midY)
+                let across = (xs.max()! - xs.min()!) >= (ys.max()! - ys.min()!)
+                found = places.sorted { across ? $0.minX < $1.minX : $0.minY < $1.minY }[tab]
+            }
+            cached = (found ?? .null, .now)
+            return found
         }
 
-        /// iOS moves the copy it draws for the selected tab, gestures and all, to whichever tab is picked next, so a
-        /// gesture only counts if the touch is on this tab's place right now.
-        private func onTab(_ gesture: UIGestureRecognizer) -> Bool {
-            guard let window = gesture.view?.window, let found = tabButtons(in: window) else { return false }
-            return found.target.insetBy(dx: -4, dy: -4).contains(gesture.location(in: window))
-        }
-
-        /// Gives the tab's button (and the copy iOS draws for the selection) the long press, once each.
-        func attach(in window: UIWindow) {
-            guard let (buttons, target) = tabButtons(in: window) else { return }
-            for b in buttons where b.frame == target && !(b.view.gestureRecognizers ?? []).contains(where: { $0.name == Self.name }) {
+        /// Puts the long press and double tap on the window, once.
+        func attach(to window: UIWindow) {
+            let names = Set((window.gestureRecognizers ?? []).compactMap(\.name))
+            if !names.contains(Self.name) {
                 let press = UILongPressGestureRecognizer(target: self, action: #selector(pressed(_:)))
                 press.name = Self.name
                 press.minimumPressDuration = 0.4
+                press.cancelsTouchesInView = false
                 press.delegate = self
-                b.view.addGestureRecognizer(press)
+                window.addGestureRecognizer(press)
             }
-            // The tap still selects the tab; this only notices the second one.
-            for b in buttons where b.frame == target && !(b.view.gestureRecognizers ?? []).contains(where: { $0.name == Self.doubleName }) {
+            // The tap still selects the tab; this only notices the second one, and holds back no other touch.
+            if !names.contains(Self.doubleName) {
                 let tap = UITapGestureRecognizer(target: self, action: #selector(doubleTapped(_:)))
                 tap.name = Self.doubleName
                 tap.numberOfTapsRequired = 2
                 tap.cancelsTouchesInView = false
+                tap.delaysTouchesEnded = false
                 tap.delegate = self
-                b.view.addGestureRecognizer(tap)
+                window.addGestureRecognizer(tap)
             }
+        }
+
+        /// Only touches on this tab reach these gestures; everywhere else they never hear of it.
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+            guard let window = gestureRecognizer.view as? UIWindow, let frame = target(in: window) else { return false }
+            return frame.insetBy(dx: -4, dy: -4).contains(touch.location(in: window))
         }
 
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                                shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
 
         @objc func doubleTapped(_ tap: UITapGestureRecognizer) {
-            guard tap.state == .ended, onTab(tap) else { return }
+            guard tap.state == .ended else { return }
             doubleTap?()
         }
 
         @objc func pressed(_ press: UILongPressGestureRecognizer) {
-            guard press.state == .began, onTab(press) else { return }
+            guard press.state == .began else { return }
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             action()
         }
