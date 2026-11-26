@@ -6,7 +6,7 @@ import PulshadeShared
 
 // MARK: - Reading someone's notes
 
-/// A profile's notes, in a section that stays shut until tapped: each is a row with its title; tap one to read it.
+/// A profile's notes in one card: each is a row with its title; tap one to read it.
 /// A locked note asks for its password first, and opens on this device only.
 struct ProfileNoteList: View {
     var notes: [ProfileNote]
@@ -16,28 +16,26 @@ struct ProfileNoteList: View {
     var body: some View {
         let shown = ProfileNote.cleaned(notes)
         if !shown.isEmpty {
-            ExpandableCard(title: "Notes", symbol: "doc.text", count: shown.count, startsOpen: true) {
-                HStack(spacing: 6) {
-                    ForEach(shown.prefix(3)) { note in
-                        Image(systemName: Self.symbol(note))
-                            .font(.system(size: 12)).foregroundStyle(Ink.dim)
-                    }
-                }
-            } content: {
-                VStack(spacing: 0) {
-                    ForEach(Array(shown.enumerated()), id: \.element.id) { i, note in
-                        if i > 0 { Divider().overlay(Ink.line).padding(.leading, 56) }
-                        row(note)
-                    }
+            ProfileCard {
+                ForEach(Array(shown.enumerated()), id: \.element.id) { i, note in
+                    if i > 0 { Divider().overlay(Ink.line).padding(.leading, 60) }
+                    row(note)
                 }
             }
-            .frame(maxWidth: 340)
             .sheet(item: $reading) { note in NoteReaderSheet(note: note, tint: tint) }
         }
     }
 
     private static func symbol(_ note: ProfileNote) -> String {
         note.isLocked ? "lock.fill" : note.isRestricted ? "person.fill.checkmark" : "doc.text.fill"
+    }
+
+    /// The first words of a note anyone can read; what kind of note it is otherwise.
+    private static func preview(_ note: ProfileNote) -> String {
+        guard !note.isLocked, note.restricted != true, note.sharedWith == nil,
+              let text = note.text?.split(whereSeparator: \.isNewline).joined(separator: " ")
+                .trimmingCharacters(in: .whitespaces), !text.isEmpty else { return note.subtitle }
+        return text
     }
 
     private func row(_ note: ProfileNote) -> some View {
@@ -49,7 +47,7 @@ struct ProfileNoteList: View {
                     .background(Ink.raised, in: .rect(cornerRadius: 9, style: .continuous))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(note.title).font(.system(size: 15, weight: .semibold)).foregroundStyle(Ink.text).lineLimit(1)
-                    Text(note.subtitle).font(.system(size: 12.5)).foregroundStyle(Ink.dim).lineLimit(1)
+                    Text(Self.preview(note)).font(.system(size: 12.5)).foregroundStyle(Ink.dim).lineLimit(2)
                 }
                 Spacer(minLength: 8)
                 Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Ink.faint)

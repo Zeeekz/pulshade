@@ -7,61 +7,11 @@ private extension ProfileLink {
     var displayTitle: String { kind == .custom ? (label ?? "Link") : kind.title }
 }
 
-/// A titled section that stays shut until tapped: its header shows the name, how many are inside and a small preview,
-/// and tapping it stretches the rest open. Used for the sections of a profile.
-struct ExpandableCard<Preview: View, Content: View>: View {
-    @Environment(\.theme) private var theme
-    var title: String
-    var symbol: String
-    var count: Int
-    /// Profiles show what's pinned straight away; it can still be folded away.
-    var startsOpen = false
-    @ViewBuilder var preview: Preview
-    @ViewBuilder var content: Content
-    @State private var folded: Bool?
-    private var open: Bool { !(folded ?? !startsOpen) }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            Button {
-                withAnimation(.snappy(duration: 0.32)) { folded = open }
-            } label: {
-                HStack(spacing: 10) {
-                    Image(systemName: symbol).font(.system(size: 14, weight: .semibold)).foregroundStyle(theme.accent).frame(width: 22)
-                    Text(title).font(.system(size: 15, weight: .semibold)).foregroundStyle(Ink.text)
-                    Text("\(count)")
-                        .font(.system(size: 12, weight: .semibold)).foregroundStyle(Ink.dim)
-                        .padding(.horizontal, 8).frame(height: 20)
-                        .background(Ink.raised, in: .capsule)
-                    Spacer(minLength: 8)
-                    if !open { preview.transition(.opacity) }
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 12, weight: .bold)).foregroundStyle(Ink.faint)
-                        .rotationEffect(.degrees(open ? 90 : 0))
-                }
-                .padding(.horizontal, 14).frame(minHeight: 52)
-                .contentShape(.rect)
-            }
-            .buttonStyle(.plain)
-            .accessibilityValue(open ? "expanded" : "collapsed")
-            .accessibilityHint("Shows or hides the \(title.lowercased())")
-            if open {
-                Divider().overlay(Ink.line)
-                content.transition(.opacity.combined(with: .move(edge: .top)))
-            }
-        }
-        .background(Ink.surface, in: .rect(cornerRadius: 16, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(Ink.line))
-        .clipShape(.rect(cornerRadius: 16, style: .continuous))
-    }
-}
-
-/// A profile's links and wallets, each a row with its logo: tap a link to open it (after asking), tap a wallet to see
-/// the address with a copy button and a QR code. Shown on every profile view.
-struct ProfileLinkList: View {
+/// A profile's links and wallets as small chips under the bio, each with its logo and name, wrapping onto more lines
+/// as needed. Tap a link to open it (after asking), tap a wallet to see the address with a copy button and a QR code.
+struct ProfileLinkChips: View {
     @Environment(\.theme) private var theme
     var links: [ProfileLink]
-    var tint: Color
     /// When this person's wallet last changed, if it did, and whether the profile is your own.
     var walletChangedAt: Date? = nil
     var isMine = false
@@ -69,13 +19,30 @@ struct ProfileLinkList: View {
     @State private var showing: ProfileLink?
 
     var body: some View {
-        // Checked again on the way in, so nothing odd gets a row even if it got this far.
+        // Checked again on the way in, so nothing odd gets a chip even if it got this far.
         let shown = ProfileLink.cleaned(links)
-        let socials = shown.filter { !$0.kind.isWallet }, wallets = shown.filter(\.kind.isWallet)
         if !shown.isEmpty {
-            VStack(spacing: 16) {
-                if !socials.isEmpty { linkTiles(socials) }
-                if !wallets.isEmpty { card("Wallets", wallets) }
+            CenteredFlow(spacing: 6, lineSpacing: 6) {
+                ForEach(shown) { link in
+                    Button {
+                        if link.url != nil { asking = link } else { showing = link }
+                    } label: {
+                        HStack(spacing: 6) {
+                            BrandTile(kind: link.kind, size: 20)
+                            Text(link.displayTitle)
+                                .font(.system(size: 12.5, weight: .semibold))
+                                .foregroundStyle(Ink.text)
+                                .lineLimit(1)
+                        }
+                        .padding(.leading, 5).padding(.trailing, 10).frame(height: 30)
+                        .background(Ink.raised, in: .capsule)
+                        .overlay(Capsule().strokeBorder(Ink.line))
+                        .contentShape(.capsule)
+                    }
+                    .buttonStyle(PressScale())
+                    .accessibilityLabel(link.kind.isWallet ? "\(link.displayTitle) address" : "\(link.displayTitle), \(link.subtitle)")
+                    .accessibilityHint(link.url != nil ? "Opens in your browser after asking" : "Shows the address")
+                }
             }
             .frame(maxWidth: .infinity)
             .confirmationDialog("Leave Pulshade?", isPresented: Binding(get: { asking != nil }, set: { if !$0 { asking = nil } }),
@@ -90,75 +57,49 @@ struct ProfileLinkList: View {
             }
         }
     }
+}
 
-    /// Links as a grid of logos with their names, all in view, like a link page.
-    private func linkTiles(_ items: [ProfileLink]) -> some View {
-        ExpandableCard(title: "Links", symbol: "link", count: items.count, startsOpen: true) {
-            HStack(spacing: -7) {
-                ForEach(items.prefix(5)) { BrandTile(kind: $0.kind, size: 24) }
+/// Lays its children out in rows, each row centred, starting a new row when one is full.
+struct CenteredFlow: Layout {
+    var spacing: CGFloat = 6
+    var lineSpacing: CGFloat = 6
+
+    private func rows(_ subviews: Subviews, width: CGFloat) -> [[(Int, CGSize)]] {
+        var rows: [[(Int, CGSize)]] = [[]]
+        var x: CGFloat = 0
+        for (i, view) in subviews.enumerated() {
+            let size = view.sizeThatFits(.unspecified)
+            let fitted = CGSize(width: min(size.width, width), height: size.height)
+            if x > 0 && x + fitted.width > width {
+                rows.append([])
+                x = 0
             }
-        } content: {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 74, maximum: 100), spacing: 8)], spacing: 12) {
-                ForEach(items) { link in
-                    Button { asking = link } label: {
-                        VStack(spacing: 7) {
-                            BrandTile(kind: link.kind, size: 46)
-                                .shadow(color: tint.opacity(0.18), radius: 8, y: 3)
-                            Text(link.displayTitle)
-                                .font(.system(size: 11.5, weight: .medium))
-                                .foregroundStyle(Ink.dim)
-                                .lineLimit(1)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .contentShape(.rect)
-                    }
-                    .buttonStyle(PressScale())
-                    .accessibilityLabel("\(link.displayTitle), \(link.subtitle)")
-                    .accessibilityHint("Opens in your browser after asking")
-                }
-            }
-            .padding(.horizontal, 10).padding(.vertical, 14)
+            rows[rows.count - 1].append((i, fitted))
+            x += fitted.width + spacing
         }
+        return rows
     }
 
-    private func card(_ title: String, _ items: [ProfileLink]) -> some View {
-        ExpandableCard(title: title, symbol: title == "Wallets" ? "wallet.bifold" : "link", count: items.count, startsOpen: true) {
-            HStack(spacing: -7) {
-                ForEach(items.prefix(5)) { BrandTile(kind: $0.kind, size: 24) }
-            }
-        } content: {
-            VStack(spacing: 0) {
-                ForEach(Array(items.enumerated()), id: \.element.id) { i, link in
-                    if i > 0 { Divider().overlay(Ink.line).padding(.leading, 62) }
-                    row(link)
-                }
-            }
-        }
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let width = proposal.width ?? .infinity
+        let lines = rows(subviews, width: width)
+        let height = lines.reduce(0) { $0 + ($1.map(\.1.height).max() ?? 0) } + lineSpacing * CGFloat(max(lines.count - 1, 0))
+        let widest = lines.map { $0.reduce(0) { $0 + $1.1.width } + spacing * CGFloat(max($0.count - 1, 0)) }.max() ?? 0
+        return CGSize(width: proposal.width ?? widest, height: height)
     }
 
-    private func row(_ link: ProfileLink) -> some View {
-        Button {
-            if link.url != nil { asking = link } else { showing = link }
-        } label: {
-            HStack(spacing: 14) {
-                BrandTile(kind: link.kind, size: 38)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(link.displayTitle)
-                        .font(.system(size: 15, weight: .semibold)).foregroundStyle(Ink.text).lineLimit(1)
-                    Text(link.subtitle)
-                        .font(.system(size: 12.5, design: link.kind.isWallet ? .monospaced : .default))
-                        .foregroundStyle(Ink.dim).lineLimit(1).truncationMode(.middle)
-                }
-                Spacer(minLength: 8)
-                Image(systemName: link.url != nil ? "arrow.up.right" : "qrcode")
-                    .font(.system(size: 13, weight: .semibold)).foregroundStyle(tint)
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var y = bounds.minY
+        for line in rows(subviews, width: bounds.width) {
+            let lineWidth = line.reduce(0) { $0 + $1.1.width } + spacing * CGFloat(max(line.count - 1, 0))
+            let lineHeight = line.map(\.1.height).max() ?? 0
+            var x = bounds.minX + (bounds.width - lineWidth) / 2
+            for (i, size) in line {
+                subviews[i].place(at: CGPoint(x: x, y: y + (lineHeight - size.height) / 2), proposal: ProposedViewSize(size))
+                x += size.width + spacing
             }
-            .padding(.horizontal, 12).padding(.vertical, 10)
-            .contentShape(.rect)
+            y += lineHeight + lineSpacing
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(link.kind.isWallet ? "\(link.displayTitle) address" : "\(link.displayTitle), \(link.subtitle)")
-        .accessibilityHint(link.url != nil ? "Opens in your browser after asking" : "Shows the address")
     }
 }
 

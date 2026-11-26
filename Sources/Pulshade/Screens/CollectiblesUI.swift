@@ -184,30 +184,146 @@ struct CollectibleShowcase: View {
     var copies: [Collectible]
     var isMine = false
     @State private var open: Collectible?
-    @State private var showingAll = false
 
     var body: some View {
         if let list = model.collectibleList {
-            VStack(spacing: 12) {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 96), spacing: 10)], spacing: 10) {
-                    ForEach(copies) { copy in
-                        if let item = list.item(copy.item) {
-                            Button { open = copy } label: { CollectibleTile(item: item, copy: copy) }
-                                .buttonStyle(.plain)
-                        }
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 96), spacing: 10)], spacing: 10) {
+                ForEach(copies) { copy in
+                    if let item = list.item(copy.item) {
+                        Button { open = copy } label: { CollectibleTile(item: item, copy: copy) }
+                            .buttonStyle(.plain)
                     }
-                }
-                if isMine {
-                    Button { showingAll = true } label: {
-                        Label(copies.isEmpty ? "Choose collectibles to show" : "Your collection", systemImage: "square.grid.2x2")
-                            .font(.system(size: 14, weight: .semibold))
-                    }
-                    .buttonStyle(.bordered)
                 }
             }
             .sheet(item: $open) { copy in CollectibleDetail(copy: copy, isMine: isMine) }
-            .sheet(isPresented: $showingAll) { NavigationStack { CollectionScreen() } }
         }
+    }
+}
+
+// MARK: - Picking what your profile shows
+
+/// The Collectibles part of Edit profile: the showcase as six slots (tap any to choose), whether friends see it,
+/// and the way into your whole collection.
+struct ShowcaseEditor: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.theme) private var theme
+    @State private var picking = false
+    @State private var showingAll = false
+
+    var body: some View {
+        let held = model.collection(for: model.activePersona)
+        let shown = model.showcase(for: model.activePersona)
+        let list = model.collectibleList
+        SettingsGroup("Collectibles", footer: "Friends see the ones you pick, up to \(AppModel.showcaseLimit). Nobody else does.") {
+            if let list, !held.isEmpty {
+                Button { picking = true } label: {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
+                        ForEach(0..<AppModel.showcaseLimit, id: \.self) { i in
+                            slot(i < shown.count ? shown[i] : nil, list: list)
+                        }
+                    }
+                    .padding(12)
+                    .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Choose what your profile shows, \(shown.count) of \(AppModel.showcaseLimit) picked")
+                RowDivider()
+            }
+            SettingRow("Show to friends") {
+                Toggle("Show to friends", isOn: Binding(get: { model.data.hideCollection != true },
+                                                       set: { model.setHideCollection(!$0) }))
+                    .labelsHidden()
+                    .toggleStyle(GlowToggleStyle())
+            }
+            RowDivider()
+            Button { showingAll = true } label: {
+                SettingRow("Your collection") {
+                    HStack(spacing: 6) {
+                        Text(list == nil ? "Loading…" : held.isEmpty ? "None yet" : "\(held.count)")
+                            .font(.system(size: 14)).foregroundStyle(Ink.faint)
+                        Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Ink.faint)
+                    }
+                }
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+        }
+        .sheet(isPresented: $picking) { NavigationStack { ShowcasePicker() } }
+        .sheet(isPresented: $showingAll) { NavigationStack { CollectionScreen() } }
+    }
+
+    private func slot(_ copy: Collectible?, list: CollectibleList) -> some View {
+        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+        return ZStack {
+            if let copy, let item = list.item(copy.item) {
+                VStack(spacing: 4) {
+                    CollectibleArt(item: item, size: 54, animated: false)
+                    Text("#\(copy.serial)").font(.system(size: 10.5).monospacedDigit()).foregroundStyle(Ink.faint)
+                }
+            } else {
+                Image(systemName: "plus").font(.system(size: 16, weight: .semibold)).foregroundStyle(Ink.faint)
+            }
+        }
+        .frame(maxWidth: .infinity).frame(height: 84)
+        .background(copy == nil ? Color.clear : Ink.raised, in: shape)
+        .overlay(shape.strokeBorder(Ink.line, style: StrokeStyle(lineWidth: 1, dash: copy == nil ? [5, 4] : [])))
+    }
+}
+
+/// Everything you hold, to tick the ones your profile shows. The order you tick them is the order they appear.
+struct ShowcasePicker: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        let held = model.collection(for: model.activePersona)
+        let chosen = model.showcase(for: model.activePersona).map(\.id)
+        ScrollView {
+            VStack(spacing: 12) {
+                Text("\(chosen.count) of \(AppModel.showcaseLimit) picked. Tap to add or take one off.")
+                    .font(.system(size: 13)).foregroundStyle(Ink.faint)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if let list = model.collectibleList {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 100), spacing: 10)], spacing: 10) {
+                        ForEach(held) { copy in
+                            if let item = list.item(copy.item) {
+                                let index = chosen.firstIndex(of: copy.id)
+                                let full = index == nil && chosen.count >= AppModel.showcaseLimit
+                                Button {
+                                    Haptics.tick()
+                                    model.setShowcase(index == nil ? chosen + [copy.id] : chosen.filter { $0 != copy.id })
+                                } label: {
+                                    CollectibleTile(item: item, copy: copy)
+                                        .overlay(alignment: .topTrailing) {
+                                            if let index {
+                                                Text("\(index + 1)")
+                                                    .font(.system(size: 11, weight: .bold)).foregroundStyle(Ink.onAccent)
+                                                    .frame(width: 22, height: 22)
+                                                    .background(theme.accent, in: .circle)
+                                                    .padding(6)
+                                            }
+                                        }
+                                        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                            .strokeBorder(index == nil ? .clear : theme.accent, lineWidth: 2))
+                                        .opacity(full ? 0.45 : 1)
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(full)
+                                .accessibilityAddTraits(index == nil ? [] : .isSelected)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(16)
+        }
+        .background(Ink.base)
+        .navigationTitle("Show on profile")
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
+        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
     }
 }
 
@@ -267,15 +383,6 @@ struct CollectionScreen: View {
                         }
                     }
                 }
-                Toggle(isOn: Binding(get: { model.data.hideCollection != true }, set: { model.setHideCollection(!$0) })) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Show to friends").font(.system(size: 15, weight: .medium)).foregroundStyle(Ink.text)
-                        Text("Friends see the ones you pick for your profile. Nobody else does.")
-                            .font(.system(size: 12)).foregroundStyle(Ink.faint)
-                    }
-                }
-                .padding(14)
-                .background(Ink.surface, in: .rect(cornerRadius: 14, style: .continuous))
                 if let code = model.collectorCode(for: model.activePersona) {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Collector code").font(.system(size: 13, weight: .semibold)).foregroundStyle(Ink.text)

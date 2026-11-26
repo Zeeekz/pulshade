@@ -5,7 +5,7 @@ import PulshadeShared
 
 /// The pages Settings opens, each from a row on the main list.
 enum SettingsPage: String, Hashable {
-    case profile, invite, handles, pinned, privacy, privacyLock, privacyMessages, privacyPasscodes, privacyBackup, blocked, notifications, appearance, storage, network, networkWaiting, anonymity, account
+    case profile, myProfile, profilePreview, invite, handles, pinned, privacy, privacyLock, privacyMessages, privacyPasscodes, privacyBackup, blocked, notifications, appearance, storage, network, networkWaiting, anonymity, account
 }
 
 /// Settings, laid out like a phone's own: your profile on top, then a short list of rows,
@@ -14,8 +14,6 @@ struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     @State private var path: [SettingsPage] = []
-    /// The @handle at the top says "Copied" for a moment after it's tapped.
-    @State private var copiedHandle = false
     #if DEBUG
     @State private var demoCrop: PendingCrop?
     @State private var demoFrame = CropFrame.avatar
@@ -27,7 +25,7 @@ struct SettingsView: View {
                 VStack(spacing: 22) {
                     header
                     SettingsGroup {
-                        MenuRow(page: .profile, symbol: "person.crop.circle.fill", color: .hex(0x3D8BFF), title: "Profile",
+                        MenuRow(page: .profile, symbol: "pencil", color: .hex(0x3D8BFF), title: "Edit profile",
                                 value: model.activeProfile.handle.map { "@\($0)" } ?? "No username")
                         RowDivider(inset: 54)
                         MenuRow(page: .invite, symbol: "person.badge.plus", color: .hex(0x30D158), title: "Add a friend",
@@ -71,10 +69,11 @@ struct SettingsView: View {
             .navigationDestination(for: SettingsPage.self) { page in
                 Group {
                     switch page {
-                    case .profile: ProfileSettings()
+                    case .profile, .pinned: ProfileEditScreen()
+                    case .myProfile: MyProfileView()
+                    case .profilePreview: MyProfileView(fromEditor: true)
                     case .invite: PeopleView(openChat: { model.requestedConversation = $0 }, inSettings: true)
                     case .handles: HandleSettings()
-                    case .pinned: PinnedSettings()
                     case .privacy: PrivacySettings()
                     case .privacyLock: LockSettings()
                     case .privacyMessages: MessagePrivacySettings()
@@ -118,40 +117,39 @@ struct SettingsView: View {
         return model.data.security.tor ? (local ? "Offline" : "Tor") : "Direct"
     }
 
-    /// Picture, name and @handle, centred, as the top of the page.
+    /// Your card at the top of the page: picture, name and @handle. A tap opens your profile as others see it.
     private var header: some View {
-        VStack(spacing: 10) {
-            AvatarPicker(image: Binding(get: { model.activeProfile.avatar },
-                                        set: { v in model.updateProfile { $0.avatar = v } }),
-                         seed: model.fingerprint, size: 92)
-            HStack(spacing: 6) {
-                Text(model.activeProfile.displayName)
-                    .font(.system(size: 22, weight: .semibold))
-                    .foregroundStyle(Ink.text)
-            }
-            // Tap the @handle to copy it.
-            Button {
-                guard let handle = model.activeProfile.handle else { return }
-                copyToClipboard("@\(handle)")
-                Haptics.tick()
-                withAnimation(.snappy) { copiedHandle = true }
-                Task {
-                    try? await Task.sleep(for: .seconds(1.5))
-                    withAnimation(.snappy) { copiedHandle = false }
+        NavigationLink(value: SettingsPage.myProfile) {
+            HStack(spacing: 14) {
+                Avatar(image: model.activeProfile.avatar, seed: model.fingerprint, size: 64, showsStory: false)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(model.activeProfile.displayName)
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(Ink.text)
+                        .lineLimit(1)
+                    Text(model.activeProfile.handle.map { "@\($0)" } ?? "No username")
+                        .font(.system(size: 14))
+                        .foregroundStyle(model.activeProfile.handle == nil ? Ink.faint : theme.accent)
+                        .lineLimit(1)
+                    Text("View profile").font(.system(size: 12, weight: .medium)).foregroundStyle(Ink.faint)
                 }
-            } label: {
-                Text(copiedHandle ? "Copied" : (model.activeProfile.handle.map { "@\($0)" } ?? "No username"))
-                    .font(.system(size: 14))
-                    .foregroundStyle(model.activeProfile.handle == nil ? Ink.dim : theme.accent)
-                    .contentShape(Rectangle())
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right").font(.system(size: 13, weight: .semibold)).foregroundStyle(Ink.faint)
             }
-            .buttonStyle(.plain)
-            .disabled(model.activeProfile.handle == nil)
-            .accessibilityLabel(model.activeProfile.handle.map { "@\($0)" } ?? "No username")
-            .accessibilityHint(model.activeProfile.handle == nil ? "" : "Copies your username")
+            .padding(14)
+            .background {
+                ZStack(alignment: .top) {
+                    Ink.surface
+                    LinearGradient(colors: [theme.accent.opacity(theme.scheme == .light ? 0.12 : 0.18), theme.accent.opacity(0)],
+                                   startPoint: .topLeading, endPoint: .bottomTrailing)
+                }
+            }
+            .clipShape(.rect(cornerRadius: 18, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(Ink.line))
+            .contentShape(.rect(cornerRadius: 18))
         }
-        .frame(maxWidth: .infinity)
-        .padding(.top, 8)
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(model.activeProfile.displayName), view profile")
     }
 }
 
@@ -450,24 +448,22 @@ struct SettingsScreen<Content: View>: View {
 
 // MARK: - Profile
 
-private struct ProfileSettings: View {
+/// Edit profile: every part of your profile in one page, in the order it appears on the profile itself. Picture, then
+/// name and bio, the username, links and wallets, notes, and the collectibles you show. With personas, the bar at the
+/// top says which one you're editing.
+struct ProfileEditScreen: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     @State private var name = ""
     @State private var bio = ""
     @State private var burningPersona = false
 
-    private var pinnedCount: Int { (model.activeProfile.links ?? []).count + (model.activeProfile.notes ?? []).count }
     private static let bioLimit = 120
 
-    private func hint(_ text: String, color: Color) -> some View {
-        Text(text)
-            .font(.system(size: 12, weight: .medium))
-            .foregroundStyle(color)
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 16)
-            .padding(.bottom, 10)
+    private var usernameValue: String? {
+        let more = model.activeProfile.activeHandles.count - 1
+        if model.activeProfile.handle == nil { return nil }
+        return more > 0 ? "+\(more) more" : "On"
     }
 
     /// A labelled row: the label on the left, the field filling the rest.
@@ -521,64 +517,31 @@ private struct ProfileSettings: View {
         .accessibilityAddTraits(on ? .isSelected : [])
     }
 
-    /// Cards for what your profile doesn't show yet, each opening the page where you add it. They leave as you fill them.
-    @ViewBuilder private var addPrompts: some View {
-        let hasLinks = !ProfileLink.cleaned(model.activeProfile.links ?? []).isEmpty
-        let hasNotes = !ProfileNote.cleaned(model.activeProfile.notes ?? []).isEmpty
-        if !hasLinks || !hasNotes {
-            VStack(spacing: 8) {
-                if !hasLinks { addPrompt(.pinned, "link", "Add links and wallets", "Show your socials and wallets on your profile.") }
-                if !hasNotes { addPrompt(.pinned, "doc.text", "Pin a note", "Public, or locked with a password.") }
-            }
-        }
-    }
-
-    private func addPrompt(_ page: SettingsPage, _ symbol: String, _ title: String, _ subtitle: String) -> some View {
-        NavigationLink(value: page) {
-            HStack(spacing: 12) {
-                Image(systemName: symbol).font(.system(size: 16, weight: .semibold)).foregroundStyle(theme.accent)
-                    .frame(width: 36, height: 36)
-                    .background(theme.accent.opacity(0.14), in: .rect(cornerRadius: 10, style: .continuous))
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title).font(.system(size: 15, weight: .semibold)).foregroundStyle(Ink.text)
-                    Text(subtitle).font(.system(size: 12)).foregroundStyle(Ink.faint)
-                }
-                Spacer(minLength: 8)
-                Image(systemName: "plus").font(.system(size: 13, weight: .semibold)).foregroundStyle(Ink.faint)
-            }
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Ink.surface, in: .rect(cornerRadius: 14, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Ink.line, style: StrokeStyle(lineWidth: 1, dash: [5, 4])))
-            .contentShape(.rect)
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func sectionNote(_ text: String) -> some View {
-        Text(text).font(.system(size: 12)).foregroundStyle(Ink.faint)
-            .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 6)
-    }
-
     var body: some View {
-        SettingsScreen(title: "Profile") {
+        SettingsScreen(title: "Edit profile", back: "Me") {
             if !model.personas.isEmpty {
-                personaBar
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("EDITING").font(.system(size: 11, weight: .medium)).tracking(0.4).foregroundStyle(Ink.faint).padding(.leading, 14)
+                    personaBar
+                }
             }
-            VStack(spacing: 6) {
-                ProfileHero(avatar: model.activeProfile.avatar, seed: model.fingerprint,
-                            name: model.activeProfile.displayName, handle: model.activeProfile.handle,
-                            bio: model.activeProfile.bio,
-                            avatarEditor: AnyView(AvatarPicker(image: Binding(get: { model.activeProfile.avatar },
-                                                                              set: { v in model.updateProfile { $0.avatar = v } }),
-                                                               seed: model.fingerprint, size: 84))) { EmptyView() }
-                sectionNote("This is how people see you. Tap your picture to change it.")
+            VStack(spacing: 12) {
+                AvatarPicker(image: Binding(get: { model.activeProfile.avatar },
+                                            set: { v in model.updateProfile { $0.avatar = v } }),
+                             seed: model.fingerprint, size: 104)
+                NavigationLink(value: SettingsPage.profilePreview) {
+                    Label("See it as others do", systemImage: "eye")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(theme.accent)
+                        .padding(.horizontal, 14).frame(height: 32)
+                        .background(theme.accent.opacity(0.12), in: .capsule)
+                        .contentShape(.capsule)
+                }
+                .buttonStyle(.plain)
             }
-            ProfileTabs(links: model.activeProfile.links ?? [], notes: model.activeProfile.notes ?? [],
-                        collectibles: model.showcase(for: model.activePersona), isMine: true,
-                        hasCollectibleList: model.collectibleList != nil)
-            addPrompts
-            SettingsGroup("About you", footer: "Only people you chat with see these.") {
+            .frame(maxWidth: .infinity)
+            .padding(.top, 4)
+            SettingsGroup("Name and bio", footer: "Friends see these, and so does anyone who finds your username.") {
                 fieldRow("Name") {
                     TextField("", text: $name, prompt: Text("Your name").foregroundStyle(Ink.faint))
                         .textFieldStyle(.plain)
@@ -604,15 +567,16 @@ private struct ProfileSettings: View {
                     }
                 }
             }
-            SettingsGroup {
-                MenuRow(page: .handles, symbol: "at", color: .hex(0x3D8BFF), title: "Username",
-                        value: model.activeProfile.handle.map { "@\($0)" } ?? "No username")
-                RowDivider(inset: 54)
-                MenuRow(page: .pinned, symbol: "pin.fill", color: .hex(0xFF9F0A), title: "Pinned",
-                        value: pinnedCount == 0 ? nil : "\(pinnedCount)")
+            SettingsGroup("Username", footer: "Optional. Lets people find you and send a chat request. Up to \(AppModel.maxHandles).") {
+                MenuRow(page: .handles, symbol: "at", color: .hex(0x3D8BFF),
+                        title: model.activeProfile.handle.map { "@\($0)" } ?? "Claim a username",
+                        value: usernameValue)
             }
+            ProfileLinksEditor()
+            ProfileNotesEditor()
+            ShowcaseEditor()
             if let id = model.activePersona {
-                SettingsGroup(footer: "Burning this persona deletes it for good.") {
+                SettingsGroup("Persona", footer: "Burning this persona deletes it for good, with its chats and contacts.") {
                     ActionRow(title: "Burn persona", destructive: true) { burningPersona = true }
                 }
                 .sheet(isPresented: $burningPersona) { PersonaBurnSheet(persona: id) }
@@ -628,12 +592,12 @@ private struct ProfileSettings: View {
 
 // MARK: - Handles
 
-/// The page for a persona's handles on its own (the same editor is on the Profile page).
+/// The page for a persona's handles, opened from Edit profile.
 private struct HandleSettings: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        SettingsScreen(title: "Username", back: "Profile") {
+        SettingsScreen(title: "Username", back: "Edit") {
             HandlesEditor()
             if model.activeProfile.handle != nil {
                 SettingsGroup {
@@ -641,12 +605,6 @@ private struct HandleSettings: View {
                 }
             }
         }
-    }
-}
-
-private struct PinnedSettings: View {
-    var body: some View {
-        SettingsScreen(title: "Pinned", back: "Profile") { PinnedEditor() }
     }
 }
 

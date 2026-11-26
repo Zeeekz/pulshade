@@ -1,5 +1,8 @@
 #if DEBUG
 import Foundation
+#if canImport(PulshadeShared)
+import PulshadeShared
+#endif
 
 /// `PULSHADE_DEMO=1` opens a throwaway, unlocked identity full of sample chats so
 /// the UI can be reviewed without a passcode. Debug builds only; never touches the real vault.
@@ -92,6 +95,17 @@ extension AppModel {
         d.profile.color = 2
         d.profile.handle = "nova"
         d.profile.bio = "night drives & film cameras"
+        // Links, wallets and notes, so the profile screens have something in every part.
+        d.profile.links = [ProfileLink.make(.website, from: "https://example.com"),
+                           ProfileLink.make(.github, from: "https://github.com/example")].compactMap { $0 }
+        d.profile.notes = [ProfileNote(id: "a1b2c3d4e5f60718", title: "Where to find me", text: "Rooftops after midnight.")]
+        d.contacts[0].links = [ProfileLink.make(.website, from: "https://example.com"),
+                               ProfileLink.make(.instagram, from: "https://instagram.com/example"),
+                               ProfileLink.make(.x, from: "https://x.com/example"),
+                               ProfileLink.make(.bitcoin, from: "bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq")].compactMap { $0 }
+        d.contacts[0].notes = [ProfileNote(id: "0f1e2d3c4b5a6978", title: "Film stocks I like", text: "Portra 400, Cinestill 800T."),
+                               ProfileNote(id: "1122334455667788", title: "Gear list", text: "Two bodies, one lens.")]
+        d.contacts[0].nickname = "Kai ✦"
         // Two people asking to chat.
         for (name, note, color) in [("Lumen", "saw your shots from the rooftop, insane", 1), ("Vex", "", 7)] {
             let them = Identity.generate()

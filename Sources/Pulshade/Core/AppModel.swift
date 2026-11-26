@@ -189,7 +189,8 @@ final class AppModel {
     @ObservationIgnored private var backupTask: Task<Void, Never>?
     @ObservationIgnored static var backupWait: ClosedRange<Int> = 90...600
     private var lastActivity = Date()
-    private var profileTask: Task<Void, Never>?
+    /// The pending "tell my contacts" for each profile (main or persona), so editing one doesn't cancel another's.
+    private var profileTasks: [String: Task<Void, Never>] = [:]
 
     /// The colour theme isn't secret, so it's mirrored outside the vault to tint the lock screen.
     var theme: Theme {
@@ -1553,8 +1554,8 @@ final class AppModel {
     private func forgetSession() {
         readyTask?.cancel()
         readyTask = nil
-        profileTask?.cancel()
-        profileTask = nil
+        for task in profileTasks.values { task.cancel() }
+        profileTasks = [:]
         // The helper's copy of this account's envelope keys lives in the Keychain so the locked phone can use it;
         // the copy in this process must not outlive the unlock that wrote it.
         helperWritten = nil
@@ -2044,6 +2045,18 @@ final class AppModel {
     /// again, none if there are none. With no contact (the public listing), only the notes for everyone.
     static func sharedNotes(_ profile: Profile, for fingerprint: String? = nil) -> [ProfileNote]? {
         ProfileNote.notes(profile.notes, sentTo: fingerprint)
+    }
+
+    /// The note a note card in a chat stands for: one of your own profiles' notes when you sent it, otherwise the copy
+    /// that came with the sender's profile. The chat can belong to any persona, not only the one open now, so every
+    /// record of the sender is looked at (the open persona's first), and every one of your profiles for your own.
+    func note(for card: NoteCard, sentBy sender: String, mine: Bool) -> ProfileNote? {
+        if mine {
+            let profiles = [activeProfile, data.profile] + data.personas.map(\.profile)
+            return profiles.lazy.compactMap { $0.notes?.first { $0.id == card.id } }.first
+        }
+        let records = [contact(sender, in: activePersona)].compactMap { $0 } + data.contacts.filter { $0.fingerprint == sender }
+        return records.lazy.compactMap { $0.notes?.first { $0.id == card.id } }.first
     }
 
     /// The links and wallets of a profile that are worth sending: checked again, none if there are none.
@@ -5698,8 +5711,9 @@ final class AppModel {
         profile.updatedAt = Date()
         setProfile(profile, for: persona)
         save()
-        profileTask?.cancel()
-        profileTask = Task { [weak self] in
+        let slot = persona?.uuidString ?? "main"
+        profileTasks[slot]?.cancel()
+        profileTasks[slot] = Task { [weak self] in
             try? await Task.sleep(for: .seconds(1.5))
             guard !Task.isCancelled, let self else { return }
             for c in self.contacts(of: persona) { self.enqueue(self.profilePayload(persona, for: c.fingerprint), to: c) }

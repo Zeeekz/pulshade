@@ -3,23 +3,16 @@ import SwiftUI
 import PulshadeShared
 #endif
 
-/// What you've pinned to your profile, in one list: links, wallets and notes. A "+" at the top offers each kind,
-/// so the page stays short however much is pinned. Nothing invalid is ever saved.
-struct PinnedEditor: View {
+/// The Links and wallets part of Edit profile: each one a row (tap to change it, the bin to remove it), then a way to
+/// add a link or a wallet. Nothing invalid is ever saved.
+struct ProfileLinksEditor: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     @State private var linkDraft: LinkDraft?
-    @State private var noteDraft: NoteDraft?
     @State private var pending: Pending?
-
-    struct NoteDraft: Identifiable {
-        var existing: ProfileNote?
-        var id: String { existing?.id ?? "new" }
-    }
 
     private static let maxCustom = 6
     private var links: [ProfileLink] { model.activeProfile.links ?? [] }
-    private var notes: [ProfileNote] { model.activeProfile.notes ?? [] }
     private var used: Set<ProfileLinkKind> { Set(links.map(\.kind)) }
 
     private func free(wallets: Bool) -> [ProfileLinkKind] {
@@ -29,23 +22,23 @@ struct PinnedEditor: View {
     }
 
     var body: some View {
-        let empty = links.isEmpty && notes.isEmpty
-        SettingsGroup("Pinned to your profile",
-                      footer: "Links and wallets are public. Notes can be public, locked, or sent to chosen contacts.") {
-            if empty {
-                SettingRow("Nothing pinned yet") { EmptyView() }
-                    .foregroundStyle(Ink.faint)
-            }
+        SettingsGroup("Links and wallets", footer: "Shown under your bio, to friends and to anyone who finds your username.") {
             ForEach(Array(links.enumerated()), id: \.element.id) { i, link in
                 if i > 0 { RowDivider(inset: 62) }
                 linkRow(link)
             }
-            ForEach(Array(notes.enumerated()), id: \.element.id) { i, note in
-                if i > 0 || !links.isEmpty { RowDivider(inset: 62) }
-                noteRow(note)
+            if !links.isEmpty { RowDivider(inset: 16) }
+            HStack(spacing: 0) {
+                if !free(wallets: false).isEmpty {
+                    PinAddButton(title: "Add link", symbol: "link") { linkDraft = LinkDraft(wallets: false) }
+                }
+                if !free(wallets: false).isEmpty && !free(wallets: true).isEmpty {
+                    Rectangle().fill(Ink.line).frame(width: 1, height: 28)
+                }
+                if !free(wallets: true).isEmpty {
+                    PinAddButton(title: "Add wallet", symbol: "wallet.bifold") { linkDraft = LinkDraft(wallets: true) }
+                }
             }
-            RowDivider(inset: 16)
-            addMenu
         }
         .confirms($pending)
         .sheet(item: $linkDraft) { draft in
@@ -58,33 +51,6 @@ struct PinnedEditor: View {
                 }
             }
         }
-        .sheet(item: $noteDraft) { draft in
-            NoteEditSheet(existing: draft.existing) { saved in
-                storeNotes { list in
-                    if let i = list.firstIndex(where: { $0.id == saved.id }) { list[i] = saved } else { list.append(saved) }
-                }
-            }
-        }
-    }
-
-    private var addMenu: some View {
-        Menu {
-            if !free(wallets: false).isEmpty { Button("Link", systemImage: "link") { linkDraft = LinkDraft(wallets: false) } }
-            if !free(wallets: true).isEmpty { Button("Wallet", systemImage: "wallet.bifold") { linkDraft = LinkDraft(wallets: true) } }
-            if notes.count < ProfileNote.maxCount { Button("Note", systemImage: "doc.text") { noteDraft = NoteDraft() } }
-        } label: {
-            HStack(spacing: 14) {
-                Image(systemName: "plus")
-                    .font(.system(size: 15, weight: .bold)).foregroundStyle(theme.accent)
-                    .frame(width: 36, height: 36)
-                    .background(theme.accent.opacity(0.14), in: .rect(cornerRadius: 10, style: .continuous))
-                Text("Pin something").font(.system(size: 15, weight: .medium)).foregroundStyle(theme.accent)
-                Spacer()
-            }
-            .padding(.horizontal, 12).padding(.vertical, 8).frame(minHeight: 54).contentShape(.rect)
-        }
-        .menuStyle(.button)
-        .buttonStyle(.plain)
     }
 
     private func linkRow(_ link: ProfileLink) -> some View {
@@ -97,6 +63,82 @@ struct PinnedEditor: View {
                    }
                }) {
             BrandTile(kind: link.kind, size: 36)
+        }
+    }
+
+    private func pinRow<Icon: View>(title: String, subtitle: String, mono: Bool, edit: @escaping () -> Void,
+                                    remove: @escaping () -> Void, @ViewBuilder icon: () -> Icon) -> some View {
+        HStack(spacing: 14) {
+            Button(action: edit) {
+                HStack(spacing: 14) {
+                    icon()
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(title).font(.system(size: 15, weight: .medium)).foregroundStyle(Ink.text).lineLimit(1)
+                        Text(subtitle)
+                            .font(.system(size: 12.5, design: mono ? .monospaced : .default))
+                            .foregroundStyle(Ink.faint).lineLimit(1).truncationMode(.middle)
+                    }
+                    Spacer(minLength: 8)
+                }
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            Button(action: remove) {
+                Image(systemName: "trash").font(.system(size: 14)).foregroundStyle(Ink.faint).frame(width: 40, height: 40).contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Remove \(title)")
+        }
+        .padding(.horizontal, 12).padding(.vertical, 8).frame(minHeight: 54)
+    }
+
+    private func storeLinks(_ change: (inout [ProfileLink]) -> Void) {
+        model.updateProfile { profile in
+            var list = ProfileLink.cleaned(profile.links)
+            change(&list)
+            let order = Dictionary(uniqueKeysWithValues: ProfileLinkKind.allCases.enumerated().map { ($1, $0) })
+            list.sort { (order[$0.kind] ?? 0, $0.label ?? "") < (order[$1.kind] ?? 0, $1.label ?? "") }
+            profile.links = list.isEmpty ? nil : list
+        }
+    }
+
+}
+
+/// The Notes part of Edit profile: each note a row (tap to change it, the bin to delete it), then New note.
+/// A note can be public, locked with a password, or sent only to friends you choose.
+struct ProfileNotesEditor: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.theme) private var theme
+    @State private var noteDraft: NoteDraft?
+    @State private var pending: Pending?
+
+    struct NoteDraft: Identifiable {
+        var existing: ProfileNote?
+        var id: String { existing?.id ?? "new" }
+    }
+
+    private var notes: [ProfileNote] { model.activeProfile.notes ?? [] }
+
+    var body: some View {
+        SettingsGroup("Notes", footer: "Public, locked with a password, or only for friends you choose. Up to \(ProfileNote.maxCount).") {
+            ForEach(Array(notes.enumerated()), id: \.element.id) { i, note in
+                if i > 0 { RowDivider(inset: 62) }
+                noteRow(note)
+            }
+            if notes.count < ProfileNote.maxCount {
+                if !notes.isEmpty { RowDivider(inset: 16) }
+                HStack(spacing: 0) {
+                    PinAddButton(title: "New note", symbol: "square.and.pencil") { noteDraft = NoteDraft() }
+                }
+            }
+        }
+        .confirms($pending)
+        .sheet(item: $noteDraft) { draft in
+            NoteEditSheet(existing: draft.existing) { saved in
+                storeNotes { list in
+                    if let i = list.firstIndex(where: { $0.id == saved.id }) { list[i] = saved } else { list.append(saved) }
+                }
+            }
         }
     }
 
@@ -142,21 +184,30 @@ struct PinnedEditor: View {
         .padding(.horizontal, 12).padding(.vertical, 8).frame(minHeight: 54)
     }
 
-    private func storeLinks(_ change: (inout [ProfileLink]) -> Void) {
-        model.updateProfile { profile in
-            var list = ProfileLink.cleaned(profile.links)
-            change(&list)
-            let order = Dictionary(uniqueKeysWithValues: ProfileLinkKind.allCases.enumerated().map { ($1, $0) })
-            list.sort { (order[$0.kind] ?? 0, $0.label ?? "") < (order[$1.kind] ?? 0, $1.label ?? "") }
-            profile.links = list.isEmpty ? nil : list
-        }
-    }
-
     private func storeNotes(_ change: (inout [ProfileNote]) -> Void) {
         model.updateProfile { profile in
             var list = ProfileNote.cleaned(profile.notes, keepAudience: true)
             change(&list)
             profile.notes = list.isEmpty ? nil : list
         }
+    }
+}
+
+/// An add button at the foot of an editor list, sharing the row with its neighbour.
+private struct PinAddButton: View {
+    @Environment(\.theme) private var theme
+    var title: String
+    var symbol: String
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Label(title, systemImage: symbol)
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(theme.accent)
+                .frame(maxWidth: .infinity, minHeight: 50)
+                .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
     }
 }

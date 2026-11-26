@@ -1587,8 +1587,7 @@ private struct NoteCardView: View {
 
     /// The note itself: yours, or what the sender's profile has given you.
     private func note() -> ProfileNote? {
-        if message.isMine { return model.activeProfile.notes?.first { $0.id == card.id } }
-        return model.contact(message.sender, in: model.activePersona)?.notes?.first { $0.id == card.id }
+        model.note(for: card, sentBy: message.sender, mine: message.isMine)
     }
 
     var body: some View {
@@ -2008,7 +2007,8 @@ private struct ConversationInfo: View {
                         case .group, .channel: groupSections(c)
                         case .broadcast: membersSection(c)
                         }
-                        actions(c)
+                        // A person's chat has its own cards under their profile; everything else keeps this one.
+                        if c.kind != .direct || model.contact(c.members.first ?? "", in: c.persona) == nil { actions(c) }
                     }
                     .padding(20)
                     .confirms($pending)
@@ -2061,26 +2061,22 @@ private struct ConversationInfo: View {
         }
     }
 
-    /// A person's whole profile, as they made it: their picture, name, @handle and bio in a card, and what they've
-    /// sits half over it inside a ring of their own colour, then the name, @handle, bio and the things they've
-    /// pinned. Pulling down stretches the banner; everything eases in when the sheet opens.
+    /// A person's whole profile, as they made it: the card with Message, Call and Mute, then the tabs. What only you
+    /// set for them (nickname, safety number, pin) and the ways to report, block or delete come after, in
+    /// `directSection`.
     private func personProfile(_ peer: Contact, in c: Conversation) -> some View {
         let theirName = peer.name.isEmpty ? "Anonymous" : peer.name
-        var info: [ProfileInfoRow] = []
-        if !peer.isSelf {
-            info.append(ProfileInfoRow(symbol: peer.verified ? "checkmark.seal.fill" : "checkmark.seal", label: "Safety number",
-                                       value: peer.verified ? "Verified in person" : "Not verified yet", action: { pulseCheck = true }))
-        }
-        info.append(ProfileInfoRow(symbol: "lock.fill", label: "Encryption", value: summary(c)))
         let shared = model.data.conversations.filter { $0.kind == .group && $0.persona == c.persona && $0.members.contains(peer.fingerprint) }
             .map { ProfileGroupRef(id: $0.id, title: $0.title, avatar: $0.avatar, count: $0.members.count + 1) }
         return VStack(spacing: 14) {
             ProfileHero(avatar: c.avatar ?? peer.avatar, seed: peer.fingerprint,
                         name: peer.nickname.isEmpty ? theirName : peer.nickname,
-                        subtitle: peer.nickname.isEmpty ? nil : "Calls themselves \(theirName)",
-                        handle: peer.handle, bio: peer.bio, verified: peer.verified) {
+                        subtitle: peer.isSelf ? "This is you" : peer.nickname.isEmpty ? nil : "Calls themselves \(theirName)",
+                        handle: peer.handle, bio: peer.bio, verified: peer.verified,
+                        links: peer.links ?? [], walletChangedAt: peer.walletChangedAt, isMine: peer.isSelf,
+                        facts: peer.isSelf ? [] : friendFacts(peer, in: c, groups: shared.count)) {
                 HStack(spacing: 8) {
-                    ProfileActionTile(title: "Message", symbol: "bubble.left.fill") { dismiss() }
+                    ProfileActionTile(title: "Message", symbol: "bubble.left.fill", prominent: true) { dismiss() }
                     if !peer.isSelf {
                         ProfileActionTile(title: "Call", symbol: "phone.fill") {
                             dismiss()
@@ -2092,12 +2088,21 @@ private struct ConversationInfo: View {
                     }
                 }
             }
-            ProfileTabs(info: info, links: peer.links ?? [], notes: peer.notes ?? [],
+            ProfileTabs(notes: peer.notes ?? [],
                         collectibles: peer.isSelf ? model.showcase(for: c.persona) : model.showcase(of: peer),
-                        groups: shared, messages: c.messages, walletChangedAt: peer.walletChangedAt, isMine: peer.isSelf)
+                        groups: shared, messages: c.messages, isMine: peer.isSelf,
+                        hasCollectibleList: model.collectibleList != nil)
         }
         .padding(.horizontal, 16).padding(.top, 16)
         .frame(maxWidth: .infinity)
+    }
+
+    /// When you became friends, the groups you share and how much you've said to each other.
+    private func friendFacts(_ peer: Contact, in c: Conversation, groups: Int) -> [ProfileFact] {
+        let messages = c.messages.filter { !$0.isSystem }.count
+        return [ProfileFact(value: peer.addedAt.formatted(.dateTime.month(.abbreviated).year()), label: "Friends since"),
+                ProfileFact(value: "\(groups)", label: groups == 1 ? "Group" : "Groups"),
+                ProfileFact(value: messages.formatted(.number.notation(.compactName)), label: messages == 1 ? "Message" : "Messages")]
     }
 
     private func summary(_ c: Conversation) -> String {
@@ -2134,36 +2139,118 @@ private struct ConversationInfo: View {
 
     // MARK: Direct
 
+    /// Under a person's profile: first what only you see (your nickname for them, whether you've checked their safety
+    /// number, the chat's encryption, pinning it), then reporting, blocking, removing and deleting, together in red.
     @ViewBuilder private func directSection(_ c: Conversation) -> some View {
         if let fp = c.members.first, let contact = model.contact(fp, in: c.persona) {
-            Card {
-                Field(label: "Nickname") {
-                    TextField("", text: $nickname, prompt: Text(contact.name.isEmpty ? "Add a nickname" : contact.name)
-                        .foregroundStyle(Ink.faint))
-                        .textFieldStyle(.plain)
-                        .multilineTextAlignment(.trailing)
-                        .onSubmit { model.rename(fp, to: nickname.trimmingCharacters(in: .whitespaces)) }
-                        // On iPhone the sheet is usually closed without pressing Return.
-                        .onDisappear {
-                            let wanted = nickname.trimmingCharacters(in: .whitespaces)
-                            if wanted != contact.name { model.rename(fp, to: wanted) }
+            VStack(spacing: 7) {
+                ProfileSectionTitle(title: "Only you see this")
+                ProfileCard {
+                    if !contact.isSelf {
+                        manageRow("pencil", "Nickname") {
+                            TextField("", text: $nickname, prompt: Text(contact.name.isEmpty ? "Add one" : contact.name)
+                                .foregroundStyle(Ink.faint))
+                                .textFieldStyle(.plain)
+                                .font(.system(size: 15))
+                                .foregroundStyle(Ink.text)
+                                .multilineTextAlignment(.trailing)
+                                .onSubmit { model.rename(fp, to: nickname.trimmingCharacters(in: .whitespaces)) }
+                                // On iPhone the sheet is usually closed without pressing Return.
+                                .onDisappear {
+                                    let wanted = nickname.trimmingCharacters(in: .whitespaces)
+                                    if wanted != contact.name { model.rename(fp, to: wanted) }
+                                }
                         }
+                        RowDivider(inset: 52)
+                        Button { pulseCheck = true } label: {
+                            manageRow(contact.verified ? "checkmark.seal.fill" : "checkmark.seal", "Safety number") {
+                                HStack(spacing: 6) {
+                                    Text(contact.verified ? "Verified" : "Not verified")
+                                        .font(.system(size: 14))
+                                        .foregroundStyle(contact.verified ? theme.accent : Ink.faint)
+                                    Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Ink.faint)
+                                }
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .sheet(isPresented: $pulseCheck) { PulseCheckView(fingerprint: fp, persona: c.persona) }
+                        RowDivider(inset: 52)
+                    }
+                    manageRow("lock.fill", "Encryption") {
+                        Text(summary(c)).font(.system(size: 14)).foregroundStyle(Ink.faint)
+                    }
+                    RowDivider(inset: 52)
+                    Button { model.togglePin(id) } label: {
+                        manageRow(c.pinned ? "pin.slash" : "pin", c.pinned ? "Unpin chat" : "Pin chat to top") { EmptyView() }
+                    }
+                    .buttonStyle(.plain)
                 }
-                Divider().overlay(Ink.line)
-                Button { pulseCheck = true } label: {
-                    Field(label: "Pulse check") {
-                        HStack(spacing: 6) {
-                            Text(contact.verified ? "Verified" : "Not verified")
-                                .foregroundStyle(contact.verified ? theme.accent : Ink.faint)
-                            Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(Ink.faint)
+            }
+            ProfileCard {
+                if !contact.isSelf {
+                    Button { reporting = ReportSubject(key: contact.signingKey, handle: nil, name: contact.name) } label: {
+                        manageRow("flag", "Report", tint: .red) { EmptyView() }
+                    }
+                    .buttonStyle(.plain)
+                    .sheet(item: $reporting) { ReportSheet(subject: $0) }
+                    RowDivider(inset: 52)
+                    Button { confirmBlock = true } label: {
+                        manageRow("hand.raised", "Block", tint: .red) { EmptyView() }
+                    }
+                    .buttonStyle(.plain)
+                    .confirmationDialog("Block \(contact.displayName)?", isPresented: $confirmBlock, titleVisibility: .visible) {
+                        Button("Block", role: .destructive) {
+                            dismiss()
+                            model.blockContact(fp, persona: c.persona)
+                        }
+                    } message: {
+                        Text("Deleted on your side; anything they send is dropped. They aren't told. Unblock in Privacy & Security.")
+                    }
+                    if !contact.hidden {
+                        RowDivider(inset: 52)
+                        Button { confirmRemove = true } label: {
+                            manageRow("person.crop.circle.badge.minus", "Remove contact", tint: .red) { EmptyView() }
+                        }
+                        .buttonStyle(.plain)
+                        .confirmationDialog(RemoveContact.title(contact), isPresented: $confirmRemove, titleVisibility: .visible) {
+                            Button("Remove", role: .destructive) {
+                                dismiss()
+                                model.removeContact(fp, persona: c.persona)
+                            }
+                        } message: {
+                            Text(RemoveContact.detail)
                         }
                     }
-                    .contentShape(Rectangle())
+                    RowDivider(inset: 52)
+                }
+                Button { confirmDelete = true } label: {
+                    manageRow("trash", "Delete chat", tint: .red) { EmptyView() }
                 }
                 .buttonStyle(.plain)
-                .sheet(isPresented: $pulseCheck) { PulseCheckView(fingerprint: fp, persona: c.persona) }
+                .confirmationDialog(c.deleteWarning.title, isPresented: $confirmDelete, titleVisibility: .visible) {
+                    Button("Delete", role: .destructive) {
+                        dismiss()
+                        model.delete(id)
+                    }
+                } message: {
+                    Text(c.deleteWarning.detail)
+                }
             }
         }
+    }
+
+    private func manageRow<Trailing: View>(_ symbol: String, _ title: String, tint: Color? = nil,
+                                           @ViewBuilder trailing: () -> Trailing) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: symbol).font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(tint.map { $0.opacity(0.9) } ?? theme.accent).frame(width: 26)
+            Text(title).font(.system(size: 15)).foregroundStyle(tint.map { $0.opacity(0.9) } ?? Ink.text).lineLimit(1)
+            Spacer(minLength: 8)
+            trailing()
+        }
+        .padding(.horizontal, 14)
+        .frame(minHeight: 50)
+        .contentShape(.rect)
     }
 
     // MARK: Groups & channels

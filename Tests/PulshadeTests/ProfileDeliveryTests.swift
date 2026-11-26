@@ -98,6 +98,30 @@ struct ProfileDeliveryTests {
         #expect(NoteCard.cleaned(NoteCard(id: "", title: "x", locked: false, restricted: false)) == nil, "a card with no id is dropped")
     }
 
+    @Test func aNoteCardOpensWhenTheChatBelongsToAnotherPersona() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        // Bob knows Alice only through a persona, then goes back to his main profile.
+        let shadow = try #require(bob.createPersona(name: "Shadow"))
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: "", persona: .some(shadow.id)))
+        await settle(alice, bob)
+        bob.switchPersona(nil)
+        let note = try #require(ProfileNote.publicNote(title: "Wifi", text: "the password is swordfish"))
+        alice.updateProfile { $0.notes = [note] }
+        await settle(alice, bob, seconds: 6)
+        let chat = try #require(alice.data.conversations.first { $0.kind == .direct })
+        alice.send(NoteCard(note).fallbackText, note: NoteCard(note), in: chat.id)
+        await settle(alice, bob)
+
+        let theirs = try #require(bob.data.conversations.first { $0.kind == .direct && $0.persona == shadow.id }?.messages.last)
+        let card = try #require(theirs.note)
+        #expect(bob.contact(theirs.sender, in: bob.activePersona) == nil, "the open persona doesn't know her")
+        let found = bob.note(for: card, sentBy: theirs.sender, mine: false)
+        #expect(found?.text == "the password is swordfish", "the card still opens her note")
+        #expect(alice.note(for: card, sentBy: theirs.sender, mine: true)?.id == note.id, "and her own copy opens on her side")
+    }
+
     @Test func aNoteForChosenContactsReachesOnlyThemWithNoPassword() async throws {
         let alice = try await makeUser("Alice")
         let bob = try await makeUser("Bob")
