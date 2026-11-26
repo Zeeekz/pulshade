@@ -149,8 +149,10 @@ enum Payload: Codable, Equatable {
     /// Apps from before collectibles were removed also send `badge` and `collectibles`: the decoder skips keys it
     /// doesn't know, so the rest of their profile still arrives. Collectibles came back as `showcase` (format 2 copies,
     /// signed by the relay's issuer key); older apps skip it in turn.
+    /// `stamp` (milliseconds, never lower than the last one this device sent) lets the receiver ignore an older profile that
+    /// arrives after a newer one. Apps from before don't send it, and skip it.
     case profile(name: String, avatar: Data?, color: Int?, banner: Data? = nil, bio: String? = nil, handle: String? = nil,
-                 links: [ProfileLink]? = nil, notes: [ProfileNote]? = nil, showcase: Showcase? = nil)
+                 links: [ProfileLink]? = nil, notes: [ProfileNote]? = nil, showcase: Showcase? = nil, stamp: UInt64? = nil)
     case message(WireMessage)
     /// The messages reached the device (`read` nil or false), or were seen in the open chat. Older apps ignore
     /// `read`, so a read receipt still counts as delivered there.
@@ -392,6 +394,11 @@ struct DirectoryProfile: Codable, Equatable {
     /// Handles that mean "I want to report someone": searching one opens the report form.
     static let reportHandles: Set<String> = ["abuse", "report", "safety", "moderation"]
     static func isReserved(_ handle: String) -> Bool { handle.count < 3 || reservedNames.contains(handle) }
+    /// The creator's public signing key, the one the relay lets claim reserved names. Built in, so the Creator badge
+    /// doesn't rest on the relay's word alone: a relay that let another key claim one of those names can't give it the badge.
+    static let creatorKey = Data(base64Encoded: "6xw8PZWLRS09beLYnx2Pvz3cBEvqZ+Cs8IpTcXOCNZs=")!
+    /// Whether a profile with this handle and signing key gets the Creator badge.
+    static func isCreator(handle: String, signingKey: Data?) -> Bool { isReserved(handle) && signingKey == creatorKey }
 
     var card: PeerCard {
         PeerCard(name: name, avatar: avatar, color: color, signingKey: signingKey, agreementKey: agreementKey,

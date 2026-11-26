@@ -2071,7 +2071,18 @@ final class AppModel {
         return .profile(name: profile.name, avatar: profile.avatar, color: profile.color, banner: profile.banner,
                         bio: profile.bio.flatMap { $0.isEmpty ? nil : $0 }, handle: profile.handle,
                         links: Self.sharedLinks(profile), notes: Self.sharedNotes(profile, for: contact),
-                        showcase: sharedShowcase(persona))
+                        showcase: sharedShowcase(persona), stamp: nextProfileStamp())
+    }
+
+    /// The last profile stamp this device used. Kept in memory: after a restart the clock is ahead of it anyway.
+    @ObservationIgnored private var lastProfileStamp: UInt64 = 0
+
+    /// Now in milliseconds, but always above the last stamp, so profiles sent one after another are ordered even if the
+    /// clock steps back.
+    func nextProfileStamp(now: Date = Date()) -> UInt64 {
+        let ms = UInt64(max(0, now.timeIntervalSince1970 * 1000))
+        lastProfileStamp = max(ms, lastProfileStamp + 1)
+        return lastProfileStamp
     }
 
     /// Someone's signature colour: what they chose, or one picked from their fingerprint.
@@ -5148,10 +5159,11 @@ final class AppModel {
         }
     }
 
-    /// Looks up exactly one handle and checks its signature. Nil if nobody has it.
-    func findProfile(_ raw: String) async throws -> DirectoryProfile? {
+    /// Looks up exactly one handle and checks its signature. Nil if nobody has it. Searches go on the open persona's
+    /// own lookup lane, so the relay doesn't see two personas' searches on one connection; `lane` picks another.
+    func findProfile(_ raw: String, lane: String? = nil) async throws -> DirectoryProfile? {
         guard let handle = DirectoryProfile.validHandle(raw) else { throw DirectoryError.invalidHandle }
-        guard let client = client(nil, lane: "lookup") else { throw DirectoryError.unreachable }
+        guard let client = client(nil, lane: lane ?? "lookup|" + (activePersona?.uuidString ?? "main")) else { throw DirectoryError.unreachable }
         let found: RelayClient.DirectoryEntry?
         do { found = try await client.lookup(handle) } catch { throw DirectoryError.unreachable }
         guard let entry = found else { return nil }
@@ -5375,7 +5387,7 @@ final class AppModel {
         if let known = contact(profile.fingerprint, in: persona), !known.awaitingAcceptance, !known.hidden { return known }
         guard let (handshake, request) = signedHandshake(persona: persona, to: profile.signingKey, context: .request) else { return nil }
         let mailbox = Mailbox.make()
-        var contact = Contact(fingerprint: profile.fingerprint, name: String(profile.name.prefix(64)), avatar: profile.avatar,
+        var contact = Contact(fingerprint: profile.fingerprint, name: ProfileText.name(profile.name), avatar: profile.avatar,
                               signingKey: profile.signingKey, agreementKey: profile.agreementKey, sendID: profile.sendID,
                               receiveKey: mailbox.receiveKey)
         contact.color = profile.color
@@ -5397,7 +5409,7 @@ final class AppModel {
     func acceptRequest(_ id: FriendRequest.ID) -> Conversation? {
         guard let request = data.requests.first(where: { $0.id == id }) else { return nil }
         let mailbox = Mailbox.make()
-        var peer = Contact(fingerprint: request.fingerprint, name: String(request.card.name.prefix(64)),
+        var peer = Contact(fingerprint: request.fingerprint, name: ProfileText.name(request.card.name),
                            avatar: request.card.avatar, signingKey: request.card.signingKey,
                            agreementKey: request.card.agreementKey, sendID: request.card.sendID, receiveKey: mailbox.receiveKey,
                            device: request.device ?? Data())
@@ -8066,6 +8078,9 @@ final class AppModel {
     static func directoryLane(_ persona: UUID?) -> String { "dir|" + (persona?.uuidString ?? "main") }
     /// Each persona's collector key talks to the relay on a lane of its own, never the one its signed @handle requests
     /// use: a shared connection (and Tor circuit) would let the relay tie the handle to what the collector key holds.
+    /// A link tapped somewhere with no question of its own, waiting for "Leave Pulshade?" at the root.
+    var externalLink: URL?
+
     static func collectorLane(_ persona: UUID?) -> String { "collect|" + (persona?.uuidString ?? "main") }
 
     func client(_ relay: String?, lane: String = "main") -> RelayClient? {
@@ -8490,7 +8505,7 @@ final class AppModel {
             markSeen()
             // A stranger's card is kept in the vault until answered, so it is held to the sizes a profile may have.
             var kept = card
-            kept.name = String(card.name.prefix(64))
+            kept.name = ProfileText.name(card.name)
             if let avatar = card.avatar, avatar.count > Self.maxAvatarBytes { kept.avatar = nil }
             var incoming = FriendRequest(fingerprint: fp, card: kept, handshake: request, note: String(note.prefix(280)),
                                          persona: invite.persona)
@@ -8969,14 +8984,26 @@ final class AppModel {
         case let .callEnd(id):
             guard call?.invite.id == id, call?.peer == fp, call?.persona == persona else { break }
             endCall(note: call?.phase == .ringing && call?.outgoing == false ? "Missed call" : nil, tell: false)
-        case let .profile(name, avatar, color, banner, bio, handle, links, notes, showcase):
-            sender.name = String(name.prefix(64))
-            sender.bio = bio.map { String($0.prefix(160)) }
+        case let .profile(name, avatar, color, banner, bio, handle, links, notes, showcase, stamp):
+            // An older profile arriving after a newer one (sent again, or delivered out of order) is ignored: it could
+            // bring back a note taken away or an old wallet.
+            if let stamp, let held = sender.profileStamp, stamp <= held { break }
+            if let stamp { sender.profileStamp = stamp }
+            sender.name = ProfileText.name(name)
+            sender.bio = ProfileText.bio(bio)
             // Never trust what arrives: keep only entries that pass the same checks as ours.
             let newLinks = Optional(ProfileLink.cleaned(links)).flatMap { $0.isEmpty ? nil : $0 }
             // A wallet they already showed that now reads differently: remember when, so the sheet can warn.
             let wallets = { (list: [ProfileLink]?) in Set((list ?? []).filter(\.kind.isWallet).map { $0.kind.rawValue + ":" + $0.value }) }
             if !wallets(sender.links).isEmpty, wallets(sender.links) != wallets(newLinks) { sender.walletChangedAt = Date() }
+            // And any address for a kind of wallet they've shown before, even if they took it down in between.
+            var known = sender.knownWallets ?? [:]
+            for old in sender.links ?? [] where old.kind.isWallet && known[old.kind.rawValue] == nil { known[old.kind.rawValue] = old.value }
+            for link in newLinks ?? [] where link.kind.isWallet {
+                if let before = known[link.kind.rawValue], before != link.value { sender.walletChangedAt = Date() }
+                known[link.kind.rawValue] = link.value
+            }
+            sender.knownWallets = known.isEmpty ? nil : known
             sender.links = newLinks
             sender.notes = Optional(ProfileNote.cleaned(notes)).flatMap { $0.isEmpty ? nil : $0 }
             // Kept only in shape; whether it's theirs and the relay signed it is checked when shown.
@@ -9338,7 +9365,7 @@ final class AppModel {
             if crossed { data.contacts[i].pqCardSent = nil }
             if crossed, let me = me(persona), myHandshakeWins(me: me.fingerprint, persona: persona, them: fp, theirDevice: device) {
                 data.contacts[i].pq = pq
-                data.contacts[i].name = String(card.name.prefix(64))
+                data.contacts[i].name = ProfileText.name(card.name)
                 data.contacts[i].avatar = card.avatar
                 data.contacts[i].color = card.color
                 data.invites.removeAll { $0.receiveKey == invite.receiveKey }
@@ -9351,7 +9378,7 @@ final class AppModel {
         peer.persona = persona
         peer.pq = pq
         peer.relay = invite.relay
-        peer.name = String(card.name.prefix(64))
+        peer.name = ProfileText.name(card.name)
         peer.avatar = card.avatar.flatMap { $0.count <= Self.maxAvatarBytes ? $0 : nil }
         peer.color = card.color
 
@@ -9601,10 +9628,15 @@ final class AppModel {
 
     /// Shows a contact's @handle only once the directory has it signed by their key, so nobody can pass themselves
     /// off as someone else's handle (or the creator's).
+    /// Checks a handle a contact's profile claims. It waits a random while and goes on a connection used for nothing
+    /// else, so the relay can't tie the lookup to the profile that just arrived, or to another persona's lookups.
     private func confirmHandle(_ handle: String, of contact: Contact) {
         let (fp, persona) = (contact.fingerprint, contact.persona)
         Task { [weak self] in
-            guard let self, let found = try? await self.findProfile(handle), found.fingerprint == fp,
+            try? await Task.sleep(for: .seconds(Double.random(in: 2...20)))
+            let lane = "lookup-once|" + UUID().uuidString
+            defer { RelayClient.retire(lane: lane) }
+            guard let self, let found = try? await self.findProfile(handle, lane: lane), found.fingerprint == fp,
                   var current = self.contact(fp, in: persona) else { return }
             current.handle = handle
             self.upsert(current)
@@ -11710,14 +11742,14 @@ extension AppModel {
             let f = card.fingerprint
             if let c = contactIndex(f, persona) {
                 guard data.contacts[c].hidden, data.contacts[c].devices.allSatisfy({ $0.sendID.isEmpty }) else { continue }
-                data.contacts[c].name = card.name
+                data.contacts[c].name = ProfileText.name(card.name)
                 data.contacts[c].color = card.color
                 // A picture stays only while it is the one their card names.
                 if card.avatarHash == nil || data.contacts[c].avatar.map({ Data(SHA256.hash(data: $0)) }) != card.avatarHash {
                     data.contacts[c].avatar = nil
                 }
             } else {
-                var peer = Contact(fingerprint: f, name: card.name, signingKey: card.signingKey,
+                var peer = Contact(fingerprint: f, name: ProfileText.name(card.name), signingKey: card.signingKey,
                                    agreementKey: card.agreementKey, sendID: Data(), hidden: true)
                 peer.devices = []
                 peer.color = card.color

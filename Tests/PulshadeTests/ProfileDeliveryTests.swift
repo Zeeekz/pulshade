@@ -45,6 +45,44 @@ struct ProfileDeliveryTests {
         #expect(bob.contact(aliceFP)?.links == nil)
     }
 
+    /// A wallet taken down and later replaced still warns: the last address of each kind is remembered.
+    @Test func aWalletReplacedAfterAGapStillWarns() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, bob, seconds: 2)
+        let aliceFP = alice.fingerprint
+        alice.updateProfile { $0.links = [ProfileLink.make(.bitcoin, from: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")!] }
+        await settle(alice, bob)
+        #expect(bob.contact(aliceFP)?.walletChangedAt == nil)
+        alice.updateProfile { $0.links = nil }
+        await settle(alice, bob)
+        // The warning from the removal has run out by the time a new one goes up.
+        if let i = bob.data.contacts.firstIndex(where: { $0.fingerprint == aliceFP }) { bob.data.contacts[i].walletChangedAt = nil }
+        alice.updateProfile { $0.links = [ProfileLink.make(.bitcoin, from: "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa")!] }
+        await settle(alice, bob)
+        #expect(bob.contact(aliceFP)?.walletChangedAt != nil)
+    }
+
+    /// A profile older than the newest one taken is ignored, so a late copy can't bring back what was taken down.
+    @Test func anOlderProfileArrivingLateIsIgnored() async throws {
+        let alice = try await makeUser("Alice")
+        let bob = try await makeUser("Bob")
+        defer { for m in [alice, bob] { m.lock() } }
+        _ = try #require(bob.addContact(code: alice.makeInviteCode(), nickname: ""))
+        await settle(alice, bob, seconds: 2)
+        let aliceFP = alice.fingerprint
+        alice.updateProfile { $0.bio = "First" }
+        await settle(alice, bob)
+        #expect(bob.contact(aliceFP)?.bio == "First")
+        // As if a newer profile had already been taken.
+        if let i = bob.data.contacts.firstIndex(where: { $0.fingerprint == aliceFP }) { bob.data.contacts[i].profileStamp = .max - 1 }
+        alice.updateProfile { $0.bio = "Second" }
+        await settle(alice, bob)
+        #expect(bob.contact(aliceFP)?.bio == "First")
+    }
+
     @Test func notesReachContactsAndLockedOnesOpenOnlyWithTheirPassword() async throws {
         let alice = try await makeUser("Alice")
         let bob = try await makeUser("Bob")

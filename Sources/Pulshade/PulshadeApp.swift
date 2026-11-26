@@ -34,12 +34,14 @@ struct PulshadeApp: App {
                 .preferredColorScheme(model.theme.scheme)
                 // A code scanned with the Camera app. It waits here if Pulshade is locked.
                 .onOpenURL { model.open($0) }
-                // Pulshade's own web links tapped inside Pulshade (in a chat, say) open here, not in the browser.
+                // Pulshade's own web links tapped inside Pulshade (in a chat, say) open here, not in the browser. Any
+                // other link leaves Pulshade and Tor, so it is never handed straight to the system: it's asked about
+                // first, and only a plain web address can be opened (screens with links in text ask on their own too).
                 .environment(\.openURL, OpenURLAction { url in
-                    guard WebLinks.parse(url) != nil else { return .systemAction }
-                    model.open(url)
+                    if WebLinks.parse(url) != nil { model.open(url) } else { model.externalLink = url }
                     return .handled
                 })
+                .confirmsExternalLink(Binding(get: { model.externalLink }, set: { model.externalLink = $0 }))
                 #if os(iOS)
                 .onReceive(NotificationCenter.default.publisher(for: .pulshadePushToken)) { _ in model.refreshPush() }
                 .onChange(of: scenePhase) { _, phase in

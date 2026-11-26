@@ -23,6 +23,8 @@ struct ProfileHero<Actions: View>: View {
     var links: [ProfileLink] = []
     var walletChangedAt: Date? = nil
     var isMine = false
+    /// The profile's signing key: the Creator badge needs it to be the creator's.
+    var signingKey: Data? = nil
     /// A few numbers in a strip under the bio, such as how long you've been friends and how many groups you share.
     var facts: [ProfileFact] = []
     @ViewBuilder var actions: Actions
@@ -63,6 +65,8 @@ struct ProfileHero<Actions: View>: View {
                         .font(.system(size: 15))
                         .foregroundStyle(Ink.text)
                         .tint(theme.accent)
+                        // A link in a bio leaves Pulshade and Tor: asked about first, like one in a chat.
+                        .confirmsLinkTaps()
                         .lineSpacing(2)
                         .multilineTextAlignment(.center)
                         .textSelection(.enabled)
@@ -113,7 +117,7 @@ struct ProfileHero<Actions: View>: View {
             .buttonStyle(.plain)
             .accessibilityLabel("@\(handle)")
             .accessibilityHint("Copies the username")
-            if DirectoryProfile.isReserved(handle) {
+            if DirectoryProfile.isCreator(handle: handle, signingKey: signingKey) {
                 Label("Creator", systemImage: "checkmark.seal.fill")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(theme.accent)
@@ -621,7 +625,7 @@ struct MyProfileView: View {
                             name: profile.displayName,
                             subtitle: model.activePersona == nil ? nil : "Persona",
                             handle: profile.handle, bio: profile.bio,
-                            links: profile.links ?? [], isMine: true, facts: facts) {
+                            links: profile.links ?? [], isMine: true, signingKey: model.me(model.activePersona)?.card.signing, facts: facts) {
                     HStack(spacing: 8) {
                         ProfileActionTile(title: "Edit profile", symbol: "pencil", prominent: true) { edit() }
                         if let handle = profile.handle, let me = model.me(model.activePersona) {
@@ -807,10 +811,10 @@ struct FoundProfileView: View {
     var body: some View {
         VStack(spacing: 14) {
             ProfileHero(avatar: profile.avatar, seed: profile.fingerprint,
-                        name: profile.name.isEmpty ? "Anonymous" : profile.name,
+                        name: ProfileText.name(profile.name).isEmpty ? "Anonymous" : ProfileText.name(profile.name),
                         subtitle: model.isMine(profile.fingerprint) ? "This is you" : nil,
-                        handle: profile.handle, bio: profile.bio,
-                        links: profile.links ?? [], isMine: model.isMine(profile.fingerprint)) { actions }
+                        handle: profile.handle, bio: ProfileText.bio(profile.bio),
+                        links: profile.links ?? [], isMine: model.isMine(profile.fingerprint), signingKey: profile.signingKey) { actions }
             if let earlier = model.earlierOwner(of: profile) {
                 Label("@\(profile.handle) used to be \(earlier.displayName). This is a different account.",
                       systemImage: "exclamationmark.triangle.fill")

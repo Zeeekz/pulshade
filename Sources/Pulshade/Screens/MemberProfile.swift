@@ -38,7 +38,7 @@ struct MemberProfileSheet: View {
                                     name: person.displayName, subtitle: role, handle: person.handle,
                                     bio: person.hidden ? nil : person.bio, verified: person.verified,
                                     links: person.hidden ? [] : (person.links ?? []),
-                                    walletChangedAt: person.walletChangedAt, isMine: person.isSelf) {
+                                    walletChangedAt: person.walletChangedAt, isMine: person.isSelf, signingKey: person.signingKey) {
                             VStack(spacing: 10) { action(person, convo) }
                         }
                         if !person.hidden {

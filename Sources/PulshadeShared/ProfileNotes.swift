@@ -334,3 +334,65 @@ public enum Scrypt {
         }
     }
 }
+
+/// Names and bios from other people, cleaned before they're kept or shown: no hidden or direction-changing marks, no
+/// stacks of accents piled on one letter, held to the sizes a profile may have, and a name that reads as PULSHADE
+/// labelled as not being it, since the app's own notices go by that name.
+public enum ProfileText {
+    public static let maxName = 64
+    public static let maxBio = 160
+    /// What's added to a name that reads as PULSHADE.
+    public static let notBrand = " (not PULSHADE)"
+
+    /// One line, at most `maxName` characters. Empty if nothing is left.
+    public static func name(_ raw: String) -> String {
+        let line = String(strip(raw).map { $0.isNewline || $0 == "\t" ? " " : $0 })
+        let name = String(line.trimmingCharacters(in: .whitespaces).prefix(maxName))
+        return impersonatesBrand(name) ? name + notBrand : name
+    }
+
+    /// At most `maxBio` characters, new lines kept. Nil if nothing is left.
+    public static func bio(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let text = String(strip(raw).trimmingCharacters(in: .whitespacesAndNewlines).prefix(maxBio))
+        return text.isEmpty ? nil : text
+    }
+
+    /// Whether a name reads as PULSHADE once case, accents, look-alike letters from other scripts, digits standing
+    /// in for letters and anything between the letters are set aside.
+    public static func impersonatesBrand(_ raw: String) -> Bool {
+        // Letters from other scripts that look like Latin ones go by their look first (Cyrillic Р is P, not R).
+        let looks: [Character: Character] = ["Р": "p", "р": "p", "А": "a", "а": "a", "Е": "e", "е": "e", "С": "c", "с": "c",
+                                             "О": "o", "о": "o", "Н": "h", "һ": "h", "Т": "t", "Ѕ": "s", "ѕ": "s", "І": "l",
+                                             "і": "l", "Ӏ": "l", "ӏ": "l", "ԁ": "d", "Ԁ": "d", "Ρ": "p", "ρ": "p", "Α": "a",
+                                             "α": "a", "Ε": "e", "Η": "h", "Τ": "t", "Ο": "o", "ο": "o", "υ": "u", "Ս": "u", "ս": "u"]
+        let seen = String(raw.map { looks[$0] ?? $0 })
+        let latin = seen.applyingTransform(.toLatin, reverse: false) ?? seen
+        let folded = latin.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
+        let stand: [Character: Character] = ["0": "o", "1": "l", "!": "l", "|": "l", "5": "s", "$": "s", "4": "a", "@": "a",
+                                             "3": "e", "€": "e", "7": "t", "2": "z"]
+        let letters = String(folded.compactMap { c -> Character? in
+            let c = stand[c] ?? c
+            return c.isLetter ? Character(c.lowercased()) : nil
+        })
+        return letters.contains("pulshade")
+    }
+
+    /// Drops hidden marks and, after two, any more accents stacked on one letter.
+    static func strip(_ raw: String) -> String {
+        var kept = String.UnicodeScalarView()
+        var marks = 0
+        for scalar in raw.replacingOccurrences(of: "\r\n", with: "\n").unicodeScalars {
+            if scalar != "\n" && scalar != "\t" && ProfileLinkKind.hasHidden(String(scalar)) { continue }
+            switch scalar.properties.generalCategory {
+            case .nonspacingMark, .enclosingMark, .spacingMark:
+                marks += 1
+                if marks > 2 { continue }
+            default:
+                marks = 0
+            }
+            kept.append(scalar)
+        }
+        return String(kept)
+    }
+}

@@ -137,12 +137,13 @@ import Foundation
                                                   "collectibles": [worn, worn],
                                                   "links": [["kind": "github", "value": "https://github.com/octocat"]]]]
         let readProfile = try Payload.fromWire(JSONSerialization.data(withJSONObject: profile))
-        guard case let .profile(name, avatar, color, banner, bio, handle, links, notes, showcase) = readProfile else {
+        guard case let .profile(name, avatar, color, banner, bio, handle, links, notes, showcase, stamp) = readProfile else {
             Issue.record("not read as a profile: \(readProfile)")
             return
         }
         #expect(name == "Ann" && avatar == nil && color == 2 && banner == nil && bio == "hi" && handle == "ann" && notes == nil)
         #expect(showcase == nil, "an older app's collectibles aren't taken as a showcase")
+        #expect(stamp == nil, "an older app sends no stamp, and its profile is still taken")
         #expect(links?.map(\.value) == ["https://github.com/octocat"])
 
         let id = UUID()

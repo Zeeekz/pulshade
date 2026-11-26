@@ -184,6 +184,11 @@ struct Contact: Codable, Identifiable {
     var links: [ProfileLink]?
     /// When a wallet address they had already shown last changed. Nil if it never has.
     var walletChangedAt: Date?
+    /// The last address they showed for each kind of wallet, kept after they take it down, so a new one later warns even
+    /// after a gap (an account taken over can't wait out the warning).
+    var knownWallets: [String: String]?
+    /// The stamp of the newest profile taken from them (`Payload.profile`'s `stamp`): an older one arriving late is ignored.
+    var profileStamp: UInt64?
     /// Their text notes, checked when they arrived.
     var notes: [ProfileNote]?
     /// The collectibles they show, as they sent them (checked in shape). Only the copies genuine for their key are ever
@@ -281,7 +286,7 @@ struct Contact: Codable, Identifiable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case fingerprint, name, nickname, avatar, banner, color, bio, links, walletChangedAt, notes, showcase, handle, verified, signingKey, agreementKey, devices, receiveKey, relay
+        case fingerprint, name, nickname, avatar, banner, color, bio, links, walletChangedAt, knownWallets, profileStamp, notes, showcase, handle, verified, signingKey, agreementKey, devices, receiveKey, relay
         case hidden, isSelf, awaitingAcceptance, addedAt, persona, wantsMyPresence, toldPresence, spare, oldSpares, moreSpares, departing, pq, pqCommit, pqCardSent, tooOld, revoked, contested, unlinked
         case viaCode, mailboxSince, formerMailboxes, movedHeard
         // Single-device fields from before linked devices.
@@ -302,6 +307,8 @@ struct Contact: Codable, Identifiable {
         bio = try c.decodeIfPresent(String.self, forKey: .bio)
         links = try? c.decodeIfPresent([ProfileLink].self, forKey: .links)
         walletChangedAt = try? c.decodeIfPresent(Date.self, forKey: .walletChangedAt)
+        knownWallets = try? c.decodeIfPresent([String: String].self, forKey: .knownWallets)
+        profileStamp = try? c.decodeIfPresent(UInt64.self, forKey: .profileStamp)
         notes = try? c.decodeIfPresent([ProfileNote].self, forKey: .notes)
         showcase = try? c.decodeIfPresent(Showcase.self, forKey: .showcase)
         handle = try c.decodeIfPresent(String.self, forKey: .handle)
@@ -357,6 +364,8 @@ struct Contact: Codable, Identifiable {
         try c.encodeIfPresent(bio, forKey: .bio)
         try c.encodeIfPresent(links, forKey: .links)
         try c.encodeIfPresent(walletChangedAt, forKey: .walletChangedAt)
+        try c.encodeIfPresent(knownWallets, forKey: .knownWallets)
+        try c.encodeIfPresent(profileStamp, forKey: .profileStamp)
         try c.encodeIfPresent(notes, forKey: .notes)
         try c.encodeIfPresent(showcase, forKey: .showcase)
         try c.encodeIfPresent(handle, forKey: .handle)
@@ -1580,7 +1589,7 @@ struct AppData: Codable {
     /// 30: collectibles: the copies your identities hold (`collectibles`), the signed list and its pictures in the media
     /// pool (`collectibleList`, `collectiblePictures`), a profile's showcase (`Profile.showcase`, `Contact.showcase`) and
     /// whether friends see your collection (`hideCollection`).
-    /// Also in 30: whether a channel you post in protects its posts from copying (`Conversation.protectPosts`), and how long the Burn tab's ring is held for Lock, Detach and Burn (`SecuritySettings.lockHold`,
+    /// Also in 30: a contact's last-seen wallets (`Contact.knownWallets`) and newest profile stamp (`profileStamp`); whether a channel you post in protects its posts from copying (`Conversation.protectPosts`), and how long the Burn tab's ring is held for Lock, Detach and Burn (`SecuritySettings.lockHold`,
     /// `detachHold`, `burnHold`) and whether they've been chosen (`holdTimesChosen`).
     static let currentFormat = 30
     var profile = Profile()

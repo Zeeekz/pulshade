@@ -2082,7 +2082,7 @@ struct ConversationInfo: View {
                         subtitle: peer.isSelf ? "This is you" : peer.nickname.isEmpty ? nil : "Calls themselves \(theirName)",
                         handle: peer.handle, bio: peer.bio, verified: peer.verified,
                         links: peer.links ?? [], walletChangedAt: peer.walletChangedAt, isMine: peer.isSelf,
-                        facts: peer.isSelf ? [] : friendFacts(peer, in: c, groups: shared.count)) {
+                        signingKey: peer.signingKey, facts: peer.isSelf ? [] : friendFacts(peer, in: c, groups: shared.count)) {
                 HStack(spacing: 8) {
                     ProfileActionTile(title: "Message", symbol: "bubble.left.fill", prominent: true) { dismiss() }
                     if !peer.isSelf {
@@ -2354,6 +2354,7 @@ struct ConversationInfo: View {
             Text(LinkPreviews.linked(text))
                 .font(.system(size: 15)).foregroundStyle(Ink.text)
                 .tint(theme.accent)
+                .confirmsLinkTaps()
                 .multilineTextAlignment(.center)
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
