@@ -115,7 +115,7 @@ public struct Showcase: Codable, Equatable, Sendable {
                             copies: [Collectible], nameBadge: Collectible? = nil) throws -> Showcase {
         let collectorKey = collector.publicKey.rawRepresentation
         let shown = Array(copies.prefix(limit))
-        let extra = nameBadge.map { badge in !shown.contains(badge) } ?? false
+        let extra = nameBadge.map { badge in !shown.contains { $0.id == badge.id } } ?? false
         return Showcase(collector: collectorKey, cert: try signing.signature(for: certPart(collectorKey)),
                         bind: try collector.signature(for: bindPart(signing.publicKey.rawRepresentation)),
                         copies: shown + (extra ? [nameBadge!] : []), nameBadge: nameBadge?.id, badgeExtra: extra ? true : nil)
