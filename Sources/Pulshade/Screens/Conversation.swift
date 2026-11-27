@@ -132,6 +132,12 @@ struct ConversationView: View {
                         if c.kind == .direct, model.contact(c.members.first ?? "")?.verified == true {
                             Image(systemName: "checkmark.seal.fill").font(.system(size: 11)).foregroundStyle(theme.accent)
                         }
+                        if c.kind == .direct, let peer = model.contact(c.members.first ?? "", in: c.persona),
+                           let badge = model.nameBadge(of: peer), let item = model.collectibleList?.item(badge.item) {
+                            CollectibleArt(item: item, size: 20, animated: false)
+                                .frame(width: 20, height: 20)
+                                .accessibilityLabel("\(item.name) #\(badge.serial)")
+                        }
                     }
                     let here = c.kind == .direct && c.members.first.map(model.isOnline) == true
                     let waitingSince = c.kind == .direct ? c.members.first.flatMap(model.keysPendingSince) : nil

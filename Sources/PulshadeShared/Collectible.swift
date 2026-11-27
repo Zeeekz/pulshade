@@ -98,29 +98,57 @@ public struct Showcase: Codable, Equatable, Sendable {
     /// 23 still decodes; without it nothing is shown.
     public var bind: Data?
     public var copies: [Collectible]
+    /// The copy shown beside their name (`Collectible.id`), one of `copies`. Older builds of 23 skip it.
+    public var nameBadge: String?
+    /// The name badge isn't part of the showcase: it's sent as one extra copy, the last, and the profile leaves it out.
+    public var badgeExtra: Bool?
 
-    public init(collector: Data, cert: Data, bind: Data? = nil, copies: [Collectible]) {
+    public init(collector: Data, cert: Data, bind: Data? = nil, copies: [Collectible], nameBadge: String? = nil, badgeExtra: Bool? = nil) {
         (self.collector, self.cert, self.bind, self.copies) = (collector, cert, bind, copies)
+        (self.nameBadge, self.badgeExtra) = (nameBadge, badgeExtra)
     }
 
     public static func certPart(_ collector: Data) -> Data { Data("pulshade.collector.cert.v1".utf8) + collector }
     public static func bindPart(_ signingKey: Data) -> Data { Data("pulshade.collector.bind.v1".utf8) + signingKey }
 
     public static func make(signing: Curve25519.Signing.PrivateKey, collector: Curve25519.Signing.PrivateKey,
-                            copies: [Collectible]) throws -> Showcase {
+                            copies: [Collectible], nameBadge: Collectible? = nil) throws -> Showcase {
         let collectorKey = collector.publicKey.rawRepresentation
+        let shown = Array(copies.prefix(limit))
+        let extra = nameBadge.map { badge in !shown.contains(badge) } ?? false
         return Showcase(collector: collectorKey, cert: try signing.signature(for: certPart(collectorKey)),
-                        bind: try collector.signature(for: bindPart(signing.publicKey.rawRepresentation)), copies: copies)
+                        bind: try collector.signature(for: bindPart(signing.publicKey.rawRepresentation)),
+                        copies: shown + (extra ? [nameBadge!] : []), nameBadge: nameBadge?.id, badgeExtra: extra ? true : nil)
     }
 
     /// A showcase that arrived, kept only in shape: a 32-byte key, a 64-byte certificate, and at most `limit` copies held by
-    /// that key with valid ids and signatures of the right size. Nil if nothing's left.
+    /// that key with valid ids and signatures of the right size (one more when the last is an extra name badge), and a
+    /// name badge only if it names one of them. Nil if nothing's left.
     public static func received(_ showcase: Showcase?) -> Showcase? {
         guard let showcase, showcase.collector.count == 32, showcase.cert.count == 64, showcase.bind?.count == 64 else { return nil }
+        let extra = showcase.badgeExtra == true && showcase.nameBadge != nil && showcase.copies.last?.id == showcase.nameBadge
         let copies = Collectible.unique(showcase.copies.filter {
             $0.owner == showcase.collector && CollectibleList.validID($0.item) && $0.serial > 0 && $0.sig.count == 64
-        }, limit: limit)
-        return copies.isEmpty ? nil : Showcase(collector: showcase.collector, cert: showcase.cert, bind: showcase.bind, copies: copies)
+        }, limit: limit + (extra ? 1 : 0))
+        guard !copies.isEmpty else { return nil }
+        let badge = showcase.nameBadge.flatMap { id in copies.contains { $0.id == id } ? id : nil }
+        let keptExtra = extra && badge != nil && copies.last?.id == badge
+        return Showcase(collector: showcase.collector, cert: showcase.cert, bind: showcase.bind,
+                        copies: keptExtra || copies.count <= limit ? copies : Array(copies.prefix(limit)),
+                        nameBadge: badge, badgeExtra: keptExtra ? true : nil)
+    }
+
+    /// The copies that can be shown on the profile: the genuine ones, without an extra name badge.
+    public func shown(for signingKey: Data, issuer: Data?) -> [Collectible] {
+        let real = genuine(for: signingKey, issuer: issuer)
+        guard badgeExtra == true, let nameBadge else { return Array(real.prefix(Self.limit)) }
+        return Array(real.filter { $0.id != nameBadge }.prefix(Self.limit))
+    }
+
+    /// The copy shown beside their name, if it's genuine.
+    public func badge(for signingKey: Data, issuer: Data?) -> Collectible? {
+        guard let nameBadge else { return nil }
+        return genuine(for: signingKey, issuer: issuer).first { $0.id == nameBadge }
     }
 
     /// The copies that can be shown for the account with `signingKey`: the certificate is theirs, the collector key
@@ -130,7 +158,7 @@ public struct Showcase: Codable, Equatable, Sendable {
               key.isValidSignature(cert, for: Self.certPart(collector)),
               let bind, let collectorKey = try? Curve25519.Signing.PublicKey(rawRepresentation: collector),
               collectorKey.isValidSignature(bind, for: Self.bindPart(signingKey)) else { return [] }
-        return Collectible.unique(copies.filter { $0.isGenuine(for: collector, issuer: issuer) }, limit: Self.limit)
+        return Collectible.unique(copies.filter { $0.isGenuine(for: collector, issuer: issuer) }, limit: Self.limit + 1)
     }
 }
 

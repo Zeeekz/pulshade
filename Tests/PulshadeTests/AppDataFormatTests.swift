@@ -93,10 +93,11 @@ struct AppDataFormatTests {
     static let appKeys = ["activePersona", "announcementsSeen", "backupDigest", "backupSavedAt", "backupStamp", "blobSpends", "blobWipes", "blocked", "blockedNames", "bornAt", "chatBackground", "chatCodes", "clipParts", "collectibleList", "collectibleListTag", "collectiblePictures", "collectibles", "contacts", "conversations", "decoySeed", "deviceID", "deviceKey", "deviceVouch",
                           "facade", "followsAsked", "format", "friendInvites", "groupOffers", "groupRenewAfter", "groupSecret", "handlesTidied", "hideCollection", "inviteRelay", "invites", "joinAsks", "mediaFillers", "namesToRelease", "outbox", "panicSeed", "partingPosts", "pendingBackupForget", "personas", "profile",
                           "profileShared", "publicNames", "relay", "requests", "security", "seenEnvelopes", "sentDigests", "setAside", "setAsideUnseen", "shortLinks", "stories", "storyChoices", "theme"]
+    /// `nameBadge` joined in 30 before that format shipped, so no bump.
     /// The collectible fields (`badge`, `collectibles`, `collectionCode`, `collectibleCodes`) were removed without a bump on
     /// purpose: data that still has them opens, the keys are just ignored (see `dataSavedWithCollectiblesStillOpens`).
     static let profileKeys = ["avatar", "banner", "bio", "color", "format", "handle", "links",
-                              "moreHandles", "name", "notes", "showcase", "updatedAt"]
+                              "moreHandles", "name", "nameBadge", "notes", "showcase", "updatedAt"]
     static let contactKeys = ["addedAt", "agreementKey", "avatar", "awaitingAcceptance", "banner", "bio", "color", "contested", "departing", "devices",
                               "fingerprint", "followLater", "formerMailboxes", "handle", "hidden", "isSelf", "knownWallets", "links", "mailboxSince", "moreSpares", "movedHeard", "name", "nickname", "notes", "oldSpares", "persona", "pq", "pqCardSent", "pqCommit", "profileStamp", "receiveKey", "relay", "revoked",
                               "showcase", "signingKey", "spare", "toldPresence", "tooOld", "unlinked", "verified", "viaCode", "walletChangedAt", "wantsMyPresence"]

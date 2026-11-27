@@ -147,4 +147,44 @@ struct CollectibleTests {
         #expect(Showcase.received(Showcase(collector: collectorKey, cert: hers.cert, copies: hers.copies)) == nil)
         #expect(hers.genuine(for: alice.publicKey.rawRepresentation, issuer: issuerKey) == [copy])
     }
+
+    /// The copy beside your name rides in the showcase: as one of the six when it's shown there, or as one extra copy
+    /// the profile leaves out. Only a genuine copy, named by the badge, shows.
+    @Test func aNameBadgeTravelsInTheShowcase() throws {
+        let signing = Curve25519.Signing.PrivateKey(), collector = Curve25519.Signing.PrivateKey()
+        let collectorKey = collector.publicKey.rawRepresentation, me = signing.publicKey.rawRepresentation
+        let issuerKey = issuer.publicKey.rawRepresentation
+        let copies = try (1...7).map { n in
+            Collectible(item: "dice", serial: UInt32(n), owner: collectorKey,
+                        sig: try issuer.signature(for: Collectible.signedPart(item: "dice", serial: UInt32(n), owner: collectorKey)))
+        }
+        let six = Array(copies.prefix(6)), seventh = copies[6]
+
+        // Badge outside a full showcase: seven copies go, the profile shows six, the badge is the seventh.
+        let extra = try #require(Showcase.received(try Showcase.make(signing: signing, collector: collector, copies: six, nameBadge: seventh)))
+        #expect(extra.copies.count == 7)
+        #expect(extra.shown(for: me, issuer: issuerKey) == six)
+        #expect(extra.badge(for: me, issuer: issuerKey) == seventh)
+
+        // Badge that's also in the showcase: nothing extra.
+        let inside = try #require(Showcase.received(try Showcase.make(signing: signing, collector: collector, copies: six, nameBadge: six[2])))
+        #expect(inside.copies == six && inside.badgeExtra == nil)
+        #expect(inside.shown(for: me, issuer: issuerKey) == six)
+        #expect(inside.badge(for: me, issuer: issuerKey) == six[2])
+
+        // Only a badge, no showcase.
+        let alone = try #require(Showcase.received(try Showcase.make(signing: signing, collector: collector, copies: [], nameBadge: seventh)))
+        #expect(alone.shown(for: me, issuer: issuerKey).isEmpty)
+        #expect(alone.badge(for: me, issuer: issuerKey) == seventh)
+
+        // A badge naming a copy that isn't there is dropped, and "extra" can't smuggle in a seventh showcase copy.
+        var forged = try Showcase.make(signing: signing, collector: collector, copies: six)
+        forged.copies = copies
+        forged.nameBadge = "dice#99"
+        forged.badgeExtra = true
+        let kept = try #require(Showcase.received(forged))
+        #expect(kept.nameBadge == nil && kept.copies == six)
+        // Not genuine: someone else's signing key shows no badge.
+        #expect(extra.badge(for: Curve25519.Signing.PrivateKey().publicKey.rawRepresentation, issuer: issuerKey) == nil)
+    }
 }

@@ -55,18 +55,41 @@ extension AppModel {
         return chosen.compactMap { id in held.first { $0.id == id } }.prefix(Self.showcaseLimit).map { $0 }
     }
 
-    /// What friends are sent with your profile: your showcase with its certificate, unless you hide your collection.
+    /// The copy `persona` shows beside its name, if it still holds it.
+    func nameBadge(for persona: UUID?) -> Collectible? {
+        guard let id = profile(for: persona).nameBadge else { return nil }
+        return collection(for: persona).first { $0.id == id }
+    }
+
+    /// What friends are sent with your profile: your showcase and name badge with the certificate, unless you hide your
+    /// collection.
     func sharedShowcase(_ persona: UUID?) -> Showcase? {
         guard data.hideCollection != true, let me = me(persona) else { return nil }
         let shown = showcase(for: persona)
-        guard !shown.isEmpty else { return nil }
-        return try? Showcase.make(signing: me.signingKey, collector: me.collectorKey, copies: shown)
+        let badge = nameBadge(for: persona)
+        guard !shown.isEmpty || badge != nil else { return nil }
+        return try? Showcase.make(signing: me.signingKey, collector: me.collectorKey, copies: shown, nameBadge: badge)
     }
 
     /// A contact's showcase as it can be shown: only copies the relay signed for the collector key their own key vouches for.
     func showcase(of contact: Contact) -> [Collectible] {
         guard let list = collectibleList, let showcase = contact.showcase else { return [] }
-        return showcase.genuine(for: contact.signingKey, issuer: list.issuerKey).filter { list.item($0.item) != nil }
+        return showcase.shown(for: contact.signingKey, issuer: list.issuerKey).filter { list.item($0.item) != nil }
+    }
+
+    /// The collectible a contact shows beside their name, checked the same way.
+    func nameBadge(of contact: Contact) -> Collectible? {
+        guard let list = collectibleList, let badge = contact.showcase?.badge(for: contact.signingKey, issuer: list.issuerKey),
+              list.item(badge.item) != nil else { return nil }
+        return badge
+    }
+
+    /// Picks the copy shown beside your name, or none.
+    func setNameBadge(_ id: String?) {
+        let held = Set(collection(for: activePersona).map(\.id))
+        let kept = id.flatMap { held.contains($0) ? $0 : nil }
+        guard profile(for: activePersona).nameBadge != kept else { return }
+        updateProfile { $0.nameBadge = kept }
     }
 
     /// The code Pulshade Admin needs to give this identity a collectible: its collector key. Not the key contacts know.
@@ -191,6 +214,9 @@ extension AppModel {
         if let shown = profile(for: persona).showcase, shown.contains(where: { !held.contains($0) }) {
             updateProfile(of: persona) { $0.showcase = shown.filter(held.contains).nilIfEmpty }
         }
+        if let badge = profile(for: persona).nameBadge, !held.contains(badge) {
+            updateProfile(of: persona) { $0.nameBadge = nil }
+        }
         save()
     }
 
@@ -204,6 +230,9 @@ extension AppModel {
         data.collectibles?.removeAll { $0 == copy }
         if let shown = profile(for: persona).showcase, shown.contains(copy.id) {
             updateProfile(of: persona) { $0.showcase = shown.filter { $0 != copy.id }.nilIfEmpty }
+        }
+        if profile(for: persona).nameBadge == copy.id {
+            updateProfile(of: persona) { $0.nameBadge = nil }
         }
         save()
         return true

@@ -208,6 +208,7 @@ struct ShowcaseEditor: View {
     @Environment(AppModel.self) private var model
     @Environment(\.theme) private var theme
     @State private var picking = false
+    @State private var pickingBadge = false
     @State private var showingAll = false
 
     var body: some View {
@@ -227,6 +228,23 @@ struct ShowcaseEditor: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Choose what your profile shows, \(shown.count) of \(AppModel.showcaseLimit) picked")
+                RowDivider()
+                let badge = model.nameBadge(for: model.activePersona)
+                Button { pickingBadge = true } label: {
+                    SettingRow("Next to your name") {
+                        HStack(spacing: 6) {
+                            if let badge, let item = list.item(badge.item) {
+                                CollectibleArt(item: item, size: 22, animated: false)
+                                Text(item.name).font(.system(size: 14)).foregroundStyle(Ink.faint).lineLimit(1)
+                            } else {
+                                Text("None").font(.system(size: 14)).foregroundStyle(Ink.faint)
+                            }
+                            Image(systemName: "chevron.right").font(.system(size: 12, weight: .semibold)).foregroundStyle(Ink.faint)
+                        }
+                    }
+                    .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
                 RowDivider()
             }
             SettingRow("Show to friends") {
@@ -249,6 +267,7 @@ struct ShowcaseEditor: View {
             .buttonStyle(.plain)
         }
         .sheet(isPresented: $picking) { NavigationStack { ShowcasePicker() } }
+        .sheet(isPresented: $pickingBadge) { NavigationStack { NameBadgePicker() } }
         .sheet(isPresented: $showingAll) { NavigationStack { CollectionScreen() } }
     }
 
@@ -320,6 +339,51 @@ struct ShowcasePicker: View {
         }
         .background(Ink.base)
         .navigationTitle("Show on profile")
+        #if os(iOS)
+        .navigationBarTitleDisplayMode(.inline)
+        #endif
+        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+    }
+}
+
+/// Everything you hold, to pick the one friends see beside your name in a chat, or none.
+struct NameBadgePicker: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.theme) private var theme
+
+    var body: some View {
+        let held = model.collection(for: model.activePersona)
+        let chosen = model.nameBadge(for: model.activePersona)?.id
+        ScrollView {
+            VStack(spacing: 12) {
+                Text("Friends see it beside your name at the top of your chat. Tap it again to take it off.")
+                    .font(.system(size: 13)).foregroundStyle(Ink.faint)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if let list = model.collectibleList {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 100), spacing: 10)], spacing: 10) {
+                        ForEach(held) { copy in
+                            if let item = list.item(copy.item) {
+                                let on = chosen == copy.id
+                                Button {
+                                    Haptics.tick()
+                                    model.setNameBadge(on ? nil : copy.id)
+                                } label: {
+                                    CollectibleTile(item: item, copy: copy)
+                                        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                            .strokeBorder(on ? theme.accent : .clear, lineWidth: 2))
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityAddTraits(on ? .isSelected : [])
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(16)
+        }
+        .background(Ink.base)
+        .navigationTitle("Next to your name")
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif

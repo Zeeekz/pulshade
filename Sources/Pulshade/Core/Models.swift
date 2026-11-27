@@ -31,6 +31,8 @@ struct Profile: Codable, Equatable {
     /// The collectibles you show at the top of your profile (`Collectible.id`s, up to `AppModel.showcaseLimit`), from the
     /// ones this identity holds.
     var showcase: [String]?
+    /// The collectible friends see beside your name in a chat (a `Collectible.id` this identity holds).
+    var nameBadge: String?
     /// When any of this last changed, so your devices can agree on the newest version.
     var updatedAt: Date?
     /// The `AppData.currentFormat` of the build that last saved this profile. Devices of one account pass profiles
@@ -1612,6 +1614,7 @@ struct AppData: Codable {
     /// whether friends see your collection (`hideCollection`).
     /// Also in 30: a contact's last-seen wallets (`Contact.knownWallets`) and newest profile stamp (`profileStamp`); whether a channel you post in protects its posts from copying (`Conversation.protectPosts`), and how long the Burn tab's ring is held for Lock, Detach and Burn (`SecuritySettings.lockHold`,
     /// `detachHold`, `burnHold`) and whether they've been chosen (`holdTimesChosen`).
+    /// Also in 30: the collectible shown beside your name (`Profile.nameBadge`).
     static let currentFormat = 30
     var profile = Profile()
     var contacts: [Contact] = []
